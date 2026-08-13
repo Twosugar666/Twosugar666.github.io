@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Xuanbo Guo · Personal Blog</title>
-  <meta name="description" content="Xuanbo Guo — Master's student at Beihang University. Multimodal LLMs, Agent Systems, Neural Rendering." />
+  <meta name="description" content="Xuanbo Guo — Master's student at Beihang University. Post-training, Vertical Agents, Multimodal LLMs, Neural Rendering." />
   <link rel="icon" href="https://github.com/Twosugar666.png" />
   <link rel="stylesheet" href="assets/style.css" />
 </head>
@@ -13,150 +13,146 @@
     <div class="nav-inner">
       <a class="brand" href="#top">Xuanbo&nbsp;Guo</a>
       <div class="nav-links">
-        <a href="#about">About</a>
-        <a href="#research">Research</a>
         <a href="#experience">Experience</a>
         <a href="#publications">Publications</a>
         <a href="#blog">Blog</a>
+        <a href="#research">Research</a>
         <button id="theme-toggle" aria-label="切换主题">◐</button>
       </div>
     </div>
   </nav>
 
-  <header class="hero" id="top">
-    <img class="avatar" src="https://github.com/Twosugar666.png" alt="Xuanbo Guo" />
-    <h1>Xuanbo Guo</h1>
-    <p class="subtitle">🎓 Master's Student @ Beihang University · Computer Science</p>
-    <p class="tagline">Post-training · Vertical Agents · Multimodal LLMs · Neural Rendering</p>
-    <p class="intro">
-      Currently at <strong>WeChat 小微团队</strong>, working on <strong>LLM post-training</strong>
-      and <strong>vertical-domain agents</strong>. Exploring the intersection of
-      <strong>AI Agents</strong>, <strong>Vision-Language Models</strong>, and <strong>3D Perception</strong>.
-    </p>
-    <div class="social">
-      <a href="https://github.com/Twosugar666" target="_blank" rel="noopener">GitHub</a>
-      <a href="mailto:1403222698@qq.com">Email</a>
-    </div>
-  </header>
+  <div class="layout" id="top">
 
-  <main>
-    <section id="about">
-      <h2>About</h2>
-      <p>
-        我是 Xuanbo Guo，北京航空航天大学计算机科学在读硕士，研究方向为<strong>多模态信息融合</strong>。
-        目前在<strong>腾讯微信 · 小微团队</strong>，专注于<strong>大模型后训练（Post-training）</strong>与
-        <strong>垂类 Agent</strong> 的搭建。关注多模态大模型、智能体系统与神经渲染，
-        尤其对 AI Agents、视觉语言模型（VLMs）与 3D 感知的交叉方向充满热情。
-      </p>
-    </section>
-
-    <section id="research">
-      <h2>Research &amp; Projects</h2>
-      <div class="cards">
-        <article class="card">
-          <h3>🧩 Magnetic Source Imaging Registration</h3>
-          <p class="card-meta">NeRF + VLM</p>
-          <p>
-            基于自监督学习与多视角可微渲染的磁源成像配准。
-            🏆 专利已受理，论文被 <em>Information Fusion</em> 接收。
-          </p>
-        </article>
-        <article class="card">
-          <h3>🤖 Self-LLM &amp; RL for Agent Enhancement</h3>
-          <p class="card-meta">LLM · Reinforcement Learning</p>
-          <p>
-            <strong>self-llm</strong>（25k+ ⭐）强化学习模块核心贡献者，
-            开发了基于 GRPO 的微调方案与多智能体协作框架。
-          </p>
-        </article>
-        <article class="card">
-          <h3>💬 Post-training &amp; Vertical Agents @ WeChat</h3>
-          <p class="card-meta">SFT · RL · Agent</p>
-          <p>
-            在微信小微团队从事大模型后训练与垂类 Agent 搭建，
-            面向微信生态场景打磨模型的指令遵循、工具调用与任务执行能力。
-          </p>
-        </article>
+    <!-- 左栏：个人信息 -->
+    <aside class="sidebar">
+      <div class="profile-card">
+        <img class="avatar" src="https://github.com/Twosugar666.png" alt="Xuanbo Guo" />
+        <h1>Xuanbo Guo</h1>
+        <p class="subtitle">🎓 Master's Student<br />@ Beihang University · CS</p>
+        <p class="tagline">Post-training · Vertical Agents<br />Multimodal LLMs · Neural Rendering</p>
+        <div class="social">
+          <a href="https://github.com/Twosugar666" target="_blank" rel="noopener">🐙 GitHub</a>
+          <a href="mailto:1403222698@qq.com">📫 Email</a>
+        </div>
       </div>
-    </section>
 
-    <section id="experience">
-      <h2>Experience</h2>
-      <ul class="timeline">
-        <li>
-          <span class="time">2026 – Present</span>
-          <div><strong>💬 Tencent WeChat · 小微团队</strong><br />Post-training &amp; Vertical Agent</div>
-        </li>
-        <li>
-          <span class="time">Apr 2025 – 2026</span>
-          <div><strong>🌟 ByteDance</strong><br />Multimodal LLM Research Intern</div>
-        </li>
-        <li>
-          <span class="time">Jan 2025 – Apr 2025</span>
-          <div><strong>🛒 Kuaishou</strong><br />E-commerce Multimodal LLM Intern</div>
-        </li>
-        <li>
-          <span class="time">Oct 2024 – Jan 2025</span>
-          <div><strong>🎥 Netease</strong><br />Multimodal Algorithm Intern (Media Tech)</div>
-        </li>
-        <li>
-          <span class="time">May 2024 – Sep 2024</span>
-          <div><strong>🚗 NIO 蔚来</strong><br />AI Algorithm Intern (Advanced Intelligent Systems)</div>
-        </li>
-        <li>
-          <span class="time">Dec 2023 – May 2024</span>
-          <div><strong>💡 Fourth Paradigm 第四范式</strong><br />AI Agent Algorithm Intern</div>
-        </li>
-      </ul>
-    </section>
+      <section id="about">
+        <h2>About</h2>
+        <p>
+          北航计算机科学在读硕士，研究方向为<strong>多模态信息融合</strong>。
+          目前在<strong>腾讯微信 · 小微团队</strong>，专注于<strong>大模型后训练</strong>与
+          <strong>垂类 Agent</strong> 的搭建。关注 AI Agents、视觉语言模型（VLMs）
+          与 3D 感知的交叉方向。
+        </p>
+      </section>
+    </aside>
 
-    <section id="publications">
-      <h2>Publications</h2>
-      <ul class="pubs">
-        <li>
-          🎤 <strong>Xuanbo Guo</strong>, Yanjie Liang, Jianxiang Zhou, Baqun Sun, Ke Wang.
-          “MTAD: A Three-Stage Framework for Machine Translation Agents Distillation.”
-          <em>ICASSP 2026</em> (IEEE International Conference on Acoustics, Speech and Signal Processing).
-          <a href="https://ieeexplore.ieee.org/document/11462599/" target="_blank" rel="noopener">[paper]</a>
-        </li>
-        <li>
-          🧲 <strong>Xuanbo Guo</strong>, Xingwen Fu, Ling Li, Wei Li.
-          “VFMReg: Vision Foundation Model Regression for End-to-End OPM-MEG Helmet-to-MRI
-          Co-Registration from Multi-View RGB.”
-          <em>ISPP 2026</em> (International Conference on Image, Signal Processing and Pattern Recognition).
-          <a href="https://ieeexplore.ieee.org/document/11542846" target="_blank" rel="noopener">[paper]</a>
-        </li>
-        <li>
-          ✍️ <em>Information Fusion</em> (Accepted):
-          “Magnetic source imaging registration based on self-supervised learning
-          and multi-view differentiable rendering”
-        </li>
-        <li>🧾 2 papers under review (WWW 2026)</li>
-      </ul>
-    </section>
+    <!-- 中栏：博客 -->
+    <main class="col-main">
+      <section id="blog">
+        <h2>Blog</h2>
+        <ul class="post-list">
+          <li>
+            <a href="posts/grpo-notes.html">GRPO 微调实践笔记：从公式到多智能体协作</a>
+            <span class="post-date">2026-08-13</span>
+          </li>
+          <li>
+            <a href="posts/hello-blog.html">你好，博客！为什么我开始写技术博客</a>
+            <span class="post-date">2026-08-13</span>
+          </li>
+        </ul>
+      </section>
 
-    <section id="blog">
-      <h2>Blog</h2>
-      <ul class="post-list">
-        <li>
-          <a href="posts/grpo-notes.html">GRPO 微调实践笔记：从公式到多智能体协作</a>
-          <span class="post-date">2026-08-13</span>
-        </li>
-        <li>
-          <a href="posts/hello-blog.html">你好，博客！为什么我开始写技术博客</a>
-          <span class="post-date">2026-08-13</span>
-        </li>
-      </ul>
-    </section>
+      <section id="research">
+        <h2>Research &amp; Projects</h2>
+        <div class="cards">
+          <article class="card">
+            <h3>🧩 Magnetic Source Imaging Registration</h3>
+            <p class="card-meta">NeRF + VLM</p>
+            <p>
+              基于自监督学习与多视角可微渲染的磁源成像配准。
+              🏆 专利已受理，论文被 <em>Information Fusion</em> 接收。
+            </p>
+          </article>
+          <article class="card">
+            <h3>🤖 Self-LLM &amp; RL for Agent Enhancement</h3>
+            <p class="card-meta">LLM · Reinforcement Learning</p>
+            <p>
+              <strong>self-llm</strong>（25k+ ⭐）强化学习模块核心贡献者，
+              开发了基于 GRPO 的微调方案与多智能体协作框架。
+            </p>
+          </article>
+          <article class="card">
+            <h3>💬 Post-training &amp; Vertical Agents @ WeChat</h3>
+            <p class="card-meta">SFT · RL · Agent</p>
+            <p>
+              在微信小微团队从事大模型后训练与垂类 Agent 搭建，
+              面向微信生态场景打磨模型的指令遵循、工具调用与任务执行能力。
+            </p>
+          </article>
+        </div>
+      </section>
+    </main>
 
-    <section id="contact">
-      <h2>Contact</h2>
-      <p>
-        📫 <a href="mailto:1403222698@qq.com">1403222698@qq.com</a><br />
-        🐙 <a href="https://github.com/Twosugar666" target="_blank" rel="noopener">github.com/Twosugar666</a>
-      </p>
-    </section>
-  </main>
+    <!-- 右栏：经历 + 论文 -->
+    <aside class="col-side">
+      <section id="experience">
+        <h2>Experience</h2>
+        <ul class="timeline">
+          <li>
+            <span class="time">2026 – Present</span>
+            <div><strong>💬 Tencent WeChat · 小微团队</strong><br />Post-training &amp; Vertical Agent</div>
+          </li>
+          <li>
+            <span class="time">Apr 2025 – 2026</span>
+            <div><strong>🌟 ByteDance</strong><br />Multimodal LLM Research Intern</div>
+          </li>
+          <li>
+            <span class="time">Jan 2025 – Apr 2025</span>
+            <div><strong>🛒 Kuaishou</strong><br />E-commerce Multimodal LLM Intern</div>
+          </li>
+          <li>
+            <span class="time">Oct 2024 – Jan 2025</span>
+            <div><strong>🎥 Netease</strong><br />Multimodal Algorithm Intern (Media Tech)</div>
+          </li>
+          <li>
+            <span class="time">May 2024 – Sep 2024</span>
+            <div><strong>🚗 NIO 蔚来</strong><br />AI Algorithm Intern (Advanced Intelligent Systems)</div>
+          </li>
+          <li>
+            <span class="time">Dec 2023 – May 2024</span>
+            <div><strong>💡 Fourth Paradigm 第四范式</strong><br />AI Agent Algorithm Intern</div>
+          </li>
+        </ul>
+      </section>
+
+      <section id="publications">
+        <h2>Publications</h2>
+        <ul class="pubs">
+          <li>
+            🎤 <strong>Xuanbo Guo</strong>, Yanjie Liang, Jianxiang Zhou, Baqun Sun, Ke Wang.
+            “MTAD: A Three-Stage Framework for Machine Translation Agents Distillation.”
+            <em>ICASSP 2026</em>.
+            <a href="https://ieeexplore.ieee.org/document/11462599/" target="_blank" rel="noopener">[paper]</a>
+          </li>
+          <li>
+            🧲 <strong>Xuanbo Guo</strong>, Xingwen Fu, Ling Li, Wei Li.
+            “VFMReg: Vision Foundation Model Regression for End-to-End OPM-MEG
+            Helmet-to-MRI Co-Registration from Multi-View RGB.”
+            <em>ISPP 2026</em>.
+            <a href="https://ieeexplore.ieee.org/document/11542846" target="_blank" rel="noopener">[paper]</a>
+          </li>
+          <li>
+            ✍️ <em>Information Fusion</em> (Accepted):
+            “Magnetic source imaging registration based on self-supervised learning
+            and multi-view differentiable rendering”
+          </li>
+          <li>🧾 2 papers under review (WWW 2026)</li>
+        </ul>
+      </section>
+    </aside>
+  </div>
 
   <footer>
     <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
