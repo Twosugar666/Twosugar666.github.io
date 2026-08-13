@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GRPO 微调实践笔记 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>GRPO 微调实践笔记：从公式到多智能体协作</h1>
+    <p class="post-meta">2026-08-13 · Xuanbo Guo</p>
+
+    <p>
+      在参与 <a href="https://github.com/datawhalechina/self-llm" target="_blank" rel="noopener">self-llm</a>
+      强化学习模块的开发过程中，我基于 GRPO（Group Relative Policy Optimization）搭建了一套
+      LLM 微调流程，并延伸到多智能体协作场景。这篇笔记记录一些关键理解和踩过的坑。
+    </p>
+
+    <h2>为什么是 GRPO</h2>
+    <p>
+      相比 PPO，GRPO 去掉了 value model（critic），用<strong>组内相对优势</strong>来估计 baseline：
+      对同一个 prompt 采样一组回答，用组内奖励的均值和标准差做归一化，得到每个样本的优势值。
+    </p>
+    <pre><code>A_i = (r_i - mean(r_1..r_G)) / std(r_1..r_G)</code></pre>
+    <p>
+      好处很实际：省掉了训练一个与 policy 同等规模 critic 的显存和算力开销，
+      对 7B 级别模型的单卡 / 少卡微调非常友好。
+    </p>
+
+    <h2>奖励设计是灵魂</h2>
+    <p>RL 微调的效果上限几乎由 reward function 决定。实践中我通常组合几类奖励：</p>
+    <ul>
+      <li><strong>格式奖励</strong>：输出是否满足预定结构（如 <code>&lt;think&gt;...&lt;/think&gt;</code> 标签），简单但收益稳定；</li>
+      <li><strong>正确性奖励</strong>：可验证任务（数学、代码）直接用规则判定，避免 reward hacking；</li>
+      <li><strong>长度惩罚</strong>：防止模型为了刷分生成冗余内容。</li>
+    </ul>
+
+    <h2>踩过的坑</h2>
+    <blockquote>
+      KL 散度系数不是越大越稳——过大会让模型几乎不更新，过小则几轮之后输出崩塌。
+      建议从 β=0.04 附近开始扫，并始终监控 KL 曲线。
+    </blockquote>
+    <ul>
+      <li>组内样本数 G 太小（如 4）时优势估计方差很大，建议 ≥ 8；</li>
+      <li>奖励做归一化前先 clip 掉极端值，否则个别 outlier 会主导梯度；</li>
+      <li>多智能体场景下，各 agent 的奖励要拆开回传，共用一个 reward 会互相干扰。</li>
+    </ul>
+
+    <h2>从单 Agent 到多智能体</h2>
+    <p>
+      在 GRPO 框架基础上，我们把任务拆成 planner / executor / critic 三个角色，
+      每个角色独立维护 rollout buffer，共享同一个 reward 环境但分别计算组内优势。
+      实验上这种分工在复杂推理任务上比单体模型有约 10% 的通过率提升——
+      详细数据之后单独写一篇文章展开。
+    </p>
+
+    <p>有问题欢迎邮件交流：<a href="mailto:1403222698@qq.com">1403222698@qq.com</a></p>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
