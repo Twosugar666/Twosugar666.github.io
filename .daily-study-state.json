@@ -1,0 +1,12 @@
+{
+  "rotation": ["rl", "agent", "infra"],
+  "next": 1,
+  "history": [
+    {
+      "date": "2026-08-13",
+      "domain": "rl",
+      "topic": "过程奖励模型（PRM）：PRM800K / Math-Shepherd / OmegaPRM 自动过程监督",
+      "file": "posts/daily-2026-08-13-prm.html"
+    }
+  ]
+}

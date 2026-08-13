@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜过程奖励模型（PRM）：给每一步推理打分 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜过程奖励模型（PRM）：给每一步推理打分，而不只看最终答案</h1>
+    <p class="post-meta">2026-08-13 · 收藏夹：RL · 大模型后训练 · 关键词：PRM / ORM / PRM800K / Math-Shepherd / OmegaPRM</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      之前的 <a href="grpo-notes.html">GRPO 实践笔记</a>和<a href="rl-10-papers-detailed.html">「复现 10 篇 RL 论文」详解</a>里，
+      reward 几乎清一色是 <strong>outcome reward</strong>：一道数学题最终答案对给 1、错给 0。
+      这在工程上最省事（rule-based、无需额外模型），但有一个结构性缺陷——<strong>信用分配（credit assignment）粒度太粗</strong>：
+    </p>
+    <ul>
+      <li>一条 10 步的推理链，前 9 步都对、最后一步算错，整条轨迹拿 0 分，前面的好步骤被「连坐」；</li>
+      <li>反过来，中间乱推一气、最后蒙对答案，整条轨迹拿 1 分，错误步骤被「奖励」；</li>
+      <li>训练方只知道「这条错了」，不知道「错在哪一步」，改进信号被平均稀释。</li>
+    </ul>
+    <p>
+      <strong>过程奖励模型（Process Reward Model, PRM）</strong>就是对这个缺陷的直接回应：不只给最终答案打分，
+      而是给推理链中的<strong>每一步</strong>打一个分数。它对应的旧范式是只看结果的
+      <strong>ORM（Outcome Reward Model）</strong>。这两条路线在 2022～2024 年间被系统性对比和规模化验证，
+      是今天 reasoning model 后训练工具箱里的标准组件，也是理解 o1 类「搜索 + 验证」复现工作（OpenR、Rest-MCTS* 等）的必备前置。
+    </p>
+    <blockquote>
+      本篇笔记的主线：<strong>PRM 的监督数据从哪来</strong>。
+      三个里程碑恰好给出三种答案——OpenAI 用人工标注（PRM800K），Math-Shepherd 用蒙特卡洛 rollout 自动估计，
+      OmegaPRM 用 MCTS + 二分搜索把自动标注的成本再压一个量级。
+    </blockquote>
+
+    <h2>核心概念</h2>
+    <h3>ORM vs PRM：奖励的粒度</h3>
+    <pre><code>ORM:  reward = R(question, full_solution)        # 整条解答一个标量
+PRM:  reward_t = R(question, step_1 ... step_t)   # 每个前缀一个标量，逐步给分</code></pre>
+    <p>
+      DeepMind 的 Uesato et al.（2022）最早在 GSM8K 上做了受控对比：当 generator 已经足够强、
+      错误多为「单个细微步骤」而非「整体跑偏」时，<strong>过程反馈训出的求解器比结果反馈更可靠</strong>。
+      OpenAI 随后把这一结论在更难的 MATH 数据集上规模化确认（Lightman et al., 2023）。
+    </p>
+    <h3>PRM 的三种用法</h3>
+    <table>
+      <thead><tr><th>用法</th><th>时机</th><th>做法</th><th>代价</th></tr></thead>
+      <tbody>
+        <tr><td><strong>验证 / 重排（Verification）</strong></td><td>推理时</td><td>采样 N 条候选解答，用 PRM 逐步打分后聚合，选最优（best-of-N）；可与 self-consistency 投票组合</td><td>只加推理成本，不动训练</td></tr>
+        <tr><td><strong>稠密奖励（Dense Reward）</strong></td><td>训练时</td><td>把每步分数直接作为 PPO/GRPO 的逐步 reward（step-by-step PPO），替代或叠加 outcome reward</td><td>训练管线多一个打分模型，需注意 reward hacking</td></tr>
+        <tr><td><strong>引导搜索（Search Guidance）</strong></td><td>推理时</td><td>在 MCTS / beam search 中对每个中间状态打分，提前剪掉低分分支（o1 复现框架的常用组件）</td><td>推理算力换准确率，需平衡搜索预算</td></tr>
+      </tbody>
+    </table>
+    <p>
+      三种用法共享同一个模型，只是部署位置不同。对工程落地来说，
+      <strong>「先做推理时重排、再考虑训练时稠密奖励」</strong>是风险最低的顺序——这点在实践建议部分展开。
+    </p>
+
+    <h2>技术要点</h2>
+
+    <h3>1. Let's Verify Step by Step：人工过程监督的天花板（OpenAI, 2023）</h3>
+    <p><strong>出处</strong>：Lightman et al., <a href="https://arxiv.org/abs/2305.20050" target="_blank" rel="noopener">arXiv:2305.20050</a>。</p>
+    <ul>
+      <li><strong>数据</strong>：发布 <strong>PRM800K</strong>——80 万条<strong>步骤级</strong>人工标注。标注对象是 GPT-4 在 MATH 数据集上生成的解答，人工把每一步标为 positive / negative / neutral 三类（即判断每一步是否正确推进了求解）；</li>
+      <li><strong>模型</strong>：PRM 训练为逐步分类器，对「问题 + 截至当前步的前缀」预测当前步的标签；</li>
+      <li><strong>结论</strong>：过程监督显著优于结果监督。用过程监督的 RM 从每条题目的 <strong>1860 个采样解答</strong>中做 best-of-N 选择，在 MATH 测试集的一个代表性子集上解出 <strong>78%</strong> 的题目，明显超过同等条件下的 outcome 监督 RM；</li>
+      <li><strong>标注效率</strong>：论文还报告<strong>主动学习（active learning）</strong>显著提升过程监督的数据效率——优先让标注员标「模型确信但实际错误」的解答，同样的标注预算换来更大的效果提升。</li>
+    </ul>
+    <p>
+      <strong>这篇的历史地位</strong>：它证明了过程监督的<strong>上限</strong>，但也暴露了<strong>成本</strong>——
+      80 万条步骤级人工标注，是绝大多数团队付不起的价格。于是整个后续文献的主线就变成：
+      <strong>如何不要人工标注，拿到同等质量的步骤级信号</strong>。
+    </p>
+
+    <h3>2. Math-Shepherd：用蒙特卡洛 rollout 自动标注每一步（2023, ACL 2024）</h3>
+    <p><strong>出处</strong>：Wang et al., <a href="https://arxiv.org/abs/2312.08935" target="_blank" rel="noopener">arXiv:2312.08935</a>（ACL 2024）。</p>
+    <p><strong>核心思想一句话</strong>：一步推理好不好，看「从这一步继续走下去，最终能走到正确答案的概率」。这个概率不用人来标，用一个 completer 模型从当前前缀多次续写、统计到达正确答案的比例即可：</p>
+    <pre><code>对解答中的第 i 步 s_i：
+  用 completer 从前缀 (question, s_1..s_i) 独立续写 N 条完整解答
+  hard label:  y_i = 1  {至少一条续写到达正确答案}  else 0
+  soft label:  y_i = (到达正确答案的续写条数) / N   ∈ [0, 1]
+
+随后用 (前缀, y_i) 训练 PRM（逐步回归/分类），全程零人工标注。</code></pre>
+    <p><strong>推理时重排的聚合方式</strong>：一条候选解答的总分 = <strong>各步 PRM 分数取 min</strong>（保守策略：任何一步出错都重罚），还可以与 self-consistency 组合——先按最终答案分组投票，再用组内 PRM 总分决胜。</p>
+    <p><strong>训练时用法</strong>：step-by-step PPO——每生成一步立即给出稠密 reward，而不是等整条解答结束才结算。</p>
+    <table>
+      <thead><tr><th>结果（论文报告）</th><th>GSM8K</th><th>MATH</th></tr></thead>
+      <tbody>
+        <tr><td>Mistral-7B：step-by-step PPO（vs. SFT 基线）</td><td>77.9% → <strong>84.1%</strong></td><td>28.6% → <strong>33.0%</strong></td></tr>
+        <tr><td>Mistral-7B：+ Math-Shepherd 验证重排</td><td><strong>89.1%</strong></td><td><strong>43.5%</strong></td></tr>
+        <tr><td>DeepSeek-67B：+ Math-Shepherd 验证重排</td><td><strong>93.3%</strong></td><td><strong>48.1%</strong></td></tr>
+      </tbody>
+    </table>
+    <p><strong>两个值得记住的细节</strong>：</p>
+    <ul>
+      <li><strong>自动标注的质量</strong>：人工抽检 160 条自动标签，与人工判断一致率约 86%——不完美，但足以训练出有效的 PRM；</li>
+      <li><strong>分布匹配比标注来源更重要</strong>：在 MATH 上，用自家自动数据训出的 PRM 反而<strong>超过</strong>用人工标注 PRM800K 训出的 PRM。作者归因于：PRM800K 标在 GPT-4 的输出分布上，而开源 LLaMA/MetaMATH 系列的输出分布不同；且自动数据量是 PRM800K 的约 4 倍。<strong>用目标 policy 自己的输出做标注源</strong>，是这条路线最重要的工程教训。</li>
+    </ul>
+    <p><strong>代价</strong>：MC rollout 标注不便宜——每道题的每一步都要续写 N 条，标注成本 ≈ 步数 × N 次生成。这正是下一个工作要解决的问题。</p>
+
+    <h3>3. OmegaPRM：MCTS + 二分搜索，把自动标注再压一个量级（Google DeepMind, 2024）</h3>
+    <p><strong>出处</strong>：Luo et al., <a href="https://arxiv.org/abs/2406.06592" target="_blank" rel="noopener">arXiv:2406.06592</a>。</p>
+    <ul>
+      <li><strong>问题</strong>：Math-Shepherd 式的逐步 MC 估计要在每个前缀上独立续写，搜索空间巨大、效率受限；</li>
+      <li><strong>方法</strong>：受 AlphaGo Zero 启发的 <strong>divide-and-conquer 式 MCTS</strong>。不再对每个前缀从头估计，而是在搜索树上用<strong>二分查找迅速定位 CoT 中的「第一个错误步」</strong>——这恰好模拟了人工标注员「找到首个出错位置」的行为；同时平衡正负样本，保证数据质量；</li>
+      <li><strong>规模</strong>：全程零人工，收集 <strong>150 万+</strong> 条过程监督标注（比 Math-Shepherd 路线显著更高效）；</li>
+      <li><strong>结果</strong>（PRM + 加权 self-consistency，论文报告）：
+        <table>
+          <thead><tr><th>模型</th><th>MATH500</th><th>GSM8K</th></tr></thead>
+          <tbody>
+            <tr><td>Gemini Pro（instruction-tuned）</td><td>51% → <strong>69.4%</strong></td><td>86.4% → <strong>93.6%</strong></td></tr>
+            <tr><td>Gemma2 27B</td><td>42.3% → <strong>58.2%</strong></td><td>74.0% → <strong>92.2%</strong></td></tr>
+          </tbody>
+        </table>
+      </li>
+    </ul>
+
+    <h3>4. 三代方案横向对比</h3>
+    <table>
+      <thead><tr><th></th><th>PRM800K / Let's Verify</th><th>Math-Shepherd</th><th>OmegaPRM</th></tr></thead>
+      <tbody>
+        <tr><td><strong>步骤标签来源</strong></td><td>人工标注（80 万条）</td><td>MC rollout 自动估计（hard/soft label）</td><td>MCTS + 二分定位首个错误</td></tr>
+        <tr><td><strong>标注对象分布</strong></td><td>GPT-4 输出</td><td>目标 policy 自身分布</td><td>搜索树（含目标模型 rollout）</td></tr>
+        <tr><td><strong>成本特征</strong></td><td>最贵，不可复制</td><td>零人工，但 步数×N 次续写</td><td>零人工，二分大幅降低估计次数</td></tr>
+        <tr><td><strong>规模</strong></td><td>80 万</td><td>约为 PRM800K 的 4 倍</td><td>150 万+</td></tr>
+        <tr><td><strong>PRM 用法验证</strong></td><td>best-of-N 重排（78% @ MATH 子集）</td><td>重排 + step-by-step PPO</td><td>重排（加权 self-consistency）</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5. 参考实现骨架（自动标注 + 重排）</h3>
+    <pre><code># Math-Shepherd 风格的自动过程标注（伪代码）
+def auto_label_step(question, prefix_steps, completer, N=8, gold_answer=None):
+    cnt = 0
+    for _ in range(N):
+        completion = completer.sample(question, prefix=prefix_steps)
+        if extract_answer(completion) == gold_answer:
+            cnt += 1
+    return cnt / N                      # soft label；hard label = int(cnt > 0)
+
+# 推理时 best-of-N 重排（min 聚合）
+def score_solution(prm, question, steps):
+    return min(prm.score(question, steps[:i]) for i in range(1, len(steps) + 1))
+
+best = max(candidates, key=lambda sol: score_solution(prm, question, sol.steps))</code></pre>
+    <p>
+      注意它与 <a href="rl-10-papers-detailed.html">GRPO 详解笔记</a>中 rollout 管线的同构性：
+      「对同一 prompt 采样一组解答」与「对同一前缀续写一组 completion」本质是同一件基础设施，
+      只是采样锚点从「题目开头」移到了「每个中间步骤」——已有的 sampler/reward 打分模块几乎可以直接复用。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先重排、后稠密</strong>：best-of-N 验证只增加推理成本、不碰训练管线，是验证 PRM 价值的最低风险路径；确认 PRM 在自己数据分布上确实比 majority voting / ORM 强之后，再考虑把分数接入 PPO/GRPO 做稠密奖励。</li>
+      <li><strong>标注源跟 policy 走</strong>：Math-Shepherd 超过 PRM800K 的教训说明，用<strong>当前 policy 自己的输出</strong>生成自动标注，比借用强模型的现成标注更重要。policy 更新几个大版本后，PRM 数据也应重新采集。</li>
+      <li><strong>什么时候值得上 PRM</strong>：多步结构明确、且 outcome 信号稀疏的场景。一个实操信号是 GRPO 笔记里的 <code>frac_degenerate</code> 指标偏高——整组全对/全错导致 advantage 全零时，步骤级信号能把「组内无差异」的题目重新变出梯度。</li>
+      <li><strong>聚合方式的取舍</strong>：min 聚合保守、抗「一步致命」，但对长链会系统性低估（任一步被误判就拉低总分）；mean 聚合平滑但容易放过局部错误。可以按任务平均步长和 PRM 校准程度在两者之间调。</li>
+      <li><strong>防 reward hacking</strong>：稠密 reward 意味着 policy 有更多可钻的空子（比如学会写「PRM 喜欢但对求解无帮助」的步骤）。PRM 进训练管线后，一切结论仍以<strong>固定题库、固定温度的独立 outcome 评测</strong>为准，并人工抽检自动标签质量（Math-Shepherd 的 86% 一致率提醒我们：自动标签是有噪的）。</li>
+      <li><strong>与 Agent 场景的连接</strong>：数学之外，同样的「逐步打分」思路正被搬到 agent 轨迹上（如 AgentPRM 对 WebShop/BabyAI 轨迹做 Q 值/advantage 回归）。对做垂类 Agent 的团队，PRM 是介于「规则 reward」和「LLM-as-judge 整体打分」之间的第三档选择。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说 PRM 相比 ORM 改善了信用分配？用「10 步推理、第 8 步算错但前面都对」的例子说明两者给出的训练信号有何不同。
+        <details><summary>参考答案</summary>
+        ORM 只对整条解答输出一个标量：这条轨迹得 0，梯度会无差别地压低<strong>所有</strong> token 的概率，前 7 个正确步骤被「连坐」。PRM 给每个前缀打分：前 7 步拿正分、第 8 步起拿负分，policy 能精确保留正确前缀、只惩罚出错步骤。信用分配的粒度从「轨迹级」细化到「步骤级」，监督信号的方差和稀释都显著降低——尤其在错误多为单步细微错误（而非整体跑偏）的强 generator 阶段，这一差异决定性地体现为最终准确率差距（Uesato et al. 2022；Lightman et al. 2023）。</details>
+      </li>
+      <li>
+        Math-Shepherd 的 hard label 和 soft label 各自隐含什么假设？什么情况下 hard label 会引入明显噪声？
+        <details><summary>参考答案</summary>
+        soft label（到达正确答案的比例）假设「一步的质量 = 从它出发成功求解的概率」，把标签当作价值估计，连续、可比较；hard label（存在至少一条成功续写即为 1）假设「一步只要不堵死所有正确路径就算对」，等价于可达性而非价值。hard label 的噪声场景：某步其实引入了错误，但题目碰巧有多条解法、或 completer 足够强能「带着错误硬扛回正确答案」——此时该步仍被标 1，错误步骤被奖励。反过来当 completer 太弱时，大量本来正确的步骤会因续写全败被标 0（标签被 completer 能力污染）。soft label 对这两种情况都更平滑，但 N 不够大时估计方差高。</details>
+      </li>
+      <li>
+        Math-Shepherd 重排时为什么用各步分数的 min 而不是 mean 作为整条解答的得分？
+        <details><summary>参考答案</summary>
+        数学推理的错误具有「一步致命」特性：中间任何一步出错，后续步骤写得再漂亮，答案通常也救不回来。min 聚合正好编码这一先验——总分由最差的一步决定，任何可疑步骤都会重罚整条候选，误检率低、对「表面通顺但暗藏错步」的解答尤其敏感。代价是对长链系统性偏保守（步数越多，被某一步拉低的概率越大），且对 PRM 的误判更敏感；mean 聚合更平滑、对单步误判鲁棒，但会放过局部错误。实践中 min 是默认起点，再按 PRM 校准质量调整。</details>
+      </li>
+      <li>
+        结合 <a href="grpo-notes.html">GRPO 笔记</a>：GRPO 已经用组内相对 reward 做 baseline 了，再引入 PRM 还能带来什么增量？
+        <details><summary>参考答案</summary>
+        至少三块增量：① <strong>组内无差异的题重获信号</strong>——GRPO 里整组全对/全错时 advantage 全零（<code>frac_degenerate</code>），PRM 的步骤分能在「同样错误」的多条轨迹间区分出谁错得更早/更少，产生组内梯度；② <strong>组内差异的题定位更准</strong>——outcome advantage 对全组 token 一视同仁，PRM 分数可作为逐步的 reward shaping，把「哪一步拖了后腿」显式化；③ <strong>推理时免费增益</strong>——训出的 PRM 不训练也能做 best-of-N 重排（Math-Shepherd 验证把 Mistral-7B 推到 GSM8K 89.1%），这是纯 GRPO 管线没有的组件。值得注意的是，近期有分析指出 GRPO 的组内归一化<strong>隐式地</strong>完成了一部分过程式信用分配，说明 outcome 与 process 的边界并没有那么泾渭分明。</details>
+      </li>
+      <li>
+        自动过程标注的主要成本在哪里？OmegaPRM 的二分定位为什么能大幅降本，它牺牲了/保留了什么？
+        <details><summary>参考答案</summary>
+        成本在「每个前缀 × N 条续写」：T 步的解答做逐步 MC 估计约需 T×N 次生成，题目一多就是天文数字。OmegaPRM 的观察是：标注员真正要找的是<strong>第一个错误步</strong>，而「从某前缀出发能否成功」是一个随步数单调恶化的量——错误一旦出现，后续前缀的成功率不会再回升。于是可以用二分查找在 log(T) 个前缀上做 MC 估计，把首个错误夹逼出来，估计次数从 O(T) 降到 O(log T)。保留的是「首个错误」这一信息量最大的监督信号和正负样本的平衡（错误前为正、错误后为负）；牺牲的是对「错误之后仍有独立错误」这类细粒度标签的刻画，以及对单调性假设不成立场景（如自我修正式推理）的适配。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Lightman et al. <em>Let's Verify Step by Step</em>（OpenAI, 2023）：<a href="https://arxiv.org/abs/2305.20050" target="_blank" rel="noopener">arXiv:2305.20050</a>；数据集 <a href="https://github.com/openai/prm800k" target="_blank" rel="noopener">openai/prm800k</a></li>
+      <li>Wang et al. <em>Math-Shepherd: Verify and Reinforce LLMs Step-by-step without Human Annotations</em>（ACL 2024）：<a href="https://arxiv.org/abs/2312.08935" target="_blank" rel="noopener">arXiv:2312.08935</a> · <a href="https://aclanthology.org/2024.acl-long.510/" target="_blank" rel="noopener">ACL Anthology</a></li>
+      <li>Luo et al. <em>Improve Mathematical Reasoning in Language Models by Automated Process Supervision</em>（OmegaPRM, Google DeepMind, 2024）：<a href="https://arxiv.org/abs/2406.06592" target="_blank" rel="noopener">arXiv:2406.06592</a></li>
+      <li>Uesato et al. <em>Solving math word problems with process- and outcome-based feedback</em>（DeepMind, 2022）：<a href="https://arxiv.org/abs/2211.14275" target="_blank" rel="noopener">arXiv:2211.14275</a></li>
+      <li>相关笔记：<a href="grpo-notes.html">GRPO 微调实践笔记</a> · <a href="rl-10-papers-detailed.html">「复现 10 篇 RL 论文」逐篇详解</a>（GRPO / DAPO / GSPO 的 outcome reward 管线）</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
