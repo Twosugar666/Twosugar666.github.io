@@ -6,7 +6,7 @@
   --card-bg: #ffffff;
   --border: #e5e7eb;
   --code-bg: #f3f4f6;
-  --max: 1280px;
+  --max: 1560px;
 }
 
 html[data-theme="dark"] {
@@ -90,19 +90,19 @@ body {
 .layout {
   max-width: var(--max);
   margin: 0 auto;
-  padding: 2.2rem 1.25rem 3rem;
+  padding: 2.2rem 1.6rem 3rem;
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 360px;
+  grid-template-columns: 300px minmax(0, 1fr) 380px;
   grid-template-areas: "sidebar main sidecol";
-  gap: 2.2rem;
+  gap: 2rem;
   align-items: start;
 }
 
 .sidebar {
   grid-area: sidebar;
   position: sticky;
-  top: 4.2rem;
-  max-height: calc(100vh - 5.4rem);
+  top: 1.5rem;
+  max-height: calc(100vh - 3rem);
   overflow-y: auto;
   scrollbar-width: thin;
 }
@@ -432,7 +432,7 @@ footer {
 
   .profile-card { margin-bottom: 1rem; }
 
-  .sidebar section { display: none; }
+  .sidebar #about { display: none; }
 
   .col-main section:first-child,
   .col-side section:first-child {
@@ -516,54 +516,6 @@ a.card-link:hover h3 { color: var(--accent); }
   padding: 1px;
 }
 
-/* ---------- 桌面端：导航移到最左侧竖排 ---------- */
-@media (min-width: 1025px) {
-  body { padding-left: 104px; }
-
-  .nav {
-    position: fixed;
-    top: 0;
-    left: 0;
-    bottom: 0;
-    width: 104px;
-    border-bottom: none;
-    border-right: 1px solid var(--border);
-  }
-
-  .nav-inner {
-    flex-direction: column;
-    justify-content: flex-start;
-    align-items: center;
-    height: 100%;
-    max-width: none;
-    padding: 1.4rem 0.5rem;
-    gap: 1.6rem;
-  }
-
-  .brand {
-    font-size: 0.92rem;
-    text-align: center;
-    line-height: 1.4;
-  }
-
-  .nav-links {
-    flex-direction: column;
-    align-items: center;
-    gap: 1rem;
-    flex: 1;
-  }
-
-  .nav-links a {
-    font-size: 0.85rem;
-    display: block;
-    text-align: center;
-  }
-
-  .nav-links a:hover { color: var(--accent); }
-
-  #theme-toggle { margin-top: auto; }
-}
-
 /* ---------- 论文会议/期刊图标 ---------- */
 .pub-logo {
   width: 17px;
@@ -571,3 +523,8 @@ a.card-link:hover h3 { color: var(--accent); }
   vertical-align: -3px;
   margin-right: 0.25rem;
 }
+
+/* ---------- 左栏论文列表 ---------- */
+.sidebar .pubs { font-size: 0.88rem; }
+
+.social #theme-toggle { margin-left: 0.2rem; }
