@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜「复现10篇强化学习论文」系列导读 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜「复现 10 篇强化学习论文」系列导读</h1>
+    <p class="post-meta">2026-08-13 · 整理自小红书博主 <strong>@不要葱姜蒜</strong> 的 RL 复现系列 · 收藏夹：RL / Agent</p>
+
+    <blockquote>
+      原作者正在用 <strong>pytrio</strong> 从零复现 10 篇强化学习论文，全部代码开源在
+      <a href="https://github.com/KMnO4-zx/llm-agent-rl-lab" target="_blank" rel="noopener">KMnO4-zx/llm-agent-rl-lab</a>。
+      选择 pytrio 而非 verl 的原因很实际：verl 需要训推一体、至少 4～8 卡节点；
+      pytrio 不用管这些工程负担，可以把精力集中在算法本身。这篇笔记把整个系列（截至目前的 9 篇 + 预告）
+      的学习脉络整理成一张地图，方便按需跳转。
+    </blockquote>
+
+    <h2>系列总览</h2>
+    <table>
+      <thead>
+        <tr><th>篇目</th><th>主题</th><th>一句话要点</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>第 0 篇</td><td>损失函数篇</td><td>importance sampling / PPO / CISPO 等常见 RL loss 的直觉：到底在优化什么</td></tr>
+        <tr><td>第 1 篇</td><td>GRPO</td><td>组内相对优势估计，训练信号来自 <strong>reward</strong></td></tr>
+        <tr><td>第 2 篇</td><td>OPD（On-Policy Distillation）</td><td>同样用当前策略自采轨迹，但信号来自 <strong>teacher 对 student 轨迹的评价</strong></td></tr>
+        <tr><td>第 3 篇</td><td>Search-R1</td><td>检索增强推理的 RL 训练，"一杯奶茶"的成本跑通</td></tr>
+        <tr><td>第 4 篇</td><td>OPSD（On-Policy Self-Distillation）</td><td>OPD 的自蒸馏变体，代码在仓库 <code>04-opsd</code> 目录，附 SwanLab 训练记录</td></tr>
+        <tr><td>第 5 篇</td><td>ReTool（Coding Agent RL）</td><td>面向代码 Agent 的工具调用 RL，"两杯瑞幸"的成本</td></tr>
+        <tr><td>第 6 篇</td><td>DAPO</td><td>全程逐行 review 代码的手搓篇：白盒之后才真正理解算法为什么慢</td></tr>
+        <tr><td>第 7 篇</td><td>GSPO</td><td>从零跑通，AIME25 提升 6 个点</td></tr>
+        <tr><td>第 8 篇</td><td>ALFWorld（Agent-RL）</td><td>系列转向 Agentic RL：一条轨迹最多与环境交互 50 次，评测平均 21～23 步，"教 Agent 开冰箱花了 1613 元"</td></tr>
+        <tr><td>第 9 篇</td><td>Vision GRPO</td><td>多模态几何题推理，训练成本仅 5 元——"用 verl 刚开机就是这个价"</td></tr>
+        <tr><td>第 10 篇</td><td>Harness-RL（预告）</td><td>系列收官篇，尚未发布</td></tr>
+      </tbody>
+    </table>
+
+    <h2>算法主线：信号来源的分野</h2>
+    <p>这个系列前半段（第 0～7 篇）可以按<strong>训练信号从哪来</strong>串成一条线：</p>
+    <ul>
+      <li><strong>GRPO</strong>：组内相对优势，信号是环境/规则给出的 reward；</li>
+      <li><strong>OPD</strong>：轨迹同样由当前策略采样（on-policy），但监督信号换成 teacher 模型的评价——本质是蒸馏与 RL 的交叉；</li>
+      <li><strong>OPSD</strong>：teacher 换成自己，自蒸馏版本；</li>
+      <li><strong>DAPO / GSPO</strong>：GRPO 谱系上的工程化改进，GSPO 在 AIME25 上实测 +6。</li>
+    </ul>
+    <p>
+      第 0 篇的损失函数直觉（IS → PPO → CISPO）是这条线的地基，建议最先读。
+    </p>
+
+    <h2>后半段：从算法到 Agentic RL</h2>
+    <p>
+      从第 8 篇开始，作者明确转向 Agent-RL 项目而非单纯算法复现。ALFWorld 篇的两条参考工作值得记下：
+    </p>
+    <ul>
+      <li>清华团队 <strong>AgentRL</strong>（arXiv:2510.04206）：多任务 Agent-RL，ALFWorld 是五个训练与评测任务之一，提出跨策略采样与任务级优势归一化；</li>
+      <li>复旦牵头的多 Agent-RL 工作（arXiv:2603.12011）：研究 RL 在 ALFWorld、WebShop 等不同环境间的泛化能力。</li>
+    </ul>
+    <p>
+      作者还分享了一个调研工作流：把"读论文 → 定位开源代码中算法入口"这类 dirty work 交给办公类 Agent
+      先行处理（自动找原论文、筛相关新工作、生成对比表和网页报告），自己只保留算法判断与
+      PyTorch / pytrio 复现——前置调研从 1～2 天压缩到任务后台跑完。
+    </p>
+
+    <h2>工程感悟：黑盒与白盒</h2>
+    <blockquote>
+      用 transformers / verl 训练变慢时，只会怀疑卡不够好、配置不对——因为它们对自己是黑盒；
+      而 DAPO 全部代码逐行 review 过之后，"我很清楚 DAPO 发生了什么，也很清楚它为什么这么慢"。
+      这就是从 0 到 1 手写核心算法的价值：只关心算法实现是否正确，不背框架的锅。—— 第 6 篇
+    </blockquote>
+    <p>成本侧也很有意思，pytrio 路线下整系列的训练开销被压到了"饮品计价"：</p>
+    <ul>
+      <li>Search-R1 ≈ 一杯奶茶 🧋</li>
+      <li>OPSD ≈ 一顿疯狂星期四 🍗</li>
+      <li>ReTool ≈ 两杯瑞幸 ☕</li>
+      <li>Vision-GRPO ≈ 5 元（作者原话：用 verl 的话刚开机就是这个价格）</li>
+      <li>ALFWorld 是个例外：长轨迹多步交互（最多 50 步），花了 1613 元——Agent-RL 的 rollout 成本确实高一个量级。</li>
+    </ul>
+
+    <h2>对我的参考价值</h2>
+    <ul>
+      <li>与我之前写的 <a href="grpo-notes.html">GRPO 实践笔记</a>对照：作者用 pytrio 验证了"小成本复现 RL 算法"的可行性，和 verl 的重型路线互补；</li>
+      <li>OPD / OPSD 的"teacher 评价作为信号"思路，和垂类 Agent 搭建里的蒸馏数据构造可以直接打通；</li>
+      <li>Agent-RL 的 rollout 成本（ALFWorld 案例）是做垂类 Agent 训练预算时的重要参考。</li>
+    </ul>
+
+    <h2>原帖链接</h2>
+    <ul class="link-list">
+      <li><a href="https://www.xiaohongshu.com/explore/6a4a5ae60000000016024d33" target="_blank" rel="noopener">第 0 篇：损失函数篇（系列开篇）</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a4cda03000000001102f030" target="_blank" rel="noopener">第 1 篇：GRPO</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a54f08500000000110059cc" target="_blank" rel="noopener">第 2 篇：OPD 教程</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a5a3160000000001102c8b7" target="_blank" rel="noopener">第 3 篇：Search-R1</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a60b5a1000000000402a05e" target="_blank" rel="noopener">第 4 篇：OPSD</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a64d2e30000000022018743" target="_blank" rel="noopener">第 5 篇：ReTool（Coding Agent RL）</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a6a0dcd000000000f01e6d0" target="_blank" rel="noopener">第 6 篇：DAPO</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a6d724d0000000024024132" target="_blank" rel="noopener">第 7 篇：GSPO</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a707daf0000000028006ce9" target="_blank" rel="noopener">第 8 篇·调研：Agent-RL 与 ALFWorld 前期</a> / <a href="https://www.xiaohongshu.com/explore/6a731cfc000000002500c222" target="_blank" rel="noopener">ALFWorld 复现正文</a></li>
+      <li><a href="https://www.xiaohongshu.com/explore/6a79baab00000000250090fe" target="_blank" rel="noopener">第 9 篇：Vision GRPO</a></li>
+    </ul>
+    <p>开源代码：<a href="https://github.com/KMnO4-zx/llm-agent-rl-lab" target="_blank" rel="noopener">github.com/KMnO4-zx/llm-agent-rl-lab</a></p>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

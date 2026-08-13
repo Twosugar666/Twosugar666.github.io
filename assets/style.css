@@ -381,6 +381,30 @@ footer {
   color: var(--muted);
 }
 
+.post-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  margin: 1rem 0;
+}
+
+.post-body th,
+.post-body td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.post-body th {
+  background: var(--card-bg);
+  font-weight: 600;
+}
+
+.post-body .link-list li { margin-bottom: 0.35rem; }
+
+.post-body a { color: var(--accent); }
+
 .back-link {
   display: inline-block;
   margin-bottom: 1.5rem;
