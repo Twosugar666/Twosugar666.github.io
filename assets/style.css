@@ -496,3 +496,22 @@ a.card-link {
 }
 
 a.card-link:hover h3 { color: var(--accent); }
+
+/* ---------- 工作经历公司图标 ---------- */
+.exp-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+}
+
+.company-logo {
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  margin-top: 0.18rem;
+  flex-shrink: 0;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid var(--border);
+  padding: 1px;
+}
