@@ -487,3 +487,12 @@ footer {
   from { opacity: 0; transform: translateY(-4px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ---------- Repo 链接卡片 ---------- */
+a.card-link {
+  display: block;
+  text-decoration: none;
+  color: inherit;
+}
+
+a.card-link:hover h3 { color: var(--accent); }
