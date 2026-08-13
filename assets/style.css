@@ -528,3 +528,23 @@ a.card-link:hover h3 { color: var(--accent); }
 .sidebar .pubs { font-size: 0.88rem; }
 
 .social #theme-toggle { margin-left: 0.2rem; }
+
+/* ---------- Blog 中栏独立滚动流 ---------- */
+@media (min-width: 1025px) {
+  .col-main {
+    position: sticky;
+    top: 1.5rem;
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+    scrollbar-width: thin;
+    padding-bottom: 1rem;
+  }
+}
+
+/* ---------- Repo 卡片 GitHub 图标 ---------- */
+.repo-logo {
+  width: 20px;
+  height: 20px;
+  vertical-align: -3px;
+  margin-right: 0.15rem;
+}
