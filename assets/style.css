@@ -98,7 +98,14 @@ body {
   align-items: start;
 }
 
-.sidebar { grid-area: sidebar; }
+.sidebar {
+  grid-area: sidebar;
+  position: sticky;
+  top: 4.2rem;
+  max-height: calc(100vh - 5.4rem);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
 .col-main { grid-area: main; min-width: 0; }
 .col-side { grid-area: sidecol; min-width: 0; }
 
@@ -109,8 +116,6 @@ body {
   border-radius: 14px;
   padding: 1.6rem 1.4rem;
   text-align: center;
-  position: sticky;
-  top: 4.2rem;
 }
 
 .avatar {
@@ -333,7 +338,13 @@ footer {
     gap: 0;
   }
 
-  .profile-card { position: static; margin-bottom: 1rem; }
+  .sidebar {
+    position: static;
+    max-height: none;
+    overflow: visible;
+  }
+
+  .profile-card { margin-bottom: 1rem; }
 
   .sidebar section { display: none; }
 
