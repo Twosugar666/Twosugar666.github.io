@@ -548,3 +548,13 @@ a.card-link:hover h3 { color: var(--accent); }
   vertical-align: -3px;
   margin-right: 0.15rem;
 }
+
+/* ---------- 名片卡图标 ---------- */
+.card-icon {
+  width: 16px;
+  height: 16px;
+  vertical-align: -3px;
+  border-radius: 4px;
+}
+
+.subtitle .card-icon { vertical-align: -2px; }
