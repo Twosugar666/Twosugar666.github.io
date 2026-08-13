@@ -563,3 +563,11 @@ a.card-link:hover h3 { color: var(--accent); }
 
   #theme-toggle { margin-top: auto; }
 }
+
+/* ---------- 论文会议/期刊图标 ---------- */
+.pub-logo {
+  width: 17px;
+  height: 17px;
+  vertical-align: -3px;
+  margin-right: 0.25rem;
+}
