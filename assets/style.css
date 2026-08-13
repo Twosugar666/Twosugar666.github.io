@@ -515,3 +515,51 @@ a.card-link:hover h3 { color: var(--accent); }
   border: 1px solid var(--border);
   padding: 1px;
 }
+
+/* ---------- 桌面端：导航移到最左侧竖排 ---------- */
+@media (min-width: 1025px) {
+  body { padding-left: 104px; }
+
+  .nav {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 104px;
+    border-bottom: none;
+    border-right: 1px solid var(--border);
+  }
+
+  .nav-inner {
+    flex-direction: column;
+    justify-content: flex-start;
+    align-items: center;
+    height: 100%;
+    max-width: none;
+    padding: 1.4rem 0.5rem;
+    gap: 1.6rem;
+  }
+
+  .brand {
+    font-size: 0.92rem;
+    text-align: center;
+    line-height: 1.4;
+  }
+
+  .nav-links {
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    flex: 1;
+  }
+
+  .nav-links a {
+    font-size: 0.85rem;
+    display: block;
+    text-align: center;
+  }
+
+  .nav-links a:hover { color: var(--accent); }
+
+  #theme-toggle { margin-top: auto; }
+}
