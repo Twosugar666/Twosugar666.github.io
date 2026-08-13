@@ -52,16 +52,28 @@
     <main class="col-main">
       <section id="blog">
         <h2>Blog</h2>
+        <div class="blog-filters">
+          <button class="chip active" data-filter="all">全部</button>
+          <button class="chip" data-filter="infra">Infra</button>
+          <button class="chip" data-filter="agent">Agent</button>
+          <button class="chip" data-filter="rl">RL</button>
+        </div>
         <ul class="post-list">
-          <li>
+          <li data-cat="rl agent">
             <a href="posts/grpo-notes.html">GRPO 微调实践笔记：从公式到多智能体协作</a>
-            <span class="post-date">2026-08-13</span>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-08-13</span>
+            </span>
           </li>
-          <li>
+          <li data-cat="">
             <a href="posts/hello-blog.html">你好，博客！为什么我开始写技术博客</a>
-            <span class="post-date">2026-08-13</span>
+            <span class="post-side">
+              <span class="post-date">2026-08-13</span>
+            </span>
           </li>
         </ul>
+        <p class="empty-hint" hidden>这个收藏夹还没有文章，敬请期待 🌱</p>
       </section>
 
       <section id="research">

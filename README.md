@@ -17,5 +17,14 @@
 ## 如何发布新文章
 
 1. 在 `posts/` 下新建一个 HTML 文件（可复制现有文章作为模板）
-2. 在 `index.html` 的 Blog 列表中添加对应链接
+2. 在 `index.html` 的 Blog 列表中添加对应链接，并用 `data-cat` 归入收藏夹：
+   ```html
+   <li data-cat="rl agent">   <!-- 可选：infra / agent / rl，可多个，空格分隔 -->
+     <a href="posts/xxx.html">文章标题</a>
+     <span class="post-side">
+       <span class="post-cat">RL</span>
+       <span class="post-date">2026-08-13</span>
+     </span>
+   </li>
+   ```
 3. `git add . && git commit -m "new post" && git push`，GitHub Pages 自动更新

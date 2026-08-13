@@ -17,3 +17,27 @@
     });
   }
 })();
+
+// Blog 收藏夹筛选
+(function () {
+  const chips = document.querySelectorAll(".blog-filters .chip");
+  if (!chips.length) return;
+  const items = document.querySelectorAll(".post-list li");
+  const hint = document.querySelector(".empty-hint");
+
+  chips.forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      chips.forEach(function (c) { c.classList.remove("active"); });
+      chip.classList.add("active");
+      const f = chip.getAttribute("data-filter");
+      let visible = 0;
+      items.forEach(function (li) {
+        const cats = (li.getAttribute("data-cat") || "").split(/\s+/);
+        const show = f === "all" || cats.indexOf(f) !== -1;
+        li.classList.toggle("hidden", !show);
+        if (show) visible++;
+      });
+      if (hint) hint.hidden = visible !== 0;
+    });
+  });
+})();
