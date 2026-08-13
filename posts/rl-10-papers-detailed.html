@@ -31,6 +31,29 @@
       远端负责：采样、forward/backward、optimizer、checkpoint。
     </blockquote>
 
+    <h2>前置知识</h2>
+    <p>读懂这个系列不需要很深的背景，按三层自查即可。正文中<span class="term" data-g="policy">带虚线下划线的术语</span>都可以点击，会弹出解释卡片。</p>
+    <table>
+      <thead><tr><th>层级</th><th>需要了解的概念</th><th>到什么程度算够</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>深度学习基础</strong></td>
+          <td><span class="term" data-g="backward">前向/反向传播</span>、损失函数、梯度下降、<span class="term" data-g="adam">Adam 优化器</span></td>
+          <td>知道「loss 下降 ≈ 模型在学习」、梯度怎么推动参数更新即可，不需要会推导</td>
+        </tr>
+        <tr>
+          <td><strong>大模型基础</strong></td>
+          <td><span class="term" data-g="token">token</span> 与 <span class="term" data-g="tokenizer">tokenizer</span>、<span class="term" data-g="logprob">logprob</span>、<span class="term" data-g="temperature">temperature / top-p</span> 采样、<span class="term" data-g="sft">SFT</span>、<span class="term" data-g="lora">LoRA</span>、<span class="term" data-g="chat-template">chat template</span></td>
+          <td>用过任意大模型 API、知道「模型是一个 token 一个 token 往外蹦的」就够；本系列全部是 LoRA 微调 Qwen3.5-4B</td>
+        </tr>
+        <tr>
+          <td><strong>强化学习基础</strong></td>
+          <td><span class="term" data-g="policy">policy</span> / <span class="term" data-g="trajectory">trajectory</span> / <span class="term" data-g="reward">reward</span>、<span class="term" data-g="policy-gradient">policy gradient</span>、<span class="term" data-g="advantage">advantage</span> 与 <span class="term" data-g="baseline">baseline</span>、<span class="term" data-g="is">importance sampling</span>、<span class="term" data-g="on-policy">on-policy</span>、<span class="term" data-g="ppo">PPO</span></td>
+          <td>零基础也完全可以从第 0 篇开始——它就是把这几个概念讲成直觉的一篇，学完再回看本表会有「原来如此」的感觉</td>
+        </tr>
+      </tbody>
+    </table>
+
     <h2>目录</h2>
     <ul class="link-list">
       <li><a href="#p0">第 0 篇 · 损失函数：IS / PPO / CISPO</a></li>
@@ -239,5 +262,6 @@ GSPO: 一条回答 1 个 ratio → 1 次 clipping
   </footer>
 
   <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
 </body>
 </html>
