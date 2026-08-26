@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜IBM Granite 4.2：把 RL 搬进真实环境的开源推理模型家族 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜IBM Granite 4.2：把 RL 搬进真实环境的开源推理模型家族</h1>
+    <p class="post-meta">2026-08-26 · 收藏夹：RL / Agent · 一线追踪<br />
+      发布方：IBM，发布时间 <strong>2026-08-25</strong> · 信息来源：
+      <a href="https://www.ibm.com/granite/docs/models/granite4-2" target="_blank" rel="noopener">IBM Granite 官方文档</a>、
+      <a href="https://huggingface.co/ibm-granite/granite-4.2-30b" target="_blank" rel="noopener">Hugging Face 模型卡与官方训练解读</a>、
+      <a href="https://www.unite.ai/ibms-granite-4-2-models-learn-to-think-and-act-inside-environments/" target="_blank" rel="noopener">Unite.AI 报道</a>；
+      文中 benchmark 数字除特别说明外均为 <strong>IBM 自报</strong>（基于 NeMo Evaluator SDK 评测框架），第三方复测尚未出现</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      昨天（8 月 25 日）IBM 发布了 <strong>Granite 4.2</strong>：3B / 8B / 30B 三个尺寸的 dense 推理模型，全部 Apache 2.0 开源。
+      「又一家开源 reasoning model」本身不算新闻——2026 年带 <code>&lt;think&gt;</code> 标签的模型已经一抓一把。
+      这个发布真正值得算法工程师停下来读的，是 IBM 同步公开的<strong>完整训练管线</strong>：
+    </p>
+    <ul>
+      <li>一套<strong>分阶段、每阶段独立成 run</strong> 的 RL 课程：先可验证奖励（RLVR），再把 8B/30B 扔进<strong>真实软件工程、终端、搜索环境</strong>里做 agentic RL；</li>
+      <li>一套<strong>异步 GRPO</strong> 训练架构：生成与训练两个 GPU 池互不阻塞，用 truncated importance sampling（TIS）处理权重刷新造成的 staleness；</li>
+      <li>训练配方、数据配比、逐阶段超参全部随权重一起公开——这在 2026 年的开源发布里依然是稀缺品。</li>
+    </ul>
+    <p>
+      对本博客的读者来说，它几乎是之前几篇笔记的「工业级对照组」：
+      <a href="grpo-notes.html">GRPO 笔记</a>里的组内相对 baseline、
+      <a href="daily-2026-08-13-prm.html">PRM 笔记</a>里的 verifiable reward vs LLM judge、
+      <a href="rl-10-papers-detailed.html">10 篇论文详解</a>里 Search-R1 / ReTool 的「环境即变量」，
+      都能在这条管线里找到对应的生产级实现。
+    </p>
+
+    <h2>产品要点：模型家族</h2>
+    <table>
+      <thead><tr><th></th><th>granite-4.2-3b</th><th>granite-4.2-8b</th><th>granite-4.2-30b</th></tr></thead>
+      <tbody>
+        <tr><td><strong>架构</strong></td><td colspan="3">dense、decoder-only、全注意力 Transformer（IBM 明确没有跟风 hybrid Mamba/attention），post-training 基于 Granite 4.1 对应尺寸基座</td></tr>
+        <tr><td><strong>许可证</strong></td><td colspan="3">Apache 2.0（含加密签名、透明度披露；官方称可 unrestricted 商用）</td></tr>
+        <tr><td><strong>上下文</strong></td><td>128K 原生</td><td>128K 原生</td><td>128K 原生，官方文档注明可扩展至 <strong>512K</strong></td></tr>
+        <tr><td><strong>思考模式</strong></td><td colspan="3">三档，chat template 参数切换：<code>enable_thinking=True</code>（默认，完整 <code>&lt;think&gt;...&lt;/think&gt;</code>）/ <code>enable_thinking=False</code>（直答）/ <code>low_effort=True</code>（简短推理）；多轮对话默认丢弃历史轮次的 thinking 以省 context</td></tr>
+        <tr><td><strong>工具调用</strong></td><td colspan="3">reasoning-augmented tool calling：先推理「该调哪个工具、为什么」再发调用，OpenAI function-calling 格式</td></tr>
+        <tr><td><strong>Agentic RL</strong></td><td>❌ 未经过环境阶段</td><td>✅ SWE / 终端 / 搜索三阶段</td><td>✅ 同 8B</td></tr>
+        <tr><td><strong>量化版本</strong></td><td colspan="3">FP8（免校准）、NVFP4 / MXFP4（用 2,000 条 SFT 样本校准）、14 种 GGUF（llama.cpp）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      部署侧：官方推荐 <strong>vLLM v0.20+</strong>，reasoning 用模型仓库自带的 <code>granite_thinking_parser</code>，tool call 用 <code>qwen3_coder</code> parser；
+      所有任务统一推荐 <code>temperature=1.0, top_p=0.95</code>；OpenAI 兼容 API 可直接接 OpenHands / OpenCode 等 agentic coding harness。
+    </p>
+    <pre><code>text = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True,
+    enable_thinking=True,          # 默认完整推理；False 直答；配 low_effort=True 简短推理
+)
+# 生成参数：temperature=1.0, top_p=0.95（官方建议所有任务统一）</code></pre>
+
+    <h2>核心看点：训练管线拆解</h2>
+    <p>官方按阶段公开了配方，整体是「预训练 → SFT → 多阶段 RL → RLHF 收尾」的流水线：</p>
+
+    <h3>① 预训练与 SFT（铺垫）</h3>
+    <ul>
+      <li>预训练约 <strong>15T tokens</strong>，五阶段课程逐步扩展上下文窗口至 512K；其中约 <strong>1T tokens 为 CodeAlchemy 管线生成的合成代码</strong>；</li>
+      <li>SFT 约 <strong>720 万条样本</strong>，覆盖 chain-of-thought、推理与 agentic 轨迹数据。</li>
+    </ul>
+
+    <h3>② 分阶段 RL：每个阶段一次独立训练</h3>
+    <p>这是整个发布的重心。RL 部分不是「一锅端」，而是<strong>一条 curriculum</strong>：每个阶段是独立的训练 run，针对一种能力，从上一阶段的 checkpoint 热启动。</p>
+    <table>
+      <thead><tr><th>阶段</th><th>适用模型</th><th>环境 / 奖励</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>基础 RLVR</strong></td>
+          <td>3B / 8B / 30B</td>
+          <td>数学题（可校验答案）、代码（隐藏单测判分）、指令遵循（格式检查器）</td>
+          <td>纯 rule-based 可验证奖励；另有若干针对单项技能的短「booster」阶段</td>
+        </tr>
+        <tr>
+          <td><strong>Agentic：软件工程</strong></td>
+          <td>8B / 30B</td>
+          <td><strong>OpenHands harness</strong>，模型编辑真实代码仓库，<strong>隐藏测试套件全过才得分</strong></td>
+          <td>reward 是「任务是否真的被解决」，不是过程分</td>
+        </tr>
+        <tr>
+          <td><strong>Agentic：终端</strong></td>
+          <td>8B / 30B</td>
+          <td>真实 shell，每条 rollout 最多 <strong>64 轮环境交互</strong></td>
+          <td>长 horizon 多轮决策，直接对标 Terminal-Bench 类能力</td>
+        </tr>
+        <tr>
+          <td><strong>Agentic：搜索</strong></td>
+          <td>8B / 30B</td>
+          <td>真实 web 搜索调用回答多跳问题，<strong>LLM judge 打分</strong></td>
+          <td>唯一非 rule-based 的奖励源——多跳问答没有标准答案可自动校验</td>
+        </tr>
+        <tr>
+          <td><strong>RLHF 收尾</strong></td>
+          <td>全部</td>
+          <td>偏好 + 安全奖励模型，<strong>附加 reasoning 长度惩罚</strong></td>
+          <td>压制前面阶段可能养成的「思维链越写越长」倾向</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>③ 异步 GRPO：不要 value network，也不要同步等待</h3>
+    <p>所有 RL 阶段统一使用<strong>异步 GRPO</strong>，两个关键设计：</p>
+    <ul>
+      <li><strong>算法侧</strong>：GRPO 用同一 prompt 下一组样本的平均 reward 当 baseline，省掉 PPO 的独立 value network（与本博客 <a href="grpo-notes.html">GRPO 笔记</a>的公式一致）；</li>
+      <li><strong>系统侧</strong>：生成池与训练池分离。生成 worker 持续往共享 buffer 里写轨迹，trainer 攒够一个 step 就更新并把新权重流式推回——<strong>刷新可能落在 rollout 中途</strong>。于是一个 guardrail 限制生成端最多落后一个 update，同时用 <strong>truncated importance sampling（TIS）</strong> 钳制 stale token 的 logprob ratio，把「半 off-policy」数据的破坏力压在可控范围。</li>
+    </ul>
+    <pre><code>同步 GRPO:  [生成全组轨迹] → 等 → [训练一步] → 等 → [重新生成]   # GPU 轮流闲置
+异步 GRPO:  生成池 ████████████████ 持续采样
+            训练池     ▇▇▇  ▇▇▇  ▇▇▇  攒够就更新，权重流式回推
+代价:       部分轨迹由「落后 ≤1 个 update」的旧权重采样 → 引入轻微 off-policy
+对策:       staleness 上限 guardrail + TIS 截断 ratio</code></pre>
+    <p>
+      环境与训练的解耦靠 <strong>NeMo-Gym</strong>：规则判分器、工具、沙箱全部包在统一接口后面，
+      对训练循环来说「数学 checker」和「整个代码仓库沙箱」长得一模一样——这是分阶段课程在工程上能跑起来的前提。
+      训练循环由 <strong>NeMo-RL</strong>（Megatron-Core + vLLM 生成）驱动，硬件是 CoreWeave 托管的
+      <strong>NVIDIA GB200 NVL72</strong>（72 GPU NVLink 域 + 400 Gb/s InfiniBand）。
+    </p>
+
+    <h3>④ 官方自报成绩（未第三方复测）</h3>
+    <table>
+      <thead><tr><th>Benchmark</th><th>3B</th><th>8B</th><th>30B</th></tr></thead>
+      <tbody>
+        <tr><td>SWE-Bench Verified</td><td>—（未报告）</td><td>47.67</td><td><strong>57.00</strong></td></tr>
+        <tr><td>Terminal-Bench 2.1</td><td>—（未报告）</td><td>20.56</td><td><strong>29.24</strong></td></tr>
+        <tr><td>AIME25（数学）</td><td>78.33</td><td>86.67</td><td><strong>89.17</strong></td></tr>
+        <tr><td>GPQA（科学）</td><td>54.80</td><td>64.14</td><td><strong>66.41</strong></td></tr>
+        <tr><td>RULER @128K（长上下文）</td><td>55.30</td><td>71.41</td><td><strong>81.38</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      分数结构与训练设计自洽：3B 没跑环境阶段，于是干脆不报 SWE-Bench / Terminal-Bench；
+      依赖 agentic RL 的两项也是尺寸间差距最大的项目——能力确实主要来自训练管线，而不只是基座。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>读配方比跑模型更值</strong>：如果你在做后训练，这次最大的收获是「一份公开的工业级 agentic RL 配方」——阶段划分、奖励源选择（能 rule-based 就 rule-based，只有多跳搜索这类无标准答案任务才上 LLM judge）、逐阶段超参都在模型卡里。先读 <code>granite-4.2-30b</code> 的模型卡再决定要不要下载权重。</li>
+      <li><strong>异步架构是吞吐与正确性的明码交换</strong>：staleness guardrail（≤1 update）+ TIS 的组合给了「生成不停机」的工程收益，代价是轻微 off-policy。自己的 RL 管线如果 rollout 吞吐是瓶颈，可以参考这个档位；如果做的是 reward 方差很大的探索型任务，staleness 的容忍度应该收得更紧。</li>
+      <li><strong>环境接入学 NeMo-Gym 的抽象</strong>：把 verifier / 工具 / 沙箱统一成一种接口，让「换环境」等于「换配置」而不是「改训练代码」。这与 <a href="rl-10-papers-detailed.html">10 篇论文详解</a>里「环境即变量」的教训一脉相承——Search-R1 的搜索限流、ReTool 的沙箱超时都会污染 reward，环境封装层也是可观测性的挂载点。</li>
+      <li><strong>分阶段课程的适用边界</strong>：每阶段独立 run + 热启动的好处是数据配比干净、可归因、出问题能回退到上一阶段；代价是阶段间可能互相覆盖（灾难性遗忘），IBM 的解法是最后再加一轮 RLHF 统一偏好与长度。自己的小管线若只有一两类任务，混合训练 + 权重衰减到参考模型可能更简单。</li>
+      <li><strong>三档思考模式是产品化信号</strong>：同一权重内 enable_thinking / low_effort / 直答三档切换 + 多轮丢弃历史 thinking，说明「按 query 复杂度分配推理预算」已经是标配能力。做垂类 Agent 时，路由层可以少维护一个「小模型分流」组件，直接用模式参数控制延迟成本。</li>
+      <li><strong>对待自报分数</strong>：SWE-Bench Verified 57.00 若属实是不错的成绩，但目前只有 IBM 单方数字（NeMo Evaluator SDK），建议等社区复测，或先在自己的任务集上 A/B——尤其终端类 benchmark 方差大，29.24 的绝对水平也提醒我们 agentic RL 远未到「解决」的程度。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        异步 GRPO 中，权重在 rollout 中途刷新为什么会引入 off-policy 问题？truncated importance sampling 具体在钳制什么、为什么截断（truncate）而不是直接用完整 ratio？
+        <details><summary>参考答案</summary>
+        一条轨迹前半段由权重 W₀ 采样、后半段由 W₁ 采样，但训练时整条的 sampling logprob 都被当作来自同一个 old policy，ratio = exp(target_lp − sampling_lp) 对 stale token 来说算错了基准——这是典型的行为策略与目标策略不一致。TIS 把 ratio 截断在上限（如 2）以内：当新旧策略对某 token 的概率差异过大时，不再让梯度按真实 ratio 放大（大 ratio 意味着该 token 极度 off-policy，IS 估计方差爆炸），而是按截断值封顶。用截断而不是完整 ratio，本质是拿一点偏差换方差可控——staleness 越大，这个交换越划算；这也是为什么还要配 staleness ≤1 update 的 guardrail，把需要截断的比例压到低位。</details>
+      </li>
+      <li>
+        为什么 IBM 只给 8B / 30B 做 agentic RL，3B 止步于基础 RLVR？从「能力门槛」和「训练经济学」两个角度分析。
+        <details><summary>参考答案</summary>
+        能力门槛：agentic RL 的 reward 是「任务最终是否解决」，一条 SWE rollout 要连续做对几十步（读仓库、定位文件、编辑、跑测试）才有非零奖励。若基座成功率太低，绝大多数 rollout  reward 为 0，GRPO 组内无差异 → advantage 全零（<a href="grpo-notes.html">GRPO 笔记</a>里的 frac_degenerate 问题），环境阶段产出的梯度信号还不如同样算力投在基础 RLVR 上。训练经济学：环境 rollout 极贵——OpenHands 编辑真实仓库、终端最多 64 轮交互，单位 token 的成本和延迟远高于数学判分；把这份预算投给「够得着任务」的 8B/30B 回报率最高。3B 的定位本来就是边缘部署的推理模型，不付这笔学费反而与产品定位一致。这印证了一个通用原则：<strong>agentic RL 的收益以基座能力为前提，环境训练不是免费的</strong>。</details>
+      </li>
+      <li>
+        搜索阶段用 LLM judge 打分，而其他阶段都用 rule-based 奖励。这个选择背后的通用判据是什么？引入 LLM judge 带来了哪些新风险？
+        <details><summary>参考答案</summary>
+        通用判据：任务是否存在「廉价、确定、不可被 hack 的自动真值」。数学有唯一答案、代码有隐藏单测、指令遵循有格式检查器——rule-based 奖励确定性强、无法被语言层面的花招骗过；多跳搜索问答的答案是自由文本，判等不可行，只能退到 LLM judge（或 <a href="daily-2026-08-13-prm.html">PRM 笔记</a>里的学习式 RM）。新风险：① judge 本身有偏（偏爱长答案、特定措辞、自己家族的输出风格），policy 会学会讨好 judge 而非答对——reward hacking 的主要入口；② judge 打分的方差直接变成 advantage 噪声；③ judge 的成本随 rollout 数线性放大。缓解思路与对待 PRM 一致：固定 judge 与 prompt、定期人工抽检一致率、最终结论仍以独立 rule-based 评测为准。</details>
+      </li>
+      <li>
+        IBM 在全部 RL 阶段之后仍追加了一轮带「reasoning 长度惩罚」的 RLHF。为什么前面阶段会让模型变得啰嗦？长度惩罚与「保持推理能力」之间矛盾吗？
+        <details><summary>参考答案</summary>
+        RLVR 与 agentic RL 只奖励「最终做对」，从不惩罚「用了多少 token」。在可验证任务上，更长的思维链往往提高成功率（更多自检、更多分支探索），于是 RL 会沿着这个梯度把链越拉越长——这是 reward 缺项导致的自然漂移，不是 bug。长度惩罚把它显式计价：在偏好/安全收尾阶段把「冗长」变成负奖励，把模型拉回帕累托前沿。它与推理能力并不本质矛盾——惩罚的是「超出收益的冗余推理」，难点在系数标定：罚太狠会退化掉困难任务上必需的深思考（等价于把 low-effort 模式当成全量策略）。IBM 顺手把这个权衡产品化了：训练里压一次长度，部署时再给用户三档思考模式做 per-query 预算分配。</details>
+      </li>
+      <li>
+        对比这条「分阶段课程 + 统一环境接口」的工业管线与本博客 <a href="rl-10-papers-detailed.html">复现 10 篇论文</a> 的单环境实验，前者多解决了哪三个工程问题？
+        <details><summary>参考答案</summary>
+        ① <strong>吞吐</strong>：单环境实验里生成与训练串行等待，GPU 大量闲置；异步双池 + staleness 控制让 rollout 永不停机，这是长轨迹环境（64 轮终端交互）能训得动的前提。② <strong>环境多样性</strong>：单环境实验每换一个任务就要改训练代码接新 reward；NeMo-Gym 式统一接口让规则判分器与仓库沙箱对训练循环同构，分阶段课程只是换配置。③ <strong>可归因与可回退</strong>：单环境实验一把梭，指标掉了不知道是哪类数据的问题；分阶段独立 run + 热启动让每个阶段的能力增量可测量（3B 未跑环境阶段 → 干脆不报对应 benchmark，本身就是归因证据），某阶段训坏了直接退回上一阶段 checkpoint。可以说：10 篇论文教你算法是什么，这条管线教你算法<strong>上量</strong>时多出的一整层工程问题。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>IBM Granite 官方文档（Granite 4.2 模型页）：<a href="https://www.ibm.com/granite/docs/models/granite4-2" target="_blank" rel="noopener">ibm.com/granite/docs/models/granite4-2</a></li>
+      <li>模型权重（Apache 2.0）：<a href="https://huggingface.co/ibm-granite/granite-4.2-30b" target="_blank" rel="noopener">huggingface.co/ibm-granite/granite-4.2-30b</a>（同组织下另有 3b / 8b）</li>
+      <li>发布报道与训练管线解读：<a href="https://www.unite.ai/ibms-granite-4-2-models-learn-to-think-and-act-inside-environments/" target="_blank" rel="noopener">Unite.AI（2026-08-25）</a> · <a href="https://daily.dev/posts/granite-4-2-llms-how-they-re-built-0e5pmfzrg" target="_blank" rel="noopener">daily.dev 转引 Hugging Face 官方解读</a></li>
+      <li>相关开源组件：<a href="https://github.com/NVIDIA-NeMo" target="_blank" rel="noopener">NVIDIA-NeMo</a>（NeMo-RL / NeMo-Gym）· <a href="https://github.com/All-Hands-AI/OpenHands" target="_blank" rel="noopener">OpenHands</a></li>
+      <li>相关笔记：<a href="grpo-notes.html">GRPO 微调实践笔记</a> · <a href="daily-2026-08-13-prm.html">过程奖励模型（PRM）</a> · <a href="rl-10-papers-detailed.html">「复现 10 篇 RL 论文」逐篇详解</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

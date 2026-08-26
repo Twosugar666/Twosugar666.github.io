@@ -1,5 +1,5 @@
 {
-  "rotation": ["rl", "agent", "infra"],
+  "rotation": ["rl", "agent", "infra", "gpu", "pc"],
   "next": 1,
   "history": [
     {
@@ -7,6 +7,20 @@
       "domain": "rl",
       "topic": "过程奖励模型（PRM）：PRM800K / Math-Shepherd / OmegaPRM 自动过程监督",
       "file": "posts/daily-2026-08-13-prm.html"
+    },
+    {
+      "date": "2026-08-14",
+      "domain": "agent infra",
+      "source": "frontline",
+      "topic": "DeepSeek Harness（dsh）：一切皆插件的 Agent 运行时底座",
+      "file": "posts/daily-2026-08-14-deepseek-harness.html"
+    },
+    {
+      "date": "2026-08-26",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "IBM Granite 4.2：开源推理模型家族与真实环境 Agentic RL 训练管线（异步 GRPO + TIS）",
+      "file": "posts/daily-2026-08-26-granite-4-2.html"
     }
   ]
 }
