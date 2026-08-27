@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>特别篇｜2026 新模型全景：十五个新旗舰的架构与训练方法拆解 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>特别篇｜2026 新模型全景：十五个新旗舰的架构与训练方法拆解</h1>
+    <p class="post-meta">2026-08-27 · 收藏夹：Infra / RL · 特别篇<br />
+      调研范围：2026 年 1 月–8 月发布的主要语言模型 · 信息来源见文末「参考链接」，文中数字除特别说明外均为<strong>厂商自报</strong>；
+      闭源模型（OpenAI / Anthropic / Google）基本不披露架构，相关段落会明确标注「未披露」而非转述传闻</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      2026 年上半年是大模型发布密度史无前例的半年：6 月一度出现 Claude Mythos 5（6.9）、GPT-5.6（6.11 预览）、
+      Gemini 3.2（6.13）、Qwen3.7 与 DeepSeek V4.1（6.17）<strong>五家旗舰挤在两周内发布</strong>的「会车窗口」。
+      更值得注意的是，这一代的竞争焦点已经从「刷榜分数」迁移到了<strong>架构效率与训练方法</strong>本身：
+      混合线性注意力、流形约束残差、FP4 量化感知训练、agentic RL、按推理预算分档——这些才是算法工程师该读的部分。
+    </p>
+    <p>
+      本文按「时间线 → 架构趋势 → 训练方法趋势 → 逐家拆解」组织。与<a href="daily-2026-08-26-granite-4-2.html">上一篇 Granite 4.2</a>
+      单点深挖不同，这篇是横向扫描，目标是回答一个问题：<strong>2026 年训一个 frontier 模型，技术栈到底长什么样？</strong>
+    </p>
+
+    <h2>全景时间线（2026.01 – 2026.08）</h2>
+    <table>
+      <thead><tr><th>日期</th><th>模型</th><th>发布方</th><th>架构一句话</th><th>权重</th></tr></thead>
+      <tbody>
+        <tr><td>01 月</td><td>Qwen3-Max-Thinking</td><td>阿里</td><td>MoE + 自适应工具调用 + 测试时扩展</td><td>闭源</td></tr>
+        <tr><td>02-14</td><td>豆包 Seed 2.0</td><td>字节</td><td>~1T MoE，类 Gemini 原生多模态架构</td><td>闭源</td></tr>
+        <tr><td>02-16</td><td>Qwen3.5（397B-A17B）</td><td>阿里</td><td>MoE，激活仅 4.3%，混合推理模式</td><td>部分开源</td></tr>
+        <tr><td>02-19</td><td>Gemini 3.1 Pro</td><td>Google</td><td>稀疏 MoE + Deep Think 推理模式</td><td>闭源</td></tr>
+        <tr><td>02 月</td><td>Grok 4.20 Beta</td><td>xAI</td><td>~500B，4-agent 多智能体架构，2M 上下文</td><td>闭源</td></tr>
+        <tr><td>03-05 / 04-23</td><td>GPT-5.4 / GPT-5.5</td><td>OpenAI</td><td>未披露（5.5 起 1M 级上下文）</td><td>闭源</td></tr>
+        <tr><td>03-16 / 04-29</td><td>Mistral Small 4 / Medium 3.5</td><td>Mistral</td><td>119B MoE 激活 6B，单模型三合一</td><td>部分开源</td></tr>
+        <tr><td>03-18</td><td>MiniMax M2.7</td><td>MiniMax</td><td>230B MoE 激活 10B，Agent 原生</td><td>开源</td></tr>
+        <tr><td>04-07</td><td>GLM-5.1</td><td>智谱</td><td>754B 稀疏 MoE，全程华为昇腾训练</td><td>MIT 开源</td></tr>
+        <tr><td>04-08</td><td>Llama 5</td><td>Meta</td><td>600B+，5M 上下文（细节披露有限）</td><td>社区许可</td></tr>
+        <tr><td>04-16 / 4 月</td><td>Claude Opus 4.7 / 4.8</td><td>Anthropic</td><td>未披露</td><td>闭源</td></tr>
+        <tr><td>04-24</td><td>DeepSeek V4（Pro / Flash）</td><td>DeepSeek</td><td>1.6T/49B MoE，CSA+HCA 混合注意力，mHC</td><td>MIT 开源</td></tr>
+        <tr><td>05-03</td><td>GLM-6-130B</td><td>智谱</td><td>MoMA：视觉/代码/搜索 Agent 混合路由</td><td>开源</td></tr>
+        <tr><td>05-20</td><td>Qwen3.7 系列</td><td>阿里</td><td>~1.2T MoE 激活 45B，全域思考模式</td><td>预览闭源</td></tr>
+        <tr><td>06-09</td><td>Claude Mythos 5（GA）</td><td>Anthropic</td><td>未披露；Opus 4.8 基座 + 网安后训练， gated</td><td>闭源受限</td></tr>
+        <tr><td>06-13</td><td>Gemini 3.2</td><td>Google</td><td>稀疏 MoE，多模态升级</td><td>闭源</td></tr>
+        <tr><td>06-27 / 07-09</td><td>GPT-5.6（Sol / Terra / Luna）</td><td>OpenAI</td><td>未披露；三档家族，1.05M 上下文</td><td>闭源</td></tr>
+        <tr><td>07-08</td><td>Grok 4.5</td><td>xAI</td><td>1.5T MoE（V9），Cursor 真实开发数据训练</td><td>闭源</td></tr>
+        <tr><td>07-16 / 07-27</td><td>Kimi K3</td><td>月之暗面</td><td>2.8T MoE 激活 104B，KDA 线性注意力 + AttnRes</td><td>修改版 MIT</td></tr>
+        <tr><td>07-24</td><td>Claude Opus 5</td><td>Anthropic</td><td>未披露；1M 上下文，五档 effort</td><td>闭源</td></tr>
+        <tr><td>08-12</td><td>Grok 4.6</td><td>xAI（SpaceXAI）</td><td>同 4.5 基座，加长后训练 + agentic RL</td><td>闭源</td></tr>
+        <tr><td>08-14</td><td>GLM-5.3</td><td>智谱</td><td>同基座后训练 Scaling，1M 上下文</td><td>预告开源</td></tr>
+        <tr><td>08-25</td><td>IBM Granite 4.2</td><td>IBM</td><td>dense 3B/8B/30B，异步 GRPO + 真实环境 agentic RL</td><td>Apache 2.0</td></tr>
+      </tbody>
+    </table>
+    <p>
+      另有百度 ERNIE 5.0（统一多模态理解+生成，技术报告已上 arXiv）、美团 LongCat-2.0（报道称 1.6T，5 万余张国产芯片一个月完成预训练）、
+      小米 MiMo-V2、腾讯混元 HY2.0（2025-12，406B-A32B MoE）等同期活跃。Grok 5（6T / 10T 两档）仍在 Colossus 2 上训练，尚未发布。
+    </p>
+
+    <h2>架构趋势：2026 年的五个共识</h2>
+
+    <h3>① MoE 成为旗舰默认形态，竞争点是「稀疏度管理」</h3>
+    <p>
+      这一代新模型里，dense 架构几乎只剩 IBM Granite 4.2 这种明确面向部署效率的特例。旗舰全部转向 MoE，
+      且稀疏度一个比一个激进：DeepSeek V4-Pro 每 token 只激活 <strong>49B / 1.6T（3%）</strong>，Kimi K3 为
+      <strong>104B / 2.8T（3.7%）</strong>，Mistral Small 4 更是 <strong>6B / 119B（5%）</strong>。
+      于是真正的技术分水岭落在路由与负载均衡上：
+    </p>
+    <ul>
+      <li><strong>DeepSeek V4</strong> 延续 auxiliary-loss-free 路线：用动态偏置（按 batch 负载加减 bias）替代辅助均衡损失，不与主损失抢梯度；V4 还把亲和度函数从 sigmoid 换成 √Softplus，并在前几层直接用 <strong>hash routing</strong>（按 token ID 确定性路由）——浅层的通用模式根本不需要学习路由。</li>
+      <li><strong>Kimi K3</strong> 在 896 选 16 的极端稀疏度下提出 <strong>Quantile Balancing</strong>：直接由 router 分数的分位数推导专家分配，消掉了启发式更新规则和敏感的均衡超参。</li>
+      <li>激活专家数普遍下调：DeepSeek 从 V3 的 8 个降到 V4 的 6 个，Qwen3.7 从 3.6 的 Top-8 降到 Top-6——单个专家更专精，每 token 需要的专家更少。</li>
+    </ul>
+
+    <h3>② 注意力机制大分化：线性/稀疏注意力为 1M 上下文回归</h3>
+    <p>2026 年旗舰上下文集体迈过 1M token（Kimi K3、DeepSeek V4、Claude Opus 5、GPT-5.6 均为 1M 级），靠的不是硬堆全注意力，而是各家不同的「亚二次方」方案：</p>
+    <table>
+      <thead><tr><th>方案</th><th>代表</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr><td><strong>混合线性注意力</strong></td><td>Kimi K3（KDA）</td><td>93 层中 69 层用 Kimi Delta Attention（线性注意力变体），仅 24 层保留 Gated MLA 全注意力；官方称百万 token 解码快 6.3×。代价是 prefix caching 失效，Moonshot 给 vLLM 贡献了专用实现</td></tr>
+        <tr><td><strong>压缩 + 稀疏注意力</strong></td><td>DeepSeek V4（CSA/HCA）</td><td>在 V3.2 的 DSA 基础上，先做 token 级 KV 压缩（第三方解读为 4× 压缩 + lightning indexer 选 top-1024），再做稀疏注意力；MLA 至此被替换</td></tr>
+        <tr><td><strong>混合线性注意力 + MoE</strong></td><td>Qwen3.6/3.7</td><td>混合线性注意力配 MoE，原生 256K + YaRN 扩到 1M</td></tr>
+        <tr><td><strong>全注意力（未披露细节）</strong></td><td>GPT-5.6 / Claude / Gemini</td><td>闭源三家均不披露注意力方案，只能从「1M 上下文 + 价格没爆炸」反推有等效优化</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ 「深度方向」成为新的创新轴：mHC 与 AttnRes</h3>
+    <p>
+      过去三年架构创新集中在「宽度」（MoE 专家）和「序列」（注意力），2026 年两家不约而同动了<strong>残差流</strong>这个最保守的部件：
+    </p>
+    <ul>
+      <li><strong>DeepSeek V4 的 mHC（Manifold-constrained Hyper-Connections）</strong>：把 Hyper-Connections 的多流残差约束在流形上，解决 HC 放大梯度不稳的问题——官方口径是 2.4 倍参数下训练吞吐反升。</li>
+      <li><strong>Kimi K3 的 AttnRes（Attention Residuals）</strong>：跨深度<strong>选择性检索</strong>历史层表示，而不是均匀累加；官方称约 25% 训练效率提升、额外开销不到 2%。K3 还配了 Per-Head Muon（按注意力头独立跑 Muon 优化器）和 SiTU 激活函数。</li>
+    </ul>
+
+    <h3>④ 量化感知训练（QAT）下沉到 SFT 阶段</h3>
+    <p>
+      FP8 训练已是 2025 年的旧闻；2026 年的标志是 <strong>FP4 进入主训练流</strong>：Kimi K3 从 SFT 起就做量化感知训练，
+      专家权重 MXFP4、激活 MXFP8（非专家组件保持高精度）；DeepSeek V4 的路由专家权重直接以 FP4 存储；
+      Granite 4.2 发布即提供 NVFP4 / MXFP4 校准版。低精度不再是部署时的「事后压缩」，而是训练配方的一部分。
+    </p>
+
+    <h3>⑤ 闭源模型进入「架构黑箱」时代</h3>
+    <p>
+      OpenAI 对 GPT-5.6 的披露是这一代闭源策略的极端样本：<strong>无参数量、无 dense/MoE 说明、无注意力方案、无训练数据规模、无算力数字</strong>，
+      唯一具体的技术披露在安全侧（见下节）。Anthropic 与 Google 同样只发布 system card / model card。
+      对工程师的实操含义：闭源模型的一切性质（显存、长上下文衰减、知识截止）只能对 API 实测，不能从 config 推断——
+      「架构信息」本身已经变成开源阵营的差异化竞争力。
+    </p>
+
+    <h2>训练方法趋势：后训练的四个转向</h2>
+
+    <h3>① RL 的主战场从「可验证奖励」转向「真实环境 agentic RL」</h3>
+    <p>
+      RLVR（数学判分 / 单测判分）在 2026 年已是基础设施，新前沿是把模型扔进真实环境：
+      IBM Granite 4.2 在 OpenHands 真实仓库、真实终端（64 轮交互）、真实搜索里做分阶段 RL（<a href="daily-2026-08-26-granite-4-2.html">详见上篇</a>）；
+      Grok 4.6 官方明确表示提升来自「更长的补充训练 + 重新生成的微调数据 + agentic 环境中的 RL」；
+      GLM-5.3 的 Terminal-Bench 从 4.6 跳到 28.3 被官方归因于同源基座上的后训练 Scaling。
+      共同模式：<strong>基座不变，能力增量全部来自后训练</strong>——「同基座刷后训练」成为 6–8 周快节奏发布的技术基础。
+    </p>
+
+    <h3>② 推理预算分档成为标配产品能力</h3>
+    <p>
+      Claude Opus 5 提供 low → max 五档 effort（且在 xhigh/max 档禁止关闭 thinking）；Grok 4.6 新增 xhigh 档；
+      GLM-5.3 始终开思考、分 low/high/max 三档；GPT-5.6 Sol 有 max effort 与可调子智能体的 ultra 模式；
+      Granite 4.2 在权重内做三档切换。训练侧的含义值得注意：档位不是推理时截断出来的，
+      而是后训练里显式训进去的（Granite 甚至专门用一轮带长度惩罚的 RLHF 来压冗余思维链）。
+      <strong>「按 query 复杂度分配推理预算」已经从技巧变成模型能力。</strong>
+    </p>
+
+    <h3>③ 数据路线分裂：蒸馏派 vs 反蒸馏派</h3>
+    <ul>
+      <li><strong>蒸馏派</strong>：Google 用 k-sparse 分布蒸馏（只保留教师 top-k token 概率）训练 Flash 小模型；xAI 的 Grok 4.5/4.6 用 Cursor 的真实开发者工作流数据做训练协作——「真实环境轨迹数据」本身成为可交易的资产。</li>
+      <li><strong>反蒸馏派</strong>：字节 Seed 公开表态「一款模型可以通过蒸馏进入前沿，但一家实验室没法通过蒸馏成为前沿实验室」；图像生成侧的 Z-Image 也明确拒绝用专有模型输出做训练（理由是学生上限被教师锁死）。</li>
+      <li><strong>合成数据依旧主流</strong>：Granite 4.2 预训练里约 1T token 是 CodeAlchemy 管线生成的合成代码；DeepSeek 系继续用 GRPO 自博弈生成推理数据。</li>
+    </ul>
+
+    <h3>④ 训练算力与安全的「双工业化」</h3>
+    <ul>
+      <li><strong>国产算力跑通旗舰全流程</strong>：DeepSeek V4（1.6T）据报道全程在昇腾 950PR 上训练；GLM-5.1（754B）实现旗舰级「零 NVIDIA」；美团 LongCat-2.0 用 5 万余张国产芯片一个月完成预训练（均为媒体/WAIC 报道口径，未经厂商技术报告逐一证实）。</li>
+      <li><strong>安全训练量化披露</strong>：OpenAI 披露为 GPT-5.6 投入 <strong>70 万+ A100 等效 GPU 小时</strong>做自动化红队（优化搜索 + RL + 测试时搜索找通用越狱）；METR 的部署前评估特别指出 OpenAI <strong>刻意不对思维链施压训练</strong>，保留 CoT 作为可监控表面。Anthropic 则给 Mythos 5 单设了 Opus 之上的「Capybara」能力分级并限制访问。</li>
+      <li><strong>反面教材</strong>：OpenAI 4 月的事故复盘《Where the Goblins Came From》值得每个做 RLHF 的人读——GPT-5.5 训练中一个失准的奖励模型系统性地偏好提及「哥布林」的回复（相关提及率相对 GPT-5.2 基线暴涨 3,881%），应急修复竟是系统提示词里重复四遍「禁止谈论哥布林」。奖励模型的微小错位会被 RL 放大成行为灾难，这是 2026 年最生动的一课。</li>
+    </ul>
+
+    <h2>逐家拆解</h2>
+
+    <h3>DeepSeek V4：开源阵营的技术报告标杆</h3>
+    <p>4 月 24 日预览发布，MIT 许可，双档配置：</p>
+    <table>
+      <thead><tr><th></th><th>V4-Pro</th><th>V4-Flash</th><th>V3（对照）</th></tr></thead>
+      <tbody>
+        <tr><td>总参数 / 激活</td><td>1.6T / 49B</td><td>284B / 13B</td><td>671B / 37B</td></tr>
+        <tr><td>路由专家</td><td>384 选 6</td><td>256 选 6</td><td>256 选 8</td></tr>
+        <tr><td>注意力</td><td colspan="2">CSA + HCA 混合（token 级压缩 + 稀疏）</td><td>MLA</td></tr>
+        <tr><td>残差</td><td colspan="2">mHC（流形约束超连接）</td><td>标准残差</td></tr>
+        <tr><td>上下文 / 最大输出</td><td colspan="2">1M / 384K</td><td>128K / 8K</td></tr>
+        <tr><td>训练栈</td><td colspan="2">Muon 优化器、MTP 多 token 预测、auxiliary-loss-free 动态偏置均衡、浅层 hash routing、√Softplus 亲和度、FP4 专家权重；后训练 GRPO + SFT + on-policy 蒸馏 + 工具使用训练</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <p>
+      值得强调的设计哲学：V4 的每一项改动都指向「同一个 token 预算装更多知识」——压缩注意力省 KV、FP4 省显存带宽、
+      少激活一个专家省计算。V3 时代「557.6 万美元训出 frontier」的成本叙事，在 V4 延续为「同成本 2.4 倍容量」。
+    </p>
+
+    <h3>Kimi K3：把「稀疏度 + 线性注意力」推到极限</h3>
+    <p>7 月 16 日发布、7 月 27 日开放权重（修改版 MIT）。这是目前披露最完整的超大开源模型，技术报告给出全套配置：</p>
+    <table>
+      <thead><tr><th>维度</th><th>配置</th></tr></thead>
+      <tbody>
+        <tr><td>规模</td><td>2.8T 总参数 / 104B 激活；93 层（69 层 KDA 线性注意力 + 24 层 Gated MLA + 1 dense 层）</td></tr>
+        <tr><td>MoE</td><td>Stable LatentMoE：896 专家选 16 + 2 共享专家；Latent 维度 3584，单专家 hidden 3072</td></tr>
+        <tr><td>注意力</td><td>hidden 7168、96 头；KDA 负责长程效率，Gated MLA 周期性保留全注意力</td></tr>
+        <tr><td>训练技术</td><td>Quantile Balancing（分位数负载均衡）、Per-Head Muon（逐注意力头优化）、SiTU-GLU 激活、AttnRes 跨深度检索；官方称整体 scaling 效率约为 K2 的 2.5×</td></tr>
+        <tr><td>精度</td><td>SFT 起量化感知训练：专家权重 MXFP4 / 激活 MXFP8</td></tr>
+        <tr><td>多模态</td><td>原生文/图/视频，视觉编码器 MoonViT-V2（401M）</td></tr>
+        <tr><td>上下文</td><td>1,048,576 tokens；KDA 破坏传统 prefix caching，团队向 vLLM 贡献了专用实现（物理 KDA 状态块与前缀匹配粒度解耦）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      K3 的工程启示：线性注意力不是「免费午餐」，它把成本从训练转移到了推理栈（缓存结构、kernel 全要重写，
+      vLLM 为此做了 FlashKDA 集成、fused KDA decode 等一整层工作）。选架构时要看全栈成本，不只看 FLOPs。
+    </p>
+
+    <h3>OpenAI GPT-5.6：黑箱化与安全工业化</h3>
+    <p>
+      6 月 27 日向约 20 家受信伙伴限量预览（应美国政府要求暂缓大范围开放），7 月 9 日起全面铺开。
+      首次以三档家族发布：Sol（$5/$30）、Terra（$2.50/$15）、Luna（$1/$6），统一 1.05M 上下文、128K 最大输出。
+      架构与训练配方<strong>完全未披露</strong>；值得记录的三条训练侧信息：① 70 万+ A100 等效小时的自动化红队；
+      ② METR 确认其「不针对思维链训练」的策略；③ 5.5 的哥布林事故后，5.6 被广泛认为是首条重建奖励审计管线的模型（此点为分析推测）。
+      8 月 13 日又预览了 Ultrafast 模式（同权重最高 14× 速度）。
+    </p>
+
+    <h3>Anthropic：Fable / Mythos / Opus / Sonnet 四层梯队</h3>
+    <p>
+      Anthropic 2026 年的产品线出现了能力分级制度：<strong>Fable 5</strong> 是最高能力模型（受 EO 14409 出口管制，
+      6 月曾离线约三周）；<strong>Mythos 5</strong> 是网安特化 gated 模型——官方红队报告明确说它的漏洞挖掘能力
+      「从通用代码与推理训练中涌现」，做法是 Opus 4.8 基座 + 网安后训练，这是「通用能力溢出 → 专用 gated 发布」的第一个案例；
+      <strong>Opus 5</strong>（7.24）定位「Fable 5 半价档」，1M 上下文、五档 effort、默认开思考，$5/$25 与 4.8 同价。
+      架构全部未披露；训练侧可参考的是其对齐叙事：Opus 5 号称在自动化行为审计中欺骗行为最低、宪法遵循度最高（自报）。
+    </p>
+
+    <h3>Google Gemini 3.x：稀疏 MoE + Deep Think + 蒸馏工厂</h3>
+    <p>
+      Gemini 3 系延续 1.5 以来的稀疏 MoE 路线，主打原生多模态与 Deep Think 推理模式；3.1 Pro（2.19）、3.2（6.13）依次迭代。
+      训练侧两个已知点：全程 TPU；Flash 小模型用 <strong>k-sparse 分布蒸馏</strong>（教师只传 top-k token 概率，省存储省吞吐）。
+      其余未披露。Gemini 的代表性不在架构新颖，而在「多模态 token 与文本统一预训练」这条只有 Google 坚持了四年的路线。
+    </p>
+
+    <h3>阿里 Qwen3.5 → 3.8：全尺寸矩阵与「全域思考」</h3>
+    <ul>
+      <li><strong>Qwen3.5</strong>（2.16）：397B-A17B（激活仅 4.3%），0.8B–397B 全尺寸覆盖，混合推理模式（思考/非思考无缝切换），201 种语言；</li>
+      <li><strong>Qwen3.6</strong>（3–4 月）：dense + 稀疏 MoE 双线，混合线性注意力，原生 256K + YaRN 至 1M；</li>
+      <li><strong>Qwen3.7</strong>（5.20 云峰会）：Max-Preview 约 1.2T MoE 激活 45B，Top-6 路由（较 3.6 推理成本降 28%，自报）；核心创新是<strong>全域思考（All-field Thinking）</strong>——文本+图像+代码统一推理链；SWE-bench Verified 自报 72.3%；</li>
+      <li><strong>Qwen3.8-Max</strong>：第三方报道总参数跳至 2.4T，细节未证实。</li>
+    </ul>
+
+    <h3>xAI Grok 4.5 / 4.6：用「数据 + 后训练时长」代替架构创新</h3>
+    <p>
+      Grok 4.5（7.8）基于 V9 基座：1.5T MoE，训练数据包含与 Cursor 合作的真实开发者工作流；500K 上下文，$2/$6。
+      Grok 4.6（8.12）<strong>不换基座</strong>，官方归因于更长的补充训练、重新生成的微调数据与 agentic 环境 RL，新增 xhigh 推理档。
+      背后是 Colossus 2（约 55 万张 GB200/GB300，千兆瓦级）同时训练 7 个模型——xAI 的路线是纯粹的「算力 + 数据」 scaling 信徒，
+      架构细节零披露。Grok 4.20 的 4-agent 多智能体模式（协调/研究/逻辑/唱反调四个角色并行互验）是推理时架构的有趣分支。
+    </p>
+
+    <h3>其余各家速览</h3>
+    <table>
+      <thead><tr><th>模型</th><th>架构 / 训练要点</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Meta Llama 5</strong>（4.8）</td><td>600B+，宣称 5M 上下文、50 万+ B200 训练</td><td>细节来源单一，未见完整技术报告，谨慎引用</td></tr>
+        <tr><td><strong>智谱 GLM-5.1</strong>（4.7）</td><td>754B 稀疏 MoE（约 40B 等效激活），200K，MIT 开源；全程昇腾 910B 训练</td><td>旗舰级「零 NVIDIA」首例</td></tr>
+        <tr><td><strong>智谱 GLM-6-130B</strong>（5.3 开源）</td><td>MoMA 架构：视觉/代码/搜索 Agent 混合路由</td><td>「多模态 Agent 混合推理」方向</td></tr>
+        <tr><td><strong>GLM-5.3</strong>（8.14）</td><td>同基座后训练 Scaling，1M 上下文，思考常开三档</td><td>Terminal-Bench 4.6→28.3（自报）</td></tr>
+        <tr><td><strong>MiniMax M2.7</strong>（3.18）</td><td>230B MoE / 10B 激活，Agent 原生设计，开源权重</td><td>小激活比的 Agent 特化</td></tr>
+        <tr><td><strong>Mistral Small 4</strong>（3.16）</td><td>119B MoE / 6B 激活；单模型合并 Magistral 推理 + Pixtral 视觉 + Devstral 编码，<code>reasoning_effort</code> 一档参数调深度</td><td>「统一可配置模型」路线</td></tr>
+        <tr><td><strong>字节豆包 Seed 2.0</strong>（2.14）</td><td>~1T MoE，类 Gemini 原生多模态；36 氪报道其训练时遭遇稳定性事故，多团队花三个月从架构与数据两端打补丁才训成</td><td>「不蒸馏」立场的代表</td></tr>
+        <tr><td><strong>百度 ERNIE 5.0</strong></td><td>统一多模态：单一架构同时做理解（文档/视频 VQA）与生成（图像/视频），技术报告已公开（arXiv 2602.04705）</td><td>理解-生成统一路线</td></tr>
+        <tr><td><strong>IBM Granite 4.2</strong>（8.25）</td><td>dense 3B/8B/30B；异步 GRPO + 真实环境 agentic RL 全配方公开</td><td><a href="daily-2026-08-26-granite-4-2.html">上篇已详解</a></td></tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>做后训练选型，先读开源技术报告再谈闭源 API</strong>：2026 年可读性最高的三份配方是 DeepSeek V4（auxiliary-loss-free 均衡 + mHC + Muon）、Kimi K3（Quantile Balancing + Per-Head Muon + QAT）、Granite 4.2（分阶段 agentic RL + 异步 GRPO）。闭源三家能给你的只有行为，开源三家能给你机制。</li>
+      <li><strong>「同基座刷后训练」是中小团队可复用的节奏</strong>：Grok 4.6、GLM-5.3 都证明基座不动、只加长后训练也能换来 benchmark 两位数涨幅。如果你有一个够用的基座，下一个季度的算力预算投给 agentic RL 环境与数据再生，性价比大概率高于重训基座——但前提是你的基座已越过「rollout 成功率非零」的门槛（参见上篇对 3B 不做环境 RL 的分析）。</li>
+      <li><strong>评估长上下文模型时区分「窗口大小」与「缓存经济性」</strong>：KDA/CSA 这类亚二次方注意力的代价是 prefix caching 语义改变（vLLM 为 K3 单独解耦了状态块与前缀粒度）。接入前在你的真实 prompt 分布上测缓存命中率，别看宣传窗口。</li>
+      <li><strong>奖励模型要有「哥布林审计」</strong>：GPT-5.5 事故的通用教训——上线前对 RM 输出做分布审计（哪些表面特征被系统性偏爱），比上线后用系统提示词打补丁便宜得多。GRPO 系方法同样不免疫：组内 baseline 消不掉「组间共享的偏置」。</li>
+      <li><strong>推理预算档位纳入路由层设计</strong>：五档 effort（Opus 5）、三档思考（GLM-5.3 / Granite 4.2）、xhigh（Grok 4.6）意味着「小模型分流」组件可以被「同模型降档」替代。垂类 Agent 的路由表建议从「选模型」改写为「选模型 × 选档位」的二维表。</li>
+      <li><strong>对自报数字保持分层信任</strong>：本文大部分分数为厂商自报；DeepSeek/Kimi 有权重可自测，闭源模型只能等第三方复测。Llama 5 的「5M 上下文 / Recursive Self-Improvement」等说法目前仅见于单一来源，引用前务必回到 Meta 原始材料。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        DeepSeek V4 在前几层用 hash routing（按 token ID 确定性路由）替代学习路由。为什么这个替换在浅层是安全的，在深层却不行？
+        <details><summary>参考答案</summary>
+        浅层学到的多是与语义弱相关的通用模式（词法、句法、局部搭配），这类知识按 token 身份组织即可——同一个 token 在任何上下文里需要的「初级加工」高度稳定，确定性路由不会损失表达力，还省掉了浅层路由器的训练信号竞争。深层承载的是上下文相关的语义组合，同一个 token 在不同语境需要路由到不同专家（如「苹果」在食谱 vs 财报中），确定性路由无法表达这种条件依赖。这与「浅层特征通用、深层特征 task-specific」的可解释性观察一致；工程上还顺带获得一个好处：浅层路由决策无状态、可静态分析，利于专家并行的静态编排。</details>
+      </li>
+      <li>
+        Kimi K3 用 69 层线性注意力（KDA）+ 24 层全注意力（Gated MLA）的混合配比。为什么不是全 KDA？周期性保留全注意力层在解决什么问题？
+        <details><summary>参考答案</summary>
+        线性注意力把历史压缩成固定维度的循环状态，天然有损：精确检索「很久以前某个具体 token」的能力（associative recall）会随距离衰减，而全注意力的 KV 是无损的。全 KDA 模型在 1M 上下文的「大海捞针」类任务上会出现系统性掉点。周期性插入全注意力层等于在深度方向上设置若干「精确检索检查点」，让循环状态里已经模糊的信息有机会从原始 KV 重新读出。这和 DeepSeek CSA「先压缩再稀疏选 top-k」是同一件事的两种实现：都承认纯压缩/线性方案保不住精确检索，区别在于 K3 在深度方向补救，DeepSeek 在序列方向补救。</details>
+      </li>
+      <li>
+        Grok 4.6 与 GLM-5.3 都是「不换基座、只加强后训练」的发布。这种做法的能力天花板由什么决定？什么信号提示你该重训基座了？
+        <details><summary>参考答案</summary>
+        天花板由基座的「可引导能力」决定：RL 只能放大基座中已有非零概率的行为（rollout 全败则 GRPO advantage 全零），SFT 蒸馏同理（学生上限被教师锁死，且受基座表示容量约束）。具体的预警信号：① 环境 RL 的首轮成功率低到组内无差异，加数据只能学到格式学不到策略；② 后训练增益逐版递减（GLM-5.2→5.3 的边际若显著小于 5.1→5.2，说明基座潜力快吃光了）；③ 错误模式从「不会解题」退化为「知识不存在」（后训练补不了预训练没见过的事实）。出现③基本就是重训基座的信号。字节 Seed 2.0 训练稳定性事故、三个月打补丁也提示另一个方向：基座质量本身就是后训练投资回报率的乘数。</details>
+      </li>
+      <li>
+        为什么闭源实验室（OpenAI/Anthropic/Google）在 2026 年集体停止披露架构，而开源阵营（DeepSeek/Moonshot/智谱）反而披露得越来越细？这对双方各是什么策略？
+        <details><summary>参考答案</summary>
+        闭源侧：当能力差异主要来自训练配方而非架构论文时，配方就是核心商业秘密；不披露还能规避「被对手针对性蒸馏/复制」与监管审视，沉默本身是防御。披露的义务被转移到 system card（安全面）——因为企业客户与政府的采购门槛在安全合规，不在架构新颖性。开源侧：权重本来就要放出来，架构藏不住；把训练配方讲透反而能换来三样东西——社区 kernel/框架适配（Moonshot 给 vLLM 贡献 KDA 实现，本质是发动社区帮自己补推理栈）、学术界引用与人才吸引力、以及「透明度」作为对闭源阵营的差异化营销。同一个动作（不披露 vs 披露），对卖 API 的是护城河，对卖权重+生态的是获客漏斗。</details>
+      </li>
+      <li>
+        Mistral Small 4 用一个 <code>reasoning_effort</code> 参数把推理、视觉、编码三个原独立产品线合并成单模型。这种「统一可配置模型」对推理基础设施提出了什么新要求？
+        <details><summary>参考答案</summary>
+        ① 调度器必须把 effort 档位当一等公民：不同档位的 token 吞吐差可达数倍，容量规划、限流和计价都要按档分桶，否则高档请求会把低档的延迟拖垮；② KV cache 与 batching 策略要兼容「同模型多行为模式」——思考档的长输出让 decode 阶段占比剧增，continuous batching 的混合配比不再是稳态；③ 可观测性要按档位切片：同一模型在低档的幻觉率与高档可能完全不同，统一监控会掩盖回归；④ 对客户端，「模型版本钉死」要扩展为「模型 × 默认档位」钉死，因为服务端改默认档位等价于一次静默的模型升级。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Kimi K3：<a href="https://www.marktechpost.com/2026/07/16/moonshot-ai-releases-kimi-k3-a-2-8-trillion-parameter-open-moe-model-with-kimi-delta-attention-and-1m-context/" target="_blank" rel="noopener">MarkTechPost（2026-07-16）</a> · <a href="https://openlm.ai/kimi-k3/" target="_blank" rel="noopener">openlm.ai 规格汇总</a> · <a href="https://vllm.ai/blog/2026-07-22-kimi-k3-preview" target="_blank" rel="noopener">vLLM 官方博客：K3 生产支持预览（2026-07-22）</a> · <a href="https://www.firecrawl.dev/blog/kimi-k3" target="_blank" rel="noopener">Firecrawl 开发者指南（2026-08-13）</a></li>
+      <li>DeepSeek V4：<a href="https://github.com/ankit-pn/deepseek-v4-architecture-report" target="_blank" rel="noopener">社区架构分析 repo（2026-05-14 更新）</a> · <a href="https://techjacksolutions.com/ai-tools/deepseek/deepseek-v4-architecture/" target="_blank" rel="noopener">TechJack 架构指南（2026-07-22）</a> · <a href="https://chat-deep.ai/docs/deepseek-v4-architecture/" target="_blank" rel="noopener">chat-deep.ai 架构地图（2026-08-14）</a> · <a href="https://www.morphllm.com/deepseek-v4" target="_blank" rel="noopener">Morph：V4 vs V3 对比（2026-08-21）</a></li>
+      <li>OpenAI GPT-5.6：<a href="https://iotdigitaltwinplm.com/gpt-5-6-sol-explained-2026/" target="_blank" rel="noopener">iotdigitaltwinplm 披露边界分析（2026-06-27）</a> · <a href="https://www.scriptbyai.com/timeline-of-chatgpt/" target="_blank" rel="noopener">ScriptByAI 发布年表（2026-08-22 更新）</a> · 哥布林事故复盘见 OpenAI 官方博文《Where the Goblins Came From》（2026-04-30）</li>
+      <li>Anthropic：<a href="https://releasebot.io/updates/anthropic/claude-developer-platform" target="_blank" rel="noopener">Claude 开发者平台更新日志（Opus 5，2026-07-24）</a> · <a href="https://techjacksolutions.com/ai-tools/anthropic-claude/what-is-claude-mythos/" target="_blank" rel="noopener">Mythos 5 / Capybara 分级解析（2026-08-04）</a> · <a href="https://dealcan.ca/article/a4d7c67d-aa5c-4bb4-b2d7-c0c5b945b34d" target="_blank" rel="noopener">Opus 5 发布快讯（2026-07-25）</a></li>
+      <li>Google Gemini 3.x：<a href="https://blog.roboflow.com/use-gemini-3/" target="_blank" rel="noopener">Roboflow 技术解析（2026-03-16）</a> · <a href="https://menuagentic.com/blogs/claude-mythos-5-vs-gpt-5-6-vs-gemini-3-2-vs-qwen-3-7-vs-deepseek-v4-1/" target="_blank" rel="noopener">六月旗舰会车分析（2026-06-22）</a></li>
+      <li>Qwen3.5–3.8：<a href="https://blog.csdn.net/xyghehehehe/article/details/161263637" target="_blank" rel="noopener">Qwen3.7 云峰会解析（CSDN，2026-05-20）</a> · <a href="https://router.one/blog/qwen3-doubao-vs-claude-gpt-china" target="_blank" rel="noopener">Router One 国内选型指南（2026-08-16）</a> · <a href="https://www.spheron.network/blog/deploy-qwen3-7-max-gpu-cloud/" target="_blank" rel="noopener">Spheron 部署指南（2026-06-08）</a></li>
+      <li>xAI Grok：<a href="https://felloai.com/all-we-know-so-far-about-grok-5/" target="_blank" rel="noopener">Fello AI：Grok 产品线与 Grok 5 现状（2026-08-13）</a> · <a href="https://codersera.com/blog/grok-4-6-launch-guide-2026/" target="_blank" rel="noopener">Codersera：Grok 4.6 发布（2026-08-13）</a> · <a href="https://www.mindstudio.ai/blog/xai-grok-roadmap-7-models-training-grok-5-10-trillion" target="_blank" rel="noopener">MindStudio：Colossus 2 路线图（2026-05-01）</a></li>
+      <li>国产阵营：<a href="https://juejin.cn/post/7629167139825123354" target="_blank" rel="noopener">GLM-5.1 / Qwen3.6 / MiniMax M2.7 横评（掘金，2026-04-16）</a> · <a href="https://aicoding.csdn.net/6a8541d7662f9a54cb9e7680.html" target="_blank" rel="noopener">GLM-5.3 发布信息（2026-08-18）</a> · <a href="https://www.36kr.com/p/3938724380360071" target="_blank" rel="noopener">36 氪：Seed 团队与豆包 2.0 训练始末（2026-08-14）</a> · <a href="https://arxiv.org/pdf/2602.04705" target="_blank" rel="noopener">ERNIE 5.0 Technical Report（arXiv 2602.04705）</a> · <a href="https://www.cnblogs.com/bykj123/p/22173013" target="_blank" rel="noopener">国产算力训练报道汇总（2026-08-03）</a></li>
+      <li>欧美开源：<a href="https://aizolo.com/blog/mistral-ai-models-2026/" target="_blank" rel="noopener">Mistral 全系解析（2026-08-03）</a> · <a href="https://aiunpacking.com/guides/open-source-ai-models-2026-llama-mistral-deepseek/" target="_blank" rel="noopener">开源模型全景（2026-05-20，Llama 5 单一来源）</a></li>
+      <li>相关笔记：<a href="daily-2026-08-26-granite-4-2.html">IBM Granite 4.2：异步 GRPO 与真实环境 Agentic RL</a> · <a href="grpo-notes.html">GRPO 微调实践笔记</a> · <a href="daily-2026-08-13-prm.html">过程奖励模型（PRM）</a> · <a href="rl-10-papers-detailed.html">「复现 10 篇 RL 论文」逐篇详解</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
