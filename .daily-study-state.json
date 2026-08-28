@@ -29,6 +29,13 @@
       "source": "frontline",
       "topic": "Microsoft Agent Lightning v1.0：Harnessed Agentic RL（LLM endpoint proxy / ~3500 LOC / SWE-bench）",
       "file": "posts/daily-2026-08-28-agent-lightning-v1.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "base infra agent",
+      "source": "base",
+      "topic": "腾讯混元 Hy4 preview：770B-A49B 开源旗舰基座（MoE / Gated DSA / iHC / MTP / 1M）",
+      "file": "posts/daily-2026-08-28-base-hy4.html"
     }
   ]
 }
