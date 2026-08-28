@@ -1,6 +1,7 @@
 {
   "rotation": ["rl", "agent", "infra", "gpu", "pc"],
   "next": 2,
+  "daily_streams": ["frontline", "harness", "algo"],
   "history": [
     {
       "date": "2026-08-13",
@@ -24,7 +25,7 @@
     },
     {
       "date": "2026-08-28",
-      "domain": "agent rl",
+      "domain": "agent rl harness",
       "source": "frontline",
       "topic": "Microsoft Agent Lightning v1.0：Harnessed Agentic RL（LLM endpoint proxy / ~3500 LOC / SWE-bench）",
       "file": "posts/daily-2026-08-28-agent-lightning-v1.html"
