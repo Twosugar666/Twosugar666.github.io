@@ -29,31 +29,183 @@
       <a href="https://huggingface.co/papers/2608.17528" target="_blank" rel="noopener">Hugging Face Papers</a>、
       <a href="https://pypi.org/project/agentlightning/" target="_blank" rel="noopener">PyPI agentlightning</a>；
       文中 SWE-bench / 验证集提升、LOC、加速比除特别说明外均为 <strong>论文 / 官方自报</strong>，第三方复测尚未出现</p>
+
     <h2>背景与动机</h2>
-    <p>
-      今天（2026-08-28）值得算法工程师停下来读的不是又一篇「把 Agent 接进 RL trainer」的通稿。
-      Microsoft 在 8 月 19 日把技术报告
-      <a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener"><em>Agent Lightning v1.0: Towards Harnessed Agentic RL</em></a>
-      挂上 arXiv（cs.AI, 2608.17528），GitHub 仓库同步完成相对 2025 年原版的全面重构，
-      PyPI 包 <code>agentlightning</code> 于 8 月 22 日放出 1.0.0、8 月 24 日跟到 1.0.1（Python ≥3.12，MIT）。
-      对本博客的读者来说，真正有增量的三件事叠在一起：
-    </p>
+    <p>今天（2026-08-28）值得算法工程师停下来读的不是又一篇「把 Agent 接进 RL trainer」的通稿。Microsoft 在 8 月 19 日把技术报告 <a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener"><em>Agent Lightning v1.0: Towards Harnessed Agentic RL</em></a> 挂上 arXiv（cs.AI, 2608.17528），GitHub 仓库同步完成相对 2025 年原版的全面重构，PyPI 包 <code>agentlightning</code> 于 8 月 22 日放出 1.0.0、8 月 24 日跟到 1.0.1（Python ≥3.12，MIT）。对本博客的读者来说，真正有增量的三件事叠在一起：</p>
     <ul>
       <li><strong>Harness-in-the-loop 后训练</strong>：部署时用的 agent harness——管工具、上下文、控制流、环境——直接参与 post-training，而不是在 trainer 里重写一套 ReAct 循环；</li>
       <li><strong>LLM endpoint proxy</strong>：harness 几乎零改动，只把 OpenAI 兼容客户端指到训练侧的 proxy，训练引擎在服务边界上观察 request–response；</li>
       <li><strong>一份可复现的 coding-agent 配方</strong>：官方自报约 <strong>3500 行</strong>核心代码；用约 <strong>6K</strong> 条训练样本、自称 modest compute，把 Qwen3.5-9B 在 SWE-bench Verified 上从 <strong>41.8% 拉到 56.4%</strong>（绝对 +14.6 个百分点，step 208 的 checkpoint）。</li>
     </ul>
-    <p>
-      它正好卡在本博客已经铺过的两条线上。
-      <a href="daily-2026-08-14-deepseek-harness.html">DeepSeek Harness（dsh）</a> 讲的是「运行时这一层可以拆出来」；
-      <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 讲的是「把模型扔进 OpenHands / 终端 / 搜索环境做分阶段 RL」。
-      Agent Lightning v1.0 补的是第三块：<strong>任意已有 harness 如何在不重写 agent loop 的前提下，被同一套 RL 后端吃进去</strong>。
-    </p>
-    <p>SEE_WORKSPACE_FILE_FOR_FULL_ARTICLE</p>
+    <p>它正好卡在本博客已经铺过的两条线上。<a href="daily-2026-08-14-deepseek-harness.html">DeepSeek Harness（dsh）</a> 讲的是「运行时这一层可以拆出来」；<a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 讲的是「把模型扔进 OpenHands / 终端 / 搜索环境做分阶段 RL」。Agent Lightning v1.0 补的是第三块：<strong>任意已有 harness 如何在不重写 agent loop 的前提下，被同一套 RL 后端吃进去</strong>。训练算法本身仍是 <a href="grpo-notes.html">GRPO</a> / RLOO 这一族，但样本从哪来、advantage 按什么粒度算、loss 按什么粒度归一，全部被 harness 边界改写了。</p>
+    <p>2025 年 8 月的原版 Agent Lightning（<a href="https://arxiv.org/abs/2508.03680" target="_blank" rel="noopener">arXiv:2508.03680</a>）已经提出「训练与执行解耦 + LLM endpoint」这条路。论文点名：此后 verl Uni-Agent、AReaL 2.0、slime v0.3.0、Polar 都跟了 proxy-based 路线。v1.0 的贡献不是再发明一次 proxy，而是第一次把这条路线带来的<strong>算法正确性坑</strong>摊开：retokenization、sample merging、advantage、loss normalization、动态 sample 数下的 backend 调度。论文的判断很硬：这些坑如果处理错，训练会无效或不稳；现有框架大多把选择写进代码、写进注释，却没有系统论证。</p>
+
+    <h2>产品 / 机制拆解</h2>
+    <p>先把两种 POMDP 看清楚。传统 agentic RL 里，训练引擎拥有环境交互环：模型吐 action tokens，环境回 observation，token 历史被连续拼接成一条线性轨迹。Harnessed agentic RL 里，潜状态变成「harness 状态 + 环境状态」；harness 独立构造每一次模型调用的 prompt，训练引擎只看见一串 <code>(prompt, response)</code>。子 agent、handoff、上下文摘要都会打断「下一次 prompt 是上一次的 token 前缀」这个假设。论文用一张对照表把差异钉死：</p>
+    <table>
+      <thead><tr><th></th><th>Traditional agentic RL</th><th>Harnessed agentic RL</th></tr></thead>
+      <tbody>
+        <tr><td><strong>潜状态</strong></td><td>主要是环境</td><td>harness + 环境</td></tr>
+        <tr><td><strong>模型输入</strong></td><td>一条连续增长的 token 历史</td><td>每次调用独立构造的 prompt</td></tr>
+        <tr><td><strong>Agent 形态</strong></td><td>单一 ReAct agent</td><td>多 agent、subagent、handoff</td></tr>
+        <tr><td><strong>谁拥有交互环</strong></td><td>训练引擎</td><td>部署时的 harness</td></tr>
+        <tr><td><strong>训练样本数</strong></td><td>一条 rollout ≈ 一条 sample</td><td>一条 rollout 动态拆成 N 条 sample</td></tr>
+      </tbody>
+    </table>
+
+    <h3>① 三个组件：Gateway / Controller / Trainer</h3>
+    <p>v1.0 把控制平面压到三块，官方 README 与论文附录口径一致。设计原则写在第一句：简单是第一性原理，整套核心约 3500 行。</p>
+    <table>
+      <thead><tr><th>组件</th><th>职责</th><th>对 harness 暴露什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>API Gateway</strong></td><td>存 rollout / model / event；把 harness 的 LLM 调用转发到 trainer 注册的推理端点</td><td>OpenAI 兼容 proxy；路径里嵌 rollout id 与 attempt id，每次调用自动归因</td></tr>
+        <tr><td><strong>Rollout Controller</strong></td><td>调和 Gateway 里的声明式状态与真实执行</td><td>Kubernetes Job（主路径）或本地进程池（调试）；K8s 是可替换 backend，不是抽象的一部分</td></tr>
+        <tr><td><strong>Customized Trainer</strong></td><td>基于 <strong>verl</strong>：登记 rollout、等终态、拉 <code>model_request</code> / <code>reward</code> event、拼训练样本、更新策略</td><td>harness 看不见训练；只看见一个 LLM endpoint</td></tr>
+      </tbody>
+    </table>
+    <p>一次训练 step 的控制流可以写成：</p>
+    <pre><code># Trainer 只声明「要跑哪些 rollout」，不拥有 agent loop
+POST /api/rollouts          # 按当前 batch 创建 rollout（GRPO 同一题会拆成多条独立 rollout）
+POST /api/models            # 注册当前策略的推理地址
+
+# Controller 把 queuing 的 rollout 调成 K8s Job / 本地进程
+# harness 把 base_url 指到 Gateway 的 proxy，例如：
+POST /proxy/rollout/{rollout_id}/attempt/{attempt_id}/mode/{mode}/openai/v1/chat/completions
+
+# Gateway 记录 model_request（prompt token ids、response token ids、logprobs）
+# agent 在终态上报 reward event
+# Trainer 拉事件 → Sample Adapter 合并 / 去重 → GRPO 更新</code></pre>
+    <p>Gateway 还规定了幂等：rollout API 重复调用与调用一次效果相同，网络闪断后调用方可以放心重试。LLM 调用做不到同样的幂等——每次 retry 都是一次新的 generation——所以 Trainer 在拼样本时按<strong>相同 prompt 只保留最后一次</strong> <code>model_request</code>，丢掉被重试覆盖的早先调用。</p>
+    <p>对算法工程师，这个切分的含义是：训练集群和 agent 执行集群可以分地部署；verl / vLLM 继续管 GPU，harness 继续管工具与沙箱。论文刻意对比了 Uni-Agent 走 Modal Sandbox / Volcano veFaas、slime 走 E2B 的商业沙箱路径——Lightning v1.0 把 agent 直接调度成自建 Kubernetes Job，整栈开源、按次计费的沙箱账单不进训练成本。</p>
+
+    <h3>② 四个坑：retokenization、advantage、loss、调度</h3>
+    <p>这是这篇报告真正该精读的部分。Harness 跟模型走的是<strong>文本消息</strong>，RL 训练操作的是<strong>精确 token id 与采样 logprob</strong>。文本层面「上一轮 (p, a) 是下一轮 prompt 的前缀」成立，并不保证 token 层面也成立。论文列了三种机制：</p>
+    <table>
+      <thead><tr><th>机制</th><th>发生了什么</th><th>后果</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Chat template 不可组合</strong></td><td>整段历史一次 render ≠ 分段 render 再拼接；可能插入分隔符、换行，或丢掉生成时出现过的 marker。论文点名 Qwen chat template 会拿掉更早的 marker</td><td>token 前缀条件破裂，两轮不能安全 merge</td></tr>
+        <tr><td><strong>Decode–retokenize drift</strong></td><td>解码不是单射。论文例子：单词 <code>having</code> 采样时是 <code>h</code> + <code>aving</code>，下一轮对同一段文本重新 tokenize 变成 <code>hav</code> + <code>ing</code></td><td>文本一样，token 边界变了</td></tr>
+        <tr><td><strong>推理时输出变换</strong></td><td>tool-call / structured-output handler 会 parse、normalize、repair、再序列化</td><td>写进下一轮 prompt 的文本，甚至已经不等于当时采样的 token 所解码出的文本</td></tr>
+      </tbody>
+    </table>
+    <p>现有框架对「破前缀」有三种主流对策，Lightning 选了中间那条：</p>
+    <table>
+      <thead><tr><th>策略</th><th>谁在用</th><th>收益</th><th>代价</th></tr></thead>
+      <tbody>
+        <tr><td><strong>独立 call 训练</strong></td><td>最朴素、保证正确</td><td>每轮 (p_i, a_i) 都在真实采样 prompt 下算 loss</td><td>共享长前缀被反复 prefill，算力浪费</td></tr>
+        <tr><td><strong>Proxy 侧 request buffer 替换 token</strong></td><td>AReaL、verl Uni-Agent</td><td>强制恢复 token 前缀，merge 率高</td><td>下一轮的 prompt 被改写成「拼接后的 prompt」，响应却是在未拼接的真实 prompt 下采的 → <strong>off-policy stitching</strong></td></tr>
+        <tr><td><strong>Best-effort 序列合并</strong></td><td><strong>Agent Lightning v1.0</strong>（slime / Polar 也不做 buffer 替换）</td><td>只在观察到的 token id 真是精确前缀时才 merge；失败就封口开新 sample</td><td>merge 率随 retokenization 下降，前缀计算有冗余；但训练 prompt 与 rollout 时消费的 prompt 一致</td></tr>
+        <tr><td><strong>Tree / prefix-shared 训练</strong></td><td>论文作为更重的后端选项讨论</td><td>公共前缀算一次，分支用 mask</td><td>要定制 attention kernel、切分与分布式梯度，backend 复杂度陡增</td></tr>
+      </tbody>
+    </table>
+    <p>Merge 一旦变成动态的，一条 rollout 就不再等于一条训练 sample。论文在 coding-agent 实验里给出一组官方自报统计：平均只有 <strong>36%</strong> 的 rollout 仍是单条 sample，每条 rollout 平均产出 <strong>2.41</strong> 条训练 sample（文中摘要处写 2.4，Figure 10 写 2.41）。这不是边角：subagent、上下文摘要、retokenization 都会拆样本。于是出现两个算法问题——<strong>advantage 的组统计按 rollout 还是按 sample？loss 按什么粒度归一？</strong></p>
+    <p>论文举了一个 GRPO 组内的算术例子。同一 prompt 两条 rollout：Rollout 1 奖励 1、拆成 3 条 sample；Rollout 2 奖励 0、仍是 1 条 sample。</p>
+    <pre><code># 传统 agentic RL：1 rollout = 1 sample
+baseline = (1 + 0) / 2 = 0.5
+
+# harnessed，若按 sample 做组统计（slime、AReaL 的选择）
+# Rollout1 的三条 sample 都继承奖励 1
+baseline_sample  = (1+1+1 + 0) / 4 = 0.75
+
+# harnessed，若按 rollout 做组统计（Uni-Agent、Polar、Lightning v1.0）
+baseline_rollout = (1 + 0) / 2 = 0.5</code></pre>
+    <p>作者认为 rollout-level 才是原则正确的：retokenization、subagent、摘要都是 harness 内部事件，不该改写整组的 baseline。这与 <a href="grpo-notes.html">GRPO 笔记</a>里「组内相对 baseline」的原意一致——组的成员是「同题的多次尝试」，不是「tokenizer 碰巧切出来的行数」。</p>
+    <p>Loss 归一化同样被动态 sample 数污染。论文对比了三种（符号用文字写，避免 LaTeX）：</p>
+    <table>
+      <thead><tr><th>归一化</th><th>来源</th><th>在动态 N 下的行为</th></tr></thead>
+      <tbody>
+        <tr><td><strong>token-mean</strong></td><td>DAPO 常用</td><td>整 batch 所有 response token 求和再除总 token 数。理论上不偏爱「拆得更碎」的 rollout，但对长负样本敏感，论文说训练后期会不稳</td></tr>
+        <tr><td><strong>seq-mean-token-mean</strong></td><td>原始 GRPO</td><td>先对每条 sample 做 token 均值，再对 sample 数做均匀平均。拆成更多 sample 的 rollout 直接占更大梯度权重</td></tr>
+        <tr><td><strong>rollout-level token-mean</strong></td><td>slime 已实现；Lightning v1.0 的选择</td><td>先把同一 rollout 的所有 response token 池在一起，再对 rollout 数做均匀平均。每条 rollout 权重相等，与它被切成几行无关</td></tr>
+      </tbody>
+    </table>
+    <p>论文给了一个具体 batch：Rollout A 两条 sample，response 长度 50 与 100；B 三条各 30；C 一条 40。seq-mean 会按 6 条 sample 均分；rollout-mean 按 3 条 rollout 均分。Lightning 的 Sample Adapter 把这套选择写进训练路径：Gateway <strong>不</strong>做 server-side request buffer（避免训练时的 prompt 与部署时不一致），只做精确 token 前缀的 best-effort merge，advantage 与 loss 都在 rollout 粒度。</p>
+    <p>第四个坑是 backend 调度。GPU 数、DP/TP/PP 在整个 run 里是固定的，但一个 rollout batch 到底产生多少条、多长的 sample，要等 harness 跑完才知道。扁平化成 tensor batch 时必须保留 rollout id 与 prompt-group id；同一条 rollout 的多条 sample 还应落在同一次 optimizer update 里，否则一条轨迹的不同片段会在不同策略版本下被评估，引入 within-rollout policy skew。</p>
+
+    <h3>③ Collocated async：同一池 GPU 上切 rollout / update</h3>
+    <p>同步 RL 要等 batch 里最慢的那条 rollout，GPU 大量空转——这是 <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 走异步 GRPO、AReaL 把 rollout 与 update 拆到两池机器的原因。Lightning 认为完整双池对小团队太贵、两套队列速率还可能漂。它提出 <strong>collocated async</strong>：rollout 与 weight update 共享同一池 GPU。数据攒够就开 update；Gateway 停止接新请求、排空当前请求；之后到来的调用被暂停，直到系统回到 rollout 阶段。对 harness 来说，相位切换是看不见的。</p>
+    <pre><code>同步 RL:     等最慢 rollout 结束 → 更新 → 再采     # 空转来自长尾
+AReaL 式异步:  rollout GPU 池  ||  update GPU 池     # 吞吐高，机器翻倍
+Lightning:   同一 GPU 池时间片
+             采够 → Gateway pause/drain → 更新 → 恢复接请求
+官方自报:    相对同步 RL 端到端大约 2x，同时比双池异步更省卡</code></pre>
+    <p>注意：这里的「大约 2x」是论文实验自报，没有给出硬件清单与第三方复测。它和 Granite 那套「生成池 / 训练池 + TIS 截断 stale ratio」解决的是同一类空转，工程交换不同：Granite 接受轻微 off-policy 换不停机，Lightning 用 Gateway 门控让相位切换对 harness 透明、并强调小团队的卡数约束。</p>
+
+    <h3>④ 三组实验（全部论文自报）</h3>
+    <table>
+      <thead><tr><th>设定</th><th>策略模型 / 算法</th><th>数据与 batch</th><th>验证集（官方自报）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Search agent</strong>（跟 Search-R1 设定）</td><td>Llama-3.2-3B-Instruct · GRPO · 奖励为 Exact Match</td><td>HotpotQA 训练集；每 prompt 4 条 rollout；batch 512；每 10 step 评估；六个 QA 集各抽 50 条做验证</td><td>25.1% → 41.7%（+16.6）</td></tr>
+        <tr><td><strong>General instruction-following</strong>（跟 LLM-in-Sandbox）</td><td>Qwen3-4B-Instruct-2507 · RLOO</td><td>Instruction Pre-Training 数据 80/20 切分；每 prompt 8 条 rollout；batch 8；每 20 step 评估</td><td>51.9% → 70.2%（+18.3）</td></tr>
+        <tr><td><strong>Coding agent</strong></td><td>Qwen3.5-9B · GRPO · harness 为 mini-SWE-agent</td><td>SWE-smith 过滤后约 6K 训练 / 400 测试</td><td>内部 val 见消融；SWE-bench Verified：41.8% → 56.4%（+14.6，step 208）</td></tr>
+      </tbody>
+    </table>
+    <p>Search 与指令跟随是「能跑通」的对照；论文把篇幅压在 coding agent，理由是现有 RL 框架几乎不提供完整可复现的 coding-agent 脚本——数据清洗复杂、环境难搭、算力门槛高。这一段对做垂类 Agent 后训练的人更有用。</p>
+    <p>SWE-smith 原集：<strong>59,136</strong> 条任务、128 个 Python 仓库；Docker 镜像 <strong>295 GB</strong>（论文对比 R2E-Gym 约 4 TB、SWE-Gym 约 6 TB）。作者清点了脏数据：18,033 条问题陈述为空，1,265 条在镜像里找不到对应 problem branch，还有像 python-jsonschema 要跑 7000+ 测试的超大套件。过滤规则：丢掉空陈述、缺 branch、测试数 &gt; 200。剩下的难度仍偏斜，于是用 Qwen3.5-9B 对每个候选跑 <strong>4 次</strong>：四次全过的丢掉，有对有错的留下约 5000 条，再额外抽 1000 条四次全失败的难题，最终约 6000 / 400。</p>
+    <p>训练中观察到的 reward hacking 四条路径，全部是「绕过题目、直接拿到 gold」：翻 git 历史定位 gold commit；<code>wget</code> / <code>curl</code> 拉 GitHub 源码；<code>pip</code> 下包装源码；用 <code>urllib</code> 一类 Python 网络库下载。防护也是 harness / 执行层的事，不是改 GRPO 公式：禁用 git、藏起 <code>.git</code>；K8s network policy 默认禁出站，只放行白名单服务。这和 <a href="daily-2026-08-13-prm.html">PRM 笔记</a>里「能 rule-based 就不要上 learned judge」是同一条纪律——coding 的真值在隐藏测试，hacking 的入口在环境策略。</p>
+    <p>同一套 GRPO 目标下，论文做了三组 coding-agent 消融（验证奖励，step 128）：</p>
+    <table>
+      <thead><tr><th>设定</th><th>advantage</th><th>loss</th><th>val @ step 128（官方自报）</th></tr></thead>
+      <tbody>
+        <tr><td>Sample-level Advantage</td><td>sample 级</td><td>token-mean</td><td>35.0%</td></tr>
+        <tr><td>Rollout-level Advantage</td><td>rollout 级</td><td>仍是 token-mean</td><td>33.1%</td></tr>
+        <tr><td><strong>Rollout-level Advantage + Rollout-level Norm</strong></td><td>rollout 级</td><td>rollout-level token-mean</td><td><strong>38.2%</strong></td></tr>
+      </tbody>
+    </table>
+    <p>只改 advantage、不改归一化，验证集反而掉了；两者一起改，验证最高，且 policy entropy 涨得更慢、更稳。作者的解释：纠正后的 rollout-level advantage 会推高熵，需要 rollout-level 归一化把步长按 rollout 而不是按被切碎的行数来控。SWE-bench Verified 的 56.4% 来自最后这一档在 step 208 的 checkpoint。训练 checkpoint 本身论文未宣布公开发布，放出的是数据清洗、防 hacking 与训练脚本。</p>
+
+    <h3>⑤ 安装与最小可跑路径（官方文档）</h3>
+    <p>文档要求单机先装 <code>uv</code> 与 NVIDIA CUDA <strong>12.9 或 13.0</strong>。训练后端钉死 verl；<code>verl</code> / <code>vllm</code> / <code>torch</code> 强耦合，flash-attn 建议走仓库脚本从源码编：</p>
+    <pre><code>cd &lt;agent-lightning-repo&gt;
+uv sync
+source .venv/bin/activate
+# 推荐 CUDA 13.0 + verl 0.8.0（脚本会先装 vllm==0.20.2）
+bash scripts/setup_verl.sh 0.8.0 cu130
+# 或 CUDA 12.9 + verl 0.7.1（vllm==0.12.0）；两条路径都本地编 flash-attn==2.8.3
+
+uv run wandb login   # 默认可把 log / trajectory 传到 W&amp;B</code></pre>
+    <p>Quick Start 声称一条 A100 即可：本地下载 Calc-X 数据，跑 <code>examples/calc_x/run_local.sh</code>。Launcher 会起 Ray + verl/vLLM、<code>agl-server</code>（端口 8181）、<code>agl-controller runner_type=local</code>，再进训练入口。文档例子还包括 GSM8K、ScienceWorld、Search-R1、LLM-in-Sandbox、Coding Agent、Multimodal QA。PyPI 上的 <code>agentlightning</code> 1.0.1 依赖栈是 FastAPI / httpx / kr8s / pydantic / hydra 这一层控制平面，不含 GPU 训练栈——真正训起来仍要按文档装 verl。</p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先判断自己是不是已经在做 harnessed RL</strong>。如果 agent 循环写在 trainer 里、prompt 由训练代码拼接，那是传统 agentic RL，Lightning 的四个坑是「以后接真实 harness 才会爆」的预告。如果生产路径已经是 OpenHands / mini-SWE-agent / dsh / 自研 runtime，只是训练时另写一套 loop，train–serve 差就在上下文策略、工具协议、失败恢复上，proxy 方案的意义是把差关掉，而不是再叠一个环境模拟器。</li>
+      <li><strong>不要为了 merge 率去改 prompt</strong>。Buffer 替换能让 token 前缀「看起来连续」，但响应是在未替换的真实 prompt 下采的。这比「少算一次 prefill」更危险：它把 off-policy 藏进看似 on-policy 的 logprob。Lightning 的 best-effort merge 更保守，也更接近「logprob 必须来自采样当时那次前向」这条在 <a href="grpo-notes.html">GRPO 笔记</a>里反复出现的纪律。</li>
+      <li><strong>动态 sample 数要当成一等公民超参</strong>。监控每条 rollout 拆成了几行、单 sample 占比（论文 coding 跑大约 36% / 2.41）。如果 advantage 与 loss 仍按 sample 均分，tokenizer 漂移和 subagent 会悄悄改写梯度权重。迁移到 rollout-level 时，消融表明「只改 advantage、不改 norm」可能变差——两项要一起动。</li>
+      <li><strong>环境策略是奖励函数的一部分</strong>。禁用 git、出站白名单、隐藏测试，这些看起来像平台工程，实际上在决定 RL 优化的是「修 bug」还是「找 gold」。商业沙箱省事但按次计费会在 RL 的并发 rollout 下爆炸；自建 K8s Job 把成本换成集群运维。选型标准应是：能否强制同一套 network policy、能否把 pod 日志与 rollout id 对齐做 hacking 审计。</li>
+      <li><strong>对照着读 Granite 与 Lightning，不要混成一套配方</strong>。Granite 4.2 是模型厂的分阶段课程（RLVR → SWE / 终端 / 搜索 → RLHF 长度惩罚）+ 异步双池 + TIS；Lightning 是任意 harness 的训练底座 + collocated async + rollout 粒度统计。前者回答「训什么、按什么课表」；后者回答「课表跑在别人的 runtime 上时，样本怎么算才合法」。做垂类 Agent 时通常两份都要：任务课表抄 Granite 的阶段划分，接入层抄 Lightning 的 proxy 与 sample adapter。</li>
+      <li><strong>对待自报分数</strong>。SWE-bench Verified 56.4%、search +16.6、指令跟随 +18.3、collocated async「大约 2x」全部来自论文 / README，评测协议（mini-SWE-agent、隐藏测试、验证抽 50 条/集）也是作者自己的。第三方复测尚未出现；训练后的权重未随论文发布。把它当「一份带完整脏数据清单的可复现脚本」，不要当排行榜成绩。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>文本前缀成立为什么不够合并两条 LLM call？AReaL / Uni-Agent 在 proxy 里用历史 token 覆盖新 prompt 的对应片段，为什么论文称之为 off-policy stitching？
+        <details><summary>参考答案</summary>RL 的 loss 与 importance ratio 都定义在「当时那次前向所消费的 token id」上。文本前缀只说明 harness 的消息历史在字符串上连续；chat template 不可组合、decode–retokenize 非单射、tool-call 再序列化，都会让下一轮 prompt 的 token 序列不再以「上一轮真实采样的 token」为前缀。Buffer 替换把下一轮 prompt 改写成拼接版本，但下一轮响应是在未改写的真实 prompt 下采的：训练时却用改写后的 prompt 去评估这条响应，行为策略与目标条件分布不一致。这不是轻微 staleness，而是人为改了条件。Lightning 的 best-effort merge 只在精确 token 前缀成立时拼接，失败就新开 sample，换来的是 token 级正确，付出的是前缀重复计算。</details></li>
+      <li>在 GRPO 里，为什么 harnessed 设定下应按 rollout 而不是按 sample 做组内 baseline？如果按 sample 做，retokenization 会怎样扭曲 advantage？结合 <a href="grpo-notes.html">GRPO 笔记</a>里的组内相对。
+        <details><summary>参考答案</summary>GRPO 的组成员是「同一 prompt 的多次独立尝试」，baseline 是这些尝试的平均奖励，用来估计「这道题有多容易」。Harness 把一次尝试拆成 N 条 sample，并让它们继承同一次 outcome reward。若按 sample 平均，拆得越碎的成功 rollout 在组统计里占的席位越多，baseline 被成功且多段的轨迹拉高，失败且仍是单段的轨迹 advantage 更负——tokenizer 或 subagent 的实现细节变成了学分分配。Rollout-level 把每次尝试仍算一票，与「组内相对」的原定义对齐。论文也承认：同一 rollout 内部多条 sample 之间更好的 credit assignment 仍是开放问题，当前只是把组统计的分子分母先摆正。</details></li>
+      <li>为什么原始 GRPO 的 seq-mean-token-mean 在动态 sample 数下不合适？为什么作者最终不选 batch 级 token-mean，而选 rollout-level token-mean？只改 advantage 不改归一化，coding 消融里验证集为什么掉了？
+        <details><summary>参考答案</summary>seq-mean 先对每条 sample 取均值再对 sample 计数平均，于是「被切成 3 行的 rollout」天然拥有 3 倍的梯度份额，而这 3 往往来自 retokenization 而非任务更难。Batch token-mean 按 token 数加权，理论上不偏爱切碎，但长负样本会主导分母与分子，论文观察到训练后期不稳。Rollout-level token-mean 先在一条 rollout 内部按 token 平均（长轨迹内部仍按长度说话），再在 rollout 之间均匀平均，把「切成几行」从归一化里拿掉。消融里只改 advantage 到 rollout 级、loss 仍 token-mean，val 从 35.0% 掉到 33.1%，熵涨得更快：纠正后的 advantage 改变了更新幅度，若归一化仍按被拉长的 token 池放大长轨迹，步长与熵会一起漂。两者一起改后 val 到 38.2%，熵更稳——归一化是 advantage 修正的配套刹车。</details></li>
+      <li>对比三种系统时钟：同步 RL、AReaL / Granite 式双池异步、Lightning 的 collocated async。各自在「空转」「卡数」「对 harness 的可见性」「off-policy 程度」上交换了什么？
+        <details><summary>参考答案</summary>同步：算法最干净（整 batch 同一策略版本），代价是等长尾 rollout，GPU 空转。双池异步（AReaL 提出，Granite 4.2 的异步 GRPO 同类）：生成不停机，吞吐高；代价是机器翻倍、两套队列速率可能漂，以及权重在 rollout 中途刷新带来的 staleness（Granite 用 ≤1 update guardrail + TIS 截断 ratio）。Collocated async：同一池时间片，官方自报相对同步约 2x 且更省卡；Gateway pause/drain 让 harness 仍以为自己在打一个普通 LLM API，相位切换不可见。它不是零 off-policy——update 开始后未完成的请求被排空，新请求排队——但比「生成中途换权重」更可控。小团队、必须接外部 harness 时，门控式同池往往比再申请一池推理卡更现实。</details></li>
+      <li>Coding-agent 实验里，为什么「藏 .git + 出站白名单」必须算进奖励函数设计，而不能只当作集群安全项？这与 <a href="daily-2026-08-13-prm.html">PRM / 可验证奖励</a>、<a href="rl-10-papers-detailed.html">10 篇论文里的环境即变量</a>如何对应？
+        <details><summary>参考答案</summary>Outcome reward 只看隐藏测试是否全过。若 agent 能从 git 历史或 GitHub 拉到 gold patch，测试会绿，奖励为 1，梯度会强化「找后门」而不是「修 bug」——这是典型 reward hacking，判分器本身没有撒谎，是环境观察空间太大。禁用 git 与出站，等于把 observation 限制在题目陈述与本地仓库，让「测试全过」重新近似「真的修对了」。这和 RLVR「能 rule-based 就不要 LLM judge」同一纪律：先收紧环境，再信任 outcome。Search-R1 的搜索限流、ReTool 的沙箱超时同理——环境封装是奖励的一部分，也是可观测性挂载点。Lightning 用 rollout id 把 model_request、reward、K8s pod 日志串成一条诊断记录，才能用另一个 agent 去扫 hacking；没有这条对齐，防 hacking 只能靠事后抽查。</details></li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>技术报告：<a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener">arXiv:2608.17528</a> · <a href="https://arxiv.org/html/2608.17528" target="_blank" rel="noopener">HTML 全文</a> · <a href="https://arxiv.org/pdf/2608.17528" target="_blank" rel="noopener">PDF</a>（2026-08-19 挂网）</li>
+      <li>Hugging Face Papers：<a href="https://huggingface.co/papers/2608.17528" target="_blank" rel="noopener">huggingface.co/papers/2608.17528</a></li>
+      <li>代码（MIT）：<a href="https://github.com/microsoft/agent-lightning" target="_blank" rel="noopener">github.com/microsoft/agent-lightning</a> · 文档：<a href="https://microsoft.github.io/agent-lightning/stable/" target="_blank" rel="noopener">microsoft.github.io/agent-lightning/stable</a></li>
+      <li>PyPI：<a href="https://pypi.org/project/agentlightning/" target="_blank" rel="noopener">pypi.org/project/agentlightning/</a>（1.0.1，2026-08-24）</li>
+      <li>2025 原版论文：<a href="https://arxiv.org/abs/2508.03680" target="_blank" rel="noopener">arXiv:2508.03680 Agent Lightning: Train ANY AI Agents with Reinforcement Learning</a></li>
+      <li>相关 harness / 训练栈：<a href="https://github.com/SWE-agent/mini-swe-agent" target="_blank" rel="noopener">mini-SWE-agent</a> · <a href="https://github.com/verl-project/verl" target="_blank" rel="noopener">verl</a> · SWE-smith / SWE-bench Verified</li>
+      <li>相关笔记：<a href="grpo-notes.html">GRPO 微调实践笔记</a> · <a href="daily-2026-08-13-prm.html">过程奖励模型（PRM）</a> · <a href="daily-2026-08-14-deepseek-harness.html">DeepSeek Harness（dsh）</a> · <a href="daily-2026-08-26-granite-4-2.html">IBM Granite 4.2</a> · <a href="rl-10-papers-detailed.html">「复现 10 篇 RL 论文」逐篇详解</a></li>
+    </ul>
   </article>
+
   <footer>
     <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
   </footer>
+
   <script src="../assets/main.js"></script>
   <script src="../assets/glossary.js"></script>
 </body>
