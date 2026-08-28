@@ -33,4 +33,162 @@
       <a href="https://arxiv.org/abs/2603.12201" target="_blank" rel="noopener">arXiv:2603.12201</a>（IndexCache）；
       Hugging Face 模型卡的 Benchmark Appendix 目前是图片占位、没有可转录的公开数字表，本文<strong>不转写排行榜、不发明 SWE-bench 分数</strong></p>
 
-PLACEHOLDER_USE_FILE
+    <h2>背景与动机</h2>
+    <p>今天（2026-08-28）腾讯 Hy Team 把 <strong>Hy4 preview</strong> 放到了 Hugging Face / ModelScope / GitCode / CNB，Apache 2.0，BF16 与 FP8 两套权重。模型卡写得很直：主干 <strong>770B 总参、每 token 激活 49B</strong>，上下文 <strong>1,048,576</strong>（规格表写作 1M），并点名与 CodeBuddy、WorkBuddy 做产品共设计。对本博客的读者，这不是又一条「又一个开源旗舰」的通稿，而是「基座」收藏夹该开张的理由：混元这条线 2026 上半年先把 <strong>infra 重建 + 中小尺寸产品闭环</strong>跑通，现在才把尺寸、上下文和后训算力一起拉到开源旗舰档。</p>
+    <p>判断可以压成三句，后面的规格表都为这三句服务，而不是反过来。</p>
+    <ul>
+      <li><strong>先产品、再旗舰</strong>。腾讯官网 Hy3 正式发布稿写明：2026 年 1 月底重建预训练与强化学习基础设施，4 月 23 日放出 Hy3 preview（重建后首个版本），再用真实业务反馈把 Hy3 正式版打到「比肩参数规模 2-5 倍的旗舰」。Hy4 preview 是这条闭环之后的尺寸跃迁，不是从 Hy2 直接跳到 770B。</li>
+      <li><strong>Hy4 不是 Hy3 的加层版</strong>。层数从 80（不含 MTP）降到 78，专家池从 192 扩到 256 routed + 1 shared，注意力从 GQA 换成 Gated DSA + IndexCache，残差改成四路 iHC，MTP 从 3.8B 扩到 10B / 0.7B 激活，上下文从 256K 拉到 1M。这是基座级改建。</li>
+      <li><strong>买点不在又一张通用 chat 榜</strong>。模型卡把生产力场景写进后训（SWE 长程、跨文件办公、游戏引擎原型、科研），serving 接口也写成一等公民：<code>tool-call-parser hy_v4</code>、<code>reasoning_effort</code>、原生 MTP 投机解码。同时官方自己承认：过长思考、过度自我验证。选基座时要看的是这四样，而不是转手的 SWE-bench 截图。</li>
+    </ul>
+    <p>它正好卡在本博客已经铺过的三条线上。<a href="special-2026-08-27-new-models-arch.html">2026 新模型全景</a>把这一代旗舰的共识写成 MoE + 亚二次方注意力 + 残差流改建 + agentic 后训练；<a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 证明「能力增量可以全部来自真实环境 RL」；<a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> 与 <a href="daily-2026-08-28-harness-runtime.html">Harness 笔记</a>则把部署时的工具 / 上下文 / 环境从 trainer 里拆出来。Hy4 preview 补的是开源中文阵营里一块缺了很久的东西：<strong>把自家办公 / 编程 Agent 的真实任务写进旗舰基座，并且把 parser、思考开关、MTP 一起开源出来</strong>。后训练算法本身仍是 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> / GRPO 这一族；换基座时真正会爆的，是 tool-call 协议和默认 CoT 预算。</p>
+    <p>时间线按一手来源钉死（Hy3 正式版日期取腾讯新闻 / WorkBuddy 上线稿 2026-07-06；架构数字取各仓库 README / HF 模型卡）：</p>
+    <table>
+      <thead><tr><th>节点</th><th>时间</th><th>一手来源在说什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Infra 重建</strong></td><td>2026 年 1 月底</td><td>腾讯官网 Hy3 正式发布稿：「从 2026 年 1 月底的基础设施重建」。Hy3 preview 通稿另写「自 2026 年 2 月起」重建预训练与 RL 基础设施，口径差两周，本文两者并存、不调平</td></tr>
+        <tr><td><strong>Hy3 preview</strong></td><td>2026-04-23</td><td>GitHub <code>Tencent-Hunyuan/Hy3-preview</code>：重建后首个模型；相对 Hy2，在复杂推理、指令遵循、上下文学习、代码、Agent 上「质变」。295B / 21B 激活，256K，快慢思考融合。许可为 Tencent Hy Community License，不是后来的 Apache 2.0</td></tr>
+        <tr><td><strong>Hy3 GA</strong></td><td>2026-07-06</td><td>腾讯官网：后训练规模与数据质量再拉一档，「比肩参数规模 2-5 倍的旗舰」；preview 上线后日均 token 消耗 ×20；WorkBuddy 上自主选择 Hy3 preview 的用户 ×6。架构仍是 295B-A21B、80 层（不含 MTP）、192 experts top-8、Apache 2.0</td></tr>
+        <tr><td><strong>Hy4 preview</strong></td><td>2026-08-28</td><td>HF / GitHub：770B-A49B，78 层，Gated DSA + iHC + 原生 MTP，1M 上下文，Apache 2.0。官方定位 early preview，明确带着已知缺陷发</td></tr>
+      </tbody>
+    </table>
+
+    <h2>机制拆解</h2>
+    <p>先把 Hy3 与 Hy4 preview 的主干规格并排。Hy3 列来自 <a href="https://github.com/Tencent-Hunyuan/Hy3" target="_blank" rel="noopener">Tencent-Hunyuan/Hy3 README</a>；Hy4 列来自 <a href="https://huggingface.co/tencent/Hy4-preview" target="_blank" rel="noopener">tencent/Hy4-preview</a> 规格表（模型卡写明：下表<strong>不含 MTP 层</strong>）。</p>
+    <table>
+      <thead><tr><th></th><th>Hy3（GA）</th><th>Hy4 preview</th></tr></thead>
+      <tbody>
+        <tr><td><strong>总参 / 激活</strong></td><td>295B / 21B</td><td>770B / 49B</td></tr>
+        <tr><td><strong>层数</strong></td><td>80（不含 MTP）</td><td>78（第 1 层 dense FFN，其余 77 层 MoE）</td></tr>
+        <tr><td><strong>Hidden</strong></td><td>4096</td><td>6144</td></tr>
+        <tr><td><strong>注意力</strong></td><td>GQA，64 heads / 8 KV，head dim 128</td><td>Gated DSA，64 heads；Query 压缩 2048，KV 压缩 512</td></tr>
+        <tr><td><strong>Indexer</strong></td><td>未在规格表列出</td><td>32 heads / dim 128，top-k 2048；IndexCache 跨层复用稀疏索引</td></tr>
+        <tr><td><strong>残差</strong></td><td>未在规格表列出（标准残差口径）</td><td>iHC，残差流数 4</td></tr>
+        <tr><td><strong>MoE</strong></td><td>192 experts，top-8</td><td>256 routed + 1 shared；top-8 routed + shared</td></tr>
+        <tr><td><strong>中间维</strong></td><td>13312（FFN）</td><td>MoE intermediate 2048；dense FFN intermediate 18432</td></tr>
+        <tr><td><strong>上下文 / 词表</strong></td><td>256K / 120832</td><td>1,048,576 / 120832</td></tr>
+        <tr><td><strong>MTP</strong></td><td>1 层，3.8B</td><td>1 层，10B 总 / 0.7B 激活（不计入主干表）</td></tr>
+        <tr><td><strong>HF 列出的模型大小</strong></td><td>README 写 295B + 3.8B MTP</td><td>Safetensors 页写 780B params（与 770B 主干 + ~10B MTP 对齐）</td></tr>
+        <tr><td><strong>精度 / 许可</strong></td><td>BF16；Apache 2.0</td><td>BF16 + FP8 权重；Apache 2.0</td></tr>
+      </tbody>
+    </table>
+    <p>词表没动（120832），层数还少了两层。变的是宽度、注意力、残差拓扑、MTP 规格和上下文。下面按这个顺序拆。</p>
+
+    <h3>① 半年闭环：先重建 infra，再用中小尺寸把产品跑通</h3>
+    <p>Hy3 preview 的 GitHub README 第一句不是参数，而是「the first model trained on our rebuilt infrastructure」。腾讯官网把原则写成三条：全面能力（推理 / 长文 / 指令遵循 / 工具调用）、优先真实评估（主动跳出易被刷的公开榜）、模型与推理共设计。姚顺雨在 preview 通稿里的原话是：扩大预训练和强化学习规模，靠开源和产品 Co-Design 拿真实反馈，再把 Hy3 正式版的实用性做上去。</p>
+    <p>正式版把这条路走完了。GitHub Hy3 README 写：preview 之后收集了 50+ 产品反馈，放大后训练数据质量与多样性；今天放出的 Hy3「outperforms similar-size models and rivals flagship open-source models with 2-5x parameters」。腾讯官网补充了产品侧流量：preview 上线后日均 token ×20；WorkBuddy 上自主选择 Hy3 preview 的用户 ×6。产品名单包括 WorkBuddy / CodeBuddy、元宝、Marvis、ima，以及微信客服、WeGame 等。</p>
+    <p>WorkBuddy 那组内部数字值得单独钉来源，因为它后来被二手文章反复转成「Agent 解决率 90%」，容易和公开榜混在一起：</p>
+    <ul>
+      <li>Hy Team 研究页（<code>hy.tencent.com/research/hy3</code> 英文稿）与腾讯新闻通稿口径一致：WorkBuddy 办公场景内部测评，任务成功率从 Hy3 preview 的 <strong>72% 升到 Hy3 的 90%</strong>，平均完成时间 <strong>-34%</strong>。WorkBuddy 上线稿写的是任务解决率 90%、平均耗时 -34.4%（多出的 0.4 个百分点只出现在产品稿，本文两处都标）。</li>
+      <li>腾讯云开发者社区转载的 Hy3 上线通稿另有一句产品 Co-design 结论：「主要场景中至少 90% 的 Agent 任务可使用 Hy3 成功执行」。这不是公开基准，是腾讯产品侧自报；它和 72%→90% 那组 WorkBuddy 内评不是同一张表。</li>
+      <li>Hy3 GitHub 另给了一组<strong>专家盲测</strong>：270 位专家用自己的工作任务打分，Hy3 均分 2.67/4，高于 GLM-5.1 的 2.51/4，优势集中在前端、数据与存储、CI/CD。幻觉率内部评测 12.5%→5.4%，常识错误 25.4%→12.7%，综合多轮问题率 17.4%→7.9%。SWE-Bench Verified 上，CodeBuddy / Cline / KiloCode 不同脚手架之间的准确率方差「保持在 4% 以内」。这些全部是官方自报，没有第三方复测。</li>
+    </ul>
+    <p>Hy4 preview 模型卡把同一套叙事接到更大的尺寸上：「We scaled Hy4 preview on three fronts: model size, context length, and training data.」预训练更强、后训练显著更大，官方自称这是他们测到的最大代际增益，并把模型放到「open-source frontier」。注意：这句话没有给出 SWE-bench / Terminal-Bench 的可转录数字。HF 的 Benchmark Appendix 章节目前是空的图片位；在数字能从模型卡正文或表格抄下来之前，不补一张假榜。</p>
+
+    <h3>② MoE 不是加层：专家池、激活与 hidden 一起改建</h3>
+    <p>如果只看「770B-A49B」，很容易把它读成 Hy3 的 2.6 倍放大。层数否掉了这种读法：Hy3 80 层（不含 MTP），Hy4 78 层。容量是从<strong>专家池和 hidden</strong> 里长出来的。</p>
+    <p>Hy3：192 experts，top-8。Hugging Face transformers 的 <code>HYV3Config</code> 另外列出 <code>num_shared_experts=1</code>、<code>moe_intermediate_size=1536</code>，与 GitHub 规格表的「192 experts, top-8」兼容（规格表没单独写 shared）。Hy4 模型卡写得更完整：每层 <strong>256 routed + 1 shared</strong>，每 token 激活 top-8 routed <strong>再加上</strong> shared。第一层仍是 dense FFN（intermediate 18432），后面 77 层才是 MoE（intermediate 2048）。这是 DeepSeek 系常见的「底层 dense、其余 MoE」布局，不是 78 层全部稀疏。</p>
+    <p>激活绝对值从 21B 到 49B，总参从 295B 到 770B。做后训练的人更关心的是：单 token 激活涨了一倍出头，但专家池只从 192 扩到 256，hidden 从 4096 拉到 6144。路由仍是 top-8。也就是说，Hy4 并没有走 Kimi K3 那种「896 选 16」的极端稀疏，也没有走 DeepSeek V4「384 选 6」的少激活路线（对照见<a href="special-2026-08-27-new-models-arch.html">全景篇</a>）。它更像把 Hy3 的 MoE 配方在 hidden 和专家宽度上做了一次旗舰化，激活比仍落在「每 token 只跑总参的一个小零头」这一档，而不是改成 dense。</p>
+    <p>部署含义直接写在 Hy3 README 里，Hy4 沿用同一数量级的并行：Hy3 建议 8 卡、H20-3e 或更大显存；Hy4 官方 vLLM / SGLang 示例都是 <code>tp=8</code>，权重推荐 <code>tencent/Hy4-preview-FP8</code>。BF16 全量在 HF 上按 safetensors 列出，模型卡把参数量标成 780B。自建集群要按「770B 主干 + 10B MTP」备盘，不能只按 49B 激活去估显存。</p>
+
+    <h3>③ Gated DSA + IndexCache：1M 上下文的注意力账</h3>
+    <p>Hy3 的注意力是朴素 GQA（64 / 8 / 128）。Hy4 模型卡写：受到 DeepSeek 和 GLM 启发，注意力改成 <strong>Gated DeepSeek Sparse Attention（Gated DSA）</strong>，并用 <strong>IndexCache</strong> 做跨层稀疏索引复用。两篇被挂在模型卡上的论文要分开读：一篇是机制本身，一篇是跨层省 indexer 的方法。Hy4 没有另发自己的注意力论文，下面的复杂度数字来自这两篇，<strong>不是</strong> Hy4 的实测加速比。</p>
+    <p><a href="https://arxiv.org/abs/2512.02556" target="_blank" rel="noopener">DeepSeek-V3.2（arXiv:2512.02556）</a> 把 DSA 写成两段：轻量 lightning indexer 先给每个 query 打分、选出 top-k 相关 token，核心注意力从 <code>O(L²)</code> 降到 <code>O(Lk)</code>。IndexCache 论文把 DSA 的默认 k 写成 2048；Hy4 规格表的 <strong>Indexer top-k 也是 2048</strong>，Indexer heads / dim 为 32 / 128。Query 压缩维 2048、KV 压缩维 512，是 MLA 式低秩压缩叠在稀疏选择前面。模型卡没有解释「Gated」三个字母在实现上比原版 DSA 多了哪一个门，本文不补公式。</p>
+    <p>DSA 的账没算完。Indexer 自己仍是 <code>O(L²)</code>，而且每层都要跑一遍。<a href="https://arxiv.org/abs/2603.12201" target="_blank" rel="noopener">IndexCache（arXiv:2603.12201，清华 + Z.ai）</a> 的观察是：相邻层的 top-k 集合高度相似（论文在 30B DSA 模型上测到相邻层 overlap 约 70-100%）。做法是把层分成少数 Full 层（自己跑 indexer）和多数 Shared 层（复用最近 Full 层的 top-k 索引），推理循环只多一个条件分支。论文在 30B DSA 上报告：可去掉 75% 的 indexer 计算，相对标准 DSA，prefill 最高 1.82×、decode 最高 1.48×（200K 上下文）；并在生产级 GLM-5 上做了初步验证。这些数字属于 IndexCache 论文，不能抄成「Hy4 1M 上下文加速了 1.82×」。Hy4 只确认自己用了这个机制。</p>
+    <p>Serving 侧能看见的对应物是 vLLM 示例里的 <code>--attention-backend FLASHMLA_SPARSE</code>。没有这个 backend，Gated DSA + indexer 这条路径在社区镜像里根本起不来。1M 窗口宣传的是可寻址长度；真正的成本在 indexer 是否跨层共享、KV 是否被压到 512 维、以及 prefix cache 在稀疏索引下还剩多少命中。模型卡没给 Hy4 的缓存命中或 1M 实测曲线，接入前只能在自己的 prompt 分布上测。</p>
+
+    <h3>④ iHC 四路残差：扩层间信息流，不是再叠 depth</h3>
+    <p>规格表有一项 Hy3 完全没写：<strong>Residual Streams 4</strong>。模型卡把残差路径写成 <strong>iHC（identity Hyper-Connections）</strong>，「to expand inter-layer information flow」。这和<a href="special-2026-08-27-new-models-arch.html">全景篇</a>里 2026 年的第三条架构共识对齐：创新轴从「宽度（MoE）」和「序列（注意力）」扩到了最保守的残差流。DeepSeek V4 用 mHC 把多流残差约束回双随机流形，Kimi K3 用 AttnRes 做跨层检索；Hy4 选的名字是 identity HC，强调保 identity mapping 的那一脉。</p>
+    <p>模型卡没有给出 iHC 的混合矩阵、是否做 Sinkhorn 投影、训练是否比单流残差更稳。HF 把解释链到一篇知乎专栏，而不是 arXiv。能确定的只有：残差流数 = 4，官方动机是扩层间信息通路，层数还略少于 Hy3。读基座 config 时不要假设「78 层 ≈ 80 层 Hy3 + 减 2」；四路流把每层可写回的表示宽度放大了，这是深度方向的容量，不是 FFN 中间维的容量。后训练若要做层间蒸馏、跨层 skip 或 linearization，iHC 的流数会进图，不能按 Hy3 的单流残差去抄 Megatron 切分。</p>
+
+    <h3>⑤ 原生 MTP：从 3.8B 到 10B / 0.7B，规格解码写进基座</h3>
+    <p>混元从 Hy3 preview 起就把 MTP 当一等模块，而不是推理框架后来外挂的 draft 模型。GitHub 规格：Hy3 / Hy3 preview 都是 1 层 MTP、3.8B 参数。Hy4 模型卡：<strong>原生 1 层 MTP，10B 总参、0.7B 激活，专用于投机解码，不计入主干表</strong>。HF 把整个仓库标成 780B params，和 770 + 10 对得上。</p>
+    <p>投机步数也在代际上加码，数字全部来自各仓库的官方 serve 命令，不是第三方调参：</p>
+    <table>
+      <thead><tr><th>模型</th><th>vLLM speculative tokens</th><th>SGLang</th><th>tool / reasoning parser</th></tr></thead>
+      <tbody>
+        <tr><td>Hy3 preview</td><td><code>num_speculative_tokens 1</code></td><td>EAGLE，<code>num-steps 1</code>，draft tokens 2</td><td><code>hy_v3</code> / <code>hunyuan</code></td></tr>
+        <tr><td>Hy3 GA</td><td><code>num_speculative_tokens 2</code></td><td>EAGLE，<code>num-steps 2</code>，draft tokens 3</td><td><code>hy_v3</code> / <code>hunyuan</code></td></tr>
+        <tr><td>Hy4 preview</td><td><code>method mtp</code>，<code>num_speculative_tokens 3</code></td><td>NEXTN，<code>num-steps 3</code>，eagle topk 1，draft tokens 4</td><td><code>hy_v4</code>（vLLM）；SGLang 示例写 <code>auto</code></td></tr>
+      </tbody>
+    </table>
+    <p>Hy4 的官方最小启动路径如下（FP8 权重 + 8 卡 + MTP + 稀疏注意力 + v4 parser）。命令原文来自模型卡，不要把 <code>hy_v4</code> 改回 <code>hy_v3</code>：</p>
+    <pre><code>vllm serve tencent/Hy4-preview-FP8 \
+  --tensor-parallel-size 8 \
+  --speculative-config.method mtp \
+  --speculative-config.num_speculative_tokens 3 \
+  --attention-backend FLASHMLA_SPARSE \
+  --tool-call-parser hy_v4 \
+  --reasoning-parser hy_v4 \
+  --enable-auto-tool-choice \
+  --port 8000 \
+  --served-model-name hy4-preview</code></pre>
+    <p>镜像是 <code>vllm/vllm-openai:hy4-preview</code> 与 <code>lmsysorg/sglang:hy4-preview</code>（SGLang 镜像写明 x86 与 Arm）。采样官方推荐 <code>temperature=0.9</code>、<code>top_p=1.0</code>。微调文档在仓库 <code>finetune/README.md</code>；量化走腾讯 <a href="https://github.com/tencent/AngelSlim" target="_blank" rel="noopener">AngelSlim</a>。Hy3 还单独给了 <code>rl/</code> 目录：GRPO + verl，Megatron-LM 训练、vLLM rollout。Hy4 preview 仓库目前能看到的是 finetune，没有同等篇幅的 RL 配方说明。想拿 Hy4 做垂类 RL，训练栈要自己对 transformers / Megatron 的 <code>hy_v4</code> 实现，不能假设 Hy3 的 <code>hy_v3</code> 图还能 load。</p>
+
+    <h3>⑥ 产品共训与 serving 接口：tool-call、reasoning_effort、官方自认的过长思考</h3>
+    <p>模型卡「Built for Productivity」一节把后训数据来源写死了：腾讯内部软件工程师、游戏开发、金融分析、安全专家，围绕他们日常交付的工作建数据。四个方向是官方自己的定性描述，没有附公开分项分数：</p>
+    <ul>
+      <li><strong>软件工程</strong>：长程开发的理解 / 规划 / 调试 / 验证，以及前端视觉与交互质量；</li>
+      <li><strong>办公与分析</strong>：跨文件的乱上下文做成可分享的文档 / 表格 / 演示，强调数据分析、公式、金融模型；</li>
+      <li><strong>游戏开发</strong>：一句话生成可玩原型，多轮里接着改引擎工程；</li>
+      <li><strong>科学研究</strong>：AI 研究、分子动力学、凝聚态、纯数学。</li>
+    </ul>
+    <p>共设计的产品点名 CodeBuddy 与 WorkBuddy。验收方式不是公开 SWE-bench，而是<strong>内部盲测 SBS</strong>：163 位内部专家、203 个工程任务。中文模型卡把量表写清楚了（均分 / 4）：</p>
+    <table>
+      <thead><tr><th>对照</th><th>Hy4 preview</th><th>对照模型</th><th>胜 / 平 / 负</th></tr></thead>
+      <tbody>
+        <tr><td>vs GLM 5.3</td><td>2.99</td><td>2.92</td><td>46.8% / 12.8% / 40.4%</td></tr>
+        <tr><td>vs Kimi K3</td><td>2.99</td><td>2.94</td><td>51.2% / 7.9% / 40.9%</td></tr>
+      </tbody>
+    </table>
+    <p>官方用词是「slightly ahead」。负场仍有四成，不是磺压。这组数字的价值是：评委是内部专家、题目是真实工程任务、对照是 2026 年 8 月的开源旗舰（GLM 5.3、Kimi K3），和 Hy3 对 GLM-5.1 的 2.67 vs 2.51 可以放在同一类「产品任务盲测」里读。它仍然是厂商自报，不能当成第三方 LMSYS 风格的 arena。</p>
+    <p>Serving 接口比盲测分数更值得写进选型清单。Hy3 的 chat template 默认 <code>reasoning_effort=no_think</code>，复杂任务再开 <code>high</code>。Hy4 preview <strong>默认就是 <code>"high"</code> 深度思维链</strong>，适合数学 / 编程 / 推理；要直接答，必须显式传：</p>
+    <pre><code>extra_body={"chat_template_kwargs": {"reasoning_effort": "no_think"}}</code></pre>
+    <p>默认思考开着，和官方自己承认的缺陷是同一件事。模型卡 Known Limitations：这是 Hy4 的早期版本，预训练和后训练都还有空间；已知问题包括「复杂任务上思考过长」以及「过度验证自己的工作」（over-verify）。他们选择像 Hy3 preview 一样先发、再听什么会坏。对 Agent 运行时，这意味着：默认档会把 <a href="daily-2026-08-28-harness-runtime.html">harness</a> 的每一步都配上长 CoT，工具循环的延迟和费用会被思考 token 主导；<code>no_think</code> 不是「关闭一个 UI 开关」，是后训练里训进去的第二条行为，要在网关层做成按任务类型的路由，而不是全局跟模型卡默认值。</p>
+    <p><code>tool-call-parser hy_v4</code> 同样是一等公民。Hy3 已经强调过工具调用稳定性、输出格式、以及跨 CodeBuddy / Cline / KiloCode 脚手架的方差。Hy4 把 parser 版本号加一，说明 chat template 与 tool 协议不保证与 <code>hy_v3</code> 互换。接 <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 那种 LLM endpoint proxy 时，训练侧必须打同一套 <code>hy_v4</code> parser；否则 retokenization 之外又多一层「工具 XML / JSON 被 harness 再序列化」的 off-policy。</p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>把 Hy4 preview 当旗舰基座，不要当 Hy3 的 drop-in</strong>。词表相同（120832）不等于图相同。注意力 backend、残差流数、MTP 宽度、tool parser 版本全换了。现有 Hy3 的 tp=8 + <code>hy_v3</code> 脚本会在 FLASHMLA_SPARSE 或 parser 上直接失败。先按模型卡镜像跑通 <code>hy4-preview</code>，再谈替换。</li>
+      <li><strong>默认 <code>high</code> 必须进路由表</strong>。Hy3 默认 <code>no_think</code>、Hy4 默认 <code>high</code>，这是产品行为反转。办公短任务、工具结果确认、多步 Agent 的中间步，应该显式传 <code>reasoning_effort=no_think</code>；编码 / 数学 / 长规划再留默认。官方已经警告 over-long reasoning 与 over-verify，继续用默认档等于主动买更长的思考税。对照 <a href="special-2026-08-27-new-models-arch.html">全景篇</a>里「按 query 分配推理预算」：这里的二维表是「Hy3 vs Hy4」×「no_think vs high」，不是再选一个小模型。</li>
+      <li><strong>选型看 parser、MTP、稀疏注意力，不看转手的 SWE 截图</strong>。HF Benchmark Appendix 此刻抄不出公开数字；盲测是 163 人 / 203 题的内部 SBS，略胜 GLM 5.3 与 Kimi K3，负场约 40%。对垂类 Agent，更可执行的验收是：<code>hy_v4</code> 能否解析你现有的 tool schema、MTP 3 token 在你的 batch 下接受率多少、FLASHMLA_SPARSE 在你的卡型上能否编过。这些是模型卡写了、可以在实验室复现的。</li>
+      <li><strong>产品共训是买点，也是分布偏移的来源</strong>。后训数据来自腾讯内部工程师、游戏、金融、安全，以及 CodeBuddy / WorkBuddy 的真实任务。这和 Granite 4.2 把模型扔进 OpenHands / 终端 / 搜索是同一类「环境即数据」。好处是开箱对办公 / 编程 Agent 更熟；坏处是你的垂类如果离这四类很远（医疗影像、工控、私有协议），共训先验帮不上忙，还可能把 over-verify 带进你的循环。要用 Hy4 做后训练，先用自家任务测一遍 tool-call 稳定性，再决定 SFT 是接着洗还是先对齐格式。</li>
+      <li><strong>1M 上下文按注意力机制验收，不按窗口数字验收</strong>。可寻址 1,048,576 token 来自规格表；Indexer top-k 钉死 2048，核心注意力是稀疏的。长仓库、多文件办公、游戏工程这些官方主打场景，瓶颈往往是 indexer 是否选中了跨文件的那几段，而不是窗口还有没有余量。接入前用自家「跨文件 + 长 CoT」轨迹看：丢关键文件的比例、MTP 草稿在超长 prompt 下的接受率、prefix cache 是否被稀疏索引打穿。</li>
+      <li><strong>preview 就按 preview 用</strong>。官方把过长思考和 over-verify 写进 Known Limitations，并明确「像 Hy3 preview 一样先发」。Hy3 从 preview 到 GA 用了大约两个半月，靠的是 50+ 产品反馈而不是再发一篇架构论文。现在上 Hy4，应预留 parser / 思考长度 / 验证循环的监控，而不是假设 GA 只是同一权重再训两周。Hy3 仓库有 GRPO + verl 配方，Hy4 preview 仓库目前只看到 finetune：要做 RL，按 <a href="daily-2026-08-28-algo-ppo.html">PPO 笔记</a>和 Hy3 的 verl 路径自己接 <code>hy_v4</code>，不要等一篇还没出现的 Hy4 RL README。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>Hy4 preview 的层数（78）比 Hy3（80，不含 MTP）还少，总参却从 295B 到 770B。如果有人说「Hy4 就是 Hy3 加层加数据」，用规格表里哪五项反驳？为什么这对后训练的模型并行切分有影响？
+        <details><summary>参考答案</summary>五项就够：① 层数下降而不是上升；② hidden 4096→6144；③ 专家池 192→256 routed + 1 shared，且明确每 token 激活 top-8 routed <em>加</em> shared；④ 注意力从 GQA 换成 Gated DSA（Query/KV 压缩 2048/512，indexer top-k 2048）；⑤ 残差从单流变成 iHC 四路，MTP 从 3.8B 变成 10B/0.7B。容量来自宽度、稀疏注意力、多流残差和 draft 模块，不是 depth。后训练切分时，pipeline 切层的粒度变了（78 vs 80），expert parallel 的专家数变了（256 vs 192），张量并行还要覆盖四路残差和 MLA 式压缩，MTP 层还要单独进投机图。按 Hy3 的 Megatron 切分表去 load Hy4，会在 expert 数、注意力 layout 和 MTP 键名三处同时对不上。</details></li>
+      <li>DSA 已经把核心注意力降到 <code>O(Lk)</code>，为什么 1M 上下文仍需要 IndexCache？把 IndexCache 论文里 30B 模型上的 1.82× / 1.48× 写成「Hy4 的加速比」，错在哪？
+        <details><summary>参考答案</summary>DSA 的核心注意力确实是 <code>O(Lk)</code>（Hy4 与 DSA 论文都把 k 放在 2048），但 lightning indexer 仍要对全部历史打分，复杂度 <code>O(L²)</code>，而且每层独立跑一遍，总账是 <code>O(N L²)</code>。上下文越长，indexer 占 prefill / decode 的比例越高，这正是 IndexCache 论文的动机。IndexCache 用 Full / Shared 层复用 top-k 索引，在 30B DSA 上报告可去掉 75% indexer 计算，200K 下 prefill 最高 1.82×、decode 最高 1.48×。Hy4 模型卡只说采用了 IndexCache，没有公布自己的加速比、Full 层比例或 1M 实测。把论文数字抄到 Hy4 上，是把「机制来源」当成「该模型的 benchmark」。正确写法是：Hy4 用了跨层索引复用；加速幅度以 Hy4 自己的 serving 曲线为准，目前官方没给。</details></li>
+      <li>Hy3 默认 <code>reasoning_effort=no_think</code>，Hy4 preview 默认 <code>"high"</code>。结合官方 Known Limitations（过长思考、over-verify）和 <a href="daily-2026-08-28-harness-runtime.html">harness</a> 的多步工具循环，为什么「跟上模型卡默认值」会把 Agent 费用打爆？网关层该怎么路由？
+        <details><summary>参考答案</summary>Hy4 的默认档是为数学 / 编程 / 复杂推理准备的深 CoT。Agent harness 每一步都是一次独立的 chat completion（见 Lightning：prompt 由 harness 构造，不是一条连续 token 历史）。若每一步都走 <code>high</code>，思考 token 会按「工具步数 × 单步 CoT」乘起来，再加上 over-verify 倾向（做完了还要再检查一遍），延迟和输出费用会被思考而不是 action 主导。Hy3 默认 <code>no_think</code> 是另一条产品曲线：先保证办公短任务的 TTFT。网关不该全局跟随 Hy4 默认值，而应按任务类型路由：工具结果确认、格式转换、多步中间态用 <code>no_think</code>；需要规划或写补丁的步骤再开 <code>high</code>。这和全景篇里「选模型 × 选档位」二维表是同一件事，只是档位名字写进了 <code>chat_template_kwargs</code>。</details></li>
+      <li>Hy4 的内部盲测是 163 位专家、203 个工程任务，均分 2.99，对 GLM 5.3 胜 46.8% / 负 40.4%，对 Kimi K3 胜 51.2% / 负 40.9%。为什么这组数字比一张缺失的 SWE-bench 更值得写进选型文档？它又为什么不能替代你自己的垂类评测？
+        <details><summary>参考答案</summary>因为官方把后训目标写成了 CodeBuddy / WorkBuddy 的真实工程任务，盲测的题目分布和后训分布是对齐的：评的是「这套产品数据训出来的模型，在同类任务上是否略好于同代旗舰」。负场约 40% 也说明优势薄，不是榜上磺压。SWE-bench 一类公开集此刻在 Hy4 模型卡正文里抄不出来（Appendix 无表），用二手截图补分数会直接违反「不发明数字」。它不能替代垂类评测，原因和 Granite 4.2 一样：共训先验绑定的是腾讯内部的软件 / 办公 / 游戏 / 安全分布。你的工具 schema、仓库结构、失败恢复策略若与 CodeBuddy 不同，2.99 的均分不会迁移。选型文档应同时记下：① 这是厂商内部 SBS，略胜 GLM 5.3 / Kimi K3；② 必须用自家 harness + <code>hy_v4</code> parser 复测 tool-call 与长程任务。</details></li>
+      <li>要把 Hy4 preview 接进 <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a> 那种「部署时 harness 进训练环」的后训练，模型卡里哪三样必须进 Sample Adapter / proxy 的验收清单？漏掉每一项会分别破坏 GRPO 的哪条假设？结合 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 里「logprob 必须来自当时那次前向」。
+        <details><summary>参考答案</summary>三样：① <code>tool-call-parser hy_v4</code> 与同一套 chat template。Harness 若用 Hy3 的 <code>hy_v3</code> 或另一套 XML/JSON 再序列化，写进下一轮 prompt 的文本已经不等于采样 token 解出来的文本，这是 Lightning 文里的第三条 retokenization 机制，importance ratio 的行为策略对不上。② <code>reasoning_effort</code> 在 rollout 与 serving 必须一致。训练用 <code>high</code>、线上网关切 <code>no_think</code>（或反过来），等于在不同条件分布下采 action，PPO/GRPO 的 on-policy 假设直接坏。③ 原生 MTP。训练引擎通常要精确 token id 与采样 logprob；MTP 草稿被接受时，最终 token 仍应来自目标模型的验证前向。若 proxy 把 MTP 草稿的 logprob 当成主模型 logprob，ratio 会系统性偏。Sample Adapter 应：钉死 template 与 parser 版本、把 <code>reasoning_effort</code> 写进 rollout 元数据、MTP 只作为 serving 加速、训练 logprob 只记主模型验证通过的 token。</details></li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Hy4 preview 模型卡：<a href="https://huggingface.co/tencent/Hy4-preview" target="_blank" rel="noopener">huggingface.co/tencent/Hy4-preview</a> · FP8：<a href="https://huggingface.co/tencent/Hy4-preview-FP8" target="_blank" rel="noopener">tencent/Hy4-preview-FP8</a> · GitHub：<a href="https://github.com/Tencent-Hunyuan/Hy4-preview" target="_blank" rel="noopener">Tencent-Hunyuan/Hy4-preview</a>（Apache 2.0，2026-08-28）</li>
+      <li>权重镜像：<a href="https://modelscope.cn/models/Tencent-Hunyuan/Hy4-preview" target="_blank" rel="noopener">ModelScope</a> · <a href="https://ai.gitcode.com/tencent_hunyuan/Hy4-preview" target="_blank" rel="noopener">GitCode</a> · <a href="https://cnb.cool/ai-models/tencent/Hy4-preview" target="_blank" rel="noopener">CNB</a></li>
+      <li>Serving 配方：<a href="https://recipes.vllm.ai/tencent/Hy4-preview" target="_blank" rel="noopener">vLLM Hy4-Preview Recipe</a> · <a href="https://lmsysorg.mintlify.app/cookbook/autoregressive/Tencent/Hy4-Preview" target="_blank" rel="noopener">SGLang Hy4-Preview Cookbook</a> · 镜像 <code>vllm/vllm-openai:hy4-preview</code>、<code>lmsysorg/sglang:hy4-preview</code></li>
+      <li>Hy3 谱系：<a href="https://github.com/Tencent-Hunyuan/Hy3" target="_blank" rel="noopener">Tencent-Hunyuan/Hy3</a> · <a href="https://github.com/Tencent-Hunyuan/Hy3-preview" target="_blank" rel="noopener">Hy3-preview</a>（2026-04-23）· <a href="https://huggingface.co/tencent/Hy3" target="_blank" rel="noopener">HF tencent/Hy3</a></li>
+      <li>腾讯官方通稿：<a href="https://www.tencent.com/zh-cn/tencent-hunyuan-officially-releases-hy3-advancing-agent-capabilities-and-deeper-product-integration/" target="_blank" rel="noopener">Hy3 正式发布：Agent 能力与产品融合</a> · <a href="https://www.tencent.com/zh-cn/articles/2202320.html" target="_blank" rel="noopener">Hy3 preview 发布稿</a> · WorkBuddy 72%→90% / -34% 见 Hy Team 研究页与腾讯新闻通稿，产品稿另写 -34.4%</li>
+      <li>机制论文（模型卡列出，数字属于论文而非 Hy4 实测）：<a href="https://arxiv.org/abs/2512.02556" target="_blank" rel="noopener">arXiv:2512.02556 DeepSeek-V3.2 / DSA</a> · <a href="https://arxiv.org/abs/2603.12201" target="_blank" rel="noopener">arXiv:2603.12201 IndexCache</a></li>
+      <li>量化与训练栈：<a href="https://github.com/tencent/AngelSlim" target="_blank" rel="noopener">tencent/AngelSlim</a> · Hy3 RL 配方（GRPO + verl）见 <a href="https://github.com/Tencent-Hunyuan/Hy3/tree/main/rl" target="_blank" rel="noopener">Hy3/rl</a>；Hy4 preview 仓库目前提供 <a href="https://github.com/Tencent-Hunyuan/Hy4-preview/tree/main/finetune" target="_blank" rel="noopener">finetune</a></li>
+      <li>相关笔记：<a href="special-2026-08-27-new-models-arch.html">2026 新模型全景</a> · <a href="daily-2026-08-26-granite-4-2.html">IBM Granite 4.2</a> · <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> · <a href="daily-2026-08-28-harness-runtime.html">Agent Harness</a> · <a href="daily-2026-08-28-algo-ppo.html">PPO 学习笔记</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>
