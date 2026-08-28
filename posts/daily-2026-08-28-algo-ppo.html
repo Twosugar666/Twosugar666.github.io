@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜PPO：Clipped Surrogate 为什么成了后训练的默认起点 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜PPO：Clipped Surrogate 为什么成了后训练的默认起点</h1>
+    <p class="post-meta">2026-08-28 · 收藏夹：算法 / RL · 学习笔记<br />
+      关键词：PPO / clipped surrogate / TRPO / GAE · 数字来自
+      <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">Schulman et al. 2017（arXiv:1707.06347）</a>、
+      <a href="https://spinningup.openai.com/en/latest/algorithms/ppo.html" target="_blank" rel="noopener">OpenAI Spinning Up</a>、
+      <a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">TRPO</a>、
+      <a href="https://arxiv.org/abs/1506.02438" target="_blank" rel="noopener">GAE</a>，不引用二手经验值</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="grpo-notes.html">GRPO 笔记</a>和
+      <a href="rl-10-papers-detailed.html">10 篇论文详解</a>反复把 PPO 当参照系——「省掉 value model」「clip 从 [0.8, 1.2] 改到 [0.8, 1.28]」——却一直没把参照系本身讲清楚。
+      本篇从 score-function 出发，经过 TRPO 式 trust region，落到 clipped surrogate，并说明为什么 2026 年的后训练仍从 PPO 起步。
+    </p>
+    <p>
+      时间线很短：Williams（1992）REINFORCE → Kakade &amp; Langford（2002）conservative policy iteration →
+      TRPO 硬 KL 约束（2015）→ GAE（2016）→ 2017 年 7 月 Schulman, Wolski, Dhariwal, Radford, Klimov 的
+      <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347</a>，
+      用 <code>clip(r, 1−ε, 1+ε)</code> 代替共轭梯度 + 线搜索。这篇 12 页笔记没有会议发表，却成了 on-policy 后训练的默认骨架：
+      RLHF 用它，DeepSeekMath 的 GRPO 只是拆掉 critic、把同一套 clipped surrogate 留下。
+    </p>
+    <blockquote>
+      本篇主线不是「PPO 公式长什么样」，而是三句判断：
+      ① vanilla policy gradient 可以多步复用同一批数据，但会毁灭性地更新；
+      ② TRPO 用硬 KL 约束解决了这件事，代价是二阶优化；
+      ③ PPO-Clip 用 pessimistic 下界把约束写进目标本身，于是后训练可以在普通 GPU 上、用普通优化器，反复吃同一批 rollout。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Score-function / REINFORCE：梯度从哪来</h3>
+    <p>
+      策略 π_θ(a|s) 是一个参数化的概率分布。目标 J(θ) 是这条策略在环境里拿到的期望回报。
+      环境不可微，不能把 reward 对 θ 反传。score-function 恒等式把期望里的梯度变成「对数概率的梯度 × 回报」：
+    </p>
+    <pre><code># 策略梯度定理（最常用的估计量，PPO 论文 Eq.1）
+g_hat = E[  ∇_θ log π_θ(a_t | s_t)  *  A_hat_t  ]
+
+# 自动微分实现：构造一个标量目标，对它求导就得到 g_hat（Eq.2）
+L_PG(θ) = E[  log π_θ(a_t | s_t)  *  A_hat_t  ]</code></pre>
+    <p>
+      这就是 REINFORCE：用回报当权重，把当时选过的 action 的对数概率往上或往下推。
+      <a href="rl-10-papers-detailed.html#p0">第 0 篇</a>里的 <code>advantage</code> / <code>sampling_logprobs</code> / <code>target_logprobs</code> 源头就是这里。
+    </p>
+    <p>
+      §2.1 点出 vanilla PG 的缺陷：<strong>同一批轨迹上做多步优化并不成立</strong>——数据来自 π_θold，多步 SGD 把 θ 推远之后 importance weight 不再接近 1，更新可以毁灭性地大。
+      §6.1 里「无 clip、无 penalty」跑出负分，不是实现 bug。
+    </p>
+
+    <h3>② Advantage 与 baseline：为什么要减、减什么</h3>
+    <p>
+      score-function 估计量是无偏的，但方差可以大到梯度没有方向。一个不改变期望、只压方差的操作是减去 baseline b(s)：
+    </p>
+    <pre><code># 不减 baseline：权重 = 这条轨迹的回报 G_t（可正可负，尺度随任务漂）
+# 减 baseline：权重 = G_t − b(s_t)
+# 只要 b 不依赖当前 action a_t，E[ ∇logπ · b(s) ] = 0，期望不变、方差通常下降
+
+# 最优的状态相关 baseline 就是价值函数：
+#   V(s)  = E[ 从 s 出发，当前策略能拿到的回报 ]
+#   Q(s,a)= E[ 在 s 采取 a 之后的回报 ]
+#   A(s,a)= Q(s,a) − V(s)     # 「比平均水平好多少」</code></pre>
+    <p>
+      正 A 提高该 action 概率，负 A 压低。差别在 A 从哪来：PPO 用配套 <strong>critic</strong> 估 V(s)；
+      <a href="grpo-notes.html">GRPO</a> 用同题一组均值/标准差，把 critic 删掉。绝对尺度没有信息，有信息的是「相对预期好多少」。
+    </p>
+    <table>
+      <thead><tr><th></th><th>REINFORCE</th><th>Actor-Critic / PPO</th><th>GRPO</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A 的来源</strong></td><td>蒙特卡洛回报 G_t（可减一个与状态无关的常数）</td><td>learned V(s)，再经 GAE 混合 TD 与 MC</td><td>同题一组样本的相对 reward</td></tr>
+        <tr><td><strong>额外模型</strong></td><td>无</td><td>一个通常与 policy 同量级的 critic</td><td>无 critic</td></tr>
+        <tr><td><strong>典型失败</strong></td><td>方差爆炸</td><td>V 估不准 → A 是噪声；LLM 上 critic 很贵</td><td>组内全对/全错 → A 全零（<code>frac_degenerate</code>）</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ 重要性采样 ratio：同一批数据为什么能用 K 次</h3>
+    <p>
+      要把「θ 已经离开 θold」这件事写进目标，需要 importance sampling。定义概率比
+    </p>
+    <pre><code>r_t(θ) = π_θ(a_t | s_t) / π_θold(a_t | s_t)
+       = exp( logπ_θ(a_t|s_t) − logπ_θold(a_t|s_t) )
+
+# r = 1：策略没动
+# r &gt; 1：新策略更喜欢这个 action
+# r &lt; 1：新策略更不喜欢这个 action</code></pre>
+    <p>
+      TRPO / PPO 的 conservative policy iteration surrogate（论文 Eq.6，记作 L^CPI）就是把 vanilla 的 <code>logπ · A</code> 换成 <code>r · A</code>：
+    </p>
+    <pre><code>L_CPI(θ) = E[ r_t(θ) * A_hat_t ]</code></pre>
+    <p>
+      θ = θold 时 r = 1，L_CPI 与 L_PG 一阶等价。多 epoch 把 r 推离 1 之后，公式按新策略重新加权旧数据——合法，只要 r 不极端。
+      极端 r 让方差爆炸，所以 ratio 既是「同一批能用 K 次」的许可证，也是必须 proximal 的原因。
+    </p>
+    <p>
+      纪律与 <a href="rl-10-papers-detailed.html#p1">old logprob</a> 一致：<strong>π_θold 必须来自采样当时的前向</strong>，更新后重算等于改写行为策略。
+    </p>
+
+    <h3>④ 从 TRPO 的硬约束到 clipped surrogate</h3>
+    <p>
+      TRPO（Schulman et al., 2015）把问题写成带约束的优化（PPO 论文 Eq.3–4）：
+    </p>
+    <pre><code>maximize   E[ r_t(θ) * A_hat_t ]
+subject to E[ KL( π_θold(·|s_t)  ||  π_θ(·|s_t) ) ]  ≤  δ</code></pre>
+    <p>
+      约束的是<strong>策略分布之间的 KL</strong>，不是参数步长——参数空间里很小的一步也能把性能崩掉（Spinning Up TRPO 页）。
+      TRPO 用共轭梯度解一阶目标 + 二阶约束，再 line search 保证真实 KL 不越界。稳定，但不兼容 dropout / 共享参数，实现重。
+    </p>
+    <p>
+      理论更喜欢惩罚（Eq.5）<code>L = E[r A] − β KL</code>，但很难选一个跨任务、跨阶段都好用的 β，所以 TRPO 坚持硬约束。
+      PPO-Penalty（§4）让 β 自适应：
+    </p>
+    <pre><code># 每个 update 后量一次平均 KL = d
+# d_targ 是目标 KL（超参）
+if d &lt; d_targ / 1.5:   β ← β / 2     # 走得太保守，放松惩罚
+if d &gt; d_targ * 1.5:   β ← β * 2     # 走得太远，加重惩罚
+# 1.5 与 2 是启发式；论文称对它们不敏感，β 初值会很快被调过来</code></pre>
+    <p>
+      真正成为默认的是第二种：PPO-Clip。不再把 KL 写进目标，而是直接 clip 概率比（Eq.7）：
+    </p>
+    <pre><code>L_CLIP(θ) = E[  min(  r_t(θ) * A_hat_t  ,
+                     clip(r_t(θ), 1−ε, 1+ε) * A_hat_t )  ]
+
+# 论文原文：「where epsilon is a hyperparameter, say, ε = 0.2」</code></pre>
+    <p>
+      三项叠在一起：未裁剪 L_CPI；把 r 钳在 [1−ε, 1+ε] 去掉「推得更远」的激励；取 min 得到 pessimistic 下界——变差时计入真实 r，变好时忽略超额。
+      在 θold 附近与 L_CPI 一阶相同。这就是 proximal 的一阶写法。
+    </p>
+
+    <h3>⑤ clip(1−ε, 1+ε) 实际在阻止什么</h3>
+    <p>
+      论文 Figure 1 / Spinning Up：关键不是「r 被硬切」，而是「超出区间之后，目标不再奖励继续走」。
+    </p>
+    <table>
+      <thead><tr><th></th><th>A_hat &gt; 0（好 action）</th><th>A_hat &lt; 0（坏 action）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>未裁剪目标想做什么</strong></td>
+          <td>把 r 尽量做大：让新策略更喜欢这个 action</td>
+          <td>把 r 尽量做小：让新策略更不喜欢这个 action</td>
+        </tr>
+        <tr>
+          <td><strong>clip 之后</strong></td>
+          <td>r 一旦 ≥ 1+ε，min 切到 (1+ε)·A，目标封顶</td>
+          <td>r 一旦 ≤ 1−ε，min 切到 (1−ε)·A（A 为负，这是上限）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      clip <strong>不是</strong>硬约束：目标对超额部分没激励，参数仍可能被其他样本 / value loss / 熵 bonus 推过区间。
+      Spinning Up 因此另加 early stopping——平均 KL 超过 <code>target_kl</code>（默认 0.01，常用 0.01 或 0.05）就停掉本轮 policy 步。
+      它也 <strong>不是</strong> CISPO 那种 <code>detach(clip(r))</code> 当固定权重（<a href="rl-10-papers-detailed.html#p0">第 0 篇</a>）：PPO clip 的是 objective，未触界时 r 仍走梯度。
+    </p>
+    <p>
+      §6.1：7 个 MuJoCo 任务 × 100 万步 × 3 种子，最后 100 episode 按「随机 = 0、最好 = 1」归一化，21 次 run 平均（Table 1）：
+    </p>
+    <table>
+      <thead><tr><th>目标</th><th>超参</th><th>平均归一化分数（论文 Table 1）</th></tr></thead>
+      <tbody>
+        <tr><td>无 clip、无 penalty</td><td>—</td><td><strong>−0.39</strong>（HalfCheetah 上崩到比随机策略更差）</td></tr>
+        <tr><td>Clipping</td><td>ε = 0.1 / <strong>0.2</strong> / 0.3</td><td>0.76 / <strong>0.82</strong> / 0.70</td></tr>
+        <tr><td>Adaptive KL</td><td>d_targ = 0.003 / 0.01 / 0.03</td><td>0.68 / 0.74 / 0.71</td></tr>
+        <tr><td>Fixed KL</td><td>β = 0.3 / 1 / 3 / 10</td><td>0.62 / 0.71 / 0.72 / 0.69</td></tr>
+      </tbody>
+    </table>
+    <p>
+      clip 全面压过 KL penalty，ε = 0.2 最高——这是把 0.2 当默认的原文依据。Figure 2：Hopper-v1 第一次更新后 KL 约 <strong>0.02</strong>，L_CLIP 在这一点附近最大，把「走多远还算赚」标成可观察的峰。
+    </p>
+
+    <h3>⑥ Value function 与 GAE：实践层面要知道的三件事</h3>
+    <p>
+      advantage 估计交给 GAE（arXiv:1506.02438）或 A3C 式有限时域。实践上三个量：
+    </p>
+    <pre><code># TD 残差：r 加上「下一状态的价值」，减去「当前价值」
+δ_t = r_t + γ * V(s_{t+1}) − V(s_t)
+
+# 截断 GAE（PPO 论文 Eq.11–12；λ = 1 时退化成 A3C 的有限时域估计 Eq.10）
+A_hat_t = δ_t + (γλ) δ_{t+1} + (γλ)^2 δ_{t+2} + ... + (γλ)^{T−t−1} δ_{T−1}
+
+# λ → 0：几乎只用一步 TD，偏差大、方差小
+# λ → 1：接近蒙特卡洛，偏差小、方差大
+# γ 决定「多远的未来还算数」，λ 决定「混合多少步 TD」</code></pre>
+    <p>论文 MuJoCo / Atari 都取 γ = 0.99、λ = 0.95（Table 3 / 5）；Spinning Up 默认 λ = 0.97。共享参数时 Eq.9 把三件事写成一个目标：</p>
+    <pre><code>L = E[ L_CLIP − c1*(V_θ(s_t) − V_targ_t)^2 + c2*Entropy[π_θ](s_t) ]
+# Atari Table 5: c1=1, c2=0.01；MuJoCo 不共享参数、不用熵 bonus</code></pre>
+    <p>
+      LLM 后训练会变形：outcome-only 的 0/1 让 critic 回归极稀疏标量（DeepSeekMath 放弃它的理由，<a href="rl-10-papers-detailed.html#p1">第 1 篇</a>）；
+      没有逐步 δ 则 λ 几乎无意义，稠密化靠组内相对或 <a href="daily-2026-08-13-prm.html">PRM</a>；
+      熵 bonus 通常换成 KL(π || π_ref)。
+    </p>
+
+    <h3>⑦ 一次迭代的完整循环</h3>
+    <p>论文 Algorithm 1 把 actor-critic 风格的 PPO 写成：</p>
+    <pre><code>for iteration = 1, 2, ...:
+    for actor = 1 .. N:                          # 并行环境
+        用 π_θold 跑 T 步
+        算 A_hat_1 ... A_hat_T                   # GAE / 有限时域
+    在这 NT 条数据上，用 minibatch size M ≤ NT
+        对 L_CLIP（或 L_CLIP+VF+S）做 K 个 epoch 的 Adam
+    θold ← θ                                     # 下一轮的采样策略</code></pre>
+    <p>「采样 → 多次复用 → 前移 θold」是相对 vanilla PG 的全部增量。K &gt; 1 换样本效率，clip / penalty 是让这件事不把策略炸掉的护栏。</p>
+    <table>
+      <thead><tr><th></th><th>MuJoCo（论文 Table 3）</th><th>Atari（论文 Table 5）</th><th>Spinning Up 默认</th></tr></thead>
+      <tbody>
+        <tr><td>每 actor 的 T</td><td>2048</td><td>128</td><td>steps_per_epoch = 4000（实现里的「一轮交互」）</td></tr>
+        <tr><td>K（优化 epoch）</td><td>10</td><td>3</td><td>train_pi_iters = 80（带 KL early stop）</td></tr>
+        <tr><td>clip ε</td><td>0.2（§6.2 沿用 §6.1 最优）</td><td>0.1 × α（α 从 1 线性退火到 0）</td><td>clip_ratio = 0.2（文档称通常 0.1～0.3）</td></tr>
+        <tr><td>Adam 步长</td><td>3×10<sup>−4</sup></td><td>2.5×10<sup>−4</sup> × α</td><td>pi_lr = 3×10<sup>−4</sup>，vf_lr = 10<sup>−3</sup></td></tr>
+        <tr><td>γ / GAE λ</td><td>0.99 / 0.95</td><td>0.99 / 0.95</td><td>0.99 / 0.97；另设 target_kl = 0.01</td></tr>
+      </tbody>
+    </table>
+    <p>
+      §6.2 同样 100 万步：PPO-Clip（ε = 0.2）对 TRPO、CEM、自适应步长 vanilla PG、A2C 等，在几乎所有 MuJoCo 环境上更高。
+      Atari 49 款、40M 帧（= 10M timestep；Table 2，三试平均）：全程平均 PPO 赢 30 / ACER 18 / A2C 1；最后 100 episode 则 ACER 28 / PPO 19 / A2C 1。论文：样本效率显著好于 A2C，与更复杂的 ACER 相当，实现简单得多。
+    </p>
+
+    <h3>⑧ 后训练为什么还从 PPO 起步——即使已经有 GRPO</h3>
+    <p>
+      容易出现一种简写：「2025 年以后都用 GRPO，PPO 过时了」。把 PPO 拆开就会发现，过时的是 critic，不是 clipped surrogate。
+    </p>
+    <table>
+      <thead><tr><th>组件</th><th>PPO（2017）</th><th>GRPO（DeepSeekMath）</th><th>后训练里还在不在</th></tr></thead>
+      <tbody>
+        <tr><td>on-policy rollout</td><td>要</td><td>要</td><td>要。old logprob 必须来自采样当时</td></tr>
+        <tr><td>importance ratio r</td><td>要</td><td>要（token 级）</td><td>要。GSPO 只是把 r 升到 sequence 级</td></tr>
+        <tr><td>clipped surrogate</td><td>核心</td><td>保留</td><td>保留。DAPO 的 Clip-Higher 改的是 ε 的不对称，不是取消 clip</td></tr>
+        <tr><td>learned critic / GAE</td><td>核心</td><td><strong>删除</strong>，换组内相对</td><td>LLM + outcome reward 下常常删；逐步 PRM / 过程分除外</td></tr>
+        <tr><td>熵 bonus / KL-to-ref</td><td>Atari 用熵</td><td>常加 reference KL</td><td>还在，只是实现从 c2·S 换成 β·KL(π || π_ref)</td></tr>
+      </tbody>
+    </table>
+    <p>
+      「从 PPO 起步」有两层，不能混。
+      <strong>算法层</strong>：先写通 <code>min(r A, clip(r) A)</code>，再决定 A 从 critic 来还是从组内相对来。
+      <a href="grpo-notes.html">GRPO 笔记</a>的 <code>A_i = (r_i − mean)/std</code> 替换的是 V(s)，替换不了 L_CLIP。
+      <strong>工程层</strong>：管线按「采样 / 复用 / 限速」三块搭。
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 的异步 GRPO 改第一块（双池 + TIS），loss 仍是带 clip 的组内相对；DAPO / GSPO 改限速细节（ε 上沿、ratio 粒度）。
+      critic 值得留的场合是逐步 reward、状态里有可学的「还剩多少分」；outcome-only 且 critic 与 7B/70B policy 同尺度时就该丢。后训练文献以第二种为主，所以日常看到的是 GRPO——教材层仍要从 PPO 讲起，否则 Clip-Higher、sequence-level ratio、TIS 都没有锚点。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先实现 clip，再争论 baseline</strong>。最小闭环：存 old logprob → 算任意 A → <code>min(r A, clip(r, 1−ε, 1+ε) A)</code>。A 用组内均值还是 critic 是下一层。顺序反了，会把还没训稳的 critic 归罪于 PPO。</li>
+      <li><strong>ε = 0.2 是 Table 1 的最优点，不是 LLM 定理</strong>。0.1 / 0.2 / 0.3 都跑过。LLM 里 token 级 r 很容易偏离 1；DAPO 上沿 1.28 是针对 entropy collapse 的不对称放松，下沿常留 0.8。先看 clip fraction：长期近 0 太保守，长期很高则 lr 或 K 过大。</li>
+      <li><strong>KL 是健康度，不是第二套 loss</strong>。PPO-Clip 目标里没有 KL。Spinning Up 用新 vs 旧的平均 KL 做 early stop；RLHF 用新 vs SFT 的 KL 当正则。曲线乱了先分清在看哪一对。</li>
+      <li><strong>old logprob 是正确性约束</strong>。更新后再前向当 old，等于把 off-policy 假装成 on-policy。TIS 截断 stale ratio 是承认半 off-policy，不是假装没有。</li>
+      <li><strong>outcome-only 时不要指望 GAE 救命</strong>。没有逐步 δ，把 λ 从 0.95 调到 0.99 无意义。要么序列级 A（GRPO），要么逐步信号（<a href="daily-2026-08-13-prm.html">PRM</a>）。</li>
+      <li><strong>后训练变体不是互斥菜单</strong>。PPO 骨架 + GRPO 换 A + DAPO 改 clip 形状 + GSPO 换 r 粒度 + Granite 换系统时钟。垂类 Agent 通常是「骨架 + 组内 A + 视任务决定是否不对称 clip」。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        从 reward 里减去一个只依赖状态、不依赖当前 action 的 baseline，为什么不改变策略梯度的期望？既然如此，为什么 PPO 还要训一个 value network，而不是减一个常数？
+        <details><summary>参考答案</summary>
+        E_a∼π[ ∇log π(a|s) · b(s) ] = b(s) · ∇_θ 1 = 0：只要 b 不依赖当前 action，就不引入偏差。减常数只能消掉全局偏移，消不掉「有的状态天生高分、有的天生低分」——同一批里期望回报可能差一个数量级。V(s) ≈ E[G|s] 让每个状态上的 A 近似零均值。PPO 用 critic 估 V；LLM + outcome 0/1 时这个网络与 policy 同规模却在回归稀疏标量，GRPO 改用同题一组均值当经验 V(s)——仍是 prompt 相关 baseline，只是换成组统计。</details>
+      </li>
+      <li>
+        A &gt; 0 时 clip 在 r = 1+ε 封顶，A &lt; 0 时在 r = 1−ε 封顶。为什么必须再用 min(unclipped, clipped)，而不是直接用 clip(r)·A？少了 min 会纵容哪一种更新？
+        <details><summary>参考答案</summary>
+        直接 clip(r)·A 会把「走出区间且走错方向」的样本也封顶。A &gt; 0 但 r 被压到 0.5 时，真实目标已经变差，应当有把 r 拉回 1 的梯度；只用 clip(r)·A 会把 r 抬到 0.8 再乘，惩罚被削弱。min 只忽略让目标变好的超额部分，不忽略让它变差的部分——这就是 pessimistic bound。少了 min，坏方向更新被纵容。CISPO 的 detach(clip(r)) 则根本不让 r 走梯度，保护机制不同。</details>
+      </li>
+      <li>
+        TRPO 已经能用 KL ≤ δ 保证不太崩，PPO 为什么还要发明 clip？结合论文 §2.2 对「固定 β 惩罚不够」的论述，以及 Table 1 里 clip vs adaptive KL 的数字。
+        <details><summary>参考答案</summary>
+        TRPO 硬约束要共轭梯度、Fisher-vector product、线搜索，也不方便和 dropout / 共享参数一起用。理论更喜欢 L = E[r A] − β KL，但论文写明单个 β 很难跨任务、跨阶段都合适。PPO-Penalty 按 d 与 d_targ 的 1.5 倍翻倍/减半，只是补丁。Table 1：无约束 −0.39，自适应 KL 最好 0.74（d_targ = 0.01），clip ε = 0.2 得到 0.82。clip 把「走多远」从整表 KL 超参变成每个样本对 r 的局部封顶，一阶 Adam 就能跑。它不是真约束（所以 Spinning Up 另加 target_kl early stop），选择它是因为把 trust region 的意图写成了可规模化的目标。</details>
+      </li>
+      <li>
+        有人说「GRPO 取代了 PPO」。按组件拆开：哪一块被取代，哪一块被原样保留？为什么 2026 年的后训练文档（包括 <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 的异步 GRPO）仍然把 PPO 当默认起点？
+        <details><summary>参考答案</summary>
+        被取代的是 critic / GAE：outcome-only 时 V(s) 回归「这题最终对不对」，同规模网络拟合稀疏标量，性价比差；GRPO 用同 prompt 一组均值/标准差当 A。原样保留的是 on-policy 采样、ratio、clipped surrogate、多 epoch 复用——Algorithm 1 去掉「训 V」之后的循环。Granite 异步 GRPO 改的是系统时钟（双池 + TIS），loss 仍带 clip。DAPO / GSPO / TIS 都是在这副骨架上改 r 的形状、粒度或 staleness。默认起点 = 先有 L_CLIP，再插入具体的 A 与系统实现。</details>
+      </li>
+      <li>
+        论文 Figure 1 的横轴是单个 action 的 r。LLM 里一条回答有数百到数千 token，每个 token 一个 r。结合 <a href="rl-10-papers-detailed.html">DAPO 的 Clip-Higher</a> 与 GSPO 的 sequence-level ratio：token 级 ε = 0.2 在长 CoT 上会系统性偏向什么？不对称上沿和序列级 clip 各修补了这一偏向的哪一侧？
+        <details><summary>参考答案</summary>
+        token 级 r 是逐位置比。长 CoT 里每个 token 偏一点，序列联合比乘性地远离 1，但 clip 只在单点封顶——约束的是「瞬时不要走太远」，不是整句偏移。对称 [0.8, 1.2] 对正优势、低概率 token 更苛刻：r 很快顶到 1.2，新路径难被抬起，表现为 entropy collapse。DAPO 把上沿放到 1.28，给这类 token 空间，下沿仍防负向崩塌。GSPO 换粒度：一条回答一个长度归一化序列比，clip 一次；论文 ε 为 3e−4 / 4e−4 是因为约束的是整句比。两者不互斥：一个改不对称，一个改作用层。outcome-only 与 GSPO 更同构，逐步 PRM 与 token 级 PPO 更同构。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Schulman, Wolski, Dhariwal, Radford, Klimov. <em>Proximal Policy Optimization Algorithms</em>（OpenAI, 2017）：<a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347</a></li>
+      <li>OpenAI Spinning Up · PPO：<a href="https://spinningup.openai.com/en/latest/algorithms/ppo.html" target="_blank" rel="noopener">spinningup.openai.com/…/ppo.html</a></li>
+      <li>TRPO（2015）：<a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">arXiv:1502.05477</a> · <a href="https://spinningup.openai.com/en/latest/algorithms/trpo.html" target="_blank" rel="noopener">Spinning Up TRPO</a></li>
+      <li>GAE（2015/2016）：<a href="https://arxiv.org/abs/1506.02438" target="_blank" rel="noopener">arXiv:1506.02438</a></li>
+      <li>Williams, REINFORCE（1992）· Kakade &amp; Langford, conservative policy iteration（ICML 2002）</li>
+      <li>相关笔记：<a href="grpo-notes.html">GRPO</a> · <a href="daily-2026-08-13-prm.html">PRM</a> · <a href="rl-10-papers-detailed.html">10 篇论文详解</a> · <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>
