@@ -24,6 +24,13 @@
       "file": "posts/daily-2026-08-26-granite-4-2.html"
     },
     {
+      "date": "2026-08-27",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "特别篇：2026 新模型全景——十五个新旗舰的架构与训练方法拆解",
+      "file": "posts/special-2026-08-27-new-models-arch.html"
+    },
+    {
       "date": "2026-08-28",
       "domain": "agent rl harness",
       "source": "frontline",
@@ -36,6 +43,13 @@
       "source": "base",
       "topic": "腾讯混元 Hy4 preview：770B-A49B 开源旗舰基座（MoE / Gated DSA / iHC / MTP / 1M）",
       "file": "posts/daily-2026-08-28-base-hy4.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "GLM-5.3 / GLM-5.3-Flash：同一基座全靠后训练，环境规模化方法论与混合注意力效率款",
+      "file": "posts/daily-2026-08-28-glm-5-3.html"
     }
   ]
 }

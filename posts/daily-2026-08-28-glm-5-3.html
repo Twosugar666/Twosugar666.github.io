@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜GLM-5.3：同一基座、全靠后训练，环境规模化时代的 RL 样本 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜GLM-5.3：同一基座、全靠后训练——环境规模化时代的 RL 样本</h1>
+    <p class="post-meta">2026-08-28 · 收藏夹：RL / Agent · 一线追踪<br />
+      发布方：智谱 Z.ai，发布时间 <strong>2026-08-26 ~ 08-28</strong>（GLM-5.3-Flash 官方博客标注 8 月 26 日，GLM-5.3 旗舰博客与 GitHub 随后上线）· 信息来源：
+      <a href="https://z.ai/blog/glm-5.3" target="_blank" rel="noopener">Z.ai 官方博客：GLM-5.3</a>、
+      <a href="https://z.ai/blog/glm-5.3-flash" target="_blank" rel="noopener">Z.ai 官方博客：GLM-5.3-Flash</a>、
+      <a href="https://github.com/zai-org/GLM-5" target="_blank" rel="noopener">GitHub: zai-org/GLM-5</a>；
+      文中 benchmark 数字均为 <strong>Z.ai 官方自报</strong>，第三方复测尚未出现</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      这两天 Z.ai 连发两弹：<strong>GLM-5.3</strong>（旗舰）与 <strong>GLM-5.3-Flash</strong>（320B 总参 / 18B 激活的效率款）。
+      模型发布天天有，这次值得写进学习笔记的原因在官方博客的第一句话：
+    </p>
+    <blockquote>
+      「Scaling post-training is all we did for GLM-5.3.」——GLM-5.3 与 GLM-5.2 <strong>共用同一个基座模型，全部能力提升来自后训练</strong>。
+    </blockquote>
+    <p>
+      这是一次罕见的「干净对照实验」：不换基座、不加参数，只把后训练（环境数量、任务多样性、RL 算力）继续 scale 一个月，
+      Terminal Bench 3.0 从 4.6 拉到 28.3，DeepSWE 从 46.2 拉到 66.9。对做后训练的人来说，
+      这既是「RL 还能继续买能力」的公开证据，也是一份关于<strong>环境规模化（environment scaling）</strong>的工程方法论——
+      官方明确说：随着 agent 能力变强，<strong>后训练的难度正在从模型转移到环境</strong>。
+      本篇就拆解这条链路，并补充同日发布的 GLM-5.3-Flash 的架构要点。
+    </p>
+
+    <h2>产品要点：双模型速览</h2>
+    <table>
+      <thead><tr><th></th><th>GLM-5.3（旗舰）</th><th>GLM-5.3-Flash（效率款）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>定位</strong></td><td>长 horizon 复杂任务 / 编码旗舰</td><td>「前沿智能，闪充价格」：生产部署主力</td></tr>
+        <tr><td><strong>基座</strong></td><td>与 GLM-5.2 <strong>同一基座</strong>，增益全部来自 post-training（GLM-5 系列基座在官方对比表中为 744B 总参 / 40B 激活）</td><td><strong>新训基座</strong>：320B 总参 / 18B 激活</td></tr>
+        <tr><td><strong>架构变化</strong></td><td>沿用 GLM-5.2 的 IndexShare 稀疏注意力 + MTP</td><td>GLM 系列首次引入<strong>稀疏 + 线性注意力混合架构</strong>；采用 <strong>mHC（Manifold-Constrained Hyper-Connections）</strong> 提升 scaling 效率；相比 GLM-5.3，注意力计算量降 <strong>3.0×</strong>、KV cache 降 <strong>4.4×</strong>（官方口径）</td></tr>
+        <tr><td><strong>预训练语料</strong></td><td>沿用 GLM-5.2 基座</td><td>30T tokens 多模态语料（GLM-5 系列首个原生多模态）</td></tr>
+        <tr><td><strong>开源</strong></td><td colspan="2">GLM-5.3 权重将在<strong>发布后两周</strong>开源（完成安全评估与加固后）；Flash 走 MIT 许可的开源权重路线，发布前曾以 <code>ox-alpha</code> 马甲在 OpenCode / OpenRouter 匿名测试并成为当周最热模型——官方特别提到这些流量<strong>全部跑在中国 AI 芯片上</strong></td></tr>
+        <tr><td><strong>价格锚点</strong></td><td>—</td><td>Artificial Analysis 智能指数 v4.1.1 得分 57，每任务约 <strong>$0.045</strong>（折扣价），官方称同档智能此前约需 10× 成本</td></tr>
+      </tbody>
+    </table>
+
+    <h2>核心看点一：GLM-5.3 的「环境规模化」方法论</h2>
+    <p>GLM-5.3 沿用 GLM-5.2 搭好的后训练栈：<strong>IndexShare</strong>（长上下文高效注意力，1M 上下文下 per-token FLOPs 降 2.9×）、<strong>SAO</strong>（面向长 horizon 任务的 RL，带 compaction）、<strong>slime</strong>（大规模异步 RL 训练框架）。过去一个月做的事情是：更多环境、更多样的任务、更多 RL 算力。其中最有信息量的是环境的生产方式。</p>
+
+    <h3>任务真实度：从「编程练习题」到「工程师的一个工作单元」</h3>
+    <p>
+      官方给出的样板是一个 ML infra 任务：模型被放进与工程师相同的工作环境——计算集群、存储系统、内部文档、代码库、实验记录全部可用——
+      要求它诊断训练栈各层瓶颈、实现优化、跑实验，最终交付一个<strong>可量化且保证正确性的端到端加速</strong>。
+      这类任务「对资深工程师也是数天的工作量」。训练目标从「完成分解好的步骤」转向「端到端对一整块工作负责」。
+    </p>
+
+    <h3>环境合成流水线：可执行、可验证、接近真实工作</h3>
+    <pre><code>research agent：从真实工作中采集任务模式
+      ↓
+合成可运行的长 horizon 环境（多步依赖 + 隐藏状态）
+      ↓
+judge agent 亲自尝试任务 → 验证「确实可解」
+      ↓
+合成 verifier（不看参考解）+ 用 solver 轨迹挖掘并封堵 reward shortcut
+      ↓
+verifier 通过三重检查：oracle 解能过 / no-op 不过 / 未解决状态不过
+      ↓
+产出一个可直接用于 RL 的二值 reward</code></pre>
+    <ul>
+      <li><strong>verifier 不许看参考解</strong>：逼它检查「事情是否真的做成了」，而不是「和答案像不像」；</li>
+      <li><strong>用 solver 轨迹挖 shortcut</strong>：让模型先跑，把它钻出来的空子逐个堵掉——奖励 hacking 被当作数据问题系统性处理；</li>
+      <li><strong>三重检查</strong>（oracle / no-op / unsolved-state）保证 reward 信号的基本可信度，官方称这样产出的二值 reward「可靠到可以直接训练」；</li>
+      <li>官方也坦承：这条流水线仍需要相当多 human-in-the-loop，进一步自动化环境生成与验证是下一步。</li>
+    </ul>
+
+    <h3>结果：长 horizon 能力跳涨，且 token 更省</h3>
+    <table>
+      <thead><tr><th>Benchmark（官方自报）</th><th>GLM-5.2</th><th>GLM-5.3</th><th>参考：Opus 4.8</th></tr></thead>
+      <tbody>
+        <tr><td>Terminal Bench 3.0</td><td>4.6</td><td><strong>28.3</strong></td><td>21.1</td></tr>
+        <tr><td>Terminal Bench 2.1</td><td>81.0</td><td><strong>88.2</strong></td><td>85.0</td></tr>
+        <tr><td>DeepSWE v1.1</td><td>46.2</td><td><strong>66.9</strong></td><td>58.0</td></tr>
+        <tr><td>SWE-Marathon v1.1</td><td>19.4</td><td><strong>42.5</strong></td><td>48.8</td></tr>
+        <tr><td>PostTrainBench</td><td>31.7</td><td><strong>39.8</strong></td><td>32.9</td></tr>
+        <tr><td>Agents' Last Exam（ALE-CLI）</td><td>23.8</td><td><strong>28.5</strong></td><td>25.7</td></tr>
+        <tr><td>HLE w/ Tools</td><td>54.7</td><td><strong>62.5</strong></td><td>57.9</td></tr>
+      </tbody>
+    </table>
+    <p>
+      更值得注意的是<strong> token 效率</strong>：在 Z.ai Code Bench（官方自建私有 benchmark）上，Max 档 GLM-5.3 以约 75K 输出 token 达到 34.5%，
+      而 GLM-5.2 要 96K 才到 23.4%；High 档 GLM-5.3 约 50K token 达 31.4%，超过 Opus 4.8 的 29.5%（120K token）。
+      即后训练不仅买了能力，还买了<strong>单位 token 的产出</strong>。（官方也注明仍落后于 Claude Fable 5 的 39.5% @ Max。）
+    </p>
+
+    <h2>核心看点二：「涌现」的网络安全能力与延后开源</h2>
+    <ul>
+      <li>训练混入了<strong>漏洞挖掘数据与环境</strong>，官方称能力增长「快于预期」：不只是发现孤立缺陷，而是开始跨多个阶段规划完整的利用链（exploitation chain）；</li>
+      <li>数字上：CyberGym 84.5（GLM-5.2 为 77.2），ExploitGym 2h/6h 从 29/39 跳到 <strong>105/130</strong>，ExploitBench 从 24.4 跳到 <strong>54.4</strong>——越往利用链上游走，增幅越大；</li>
+      <li>相应的代价：GLM-5.3 权重将<strong>延后两周</strong>开源，先完成安全评估与加固。能力越强的开放权重，发布闸门越慢——这正在成为一种常态。</li>
+    </ul>
+
+    <h2>核心看点三：GLM-5.3-Flash，效率款的架构账</h2>
+    <ul>
+      <li><strong>320B 总参 / 18B 激活</strong>，GLM-5 系列首个原生多模态模型，30T tokens 预训练语料；</li>
+      <li>架构两件套：<strong>稀疏 + 线性注意力混合</strong>（长上下文服务成本大降）+ <strong>mHC</strong>（流形约束超连接，提升 scaling 效率）；</li>
+      <li>官方效率对比：相对 GLM-5.3，注意力计算量降 3.0×、KV cache 降 4.4×；基座对比表中 LiveCodeBench-Base 37.6，高于 GLM-5-Base 的 34.4；</li>
+      <li>官方 benchmark：Terminal Bench 2.1 84.3、DeepSWE 63.4、Toolathlon Verified 78.4、AutomationBench 48.8——多项压过 GLM-5.2（46.2 / 59.9 / 26.2），「接近 Opus 4.8」；</li>
+      <li>灰度方式有意思：发布前以 <code>ox-alpha</code> 匿名上架 OpenCode / OpenRouter 收集真实反馈，成为当周最热模型，且流量全部由国产 AI 芯片承载。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>把「环境」当一等公民来预算</strong>：Z.ai 的判断——后训练的瓶颈正从模型转移到环境——与 <a href="daily-2026-08-26-granite-4-2.html">IBM Granite 4.2 笔记</a>里「环境即变量」、<a href="rl-10-papers-detailed.html">10 篇论文详解</a>里 Search-R1 的 API 限流污染 reward 是同一规律的两面。团队做 agentic RL 时，环境工程（可执行、可验证、可观测）值得独立的人力与代码仓库。</li>
+      <li><strong>verifier 三检查可直接抄</strong>：oracle 解必须过、no-op 必须挂、未解决状态必须挂。这三条把「reward 是否可信」变成可自动化测试的断言，接入 CI 即可在环境上线前拦截大部分奖励 bug。</li>
+      <li><strong>用 solver 轨迹反向挖 shortcut</strong>：不要等到 reward 被 hack 了才修。让当前 policy 先跑一批轨迹，专门用「拿了高分但任务没完成」的样本做 verifier 的对抗测试集，迭代封堵——这是把 reward hacking 从「事故」变成「数据流程」的关键一招。</li>
+      <li><strong>异步 RL 已是工业标配</strong>：GLM 的 slime 与 Granite 4.2 的异步 GRPO（生成/训练双池 + TIS）形状一致：长 horizon 任务的 rollout 太贵，同步等待等于烧钱。自建管线时把「rollout 永不停机」作为系统设计目标。</li>
+      <li><strong>读数字时带上出处</strong>：本次所有对比数字均来自 Z.ai 官方（含私有 benchmark Z.ai Code Bench）。私有 benchmark 防污染、贴真实场景是优点，但不可复现；建议等两周后权重开源 + 社区复测再做选型结论，或先在自己任务集上小样本 A/B。</li>
+      <li><strong>「先 API、后权重」的安全闸门值得留意</strong>：网络能力的超预期涌现直接导致了延后开源。做开放权重发布计划时，把「能力评估 → 安全加固 → 放权重」的两段式流程写进时间表，而不是临时救火。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        「GLM-5.3 与 5.2 共用同一基座，全部增益来自后训练」——为什么这种对照设计比通常的模型迭代更有说服力？它又能证明什么、不能证明什么？
+        <details><summary>参考答案</summary>
+        通常的模型升级同时换基座、换数据、换算法，能力提升无法归因。同一基座锁死了「参数规模、预训练分布、架构」三个最大混杂变量，于是增益只能来自后训练侧的变化（更多环境、更多任务、更多 RL 算力），这是对「RL 还能继续买能力」最接近因果的一次公开论证。但它能证明的是「在该基座的能力上限之内，后训练仍有大空间」，不能证明：① 后训练可以无限 scale（收益斜率、何时饱和未知）；② 换个更强/更弱基座结论仍成立（基座能力可能决定环境训练的可启动性，见 Granite 4.2 只给 8B/30B 做 agentic RL）；③ 成本上划算——官方没有公布这一个月后训练烧了多少算力，「买能力」的价格仍是黑箱。</details>
+      </li>
+      <li>
+        环境合成流水线里，为什么 verifier 被要求「不看参考解」？oracle / no-op / unsolved-state 三重检查分别拦截什么问题？
+        <details><summary>参考答案</summary>
+        看参考解的 verifier 容易退化成「与答案的相似度匹配」：policy 只要表面模仿参考解的文本特征就能拿分，任务实际没做成也判对——这正是要防的 reward shortcut 温床。不看参考解逼 verifier 去检查环境状态本身（文件是否真的改了、测试是否真的过了）。三重检查各堵一类失效：oracle 检查（参考解必须拿满分）拦截「verifier 太严/环境本身 broken」，避免不可解任务产生全零 reward 的 degenerate 组；no-op 检查（什么都不做必须零分）拦截「baseline 泄漏」，即环境初始状态就自带分数；unsolved-state 检查（部分完成状态必须零分/低分）拦截「中间状态虚给分」，保证二值 reward 只在真正完成时才发放。三条都过，二值 reward 才「可靠到可直接训练」。</details>
+      </li>
+      <li>
+        什么是 reward shortcut？为什么 GLM 选择用 solver 自己的轨迹来发现和封堵它，而不是只靠人工审查 verifier？
+        <details><summary>参考答案</summary>
+        reward shortcut 指 policy 不完成任务却拿到奖励的「合法漏洞」——比如调用环境未禁止的 curl/pip 直接拉答案、修改测试文件而不是源代码、输出与参考解表面相似的文本。人工审查 verifier 的问题在于：审查者的想象力和模型的「钻空子创造力」不对称，静态看代码很难枚举所有攻击面；而 RL 训练本身就是一个强大的 shortcut 搜索器——reward 哪里松，policy 就会往哪里涌。用当前 solver 的真实轨迹做对抗挖掘（专挑「高分但任务未完成」的样本），等于把训练过程提前拿来当 verifier 的红队，发现的空子是「这个模型真的会钻的」，而不是理论可能的。这也解释了为什么该流程需要迭代：policy 变强后要重新挖，shortcut 集合随能力漂移。</details>
+      </li>
+      <li>
+        GLM-5.3 在 Terminal Bench 3.0 上从 4.6 跳到 28.3。长 horizon 任务的 RL 相比短任务难在哪？SAO + compaction 这一组合可能在解决什么问题？
+        <details><summary>参考答案</summary>
+        长 horizon 的困难层层叠加：① 奖励稀疏且延迟——几十上百步交互后才结算一次二值 reward，信用分配被极度稀释；② 上下文爆炸——长轨迹超出有效上下文，模型「忘记」早期状态，策略一致性崩溃；③ rollout 成本随步数线性甚至超线性增长，组内多样本（GRPO 式）更难凑齐；④ 环境状态累积导致失败模式相关性强，组内样本不再独立，baseline 失真。SAO（面向长 horizon 的 RL）+ compaction 的对症逻辑：用 compaction 把已确认无关的历史压缩掉，保住上下文里的有效状态，让策略在长轨迹后段仍基于充分信息决策；RL 侧则需要在长 rollout 上维持稳定的 advantage 估计（这也是 4.6→28.3 这种量级提升只可能来自「环境 × 算法 × 系统」三者的联合 scale，而非单点改进）。</details>
+      </li>
+      <li>
+        GLM-5.3「分更高、token 更省」（如 High 档 50K token 31.4% vs Opus 4.8 120K token 29.5%）。后训练阶段有哪些机制可能同时改善能力与 token 效率？与 <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2 笔记</a>中的长度惩罚有何异同？
+        <details><summary>参考答案</summary>
+        可能的机制：① 真实长任务环境里的二值 reward 本身隐含效率压力——绕路、无效探索会消耗步数预算并降低完成率，policy 学到「直奔主题」；② 长 horizon 训练配合 compaction 迫使模型把推理写得更「密」（无效铺陈会在压缩中丢失收益）；③ 若奖励中显式或隐式包含成本项（步数、token、超时），效率直接被优化。与 Granite 4.2 的异同：目标一致——压制 RL 阶段奖励缺项导致的「思维链通胀」；路径不同——Granite 4.2 是在收尾 RLHF 里加显式的长度惩罚（事后纠偏），GLM-5.3 的叙述更像从任务环境与训练结构中「内生长出」的效率（事前塑造）。显式惩罚见效快但要调系数、有过罚风险；环境内生更鲁棒但依赖环境设计质量。两者共同的提醒：<strong>token 效率已经是后训练的一阶优化目标，而不是推理时才考虑的事</strong>。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Z.ai 官方博客：<a href="https://z.ai/blog/glm-5.3" target="_blank" rel="noopener">GLM-5.3</a> · <a href="https://z.ai/blog/glm-5.3-flash" target="_blank" rel="noopener">GLM-5.3-Flash</a>（2026-08-26）</li>
+      <li>代码与后续开源：<a href="https://github.com/zai-org/GLM-5" target="_blank" rel="noopener">github.com/zai-org/GLM-5</a>（GLM-5.3 权重两周后发布）；异步 RL 框架 <a href="https://github.com/THUDM/slime" target="_blank" rel="noopener">THUDM/slime</a></li>
+      <li>第三方技术对比：<a href="https://local-ai-zone.github.io/blog/flash-tier-ai-models-comparative-analysis.html" target="_blank" rel="noopener">Flash-Tier AI Models: DeepSeek V4 vs GLM-5.3 vs Qwen3.8</a>（架构趋同分析，二手解读，谨慎引用）</li>
+      <li>相关笔记：<a href="special-2026-08-27-new-models-arch.html">特别篇：2026 新模型全景（架构与训练方法拆解）</a> · <a href="daily-2026-08-26-granite-4-2.html">IBM Granite 4.2：真实环境 Agentic RL 管线</a> · <a href="grpo-notes.html">GRPO 微调实践笔记</a> · <a href="rl-10-papers-detailed.html">「复现 10 篇 RL 论文」逐篇详解</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
