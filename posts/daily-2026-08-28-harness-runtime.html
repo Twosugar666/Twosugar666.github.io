@@ -29,7 +29,354 @@
       <a href="https://github.com/microsoft/agent-lightning" target="_blank" rel="noopener">microsoft/agent-lightning</a> README 与
       <a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener">arXiv:2608.17528</a>；
       文中分数与成本数字均为<strong>各项目官方自报</strong>，第三方复测未作为依据</p>
-    PLACEHOLDER
+
+    <h2>背景与动机</h2>
+    <p>
+      2026 年算法工程师谈 Agent，已经很难只谈模型。模型吐 token；真正把「修仓库 / 跑终端 / 搜网页」做成闭环的，是外面那层工程外壳：
+      谁决定这一步调哪个工具、把什么观察写回下一轮 prompt、代码在哪执行、会话怎么截断、LLM 调用打到哪个 endpoint。
+      这一层被越来越多的仓库直接叫 <strong>harness</strong>。它不是 chatbot wrapper，也不是 RL trainer 里顺手写的 ReAct 循环——它是<strong>部署时就存在、训练时却经常被重写掉</strong>的运行时。
+    </p>
+    <p>
+      本博客已经从三个侧面碰到过它，但都没有单独回答「harness 是什么」：
+    </p>
+    <ul>
+      <li><a href="daily-2026-08-14-deepseek-harness.html">DeepSeek Harness（dsh）</a>：运行时拆成插件树，模型适配、工具、会话日志、沙箱、Agent 循环全部可替换；</li>
+      <li><a href="daily-2026-08-26-granite-4-2.html">IBM Granite 4.2</a>：8B/30B 进真实 SWE / 终端 / 搜索环境做分阶段 RL，SWE 阶段用的就是 OpenHands harness；</li>
+      <li><a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>：部署时 harness 几乎零改动，只把 OpenAI 兼容客户端指到训练侧 proxy。</li>
+    </ul>
+    <p>
+      三篇各自讲深了一点（插件运行时、环境即课程、harness-in-the-loop 训练），缺的是同一张坐标系：
+      harness 相对模型拥有什么、失败时炸的是哪一层、OpenHands / mini-SWE-agent / dsh / Lightning proxy 各自坐在哪一格。
+      本文是 Harness 收藏夹的第一篇专文，只补这张图，不重写那三篇的细节。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Harness 是模型之外、产品之下的运行时——接管工具循环、上下文组装、沙箱环境，以及（在训练场景里）LLM 调用的观察平面。
+      模型负责「下一步说什么」；harness 负责「这句话如何变成对世界的一次合法操作，以及下一次模型能看见什么」。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 分层：模型拥有什么，harness 拥有什么</h3>
+    <p>先把四层钉死。混用「agent / runtime / environment / product」是后续几乎所有设计分歧的源头。</p>
+    <table>
+      <thead><tr><th>层</th><th>拥有什么</th><th>不拥有什么</th><th>典型接口</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>模型</strong></td>
+          <td>给定 messages / tool schema，采样下一组 token（thought、tool call、直答）</td>
+          <td>工具是否真执行、沙箱是否隔离、历史如何截断、奖励如何结算</td>
+          <td>chat completions；function-calling 或纯文本</td>
+        </tr>
+        <tr>
+          <td><strong>Harness</strong></td>
+          <td>Agent 循环、工具注册与执行、上下文构造、会话 / 事件流、沙箱选择、对 LLM 的客户端或 proxy</td>
+          <td>权重内部的推理；终端用户的账号与 UX</td>
+          <td>Action → Observation；event log；sandbox provider</td>
+        </tr>
+        <tr>
+          <td><strong>环境</strong></td>
+          <td>世界状态：仓库、shell、浏览器、隐藏测试、网络策略。奖励往往从这里读出</td>
+          <td>模型采样；prompt 模板</td>
+          <td>文件系统、进程、测试套件、出站白名单</td>
+        </tr>
+        <tr>
+          <td><strong>应用</strong></td>
+          <td>面向人的产品：UI、权限、计费、审计展示</td>
+          <td>逐步工具编排的正确性（那是 harness 的活）</td>
+          <td>Web / CLI / IDE 插件</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      成品 Agent 把 harness 藏进应用；评测脚本常把 harness 写进 trainer；研究仓库则把 harness 当成可换的脚手架。
+      边界是同一条：<strong>模型从不「看见」环境，它只看见 harness 替它渲染好的那一帧上下文</strong>。
+    </p>
+    <pre><code># 每一步真正发生的事（与具体产品无关）
+view  = harness.assemble(events, skills, tool_schemas)  # 上下文：harness 拥有
+out   = llm.generate(view)                              # 采样：模型拥有
+act   = harness.parse_and_validate(out)                 # schema / 安全：harness 拥有
+obs   = env.execute(act)                                # 世界：环境拥有；隔离策略由 harness 选择
+events.append(act, obs)                                 # 记忆：harness 拥有
+# 训练时若 trainer 重写 loop，上面四步会在「部署 harness」和「训练 loop」各做一遍
+# → train–serve 差。Lightning 的 proxy 就是为了关掉这个差。</code></pre>
+
+    <h3>② 工具循环：typed tools、bash-only、插件注册表</h3>
+    <p>Harness 的第一件工作：把模型输出变成一次对世界的调用，再把结果变成模型能读的观察。看起来像 function calling，契约差三个档。</p>
+    <table>
+      <thead><tr><th></th><th>OpenHands（V1 SDK）</th><th>mini-SWE-agent</th><th>dsh</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>契约</strong></td>
+          <td>严格 <code>Action → Observation</code>；Pydantic 校验 JSON；再包成 <code>ActionEvent</code> / <code>ObservationEvent</code></td>
+          <td>没有除 bash 以外的工具，甚至<strong>不用</strong> tool-calling 接口；动作从三重反引号代码块解析</td>
+          <td>工具是插件。注册表、执行管线、系统提示里的 schema 组装都是独立服务（<code>ctx.tools</code> / <code>ctx.systemPrompt</code>）</td>
+        </tr>
+        <tr>
+          <td><strong>循环</strong></td>
+          <td>无状态 <code>step()</code>：condense → 问 LLM → 安全分析 → 执行 → 写回事件流。可打断、可确认</td>
+          <td>每步把 observation 追加到线性 messages，再问一次模型</td>
+          <td>默认逐步 tool call；另有 PTC 让模型一次生成代码编排多轮工具（见 <a href="daily-2026-08-14-deepseek-harness.html">dsh 篇</a>）</td>
+        </tr>
+        <tr>
+          <td><strong>扩展</strong></td>
+          <td>原生工具（terminal / file editor / glob / grep）+ MCP 发现，初始化时并入 <code>tools_map</code></td>
+          <td>扩展等于「让模型用 bash 自己想办法」。沙箱里不必预装任何 agent 专用包</td>
+          <td>无特权内核。换工具协议 = 换插件，而不是 fork 循环</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      三种契约对应三种评测哲学。OpenHands 把工具做成类型系统：参数错了在进环境之前就被拦下，schema 漂移以校验失败暴露。
+      mini 把工具面压到最小公共集——官方 README 写 agent class 大约 <strong>100 行</strong> Python——SWE-bench 分数更接近「这个模型会不会用 shell」，而不是「这个脚手架的编辑器好不好用」。
+      dsh 把工具面本身做成可组合对象：同一模型、换一组插件，循环策略可以完全不同。
+    </p>
+    <p>
+      对后训练还有一层隐藏作用：<strong>schema 是 prompt 的一部分</strong>。
+      训练时用一套 function-calling 定义、部署时换成 MCP 动态发现或 PTC / bash 解析，模型面对的不是同一任务，是同一任务的另一种观察空间。这就是「tool schema drift」要单独列的原因。
+    </p>
+
+    <h3>③ 上下文：线性历史、事件流压缩、独立构造的 prompt</h3>
+    <p>第二件工作：决定「下一轮模型看见什么」。这不是 tokenizer 的事，是记忆策略。</p>
+    <table>
+      <thead><tr><th>策略</th><th>谁在用</th><th>轨迹 ≈ 模型输入？</th><th>换来的 / 付出的</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>完全线性追加</strong></td>
+          <td>mini-SWE-agent（官方：every step just appends）</td>
+          <td>是。轨迹和传给 LM 的 messages 没有差别</td>
+          <td>调试、微调、RL 都干净；长任务上 context 线性膨胀，prefill 跟着涨</td>
+        </tr>
+        <tr>
+          <td><strong>Append-only 事件流 + 投影</strong></td>
+          <td>OpenHands Event System；dsh 会话日志</td>
+          <td>否。完整事件是系统真相，LLM 只看见可转换事件 / 投影后的 prompt 段</td>
+          <td>内部事件（暂停、压缩请求）不对模型可见；回放/分叉/审计有同一份 log。投影规则本身是隐患：改 condenser 等于改观察</td>
+        </tr>
+        <tr>
+          <td><strong>Condenser / 摘要</strong></td>
+          <td>OpenHands <code>LLMSummarizingCondenser</code></td>
+          <td>否。超阈值后旧事件被摘要替换；官方文档自称可带来最高约 <strong>2x</strong> 的每轮 API 成本下降</td>
+          <td>长会话可继续跑；摘要有损，且是另一次 LLM 调用。对 RL：摘要会打断 token 前缀</td>
+        </tr>
+        <tr>
+          <td><strong>每次调用独立构造 prompt</strong></td>
+          <td>带 subagent / handoff 的生产 harness；Lightning 把它定义为 harnessed agentic RL 的默认图像</td>
+          <td>否。文本上「上一轮是下一轮的前缀」往往成立，token 上不必成立</td>
+          <td>产品灵活；训练侧出现 retokenization / merge 失败。算法坑见 <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning 篇</a></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      OpenHands 把可见性写进事件类型：<code>MessageEvent</code> / <code>ActionEvent</code> / <code>ObservationEvent</code> / <code>SystemPromptEvent</code> 对 LLM 可见；
+      <code>CondensationRequest</code>、<code>PauseEvent</code> 不可见。
+      dsh 走更彻底的同方向：模型看到的一切写入仅追加会话日志，恢复 / 分叉 / 回放共享事件流——那篇已经写过，这里只标位置：
+      <strong>事件流是 harness 的磁盘，prompt 是某一时刻的视图</strong>。
+    </p>
+    <p>
+      mini 故意不做视图。FAQ 把「线性历史」列为相对 SWE-agent 的三项简化之一，并建议：做 FT / RL、不想过拟合脚手架时优先用 mini。
+      Lightning 的 coding-agent 实验接的正是 mini-SWE-agent——不是因为功能最多，而是「轨迹 = messages」让 sample adapter 少处理一层投影。
+    </p>
+
+    <h3>④ 沙箱与环境：隔离是奖励函数的一部分</h3>
+    <p>第三件工作：选执行后端。OpenHands V1 不再把这层叫 runtime，官方文档改称 <strong>sandbox</strong>：</p>
+    <table>
+      <thead><tr><th>Provider</th><th>做什么</th><th>隔离</th><th>适用</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Docker sandbox</strong>（推荐，<code>RUNTIME=docker</code>）</td><td>Agent server 跑在容器里</td><td>容器级，与宿主机隔离较好</td><td>默认路径</td></tr>
+        <tr><td><strong>Process sandbox</strong>（<code>RUNTIME=process</code> / 旧名 local）</td><td>Agent server 当本机普通进程</td><td>无容器隔离，官方标 unsafe</td><td>快，但不该碰不信任代码</td></tr>
+        <tr><td><strong>Remote sandbox</strong></td><td>远端环境里跑 agent server</td><td>远端基础设施</td><td>托管部署、评测规模化</td></tr>
+      </tbody>
+    </table>
+    <p>
+      SDK 用 Workspace 把差异收掉：Local 直接 subprocess，Docker 起容器，Remote 经 HTTP 打到 agent-server。
+      工具跑在与 workspace 同一环境——「换沙箱不必改工具代码」，也是 <a href="daily-2026-08-26-granite-4-2.html">Granite</a> 能把 OpenHands 整段当成 SWE 环境、NeMo-Gym 能让数学 checker 和仓库沙箱对训练循环同构的工程同源物。
+    </p>
+    <p>
+      mini 把沙箱做成更小的替换点。默认 <code>LocalEnvironment.execute</code> 是一次独立的 <code>subprocess.run</code>，没有常驻 shell；换成 <code>docker exec</code> 就是 Docker 后端。
+      FAQ 花整节解释「为什么不要 stateful shell」：命令何时结束、坏命令是否杀死会话、中断是否污染后续输出，全是 flaky 源头。
+      代价也写清楚：agent 不能跨 action 保留 <code>cd</code> / <code>export</code>，必须写进每一条命令。
+      部署面列出 local、docker/podman、singularity/apptainer、bubblewrap、contree 等。
+    </p>
+    <p>
+      环境策略一旦进入 RL，就不再只是安全项。<a href="daily-2026-08-28-agent-lightning-v1.html">Lightning coding-agent</a> 观察到的四条 hacking 路径——翻 git 历史、wget/curl 拉源码、pip 下包装源码、用 Python 网络库下载——全部是「观察空间太大，隐藏测试被旁路」。
+      防护写在 harness / 执行层：禁用 git、藏 <code>.git</code>、K8s network policy 默认禁出站。
+      这与 <a href="rl-10-papers-detailed.html">10 篇论文</a>里「环境即变量」、<a href="daily-2026-08-13-prm.html">PRM 笔记</a>里「能 rule-based 就不要 learned judge」同一条纪律：
+      <strong>先收紧环境，再信任 outcome reward</strong>。
+    </p>
+
+    <h3>⑤ LLM proxy：训练环看见的不是环境，是 harness 的调用</h3>
+    <p>
+      第四块机制只在「要把已有 harness 送进 RL」时才成为一等公民。传统 agentic RL 里 trainer 拥有循环；
+      harnessed agentic RL 里循环仍在部署时的 harness 手里，trainer 只看见一串 <code>(prompt, response)</code>。
+      Lightning v1.0 的 Gateway / Controller / Trainer 和四个算法坑已在专文拆过，这里只标地图位置：
+    </p>
+    <ul>
+      <li><strong>对 harness</strong>：几乎零改动。把 OpenAI 兼容 <code>base_url</code> 指到 Gateway，路径里嵌 rollout id / attempt id；</li>
+      <li><strong>对 trainer</strong>：从 event 拉 <code>model_request</code> 与 <code>reward</code>，再做 best-effort token 前缀合并；</li>
+      <li><strong>不替代</strong>工具循环、上下文策略、沙箱。Proxy 是观察平面，不是第二套 OpenHands。</li>
+    </ul>
+    <p>
+      官方 README：Train with real agent harnesses，through the proxy with <strong>ZERO changes</strong>。核心约 <strong>3500</strong> 行。
+      它解决的是 train–serve 差，不是「如何写一个更好的编辑器」。
+    </p>
+
+    <h3>⑥ 同一张地图：OpenHands / mini / dsh / Lightning</h3>
+    <table>
+      <thead><tr><th></th><th>OpenHands</th><th>mini-SWE-agent</th><th>dsh</th><th>Lightning proxy</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>位置</strong></td>
+          <td>全功能 coding harness：工具 + 事件流 + 沙箱 + condenser + 安全分析</td>
+          <td>最小 ACI：bash + 线性历史 + 无状态 subprocess</td>
+          <td>可组合的 Agent 运行时底座（一切皆插件）</td>
+          <td>训练侧观察平面：把任意已有 harness 接进 RL 后端</td>
+        </tr>
+        <tr>
+          <td><strong>工具</strong></td>
+          <td>typed tools + MCP</td>
+          <td>bash only，解析 <code>```</code></td>
+          <td>插件注册表；逐步 / PTC / 极简等模式</td>
+          <td>不拥有</td>
+        </tr>
+        <tr>
+          <td><strong>上下文</strong></td>
+          <td>append-only events + condenser 投影</td>
+          <td>线性 messages ≡ 轨迹</td>
+          <td>append-only 会话日志 + 可投影</td>
+          <td>看见独立构造的 (prompt, response)</td>
+        </tr>
+        <tr>
+          <td><strong>沙箱</strong></td>
+          <td>Docker / Process / Remote</td>
+          <td>换 <code>subprocess.run</code> 实现即可</td>
+          <td>沙箱本身也是插件</td>
+          <td>调度成 K8s Job 或本地进程；network policy 是奖励的一部分</td>
+        </tr>
+        <tr>
+          <td><strong>与本博客接缝</strong></td>
+          <td>Granite 4.2 的 SWE 环境阶段</td>
+          <td>Lightning coding-agent 的 harness；官方建议用于 FT/RL 以免过拟合脚手架</td>
+          <td>运行时这一层可以拆出来交给开发者改造</td>
+          <td>任意上述 harness 如何在不重写 loop 的前提下被同一套 GRPO 后端吃进去</td>
+        </tr>
+        <tr>
+          <td><strong>官方自报（勿交叉比较）</strong></td>
+          <td>本文不引第三方汇编的 SWE-bench 数字</td>
+          <td>README：Scores &gt;74% on SWE-bench Verified（随接入模型变化，当作 harness 能力上限的展示）</td>
+          <td>开发者预览，无 SWE 官方主打数字</td>
+          <td>Qwen3.5-9B + mini，约 6K 样本，Verified 41.8% → 56.4%（论文自报，见 Lightning 篇）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      不要把四列读成「谁更强」。OpenHands 是生产级工具面；mini 是控制变量后的模型能力探针，也是最容易做 RL 的脚手架；
+      dsh 是「运行时内核可重组」；Lightning 是「训练引擎如何尊重已有运行时」。
+      垂类团队通常要两到三件：一把日常干活的 harness、一把评测/训练用的最小 harness、必要时再加一层 proxy 把前者送进后训练——而不是在 trainer 里再写一套 loop。
+    </p>
+
+    <h3>⑦ 三类失败模式</h3>
+    <p>Harness 出问题，很少表现为「模型变笨」，而是观察、动作或奖励被静默改写。</p>
+    <table>
+      <thead><tr><th>失败</th><th>机制</th><th>看起来像</th><th>真正坏掉的是</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Context explosion</strong></td>
+          <td>每轮把完整工具输出、完整文件、完整测试 log 追加进下一帧；没有 condenser / 截断 / 投影</td>
+          <td>后期步骤变傻、重复读同一文件、超窗口、账单陡增</td>
+          <td>harness 的记忆策略。模型窗口是症状。OpenHands 用 condenser 换成本（官方自称最高约 2x 每轮下降）；mini 选择不压缩，把膨胀当作显式约束</td>
+        </tr>
+        <tr>
+          <td><strong>Tool schema drift</strong></td>
+          <td>训练、评测、部署三套工具定义不一致：名字改了、必填字段改了、MCP 列表变了、从 function-calling 换成 PTC / bash 解析</td>
+          <td>「模型突然不会用工具」；评测分数跳变；生产里参数校验失败率上升</td>
+          <td>观察空间。工具 schema 是系统提示的一部分，drift 等于换任务。极简模式（dsh 只留 shell + 文件编辑；mini 只留 bash）存在的理由，就是把这个变量钉死</td>
+        </tr>
+        <tr>
+          <td><strong>Sandbox escape / reward hacking</strong></td>
+          <td>执行后端给了过大的观察或出站能力：读 <code>.git</code>、访问 GitHub、pip 装 gold 包、逃到宿主机</td>
+          <td>测试全绿、reward = 1，补丁却没修对；或宿主机被改</td>
+          <td>奖励函数的定义域。判分器没撒谎，是环境让「找后门」成为合法动作。Process sandbox 标 unsafe，不是文案，是这个失败模式的最短路径</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      三类失败经常耦合。Context 爆炸逼着上摘要，摘要打断 token 前缀，Lightning 的 merge 率下降；
+      为压 context 去砍工具返回字段，等于制造 schema drift；
+      为让评测「更能干」打开出站，等于给 hacking 开门。
+      所以 harness 变更必须当<strong>训练超参</strong>管：改 condenser 阈值、改 MCP 列表、改 network policy，都该触发一次冻结评测，而不是只跑产品回归。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画边界，再选仓库。</strong> 「模型在真实仓库里够不够强」→ mini 或 dsh 极简模式，控制工具变量。「团队要可审计、可确认、可接 MCP 的日常 Agent」→ OpenHands 一类全功能 harness。「生产已有 harness，训练时却另写一套 ReAct」→ 优先接 Lightning 式 proxy。判据是要钉死哪一层，不是排行榜。</li>
+      <li><strong>评测 harness 与生产 harness 允许不同，但必须声明差在哪。</strong> mini 的 FAQ 公开建议：FT/RL 不要过拟合脚手架。Granite 用 OpenHands 做 SWE 环境、Lightning 用 mini 做 coding RL，两份官方配方并不打架。自己的管线需要一张对照表：工具面、历史策略、沙箱、出站策略四列，训练 / 评测 / 生产各填一行。差没写出来，分数就不可比。</li>
+      <li><strong>上下文策略按「轨迹是否还等于模型输入」分级。</strong> 需要 RL 或精细调试时，线性历史最省事。需要撑长会话时再上 condenser，并接受「摘要 = 另一次有损投影」。不要为了 merge 率去改下一轮 prompt 的 token——那是 Lightning 文里的 off-policy stitching，比多付一次 prefill 更危险。</li>
+      <li><strong>把环境策略写进奖励设计文档。</strong> 禁用 git、出站白名单、隐藏测试、process vs docker，不是平台组杂务。不信任的模型输出、并发 RL rollout，默认走容器或远端，并把 network policy 与 rollout id 对齐做审计。</li>
+      <li><strong>Schema 冻结是可复现的前提。</strong> 一次实验钉死工具名、JSON schema 或 bash 解析规则、系统提示中的工具说明、MCP 服务器集合。升级工具当作新实验。dsh 把工具注册做成可卸载的 effect，升级路径更干净，但契约仍要版本化——「一切皆插件」降低的是 fork 成本，不是协议漂移。</li>
+      <li><strong>数字不要跨 harness 比。</strong> mini README 的 &gt;74%、Lightning 的 56.4%、Granite 30B 的 57.00，分母（模型、尝试次数、隐藏测试、是否允许网络）全部不同。要做结论，用同一 harness、同一环境策略、同一温度重跑。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说「模型就是 Agent」在工程上是错的？把一次「编辑文件 → 跑测试 → 再编辑」拆成模型 / harness / 环境三层，指出每层失败时产品侧分别会看到什么。
+        <details><summary>参考答案</summary>
+        模型只采样 token。文件有没有被改、测试有没有跑、下一轮能不能看见测试 log，全是 harness 把 Action 送进环境、再把 Observation 写回事件流的结果。模型失败：工具参数胡编、推理链跑偏，产品侧看到「乱改代码」。Harness 失败：schema 校验过严/过松、condenser 丢掉关键测试输出、事件投影漏了某次 observation，产品侧看到「模型反复问已经回答过的问题」或「明明测过却不记得」。环境失败：沙箱超时、镜像缺依赖、network policy 误杀合法包源，产品侧看到「工具报错」，根因不在权重。把三层混成「Agent 不行了」，下一步就会在错误的层上加参数或加 RL。</details>
+      </li>
+      <li>
+        mini 的「轨迹 = messages」、OpenHands 的「事件流 + condenser 投影」、Lightning 的「每次 LLM 调用独立构造 prompt」，为什么是同一条光谱上的三点？prefix 假设在哪一点开始破裂，对 GRPO 意味着什么？
+        <details><summary>参考答案</summary>
+        三者差在「系统真相」和「模型输入」重合多少。完全重合（mini）时，文本前缀与 token 前缀都容易保持，一条 rollout 更可能仍是一条训练 sample。事件流投影（OpenHands / dsh）引入第一层破裂：内部事件不对模型可见，condenser 用摘要替换旧事件，下一轮 prompt 不再是上一轮的 token 级前缀。独立构造（subagent、handoff、chat template 分段 render）是第二层破裂：即使文本上看着连续，decode–retokenize 与 tool-call 再序列化也会切碎 token 边界。对 GRPO，破裂的直接后果是「1 rollout = 1 sample」不再成立；advantage 与 loss 若仍按 sample 均分，tokenizer / condenser 的实现细节会改写梯度权重——这正是 Lightning 专文把统计粒度改回 rollout 的原因。需要稳的 RL 信号时往左走（线性、少投影）；需要撑长会话与多 agent 时往右走，并配套 sample adapter，而不是假装前缀还在。</details>
+      </li>
+      <li>
+        为什么「给模型更多工具」既可能提高生产能力，也可能让评测失效？结合 mini 的 bash-only、dsh 极简模式、OpenHands 的 MCP 动态发现，说明 tool schema drift 如何同时污染评测和后训练。
+        <details><summary>参考答案</summary>
+        工具是观察空间。多一个 <code>file_editor</code> 或 MCP filesystem，模型少写很多 bash，成功率上升，但上升来自脚手架还是权重，评测无法分解。mini / dsh 极简模式把工具钉在最小公共集上，分数差才更接近模型能力差。MCP 动态发现更进一步：服务器列表在运行时才能确定，训练时若没挂同一组 MCP，部署等于换任务。后训练里 schema 还是系统提示的一部分——SFT/RL 见到的 tool 描述与线上不一致，就是经典的 train–serve 差，只是发生在工具层。纪律：生产可以工具丰富，但要另留一条冻结 schema 的评测/训练通道；升级工具当新实验，并在对照表里登记。</details>
+      </li>
+      <li>
+        为什么 sandbox escape 和 reward hacking 要放进同一类失败，而不能把前者交给安全组、后者交给算法组？以「藏 .git + 出站白名单」和 OpenHands 把 Process sandbox 标成 unsafe 为例。
+        <details><summary>参考答案</summary>
+        两者都是「动作空间 / 观察空间大于任务设计者以为的那样」。Escape：模型在 Process sandbox 里写宿主机、读密钥，安全事故。Hacking：模型在看似隔离的容器里用 git 历史或 GitHub 拿到 gold patch，隐藏测试全绿，outcome reward = 1，梯度强化找后门。判分器都没坏，坏的是环境给了额外观察。所以隔离策略就是奖励函数的定义域：藏 .git 不是运维洁癖，是让「测试通过」重新近似「真的修对了」；Process sandbox 标 unsafe，是因为这条定义域在宿主机上根本闭不上。算法组如果只调 GRPO 超参、不看 network policy，优化的目标已经不是题目。反过来，安全组如果只拦明显恶意命令、允许随意出站，RL 会自己找到更安静的旁路。两边看同一份 rollout 日志（model_request + pod 网络事件 + 测试结果）才闭合。</details>
+      </li>
+      <li>
+        一个做垂类 Agent 的小团队只有人力维护一套运行时。如何把 OpenHands、mini、dsh、Lightning proxy 配成「日常 / 评测 / 后训练」三条路径，而不是四个互不通信的仓库？指出必须共享的最小契约。
+        <details><summary>参考答案</summary>
+        日常：选一个全功能或可组合的运行时（OpenHands 或 dsh）接 MCP、确认模式、UI。评测与数据：用 mini 或 dsh 极简模式跑冻结任务集，工具面保持 bash/shell + 文件，线性或可回放的事件流。后训练：不要为了 verl 重写 loop；把日常或评测 harness 的 LLM 客户端指到 Lightning Gateway，reward 仍从隐藏测试/规则读出。必须共享的最小契约只有四条：① 同一套环境镜像与 network policy；② 工具 schema 的版本号（日常可以是超集，评测/训练是冻结子集）；③ 轨迹格式能从事件流或线性 messages 导出为 (prompt, response, reward)；④ rollout id 能把模型调用、沙箱日志、测试结果对齐。dsh 的插件树适合做「日常超集 / 评测子集」的配置化切换；OpenHands 适合当 Granite 式环境后端；mini 适合当 RL 的干净脚手架；Lightning 只负责训练观察。四件东西分工，不是四套 Agent。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>OpenHands 文档：<a href="https://docs.openhands.dev/" target="_blank" rel="noopener">docs.openhands.dev</a> ·
+        <a href="https://docs.openhands.dev/sdk/arch/agent" target="_blank" rel="noopener">Agent 循环</a> ·
+        <a href="https://docs.openhands.dev/sdk/arch/tool-system" target="_blank" rel="noopener">Tool System / MCP</a> ·
+        <a href="https://docs.openhands.dev/sdk/arch/events" target="_blank" rel="noopener">Events</a> ·
+        <a href="https://docs.openhands.dev/openhands/usage/sandboxes/overview" target="_blank" rel="noopener">Sandbox</a> ·
+        <a href="https://docs.openhands.dev/sdk/guides/context-condenser" target="_blank" rel="noopener">Context Condenser</a> ·
+        仓库 <a href="https://github.com/All-Hands-AI/OpenHands" target="_blank" rel="noopener">All-Hands-AI/OpenHands</a></li>
+      <li>mini-SWE-agent：<a href="https://github.com/SWE-agent/mini-swe-agent" target="_blank" rel="noopener">SWE-agent/mini-swe-agent</a> ·
+        <a href="https://mini-swe-agent.com/latest/" target="_blank" rel="noopener">文档</a> ·
+        <a href="https://mini-swe-agent.com/latest/faq/" target="_blank" rel="noopener">FAQ</a> ·
+        SWE-agent 论文 <a href="https://arxiv.org/abs/2405.15793" target="_blank" rel="noopener">arXiv:2405.15793</a></li>
+      <li>DeepSeek Harness：<a href="https://github.com/deepseek-ai/deepseek-harness" target="_blank" rel="noopener">deepseek-ai/deepseek-harness</a> ·
+        架构见仓库 <code>docs/architecture.md</code>、<code>docs/cordis-primer.md</code> ·
+        本博客专文 <a href="daily-2026-08-14-deepseek-harness.html">dsh：一切皆插件</a></li>
+      <li>Agent Lightning v1.0：<a href="https://github.com/microsoft/agent-lightning" target="_blank" rel="noopener">microsoft/agent-lightning</a> ·
+        技术报告 <a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener">arXiv:2608.17528</a> ·
+        文档 <a href="https://microsoft.github.io/agent-lightning/stable/" target="_blank" rel="noopener">microsoft.github.io/agent-lightning/stable</a> ·
+        本博客专文 <a href="daily-2026-08-28-agent-lightning-v1.html">把部署时 harness 放进训练环</a></li>
+      <li>环境进入 RL 的对照：<a href="daily-2026-08-26-granite-4-2.html">IBM Granite 4.2</a> ·
+        <a href="rl-10-papers-detailed.html">「复现 10 篇 RL 论文」逐篇详解</a> ·
+        <a href="daily-2026-08-13-prm.html">过程奖励模型</a> ·
+        <a href="grpo-notes.html">GRPO 微调实践笔记</a></li>
+    </ul>
   </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
 </body>
 </html>
