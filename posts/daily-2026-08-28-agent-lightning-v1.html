@@ -1,1 +1,60 @@
-PLACEHOLDER_POST
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Microsoft Agent Lightning v1.0：把部署时 harness 放进训练环 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Microsoft Agent Lightning v1.0：把部署时 harness 放进训练环</h1>
+    <p class="post-meta">2026-08-28 · 收藏夹：Agent / RL · 一线追踪<br />
+      发布方：Microsoft Research（合作单位含复旦、浙大、爱丁堡），技术报告挂网 <strong>2026-08-19</strong> ·
+      PyPI <code>agentlightning</code> <strong>1.0.0</strong> 于 2026-08-22、<strong>1.0.1</strong> 于 2026-08-24 · 信息来源：
+      <a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener">arXiv:2608.17528</a>、
+      <a href="https://arxiv.org/html/2608.17528" target="_blank" rel="noopener">arXiv HTML 全文</a>、
+      <a href="https://github.com/microsoft/agent-lightning" target="_blank" rel="noopener">GitHub microsoft/agent-lightning</a>、
+      <a href="https://huggingface.co/papers/2608.17528" target="_blank" rel="noopener">Hugging Face Papers</a>、
+      <a href="https://pypi.org/project/agentlightning/" target="_blank" rel="noopener">PyPI agentlightning</a>；
+      文中 SWE-bench / 验证集提升、LOC、加速比除特别说明外均为 <strong>论文 / 官方自报</strong>，第三方复测尚未出现</p>
+    <h2>背景与动机</h2>
+    <p>
+      今天（2026-08-28）值得算法工程师停下来读的不是又一篇「把 Agent 接进 RL trainer」的通稿。
+      Microsoft 在 8 月 19 日把技术报告
+      <a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener"><em>Agent Lightning v1.0: Towards Harnessed Agentic RL</em></a>
+      挂上 arXiv（cs.AI, 2608.17528），GitHub 仓库同步完成相对 2025 年原版的全面重构，
+      PyPI 包 <code>agentlightning</code> 于 8 月 22 日放出 1.0.0、8 月 24 日跟到 1.0.1（Python ≥3.12，MIT）。
+      对本博客的读者来说，真正有增量的三件事叠在一起：
+    </p>
+    <ul>
+      <li><strong>Harness-in-the-loop 后训练</strong>：部署时用的 agent harness——管工具、上下文、控制流、环境——直接参与 post-training，而不是在 trainer 里重写一套 ReAct 循环；</li>
+      <li><strong>LLM endpoint proxy</strong>：harness 几乎零改动，只把 OpenAI 兼容客户端指到训练侧的 proxy，训练引擎在服务边界上观察 request–response；</li>
+      <li><strong>一份可复现的 coding-agent 配方</strong>：官方自报约 <strong>3500 行</strong>核心代码；用约 <strong>6K</strong> 条训练样本、自称 modest compute，把 Qwen3.5-9B 在 SWE-bench Verified 上从 <strong>41.8% 拉到 56.4%</strong>（绝对 +14.6 个百分点，step 208 的 checkpoint）。</li>
+    </ul>
+    <p>
+      它正好卡在本博客已经铺过的两条线上。
+      <a href="daily-2026-08-14-deepseek-harness.html">DeepSeek Harness（dsh）</a> 讲的是「运行时这一层可以拆出来」；
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 讲的是「把模型扔进 OpenHands / 终端 / 搜索环境做分阶段 RL」。
+      Agent Lightning v1.0 补的是第三块：<strong>任意已有 harness 如何在不重写 agent loop 的前提下，被同一套 RL 后端吃进去</strong>。
+    </p>
+    <p>SEE_WORKSPACE_FILE_FOR_FULL_ARTICLE</p>
+  </article>
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>
