@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Miles v0.1：生产级 LLM RL 后训练全栈（SGLang + Megatron + 全异步） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Miles v0.1：生产级 LLM RL 后训练全栈（SGLang + Megatron + 全异步）</h1>
+    <p class="post-meta">2026-08-31 · 收藏夹：Infra / RL · 一线追踪<br />
+      主来源：
+      <a href="https://www.lmsys.org/blog/2026-08-18-miles-v0-1/" target="_blank" rel="noopener">LMSYS · Miles v0.1（2026-08-18，RadixArk &amp; Ecosystem Partners）</a>；
+      文中性能与规模数字均为<strong>官方自报</strong>，第三方复测未作为依据。
+      TITO 机制的深度展开见同日
+      <a href="daily-2026-08-31-harness-tito.html">Harness｜TITO</a>；
+      MoE 上序列级 IS 与 R3 的算法对照见
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      2026 年中旬之后，后训练的瓶颈已经很少是「再写一个 clipped surrogate」。
+      真正卡住的是整条生产环：多轮 Agent 轨迹怎么在推理引擎里稳定打满、trainer 与 rollout 如何互不等待、权重如何在万亿参数上秒级回灌、MoE 路由与低精度如何不把 on-policy 假设悄悄拆掉。
+      LMSYS / RadixArk 在 2026-08-18 发布的 <strong>Miles v0.1</strong>，自称接班早期 Miles / slime 的干净设计，把目标钉成一句：
+      <em>verified, clean, and customizable everywhere</em>——准确、效率、可靠、可扩展都是一等公民，而不是 demo 之后再补的工程债。
+    </p>
+    <p>
+      站内已经有三条相邻线索，但都没有覆盖「生产级全栈」这一层：
+    </p>
+    <ul>
+      <li><a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>：把<strong>部署时 harness</strong>零改动放进训练环（LLM proxy）；</li>
+      <li><a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a>：异步 GRPO + 真实环境分阶段 Agentic RL；</li>
+      <li><a href="grpo-notes.html">GRPO 笔记</a>：组内相对 advantage 与 clipped surrogate 的算法骨架。</li>
+    </ul>
+    <p>
+      Miles 站在另一侧：默认假设你已经决定要训，问题是如何在 SGLang + Megatron-LM（或 FSDP2）上把 Rollout → Training → Weight update 跑成可持续的生产作业。
+      本篇只拆这一环；Token-In-Token-Out（TITO）点到为止，深度留给 harness 专栏。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Miles v0.1 = 以 SGLang 为 rollout、以 Megatron-LM / FSDP2 为 trainer、以全异步 sample-level 调度与多种 weight sync 为粘合剂的生产级后训练全栈；agentic env、低精度、Day-0 模型与 R3 都挂在同一条环上。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 三环：Rollout → Training → Weight update</h3>
+    <p>官方把一次 RL job 写成持续循环的三个阶段：</p>
+    <table>
+      <thead><tr><th>阶段</th><th>谁在干活</th><th>产出</th><th>Miles 强调的点</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Rollout</strong></td>
+          <td>SGLang engines</td>
+          <td>轨迹组；agentic 时每条多轮 session 进独立环境拿 reward</td>
+          <td>多轮 prefix cache、router 粘性、TITO 保 token 忠实</td>
+        </tr>
+        <tr>
+          <td><strong>Training</strong></td>
+          <td>Megatron-LM（默认）或 PyTorch FSDP2</td>
+          <td>RL loss + 新 policy 权重</td>
+          <td>低精度合同、optimizer offload、同一接口换后端</td>
+        </tr>
+        <tr>
+          <td><strong>Weight update</strong></td>
+          <td>trainer → rollout fleet</td>
+          <td>新权重进入推理侧，尽量不打断 in-flight 生成</td>
+          <td>P2P RDMA 分片直写；无 NCCL/RDMA 时走 disk-delta</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># Miles RL loop（概念级，对齐官方 Figure 1）
+while training:
+  # 1) Rollout：SGLang 持续生成；agentic session ↔ 独立 sandbox
+  groups = rollout_fleet.drain_completed()   # sample-level 释放槽位
+  buffer.push(groups)                        # bounded buffer：吞吐与训练节拍解耦
+
+  # 2) Training：消费已完成组
+  batch = buffer.pop_ready()
+  loss  = trainer.rl_loss(batch)             # Megatron-LM 或 FSDP2
+  trainer.optimizer_step()
+
+  # 3) Weight update：回灌推理侧
+  sync_weights(trainer → sglang)             # P2P 或 disk-delta
+  # 两侧互不等待：rollout 不因 optimizer 停转，trainer 不等最慢那条轨迹</code></pre>
+
+    <h3>② 全异步：sample-level 调度与 bounded buffer</h3>
+    <p>
+      长上下文、工具调用、agentic 工作负载里，rollout 时间往往由少数 straggler 决定。
+      同步日程会放大这件事：trainer 空等到 batch 里最慢的一条回来，rollout 引擎又空等到 optimizer 写完。
+      Miles 的 fully async RL 让 rollout <strong>持续在飞</strong>：trainer 只消费已完成组并更新模型，两侧互不阻塞。
+    </p>
+    <p>
+      调度粒度是 <strong>sample</strong>：一条轨迹完成就立刻腾出槽位，并发度在长度极不均匀时仍稳定。
+      完成组进入 <strong>bounded data buffer</strong>，把 rollout 吞吐与训练节拍解耦；buffer 同时是可定制策略边界——保留 / 重试 / 丢弃 / 因过期拒绝，不必改调度内核。
+    </p>
+    <p>评测也做成异步，官方区分三种权重来源：</p>
+    <table>
+      <thead><tr><th>模式</th><th>权重从哪来</th><th>训练是否继续</th><th>适用</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Shared-engine</strong></td><td>占用 rollout 舰队，暂时停新提交</td><td>评测窗口内生成 gated</td><td>小 debug 集、不加 GPU</td></tr>
+        <tr><td><strong>Dedicated</strong></td><td>独立 GPU 舰队，从 checkpoint snapshot 加载</td><td>训练与 rollout 不停</td><td>正经在线评估</td></tr>
+        <tr><td><strong>External</strong></td><td>把 checkpoint 目录交给任意外部 evaluator</td><td>不停</td><td>非 SGLang 服务、自有评测栈</td></tr>
+      </tbody>
+    </table>
+    <p>
+      三种模式都把结果绑定到产生它的 checkpoint / step；若评测晚几步完成，Miles <strong>报告滞后</strong>而不是错挂到当前步；失败则跳过该评测点，不整训崩溃。
+    </p>
+
+    <h3>③ Agentic env 插件与沙箱</h3>
+    <p>
+      Agentic RL 里大量工作发生在隔离环境：编码 Agent 要有自己的 sandbox 跑命令、改文件、读回观察，最后由测试套件出 reward。
+      Miles 在 rollout 栈的不同层级提供插件点，环境可以接管「尽可能多或尽可能少」的一层。
+    </p>
+    <table>
+      <thead><tr><th>类别</th><th>官方点名的集成</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Env / verifier 生态</strong></td><td>Harbor、HUD、NeMo Gym、OpenEnv、Prime Intellect Verifiers；亦可自带环境走同一插件点</td></tr>
+        <tr><td><strong>Sandbox 后端</strong></td><td>AgentENV、Daytona、E2B、Modal；每 episode 用任务自有镜像起干净沙箱，结束后不常驻</td></tr>
+      </tbody>
+    </table>
+    <p>
+      v0.1 附带维护中的 agentic coding / terminal 端到端 recipe，官方称在真实硬件上验证过、可按现状启动。
+      这与 <a href="daily-2026-08-26-granite-4-2.html">Granite</a> 把 OpenHands 当 SWE 环境、<a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 把部署 harness 接进 proxy 是同一问题的不同切口：Miles 选择「环境插件进 SGLang rollout」，Lightning 选择「harness 不动、换 LLM endpoint」。
+    </p>
+
+    <h3>④ TITO（点到为止）与 R3</h3>
+    <p>
+      多轮里 message parsing / tool 执行 / chat-template 重渲染会改 tokenization、剪历史 reasoning、重序列化 tool call，使 trainer 看到的 token 上下文与 rollout 真实使用的不一致。
+      Miles 的 <strong>TITO session server</strong> 保留引擎产出的精确 token IDs；新 turn 只 tokenize 新增消息再与 prefix 合并；完整轨迹拼成 contiguous sample；非模型生成 token 做 loss-mask；保留原始 rollout logprob。
+      官方强调这对 <strong>R3 / OPD / zero-KL</strong> 的 token 级精确性是必要的——细节见
+      <a href="daily-2026-08-31-harness-tito.html">同日 TITO 专文</a>。
+    </p>
+    <p>
+      MoE RL 对 rollout / train 之间的微小数值差极度敏感：一次 top-k routing flip 会同时改 token 计算与收到梯度的 expert。
+      <strong>Rollout Routing Replay（R3）</strong> 在 rollout 时记录 SGLang 的 expert 路由，训练时回放；官方称在 SGLang 内高效实现，相对普通路由开销最小。
+      算法侧若改用序列级重要性采样（见 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>），有机会从根上降低对 Routing Replay 的依赖——两条线不要混为一谈：Miles 提供基建侧 R3；GSPO 是目标函数侧的另一条路。
+    </p>
+
+    <h3>⑤ 低精度、双后端、Weight sync</h3>
+    <table>
+      <thead><tr><th>主题</th><th>官方能力</th><th>要注意的合同</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>低精度</strong></td>
+          <td>Rollout：NVFP4 / MXFP4 / MXFP8 / FP8；端到端训练 recipe：NVFP4 / MXFP8 / FP8；多数模型支持 INT4 QAT</td>
+          <td>rollout 与 train 的量化必须一致，否则跨 weight update 累积成 policy divergence；Blackwell 原生 MXFP8 / NVFP4 按「精度合同」验证过与 Megatron 的低 KL</td>
+        </tr>
+        <tr>
+          <td><strong>训练后端</strong></td>
+          <td>Megatron-LM（默认，TP/PP/CP/EP/ETP，CPU/NVMe optimizer offload）与 FSDP2（直接吃 HuggingFace 实现，仅 DP）</td>
+          <td>一个 launch flag 切换；后端实现五个方法，上层不变</td>
+        </tr>
+        <tr>
+          <td><strong>P2P weight sync</strong></td>
+          <td>训练 rank 按目标 SGLang 布局 re-shard，经 RDMA 只把需要的 shard 写入 rollout rank 内存</td>
+          <td>官方：Kimi-K2 1T 上 weight-update 从 <strong>53.3s → 7.2s</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Disk-delta</strong></td>
+          <td>无直接 NCCL/RDMA 时发相对上一版本的 delta；BF16 rollout 常约 2% 参数、FP4 约 0.5%</td>
+          <td>GLM-4.7-Flash 例：单次更新载荷 62.4 GB → 0.69–0.83 GB，生成暂停约 3–5s（官方）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      内存侧：optimizer state 可 offload 到 CPU 或节点本地 NVMe，按 bucket 流回；官方称 GLM-5.2 参考跑中因此能在 32 张 GB300 上塞下 training engine，并额外省 30+ GB HBM/GPU。
+    </p>
+
+    <h3>⑥ Day-0 模型与参考跑：GLM-5.2 × 64×GB300</h3>
+    <p>
+      Miles 与 SGLang 并行拉起推理路径与 RL recipe，官方列出 Day-0 可训：Kimi-K3、DeepSeek-V4、Inkling、Qwen3.8、NVIDIA Nemotron 3 Ultra 等，覆盖 dense / MoE、hybrid attention、多模态。
+      更长名单还包括 DeepSeek-V3.2、Kimi-K2.6、GLM-5.2、Gemma-4、GPT-OSS 等；每个支持模型附 CI 守护 recipe。
+    </p>
+    <p>端到端参考跑（官方数字，终端类 coding 任务）：</p>
+    <pre><code># GLM-5.2 744B-A40B · 64× NVIDIA GB300
+# 32 GPU rollout + 32 GPU train
+# Train parallel: TP2 / PP4 / CP4 / EP8
+# Infer parallel: TP8 / EP8 · MTP on
+# Env: OpenEnv · 每任务独立 sandbox
+# max seq len 65k · batch size 64
+
+稳定完成 ~100 个 terminal-bench-like coding rollout steps
+~4.5 min / training step
+权重落后均值 ~1.7 step（rollout 相对 trainer）
+prefix-cache hit rate ~96%，并发稳定
+# 官方结论：744B 异步训可塞进 64 卡，trainer 仅占 32 卡</code></pre>
+    <p>
+      同一平台还叠了 LoRA RL（GLM-5.2 上可训参数约 212 MB，约 base BF16 的 0.014%）、On-Policy Distillation（OPD）、Zero-KL Alignment（当前官方称主要覆盖 Qwen3 家族）、以及 Miles-Diffusion / AMD ROCm 路径——本篇不展开，只标：共享的是 rollout / trainer / weight-update，而不是「只能做 GRPO」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画三环容量，再选算法超参。</strong> 若 straggler 占比高，优先开 fully async + bounded buffer，而不是把 batch 调小假装同步还行。同步日程在 tool-use 长尾上会把 GPU 利用率吃成等待。</li>
+      <li><strong>环境插件与沙箱后端分开选型。</strong> Harbor / OpenEnv / NeMo Gym 决定「任务与 verifier」；Daytona / E2B / Modal 决定「隔离与弹性」。混成一个自定义 Docker 脚本时，把 reward 与网络策略写进同一份实验卡（对照 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>）。</li>
+      <li><strong>MoE 上先回答要不要 R3。</strong> 仍用 token-level IS（GRPO 类）→ 认真接 Routing Replay；若目标已切到序列级（GSPO）→ 对照算法文，避免双重支付内存与通信。不要「两个都开着心里踏实」。</li>
+      <li><strong>低精度是跨栈合同，不是 dtype 开关。</strong> rollout FP8 / train BF16 的 drift 会在多次 weight update 后表现为「越训越不像 on-policy」。Blackwell 路径优先跟官方 MXFP8 / NVFP4 recipe，而不是只改 GEMM。</li>
+      <li><strong>Weight sync 按拓扑选路。</strong> 同织物、有 RDMA → P2P；跨集群或无 NCCL → disk-delta。用官方 Kimi-K2 的 53.3s→7.2s 当数量级直觉，但以自己的 model × fabric 实测为准。</li>
+      <li><strong>与 Lightning / Granite 的分工。</strong> 已有生产 harness、只想把轨迹打进 trainer → Lightning proxy；要把环境与 SGLang rollout 绑死做成平台 → Miles；课程式分阶段真实环境 → Granite 叙事仍有用。三者不是互斥菜单。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么 fully async + sample-level 调度能缓解 straggler，却不能消灭「权重落后」？官方参考跑里平均落后 1.7 step，训练侧应把它当成 bug 还是当成要建模的 off-policyness？
+        <details><summary>参考答案</summary>
+        Async 消除的是<strong>互等</strong>：rollout 不等 optimizer，trainer 不等最慢轨迹。它不消除「生成时用的权重」与「当前 optimizer 步」之间的时间差——落后 1.7 step 是重叠的代价。应建模（截断 stale ratio、TIS、reject stale、或缩小 buffer），而不是当成同步 bug 去「修成 0」。把 lag 报出来（评测模式同理）比假装 on-policy 更接近生产。</details>
+      </li>
+      <li>
+        Bounded buffer 被说成「可定制策略边界」。若只实现 FIFO、从不因权重版本过期而丢弃，异步环在长尾任务上会滑向什么失败模式？
+        <details><summary>参考答案</summary>
+        队列里会堆满旧权重版本上生成的长轨迹；trainer 持续吃 stale 数据，importance ratio 尾部变厚，clip 比率上升或梯度噪声变大。看起来像「算法不稳」，根因是调度策略没把「版本过期」写成一等公民。正确做法是在 buffer 边界显式配置 keep / retry / discard / reject-stale，并与 weight version 对齐。</details>
+      </li>
+      <li>
+        Miles 的 R3 与 GSPO「消除对 Routing Replay 的依赖」是否矛盾？分别保护的是什么假设？
+        <details><summary>参考答案</summary>
+        不矛盾。R3 保护的是<strong>token-level</strong> 重要性采样：π_θ(y_t|…) 对路由 flip 敏感，必须让 train 前向看见与 rollout 相同的 expert 选择。GSPO 把 ratio 升到<strong>序列似然</strong>，对单个 token 似然噪声不敏感，因此可以不依赖 Routing Replay。选型取决于 loss 粒度；混用 token-level GRPO 却关掉 R3，才是真矛盾。</details>
+      </li>
+      <li>
+        P2P weight sync 把 Kimi-K2 1T 的更新从 53.3s 降到 7.2s（官方）。若业务上仍选 disk-delta，通常是卡在哪一类约束？delta 只含约 2%（BF16）参数时，生成侧为何仍可能暂停 3–5s？
+        <details><summary>参考答案</summary>
+        Disk-delta 面向「rollout 舰队与 trainer 无直接 NCCL/RDMA」的部署——跨集群、异构织物、安全隔离。暂停来自「应用合并后的权重进 SGLang」这一小段临界区：delta 传输可以很小，但加载/校验/切换仍要短暂停生成。优化的是载荷与中断窗口，不是零停机定理。</details>
+      </li>
+      <li>
+        对比 <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 的「部署 harness 进训练环」与 Miles 的「环境插件进 SGLang rollout」：一个已有 Claude Code / 内部 coding harness 的团队，何种条件下更该先接 Lightning，何种条件下值得迁到 Miles 式全栈？
+        <details><summary>参考答案</summary>
+        先接 Lightning：harness 是产品真相、改不动；只需把 OpenAI 兼容客户端指到训练 proxy，奖励仍从原环境读——迁移成本按「改 endpoint」计。迁 Miles：团队愿意以 SGLang 为唯一 rollout、需要全异步舰队、P2P/低精度/Day-0 recipe、以及统一的 env 插件与 CI recipe；此时 harness 差异要通过 TITO / 黑盒轨迹树等路径吸收（见 TITO 文），而不是坚持「一个 HTTP proxy 包打天下」。判据是「运行时所有权」在产品 harness 还是在训练平台。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>LMSYS · Miles v0.1：Production-level Post-training（2026-08-18）：
+        <a href="https://www.lmsys.org/blog/2026-08-18-miles-v0-1/" target="_blank" rel="noopener">lmsys.org/blog/2026-08-18-miles-v0-1</a></li>
+      <li>系列相关（官方索引）：Introducing Miles · Unified FP8 · INT4 QAT · P2P weight transfer · TITO · ROCm / Day-0 模型帖</li>
+      <li>站内交叉：
+        <a href="daily-2026-08-31-harness-tito.html">TITO harness</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> ·
+        <a href="grpo-notes.html">GRPO 笔记</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
