@@ -1,1 +1,208 @@
-PLACEHOLDER_LOAD_FROM_DISK_1
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜12V-2×6 之后：ATX 3.1 / PCIe 5.1 配件如何决定 600W 级 GPU 能不能活 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜12V-2×6 之后：ATX 3.1 / PCIe 5.1 配件如何决定 600W 级 GPU 能不能活</h1>
+    <p class="post-meta">2026-08-31 · 收藏夹：配件 / 显卡 · 学习笔记<br />
+      主来源：
+      <a href="https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/alder-lake-s/atx12vo-12v-only-desktop-power-supply-design-guide/pci-express-add-in-card-considerations/" target="_blank" rel="noopener">Intel EDC · PCIe Add-in Card Considerations（ATX / CEM 5.1 重述）</a>；
+      <a href="https://cdrdv2.intel.com/v1/dl/getContent/336521" target="_blank" rel="noopener">Intel · ATX Version 3 Multi Rail Desktop Platform Power Supply Design Guide</a>；
+      <a href="https://www.corsair.com/newsroom/press-release/corsair-launches-rme-series-platinum-power-supplies-with-thermalprotect-12v-2x6-cable-for-enhanced-gpu-protection" target="_blank" rel="noopener">Corsair 新闻稿（2026-08-18）</a>；
+      <a href="https://www.tomshardware.com/pc-components/power-supplies/corsair-rm1000e-2026-thermalprotect-power-supply-review" target="_blank" rel="noopener">Tom's Hardware · Corsair RM1000e (2026) ThermalProtect 评测</a>；
+      <a href="https://www.tomshardware.com/pc-components/power-supplies/seasonic-introduces-the-worlds-first-80-plus-ruby-certified-psu-using-a-standard-atx-form-factor" target="_blank" rel="noopener">Tom's Hardware · Seasonic Prime Enterprise RX-1600（2026-08-20）</a> /
+      <a href="https://seasonic.com/news/prime-enterprise-rx-1600-80-plus-ruby/" target="_blank" rel="noopener">Seasonic 官方</a>。
+      文中功率等级、侧带编码、效率数字均按上述规格书 / 厂商陈述；<strong>厂商宣称已标注</strong>，不把宣传稿当第三方实测。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      本地跑 7B–70B、偶尔想双卡训一小段，最后卡死的往往不是 kernel，而是那根插在 GPU 上的 auxiliary 线。
+      PCIe CEM 5.0 引入了高功率辅电接口（业界熟称的 12VHPWR）；随后社区里关于接触不良、局部过热、塑胶软化的讨论把「线能不能扛住」变成公开话题。
+      CEM 5.1 与同步更新的 ATX 规格把桌面侧答案收成 <strong>12V-2×6</strong>：它在电气与机械上取代 12VHPWR，专门回应可靠性担忧；新电源设计应只装 12V-2×6，12VHPWR 应被弃用（Intel ATX design guide 对 CEM 的重述）。
+    </p>
+    <p>
+      2026 年 8 月中旬，配件侧几乎同时给出两种「规格之外」的产品回应：
+    </p>
+    <ul>
+      <li><strong>Corsair（2026-08-18）</strong>：RMe 系列（RM850e / RM1000e）标配 ThermalProtect PCIe 5.1 600W 12V-2×6 线——距 GPU 端约 30&nbsp;mm 的线梳里放温度传感，线缆温度超过 65°C 时切断 GPU 供电。Cybenetics Platinum、ATX 3.1、PCIe 5.1；需 GPU 原生 12V-2×6。Tom's Hardware 同型号独立评测标题把故事说直白：感温线在连接器熔化之前关掉 GPU。</li>
+      <li><strong>Seasonic（2026-08-20）</strong>：Prime Enterprise RX-1600——宣称首款标准 115V ATX 外形、通过 80 Plus <strong>Ruby</strong> 的电源，1600W、ATX 3.1，面向高负载桌面 / 工作站 / AI；定价未公布。效率数字为厂商陈述（见下文）。</li>
+    </ul>
+    <p>
+      对这篇博客的读者——做 post-training、本地 LLM、600W 级消费卡工作站——电源 + 原生线，才是决定「卡能不能活」的配件，不是机箱灯效。
+      桌面 Blackwell 为什么把这条线变成刚需，见同日
+      <a href="daily-2026-08-31-gpu-rubin.html">Rubin / 显卡一线</a>
+      （数据中心 Rubin 是另一条产品线；桌面卡仍然死生系于 12V-2×6）。
+      训到一半随机掉电有多伤，见
+      <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：CEM 5.1 把单卡连续预算抬到 675W（槽边 75W + 线缆 600W），用侧带把「没插到位 = 0W」写进协议；ATX 3.1 要求电源扛住 CEM 定义的功率尖峰；2026-08 的 ThermalProtect / Ruby 是厂商在「最后几厘米」和「轻载效率」两端补工程余量——都是给本地 GPU 箱用的，不是 RGB 开箱素材。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 为什么一条线要扛 600W</h3>
+    <p>
+      CEM 5.1 把<strong>单张</strong> PCIe 附加卡的连续功率上限，从过去常见的 300W 量级抬到 <strong>675W</strong>（所有轨道合计）。
+      Intel 指南给的分解例：槽边（card edge）75W + 一根 12V-2×6 辅电线 600W = 675W。
+      桌面电源侧，CEM 5.1 定义的三种 12V 辅电接头是：75W 的 2×3、150W 的 2×4、以及 600W 的 12V-2×6；另外还有走 48V 轨道、同样标到 600W 的 48VHPWR（桌面生态仍以 12V 为主，见思考题）。
+    </p>
+    <p>
+      电流密度决定线规：12V-2×6 要求 <strong>16 AWG</strong>（不是常见 18 AWG 模组线），单针电流容量按规格到 <strong>9.2&nbsp;A</strong>。
+      以前用多根 8-pin PCIe「菊花链 / 转接线」硬凑几百瓦，本质上是把接触点、线规和机械公差外包给 DIY——规格现在把「单电缆 600W」收成一等公民，正是因为那套拼接在 600W 级持续负载下不再是可接受默认。
+    </p>
+
+    <h3>② 侧带 SENSE0 / SENSE1：没插到位就 0W</h3>
+    <p>
+      12V-2×6 / 高功率辅电带四根侧带导体，在卡与电源之间做功率等级协商。
+      SENSE0、SENSE1 用于宣告功率档。下表按 <strong>Intel ATX design guide 对 CEM 的重述</strong>整理（标注为<strong>规格书侧带编码</strong>；初始档 / 最大持续档）：
+    </p>
+    <table>
+      <thead>
+        <tr><th>SENSE0 / SENSE1</th><th>初始</th><th>最大持续</th><th>读法</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Ground / Ground</td><td>375W</td><td>600W</td><td>满功率档</td></tr>
+        <tr><td>Open / Ground</td><td>225W</td><td>450W</td><td>—</td></tr>
+        <tr><td>Ground / Open</td><td>150W</td><td>300W</td><td>—</td></tr>
+        <tr><td>Short / Short</td><td>100W</td><td>150W</td><td>—</td></tr>
+        <tr><td>Open / Open</td><td>0W</td><td>0W</td><td><strong>未完全就位 → 不供电</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      Open/Open = 0W 才是安全叙事的核心：历史上 12VHPWR 相关事故叙事里，「看起来插上了、其实只有部分功率针接触」是反复出现的失败模式。
+      规格选择的对策不是「再劝用户用力推一下」，而是<strong>侧带读不到就位就拒绝送电</strong>——宁可启动失败，也不在三根针上硬跑几百瓦。
+    </p>
+
+    <h3>③ ATX 3.1 vs 老电源：尖峰、原生头、转接线</h3>
+    <p>
+      GPU 功耗是尖刺的：平均几百瓦，瞬时可以远高于连续标称。
+      ATX 3.0 / 3.1 存在的原因之一，就是要求电源能 ride through CEM 定义的 add-in-card <strong>power excursion</strong>（功率冲高），而不是只按稳态平均瓦数选型。
+      因此「2022 年某块 1000W 标称 Gold」与「2026 年 ATX 3.1 Platinum」不是同一类产品——前者可能从未按 CEM 尖峰曲线验证过。
+      （本文不引用未经核对的 2×/3× 倍数表；需要倍数请直接读 Intel design guide 表格。）
+    </p>
+    <p>
+      工程上更硬的一条：优先买<strong>电源本体就带原生 12V-2×6 输出头</strong>的 ATX 3.1 电源，用原厂或认证的 12V-2×6 线。
+      8-pin → 12V-2×6 转接器把接触点、线规和就位检测重新拆回 DIY 链路——等于把规格想杀掉的失败模式又接回来。
+      本地 LLM 箱上应<strong>强烈避免</strong>这类转接；双卡场景更是如此：两张卡需要两路原生线，不是一根分线器。
+    </p>
+
+    <h3>④ ThermalProtect：最后 3&nbsp;cm 上的保险丝，不是就位的替代品</h3>
+    <p>
+      Corsair 新闻稿（厂商宣称）：ThermalProtect 硬件做在距 GPU 连接约 <strong>30&nbsp;mm</strong> 的线梳里，监测 12V-2×6 线温；超过 <strong>65°C</strong> 则动作，关闭 GPU 以防损坏。前提是 GPU 具备原生 12V-2×6。
+      Tom's Hardware 对 RM1000e (2026) 的独立评测存在，标题强调「感温线在连接器熔化前关 GPU」——此处只引用其存在与叙事，不编造其台架数字。
+    </p>
+    <p>
+      概念位置要摆对：它是<strong>电缆末端的过温保护</strong>，补的是「就位了但仍因弯曲、积灰、局部电阻升高而过热」的尾巴；它<strong>不能</strong>替代侧带就位检测，也不能把转接线变成推荐方案。
+      同月 MSI 在 CES 2026 材料里宣传带 GPU Safeguard / Safeguard+ 的电源型号（如 MPG Ai1600TS PCIE5、MPG Ai1300TS PCIE5、MAG A1200PLS / A1000PLS PCIE5）——属<strong>厂商 CES 宣称</strong>；公开细节少于 Corsair 的 65°C / 30&nbsp;mm 描述，Tom's 对 MPG Ai1600TS PCIE5 有评测提及该功能与 Titanium 效率，本文同样不编造其阈值。
+      选型时把「OTP / Safeguard 类线缆或电源」当成 5090 级卡的加分项，而不是免检执照。
+    </p>
+
+    <h3>⑤ 80 Plus Ruby：为「大电源、轻载」发明的 5% 档</h3>
+    <p>
+      80 Plus Ruby 面向 AI / 高功率场景（此前已有服务器侧案例；Seasonic 更早在 Computex 展出过 SIC-NRX522-22A63GT 5200W CRPS 54V 服务器电源的 Ruby 路径，非 ATX）。
+      Ruby 是首个把 <strong>5% 负载</strong>写进认证门槛的档位。厂商公开的门槛约为：≥85%@5%、≥91%@10%、≥93%@20%、≥95%@50%、≥91%@100%；Titanium 在 10–100% 各档大约低约 1 个百分点量级（以认证文档为准）。
+    </p>
+    <p>
+      Seasonic 对 RX-1600 的<strong>厂商陈述</strong>效率：88.88%@5%、93.35%@10%、95.38%@20%、95.27%@50%、92.81%@100%，峰值「最高约 95.4%」。定价未宣布。
+      为什么 5% 档对本地工作站有意义：你买 1600W 是为了扛得住 LLM decode / 训练尖峰，但调试、IDE、单卡推理的大部分时间，系统平均可能只有几百瓦——电源长期坐在效率曲线左侧。
+      过规格 / 冗余电源「闲置在低效左尾」正是 Ruby 要管的工况；同一逻辑也解释了为何「标称很大」不等于「日常就高效」。
+    </p>
+
+    <h2>实践建议</h2>
+    <p>面向 2026 本地 LLM / 后训练工作站的配件清单（不做虚假 BOM 报价）：</p>
+    <ul>
+      <li><strong>电源本体：ATX 3.1 + 原生 12V-2×6。</strong> 不要用「老金牌 + 转接线」凑合上 600W 级卡。认证与接头比灯效和模组线颜值优先。</li>
+      <li><strong>禁止 8-pin→12V-2×6 转接作为默认方案。</strong> 侧带就位与线规是规格的一部分；转接把两者都绕开。</li>
+      <li><strong>插到底，直到侧带能 Ground。</strong> Open/Open = 0W 是特性。上电失败先查就位，再查线序。不要「半插着试一下功耗」。</li>
+      <li><strong>5090 级卡优先 OTP / Safeguard 类方案。</strong> Corsair ThermalProtect（65°C / 距 GPU 约 30&nbsp;mm）是目前公开描述较清楚的例子；MSI Safeguard+ 等作厂商特性对照。它们补的是末端过热，不是就位。</li>
+      <li><strong>容量与效率档一起选。</strong> 要么把平均负载抬离「长期趴在 5% 沼泽」，要么选在 5–20% 有明确规格的 Ruby / 高档 Titanium，避免大电源调试期又热又吵又费电。</li>
+      <li><strong>双卡 = 两路原生线，不要分线器。</strong> 每卡独立 12V-2×6；电源输出头数量是选型硬约束。</li>
+      <li><strong>线缆折弯与机箱风道。</strong> 12V-2×6 在 GPU 尾部常被水冷排、立式支架、过短机箱挤压。给线留半径，别把感温段 / 接触段压扁；风道要吹到连接器附近，而不是只吹散热片正面。</li>
+      <li><strong>消费卡价位锚点（NVIDIA.cn 列表价，非 TDP）。</strong> GeForce RTX 50 系（Blackwell 桌面）：5090 D v2 ¥16,499 起；5080 ¥8,299 起；5070 Ti ¥6,299 起；5070 ¥4,599 起；5060 Ti ¥3,199 起；5060 ¥2,499 起（
+        <a href="https://www.nvidia.cn/geforce/graphics-cards/50-series/" target="_blank" rel="noopener">nvidia.cn/50-series</a>）。
+        架构侧官方表述含第 5 代 Tensor（FP4 + DLSS 4.5）、第 4 代 RT、DLSS 4.5 Dynamic Multi Frame Generation——本文不臆造 5090 的 TDP / 显存 / CUDA 数；只需记住：这个价位的旗舰卡，把 12V-2×6 / ATX 3.1 从「可选项」变成工作站默认。</li>
+      <li><strong>训练作业的掉电语义。</strong> 本地 rollout / 后训练中途掉电的代价，见
+        <a href="daily-2026-08-31-miles-v01.html">Miles</a>；Agent 环上的 harness 稳定性可对照
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>。配件层的目标很朴素：尖峰能过、就位有互锁、过热能断、轻载不烂。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        规格书侧带编码里 Open/Open = 0W / 0W。这和「插歪了仍送电 → 局部过热 → 连接器损坏」的旧叙事，分别把风险放在哪个时间点？为什么规范选择启动失败，而不是降功率继续跑？
+        <details><summary>参考答案</summary>
+        Open/Open 把风险前移到<strong>上电协商</strong>：读不到就位就不送辅电，失败模式是黑屏 / 不识别大功率卡，而不是运行中三根针扛几百瓦。旧叙事的风险在<strong>运行期热积累</strong>——用户以为「已经亮机」，接触电阻却在局部发热。规范选硬失败，是因为半接触状态下「降功率」仍依赖不可靠的针脚集合，且用户很难从软件侧区分「真的降了」还是「已经在伤连接器」；0W 是可观测、可复现的安全默认。</details>
+      </li>
+      <li>
+        Corsair ThermalProtect 把 65°C 跳闸点放在距 GPU 插头约 30&nbsp;mm 的线缆上，而不是 GPU VRM 或电源内部。过温保护的信息几何意义是什么？它为什么替代不了侧带就位？
+        <details><summary>参考答案</summary>
+        连接器事故的热源常在<strong>接触界面与近端线材</strong>（接触电阻、弯折、应力），VRM 温度反映的是板载转换损耗，电源内部反映的是整机变换效率——三者相关但不等价。把传感器放在最后约 3&nbsp;cm，是直接监视「会熔化的那段」。就位是数字互锁（侧带开路 = 0W）；OTP 是模拟保险丝（已导通但仍过热则切断）。没插好时侧带应已拒绝供电，OTP 根本不该成为第一道防线；已插好却因积灰 / 弯折过热时，OTP 才有意义。</details>
+      </li>
+      <li>
+        80 Plus Ruby 相对 Titanium，多出来的关键认证点是 5% 负载档。一台 1600W、ATX 3.1 的工作站电源，在「单卡本地推理 + 偶尔训练尖峰」的负载曲线上，为什么会特别吃这一档？
+        <details><summary>参考答案</summary>
+        容量按尖峰与双卡余量选，日常平均却可能只有额定的很小比例——电源长期工作在效率曲线左尾。Titanium 传统关注 10–100%；Ruby 把 5% 写成门槛，正是给「过规格 / 冗余、但大部分时间很闲」的 AI 与工作站电源。Seasonic 公布的 RX-1600 厂商效率曲线在 5–20% 已经很高，其产品叙事也明确对准这一工况。选电源时要同时问：尖峰能不能过 ATX 3.1 excursion，以及你调试时坐在哪一段效率曲线上。</details>
+      </li>
+      <li>
+        CEM 同时描述了 12V-2×6（600W@12V）与 48VHPWR（600W@48V）。为何桌面消费生态仍以 12V-2×6 为主，48V 没有「取代」桌面辅电？
+        <details><summary>参考答案</summary>
+        同功率下 48V 电流约为 12V 的 1/4，线损与针脚应力更友好，但这要求整条桌面生态——电源轨、线缆、卡端转换、安规与存量机箱——一起迁到 48V。消费主板 / 电源库存与工具链仍建在 12V 多轨或 12V 为主的假设上；48VHPWR 更自然出现在服务器 / 机架或特定高功率设计。桌面侧 CEM 5.1 的即时工程答案是把 12V 辅电做到可依赖（2×6 + 侧带 + ATX 3.1），而不是等待一次总线电压革命。</details>
+      </li>
+      <li>
+        「单卡连续 675W」与 ATX 3.1 要求电源扛住的 add-in-card power excursion，分别约束的是哪一类失效？为什么「只看连续 TDP 选型」会在本地训练尖峰上翻车？
+        <details><summary>参考答案</summary>
+        675W 连续是<strong>稳态热与平均供电能力</strong>的预算上限（槽边 + 辅电合计）。Excursion 约束的是<strong>毫秒–秒级功率尖峰</strong>下电源输出是否掉压、保护误触发或关机。GPU 在 LLM prefill / 训练 step 边界上的瞬时需求可以显著高于连续标称；只按连续瓦数选「刚好够」的老电源，会在尖峰上触发 OCP / 欠压，表现为随机重启——对后训练作业等于丢 step。ATX 3.1 + 原生 12V-2×6 把「能过尖峰」写进电源选型，而不是事后用转接线赌运气。具体倍数以 Intel / CEM 表格为准，不要用口头传说的 2×/3× 代替。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Intel EDC · PCIe Add-in Card Considerations（含 12V-2×6 / 侧带与 CEM 5.1 重述）：
+        <a href="https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/alder-lake-s/atx12vo-12v-only-desktop-power-supply-design-guide/pci-express-add-in-card-considerations/" target="_blank" rel="noopener">edc.intel.com/…/pci-express-add-in-card-considerations</a></li>
+      <li>Intel · ATX Version 3 Multi Rail Desktop Platform Power Supply Design Guide：
+        <a href="https://cdrdv2.intel.com/v1/dl/getContent/336521" target="_blank" rel="noopener">cdrdv2.intel.com/…/336521</a></li>
+      <li>Intel EDC · Modular Power Supply Connectors（辅电接头语境）：
+        <a href="https://edc.intel.com/content/www/us/en/design/products-and-solutions/processors-and-chipsets/alder-lake-s/atx12vo-12v-only-desktop-power-supply-design-guide/modular-power-supply-connectors/" target="_blank" rel="noopener">edc.intel.com/…/modular-power-supply-connectors</a></li>
+      <li>Corsair · RMe + ThermalProtect 12V-2×6 新闻稿（2026-08-18）：
+        <a href="https://www.corsair.com/newsroom/press-release/corsair-launches-rme-series-platinum-power-supplies-with-thermalprotect-12v-2x6-cable-for-enhanced-gpu-protection" target="_blank" rel="noopener">corsair.com/newsroom/…</a></li>
+      <li>Tom's Hardware · Corsair RM1000e (2026) ThermalProtect 评测：
+        <a href="https://www.tomshardware.com/pc-components/power-supplies/corsair-rm1000e-2026-thermalprotect-power-supply-review" target="_blank" rel="noopener">tomshardware.com/…/corsair-rm1000e-2026-thermalprotect…</a></li>
+      <li>Seasonic · Prime Enterprise RX-1600 80 Plus Ruby 官方新闻：
+        <a href="https://seasonic.com/news/prime-enterprise-rx-1600-80-plus-ruby/" target="_blank" rel="noopener">seasonic.com/news/prime-enterprise-rx-1600-80-plus-ruby</a></li>
+      <li>Tom's Hardware · Seasonic 首款标准 ATX 外形 Ruby 认证电源（2026-08-20）：
+        <a href="https://www.tomshardware.com/pc-components/power-supplies/seasonic-introduces-the-worlds-first-80-plus-ruby-certified-psu-using-a-standard-atx-form-factor" target="_blank" rel="noopener">tomshardware.com/…/seasonic-introduces-…-ruby…</a></li>
+      <li>MSI CES 2026 · GPU Safeguard 电源等（厂商 CES，细节有限）：
+        <a href="https://www.msi.com/blog/msi-ces-2026-pc-parts-roundup-worlds-first-gpu-safeguard-power-supplies-cooling-and-meg-maestro-900r" target="_blank" rel="noopener">msi.com/blog/…ces-2026-pc-parts-roundup…</a></li>
+      <li>NVIDIA.cn · GeForce RTX 50 系列列表价与产品页：
+        <a href="https://www.nvidia.cn/geforce/graphics-cards/50-series/" target="_blank" rel="noopener">nvidia.cn/geforce/graphics-cards/50-series</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-31-gpu-rubin.html">同日｜Rubin / 显卡一线</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1（掉电与生产环）</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
