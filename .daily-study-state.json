@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 0,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -95,6 +95,13 @@
       "source": "pc",
       "topic": "12V-2×6 之后：ATX 3.1 / PCIe 5.1 配件如何决定 600W 级 GPU 能不能活",
       "file": "posts/daily-2026-08-31-pc-atx31.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "rl agent",
+      "source": "rotation",
+      "topic": "SUPO：把总结训练进策略的 summarization-augmented MDP（Theorem 3.2 梯度分解 / rollout 组 advantage / overlong mask）",
+      "file": "posts/daily-2026-08-31-supo.html"
     }
   ]
 }

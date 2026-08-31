@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜SUPO：把「写总结」训练进策略，让 RL 突破上下文墙 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜SUPO：把「写总结」训练进策略，让多轮 RL 突破上下文墙</h1>
+    <p class="post-meta">2026-08-31 · 收藏夹：RL / Agent · 领域轮更（rl）<br />
+      论文：Lu et al.（ByteDance Seed / Stanford / CMU），arXiv 2025 年 10 月，ACL 2026 长文正式发表 ·
+      <a href="https://arxiv.org/abs/2510.06727" target="_blank" rel="noopener">arXiv:2510.06727</a> ·
+      <a href="https://aclanthology.org/2026.acl-long.966/" target="_blank" rel="noopener">ACL Anthology 2026.acl-long.966</a></p>
+
+    <h2>背景与动机</h2>
+    <p>
+      多轮 agentic RL 有一堵绕不开的墙：<strong>上下文长度</strong>。长 horizon 任务里 agent 要调几十甚至上百轮工具，
+      上下文（prompt + 模型输出 + 工具观测）一路膨胀，带来三重困难（论文 §1）：
+    </p>
+    <ul>
+      <li><strong>指令遵循退化</strong>：模型在超长上下文里推理和遵循指令的能力明显下降，长任务里连「生成成功 rollout」都变难；</li>
+      <li><strong>rollout 成本失控</strong>：上下文越长采样越慢，长 horizon 任务里 rollout 时间成为 RL 管线的瓶颈；</li>
+      <li><strong>硬性上限</strong>：最本质的一条——任务所需工具轮数超过模型工作上下文能装下的量时，RL 连训练都无法进行。</li>
+    </ul>
+    <p>
+      昨天的 <a href="daily-2026-08-31-harness-tito.html">TITO 笔记</a>讲的是 <strong>harness 侧</strong>的上下文保真（部署时别让框架改写 token），
+      <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3 笔记</a>里 SAO + compaction 是工业界的工程化处理。
+      本篇的 SUPO 回答的是更尖锐的一层问题：<strong>能不能把「何时总结、总结什么、丢什么」本身变成 RL 优化的对象，端到端训出来？</strong>
+      答案是肯定的，而且关键在于一个干净的理论构造：summarization-augmented MDP。
+    </p>
+
+    <h2>核心概念：summarization-augmented MDP</h2>
+    <p>标准的多轮工具调用 RL（ReAct 式 MDP）里，状态转移就是「往上下文后面追加」：<code>s_{t+1} = (s_t, a_t, o_t)</code>。SUPO 在 MDP 的状态转移里直接加入一个总结阈值 <code>L</code>：</p>
+    <pre><code>每步 t：
+  a_t ~ π_θ(·|s_t)                       # 策略生成动作（思考 + 工具调用）
+  if 上下文中不含总结指令 and |(s_t,a_t,o_t)| &lt; L:
+      s_{t+1} = (s_t, a_t, o_t)          # 正常追加
+  elif 上下文中不含总结指令 and 长度 ≥ L:
+      s_{t+1} = (s_t, a_t, o_t, v_sum)   # 追加「总结指令」，触发模型写总结
+  else:                                  # 上一步刚触发了总结
+      s_{t+1} = (s_1, a_t)               # 状态重置为「初始 prompt + 总结」</code></pre>
+    <ul>
+      <li><strong>总结是策略的一部分</strong>：触发总结后生成的 <code>a_{t+1}</code>（那份摘要）是从 π_θ 采样的动作，<strong>和工具调用一样接受梯度</strong>——不是外挂的规则模块；</li>
+      <li><strong>上下文有硬上界</strong>（Proposition 3.1）：工作上下文 ≤ <code>L + 2L_A + L_O + |v_sum|</code>，不再随 horizon 无界增长；</li>
+      <li><strong>有效上下文 = L × (S+1)</strong>：最多 S 次总结，把可训练的 horizon 扩展为工作窗口的 S+1 倍。实验里 CodeGym 用 4K 工作窗口 × S=7 达到 32K 有效上下文，BrowseComp-Plus 用 64K × S=2 达到 192K；</li>
+      <li>终止条件加了一条：总结次数达到 S 也停止。</li>
+    </ul>
+
+    <h2>技术要点</h2>
+
+    <h3>1. Theorem 3.2：梯度分解让现有 RL 设施即插即用</h3>
+    <p>
+      论文的核心理论结果：在 summarization-augmented MDP 下，一条长 rollout 的 policy gradient <strong>恰好分解为 I+1 条「完整子轨迹」的梯度之和</strong>。
+      每个子轨迹的形状是：
+    </p>
+    <pre><code>[ 初始 prompt s_1 ][ 上一段轨迹的总结 ][ 本段的 (动作, 观测)×若干轮 ][ v_sum ][ 本段总结 ]</code></pre>
+    <p>
+      每条这样的子轨迹<strong>在形式上和普通多轮工具调用轨迹完全一样</strong>——verl 这类现有 RL 基础设施不需要改动，
+      把一条 rollout 拆成 I+1 条轨迹丢进去算梯度即可。这是理论与工程咬合得最漂亮的地方：
+      上下文管理没有引入任何需要新算子/新管线的梯度结构。
+    </p>
+
+    <h3>2. SUPO 目标函数的三个关键设计</h3>
+    <pre><code>J_SUPO = E[ Σ_j Σ_i Σ_t Σ_l  min(ρ·Â_j, Clip(ρ, 1−ε_low, 1+ε_high)·Â_j) · 1{T^j ≤ H, I^j ≤ S} ]
+
+ρ   = token 级重要性采样比（π_θ / π_old），非对称 clip：ε_high=0.28, ε_low=0.20
+Â_j = (R_j − mean{R})/std{R}   ← 在「rollout 组」（G=8 条同题 rollout）内算，
+                                  同一 rollout 的 I+1 条子轨迹共享同一个 Â_j
+1{·} = overlong mask：没在 H 步 / S 次总结内给出最终答案的 rollout 整体屏蔽</code></pre>
+    <table>
+      <thead><tr><th>设计</th><th>做法</th><th>为什么（论文消融证据）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>轨迹管理</strong></td>
+          <td>一条 rollout 拆成 I+1 条轨迹进 RL 设施；batch 内轨迹总数 N 用全零 mask 的 dummy 轨迹 padding 到 mini-batch 的倍数</td>
+          <td>纯工程兼容层，不影响梯度</td>
+        </tr>
+        <tr>
+          <td><strong>advantage 按 rollout 组算</strong></td>
+          <td>子轨迹不各自分组，整条 rollout 共享同一个组相对 advantage</td>
+          <td>若改在「轨迹组」内算（并发工作 WebResearcher 的做法），长而成功的 rollout 里 reward=1 的条目变多、组均值被抬高，<strong>长轨迹的 advantage 反而被稀释</strong>；消融中一致更差</td>
+        </tr>
+        <tr>
+          <td><strong>overlong masking</strong></td>
+          <td>超步数/超总结次数的 rollout 整体不计梯度</td>
+          <td>去掉后目标函数会偏向「压制长 rollout」，哪怕它们总结了正确的策略；消融中<strong>总结模式直接崩溃</strong>——rollout 越来越倾向于在单条轨迹内草草收尾，条件成功率掉到 0</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      还有一个容易被忽略的实现细节：检测到超长后，<strong>丢弃最后一个 action-observation 对</strong>再触发总结。
+      因为工具观测可能极长（<code>L_O</code> 失控），丢弃后轨迹长度被控制在 <code>L + |v_sum| + L_A</code> 以内，
+      保证总结本身不会被训练上下文截断。训练超参：GRPO 风格、无 entropy/KL loss、lr 1e-6 恒定、H=100、总结阈值取工作窗口的 95%。
+    </p>
+
+    <h3>3. 实验与结果</h3>
+    <table>
+      <thead><tr><th></th><th>CodeGym（合成多轮函数调用）</th><th>BrowseComp-Plus（检索问答）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>基座</strong></td><td>Qwen2.5-32B-Instruct</td><td>Seed-OSS-36B-Instruct</td></tr>
+        <tr><td><strong>数据</strong></td><td>12,800 训练题 / 128 评测题（不同种子题、更多轮数）</td><td>830 题中 730 训 / 100 测（作者声明仅为方法演示，不与公开榜单比分）</td></tr>
+        <tr><td><strong>GRPO 基线</strong></td><td>32K 工作上下文</td><td>64K 工作上下文</td></tr>
+        <tr><td><strong>SUPO 配置</strong></td><td>4K 窗口 × (S=7) = 32K 有效</td><td>64K 窗口 × (S=2) = 192K 有效</td></tr>
+        <tr><td><strong>结果</strong></td><td>同等有效上下文下成功率 <strong>+3.2%</strong>（绝对值）</td><td><strong>+14.0%</strong>（绝对值），达到 53%（各配置最高）</td></tr>
+      </tbody>
+    </table>
+    <p>三个值得记住的后续发现：</p>
+    <ul>
+      <li><strong>测试时可继续扩展总结轮数</strong>：训练时 S=2，评测时把上限放大到 S′∈{1,2,5,11,23}，SUPO 训练的模型准确率随总结轮数持续提升并收敛到 <strong>60.0%</strong>——「总结策略」作为一种可迁移能力被学会了，而不是过拟合到训练的 S；</li>
+      <li><strong>工具调用量最高涨到 GRPO 的 3×</strong>，且 GRPO 基线的工具调用随训练下降（上下文快满了只能少调）；</li>
+      <li><strong>学到的总结行为有实质内容</strong>：CodeGym 里学会记录「当前正在比较数组的哪个下标」（没有这个信息下一段轨迹无法续算）；BrowseComp-Plus 里学会把关键文章（id 18432）里的三个关键人名保留进总结——训练前只记「比较次数」这类不够续命的表层信息。</li>
+    </ul>
+
+    <h3>4. 生态位：与记忆类方法的边界</h3>
+    <p>
+      用 RL 学「记什么」的工作还有 MemAgent（分段读长文 + 覆盖式工作记忆，可视为 SUPO 框架退化为「读输入」的特例）、
+      MEM1（定长内部状态，但训练时仍拼接全历史，能否突破可靠上下文未知）、Memory-R1（双 agent 外部记忆库，不做压缩）。
+      SUPO 的差异点：<strong>压缩行为本身在策略里、且训练 horizon 明确突破固定窗口</strong>。
+      产业侧的呼应是 <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3</a> 的 SAO + compaction——大厂已经把「训练期上下文管理」当成后训练栈的标准组件。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>什么时候需要 SUPO 式方案</strong>：任务的工具轮数 × 单轮 token 数逼近工作窗口时。在此之前，普通多轮 GRPO + 较大上下文更简单；SUPO 的价值在「窗口装不下整条轨迹」之后才显现。</li>
+      <li><strong>两个超参决定成败</strong>：总结阈值 L（论文取窗口的 95%——留出写总结的余量，且要丢最后一对 action-observation 防观测爆长）和最大总结数 S。S 宁小勿大：测试时可以再放大（S′&gt;S 仍有增益），训练时 S 大则 rollout 成本高。</li>
+      <li><strong>overlong mask 别省略</strong>：它是防止「总结模式崩溃」的关键。自己实现时，把「未在预算内给出最终答案」的 rollout 整体置零梯度，而不是给负分。</li>
+      <li><strong>advantage 归属要想清楚</strong>：一条 rollout 的多段子轨迹共享同一个 rollout 组 advantage；把子轨迹当作独立样本分组会系统性惩罚长轨迹。</li>
+      <li><strong>与 harness 笔记联读</strong>：训练侧（SUPO）决定模型「会不会总结」，部署侧（<a href="daily-2026-08-31-harness-tito.html">TITO</a>）决定 harness「有没有忠实传递 token」。两侧任何一个失守，长 horizon 能力都会在另一端的指标上消失。</li>
+      <li><strong>评测口径</strong>：作者在 BrowseComp-Plus 上只用 730/100 的切分做方法演示、明确不与公开分比。复现时应保持这个克制——训练集来自评测分布是污染风险，结论表述限于「相对 GRPO 基线的提升」。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        把「写总结」建模为策略的一个动作（augmented MDP 的状态转移），与「外挂一个独立总结器」相比，本质区别是什么？为什么前者是端到端 RL 的前提？
+        <details><summary>参考答案</summary>
+        外挂总结器（规则触发 + 固定 prompt 的外部模块）不在梯度路径上：任务失败时，RL 无法区分是「工具用得差」还是「总结丢了关键信息」，credit assignment 到不了总结行为。SUPO 把总结写进状态转移——触发总结后生成的摘要是从 π_θ 采样的动作，与工具调用共享同一个最终 reward 和 advantage。于是一条失败轨迹的负 advantage 会同时压低「差劲的总结」和「差劲的工具调用」，模型被迫学会「为了后续成功，此刻该保留什么」。这也是论文里训练前后总结质量差异（数组下标、关键人名）能被 RL 直接塑造的原因。</details>
+      </li>
+      <li>
+        Theorem 3.2 把长 rollout 的梯度分解为 I+1 条子轨迹的梯度之和。这个分解在工程上到底买到了什么？
+        <details><summary>参考答案</summary>
+        买到了「零新设施」。每段子轨迹形如「初始 prompt + 上段总结 + 若干轮 (动作, 观测) + 总结指令 + 本段总结」，在形式上与 vanilla 多轮工具调用轨迹完全一致——verl 等现有 GRPO 设施不需要知道「上下文管理」的存在，照常算 token 级 logprob、ratio、clip 即可。梯度语义（跨总结的整条 rollout 优化）由「怎么拆轨迹 + 怎么共享 advantage + 怎么 mask」这三个数据侧操作承载，而不是改 loss 或改 attention。这也是它与 MEM1 的分野：MEM1 训练时仍要拼接全部历史加注意力 mask，上下文墙只是被推迟；SUPO 的每段子轨迹物理上就是短的，训练 horizon 真正突破了窗口。</details>
+      </li>
+      <li>
+        为什么 advantage 要在「rollout 组」内算，而不是把每条子轨迹当独立样本在「轨迹组」内算？
+        <details><summary>参考答案</summary>
+        轨迹组算法会把同一 rollout 的 I+1 条子轨迹视为 I+1 个独立样本参与 mean/std 归一化。一条成功的长 rollout（触发多次总结）会往组里贡献多个 reward=1 的条目，组均值被这些「重复成功」抬高，于是这条长 rollout 的相对 advantage 被稀释——越长的成功轨迹越得不到应有的强化，训练偏向「短平快」轨迹，与用总结扩展 horizon 的目标自相矛盾。rollout 组算法中，一条 rollout 无论拆成几段都只贡献一个 R_j 到归一化统计，长轨迹的成功被完整奖励。消融结果一致支持 rollout 组方案，且测试时总结轮数扩展的性能也更好。</details>
+      </li>
+      <li>
+        去掉 overlong masking 后为什么会「总结模式崩溃」？写出目标函数层面的机制链条。
+        <details><summary>参考答案</summary>
+        没有 mask 时，超过 H 步或 S 次总结仍未给出答案的 rollout 也带着 reward=0 参与梯度。注意这类 rollout 恰恰是「触发了总结、但还没做完」的长轨迹——它们的共同特征是包含总结行为。负 advantage 无差别地压-low 这些轨迹里的所有 token，包括总结 token：策略学到的是「写总结 → 0 分」的相关性，而非「总结得好但任务太难」。于是策略回避触发总结，越来越倾向在单条轨迹内草草收尾；总结率下降 → 长任务更做不完 → 条件成功率掉到 0，正反馈崩溃。mask 的作用是把「超出预算」从奖励信号里剔除——失败归因为预算约束而非策略行为，总结模式得以存活。这与 GRPO 里跳过 degenerate 组（全对全错无信号）是同一种「别奖励无信息样本」的直觉。</details>
+      </li>
+      <li>
+        测试时把总结轮数从训练的 S=2 扩展到 S′=23 仍能提升准确率（收敛到 60.0%），这说明了 SUPO 学到的什么性质？这个外推的边界可能在哪里？
+        <details><summary>参考答案</summary>
+        说明模型学到的不是「在恰好 2 次总结内解题」的过拟合流程，而是一个可迁移的元能力：<strong>给定当前总结 + 新观测，决定保留/丢弃什么</strong>。这个能力对总结次数是可组合的，因此更多轮数 ≈ 更长有效上下文 ≈ 能解更难的题——总结轮数成了一种 test-time compute 旋钮。边界大致在三处：① 误差累积——每段总结都有损，S′ 很大时早期关键信息被逐段稀释的概率上升，论文曲线上 60.0% 已是收敛平台而非继续线性涨；② 分布漂移——训练只见过 ≤2 次总结的状态分布，第 20 次总结时「总结的总结」嵌套深度超出训练分布，质量退化；③ 奖励与成本——更多轮数意味着更多工具调用与 token 成本，任务收益边际递减。工程含义：训练用小 S 控成本，部署按任务难度调 S′，但把 S′ 的上限设在准确率平台出现之前。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Lu et al. <em>Beyond the Context Window: Scaling Agentic RL via End-to-end Optimized Context Compression</em>（SUPO）：<a href="https://arxiv.org/abs/2510.06727" target="_blank" rel="noopener">arXiv:2510.06727</a> · <a href="https://aclanthology.org/2026.acl-long.966/" target="_blank" rel="noopener">ACL 2026 正式版（页 21074–21125）</a></li>
+      <li>实验环境：CodeGym（<a href="https://arxiv.org/abs/2509.17325" target="_blank" rel="noopener">arXiv:2509.17325</a>）· BrowseComp-Plus（<a href="https://arxiv.org/abs/2508.06600" target="_blank" rel="noopener">arXiv:2508.06600</a>）</li>
+      <li>上下文（综述视角）：<a href="https://www.preprints.org/manuscript/202607.0924" target="_blank" rel="noopener">Context Compression for Long-Horizon AI Agents</a>（2026 综述，含 SUPO / Mem1 / Context-Folding 谱系图）</li>
+      <li>相关笔记：<a href="daily-2026-08-31-harness-tito.html">TITO：多轮 Agent Harness 的 token 保真</a> · <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3：SAO + compaction 的工业实践</a> · <a href="daily-2026-08-31-algo-gspo.html">GSPO：序列级重要性采样</a> · <a href="grpo-notes.html">GRPO 微调实践笔记</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
