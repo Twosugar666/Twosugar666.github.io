@@ -1,1 +1,193 @@
-FILE:///workspace/out-2026-08-31/daily-2026-08-31-algo-gspo.html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜GSPO：序列级重要性采样如何稳住 MoE 上的 RL · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜GSPO：序列级重要性采样如何稳住 MoE 上的 RL</h1>
+    <p class="post-meta">2026-08-31 · 收藏夹：算法 / RL · 学习笔记<br />
+      主来源：
+      <a href="https://qwenlm.github.io/blog/gspo/" target="_blank" rel="noopener">Qwen · GSPO: Towards Scalable Reinforcement Learning for Language Models</a>、
+      <a href="https://arxiv.org/abs/2507.18071" target="_blank" rel="noopener">arXiv:2507.18071</a>（Zheng et al.）；
+      对照
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="rl-10-papers-series.html">10 篇导读</a>、
+      <a href="daily-2026-08-31-miles-v01.html">Miles · R3</a>。
+      公式用 <code>pre</code> 书写；实验现象以官方博客为准，不引用二手曲线数值。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 把 trust region 写成 clipped surrogate；
+      <a href="grpo-notes.html">GRPO</a> 删掉 critic，用同题一组相对 reward 当 advantage，但 <strong>importance ratio 仍停在 token 级</strong>。
+      Qwen 团队观察到：长训里 GRPO 会出现严重不稳甚至不可逆 collapse，挡住「加算力就继续涨」的 RL scaling。
+      他们把根因指向一个单位错配——<strong>token-level 的 importance ratio</strong> 去乘 <strong>sequence-level 的 reward / advantage</strong>——高方差噪声被写进每一步更新。
+    </p>
+    <p>
+      <strong>Group Sequence Policy Optimization（GSPO）</strong> 的回答很硬：重要性比率按序列似然定义，clip / 优化也整段做；组内相对 advantage 保留。
+      官方报告三点收益：更高训练效率且能随算力持续涨点；训练过程显著更稳，并从根上缓解大型 MoE 的 RL 稳定难题；对精度误差更宽容，利于简化基建。
+      这些被用作最新 Qwen3（Instruct / Coder / Thinking）大规模 RL 的算法基石。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：GSPO = 组内相对 advantage（GRPO 的 A） + 序列级 length-normalized importance ratio（把 PPO/GRPO 的 token 级 r 升一级） + 对整条 response 做 clip。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 单位错配：为什么 token 级 ratio × 序列级 reward 会噪</h3>
+    <p>
+      Outcome reward 通常一条 response 一个标量；GRPO 的 Â_i 也是按整段算的。
+      但 GRPO / PPO-Clip 在 LLM 里的常见实现是：每个生成 token 一个
+      <code>r_t = π_θ(y_t|…)/π_old(y_t|…)</code>，再进 <code>min(r_t Â, clip(r_t) Â)</code>。
+      同一条 Â 被复制到成百上千个 token 上，而每个 r_t 又在自己的数值尺度上抖——优化信号在「整段好坏」与「局部概率比」之间错位，长训里表现为不稳定甚至 collapse（官方观察）。
+    </p>
+    <pre><code># GRPO 常见形态（示意）：序列级 A，token 级 r
+for t in response:
+  r_t = exp(logπ_θ(y_t|x,y_&lt;t) - logπ_old(y_t|x,y_&lt;t))
+  loss += min(r_t * A_i, clip(r_t, 1-ε, 1+ε) * A_i)
+# A_i 来自同题一组 reward 的相对值——与 r_t 的「单位」不一致</code></pre>
+
+    <h3>② 目标：序列级 s_i(θ) 与整段 clip</h3>
+    <p>设 x 为 query，π_θold 采样一组响应 {y_i}，Â_i 为组内相对 advantage，π_θ 为待优化策略。GSPO 目标（官方形式）：</p>
+    <pre><code>J_GSPO(θ) = E_{x~D, {y_i}~π_old} [
+  (1/G) * sum_i  min(  s_i(θ) * A_hat_i ,
+                       clip(s_i(θ), 1-ε, 1+ε) * A_hat_i )  ]
+]
+
+# 序列级 importance ratio（length-normalized）
+s_i(θ) = ( π_θ(y_i|x) / π_old(y_i|x) ) ^ (1/|y_i|)
+       = exp(  mean_t  log( π_θ(y_{i,t}|x,y_{i,&lt;t})
+                           / π_old(y_{i,t}|x,y_{i,&lt;t}) )  )
+
+# 即：先对 token log-ratio 取平均，再 exp —— 降方差，并统一 s 的数值范围</code></pre>
+    <p>
+      与 PPO 相同的是 clipped surrogate 外形；与 GRPO 相同的是组内 Â。
+      不同的是：<strong>clip 的对象是整条 response 的一个 s_i</strong>，不再是逐 token 的 r_t。
+      长度归一化（1/|y|）避免长回答的联合比乘性地炸数值，也让不同长度的 s 落在可比尺度上。
+    </p>
+
+    <h3>③ 对 GRPO：clip 掉更多 token，却更高效（官方观察）</h3>
+    <p>
+      官方对比冷启动自 Qwen3-30B-A3B-Base 的模型，在训练 reward 与 AIME&#39;24 / LiveCodeBench / CodeForces 等曲线上，GSPO 相对 GRPO 训练效率更高，并能通过加训算力、更新 query 集、拉长生成持续涨点。
+      一个反直觉现象：<strong>GSPO 被 clip 掉的 token 比例比 GRPO 高约两个数量级，却仍更高效</strong>。
+      解读：GRPO 的 token 级目标大量「未触界」更新其实是噪声；GSPO 用更稀、但与序列奖励同构的信号，宁可 clip 得多，也不用局部 ratio 噪声去推参数。
+    </p>
+    <table>
+      <thead><tr><th></th><th>GRPO（典型）</th><th>GSPO</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Advantage</strong></td><td>组内相对</td><td>组内相对（同）</td></tr>
+        <tr><td><strong>Importance ratio</strong></td><td>token 级 r_t</td><td>序列级 s_i（length-normalized）</td></tr>
+        <tr><td><strong>Clip 粒度</strong></td><td>每 token</td><td>整条 response</td></tr>
+        <tr><td><strong>官方效率观察</strong></td><td>基线；长训易不稳</td><td>同算力更高；可持续 scaling</td></tr>
+        <tr><td><strong>Clip 比例</strong></td><td>相对低</td><td>高约两个数量级，却仍更高效</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ MoE：摆脱 Routing Replay 依赖</h3>
+    <p>
+      官方指出：GRPO 训 MoE 时，expert 激活的波动会阻止正常收敛；此前需要 <strong>Routing Replay</strong>——缓存 π_old 激活的 expert，在 π_θ 算 importance ratio 时回放。
+      该策略对收敛关键，但引入额外内存与通信，并可能限制 MoE 真实容量。
+    </p>
+    <p>
+      GSPO 的关键洞察：优化只看序列似然 π_θ(y|x)，对单个 token 似然 π_θ(y_t|…) 不敏感，因此<strong>不再依赖 Routing Replay</strong>。
+      与 <a href="daily-2026-08-31-miles-v01.html">Miles 的 R3</a> 对照：
+    </p>
+    <table>
+      <thead><tr><th></th><th>Miles R3</th><th>GSPO</th></tr></thead>
+      <tbody>
+        <tr><td><strong>层面</strong></td><td>基建：回放 SGLang 路由</td><td>算法：改 IS 粒度</td></tr>
+        <tr><td><strong>仍用 token-level IS 时</strong></td><td>常必要</td><td>—</td></tr>
+        <tr><td><strong>改用序列级 IS 时</strong></td><td>可不再依赖</td><td>设计目标之一</td></tr>
+      </tbody>
+    </table>
+    <p>
+      两篇不要读成互斥：平台可以同时提供 R3；算法选型到 GSPO 后，应明确是否关闭 Replay，以免双重开销。
+    </p>
+
+    <h3>⑤ 基建友好：推理引擎 logprob 与训推分离</h3>
+    <p>
+      序列似然比逐 token 似然更能容忍精度差。官方因此强调：GSPO 使<strong>直接用推理引擎返回的 likelihood 做优化</strong>成为可能，而不必强制训练引擎重算——这对 partial rollout、多轮 RL、训推分离框架尤其有利。
+      结合同日 <a href="daily-2026-08-31-harness-tito.html">TITO</a>：序列级目标降低了对「每个 token 数值绝对一致」的苛刻度，但<strong>不</strong>自动允许 harness 乱改 token 串；TITO 仍决定「似然是对哪一条 y 算的」。
+    </p>
+    <p>
+      工程落地：Unsloth / ms-swift 等框架提供
+      <code>importance_sampling_level=sequence</code>（或同名配置）以切换到序列级 IS——接 GSPO 思想时优先确认该开关与 clip 作用在 s_i 而非 r_t。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先对齐「A 的粒度」与「r 的粒度」。</strong> Outcome-only + 组内 Â → 优先序列级 s_i。逐步 PRM / 稠密过程奖励 → token 级 PPO/GRPO 仍可能更同构。混用是噪声源，不是「更精细」。</li>
+      <li><strong>MoE 上把 Routing Replay 当成 GRPO 的补丁，不是永久架构。</strong> 若主损失已是 GSPO，做一次关 Replay 的对照；省下的内存/通信应记进实验收益，而不是默认双开。</li>
+      <li><strong>ε 的数量级会随粒度变。</strong> Token 级常用 ~0.2；序列级 length-normalized 的 s 更接近 1，官方博客强调的是形式而非让读者照搬某一 ε。调参时看 clip fraction 与序列 KL，而不是照抄 token 级默认。</li>
+      <li><strong>训推分离时优先验证「推理 logprob → 序列 s_i」路径。</strong> 能稳住再考虑训练引擎重算。重算解决的是数值合同；解决不了错误 y（那是 TITO 的活）。</li>
+      <li><strong>框架开关。</strong> 在 Unsloth / ms-swift 将 <code>importance_sampling_level</code> 设为 <code>sequence</code>，并确认 advantage 仍来自组内相对、clip 包裹的是序列比。</li>
+      <li><strong>与站内其它文的阅读顺序。</strong> <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 弄清 clip → <a href="grpo-notes.html">GRPO</a> 弄清组内 A → 本文升 r 的粒度 → <a href="daily-2026-08-31-miles-v01.html">Miles</a> 看 R3 基建对照 → <a href="rl-10-papers-series.html">10 篇导读</a> 看 GSPO 在系列中的位置。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说 GRPO 的「token 级 r × 序列级 A」是单位错配？若奖励改成逐步 PRM，这个批评还成立吗？
+        <details><summary>参考答案</summary>
+        Outcome / 组内 Â 描述的是整段 y 相对同题其它样本好多少，却被用来缩放每个 token 的局部概率比，梯度把「整段信用」按局部 r_t 的噪声纹理分配。逐步 PRM 提供 token/span 级奖励时，token 级 r 与逐步 A 更同构，错配批评减弱；此时 GSPO 不是自动更优，而是要重新论证。算法选择应由奖励的时间粒度决定。</details>
+      </li>
+      <li>
+        s_i = exp(mean_t log ratio_t) 相对「先乘再开 |y| 次方」在实现上要注意什么？为何要长度归一化？
+        <details><summary>参考答案</summary>
+        数学上 (Π ratio_t)^(1/|y|) = exp(mean log ratio_t)，应用 log-sum 避免 underflow。长度归一化把不同 |y| 的联合比拉回相近尺度，降低长回答方差、统一 clip 数值范围。实现上应对 mask 后的生成 token 做 mean，把 prompt / tool 旁路排除在外。</details>
+      </li>
+      <li>
+        官方观察「GSPO clip 掉的 token 比例高两个数量级仍更高效」。这如何反驳「clip 越少学得越多」的直觉？
+        <details><summary>参考答案</summary>
+        Clip 比例衡量的是「有多少位置的更新被封顶」，不是「有效学习信号的多少」。Token 级目标大量未触界更新可能是高方差噪声；序列级目标每次更新都对准整段 A，触界更频繁但方向更干净。效率来自信号质量，不是来自未 clip token 的计数。</details>
+      </li>
+      <li>
+        为何 GSPO 能削弱对 Routing Replay 的需求，而 Miles 仍要为 token-level 栈提供 R3？一个训 MoE 的团队如何二选一或组合？
+        <details><summary>参考答案</summary>
+        Routing Replay / R3 修复的是 token 级 IS 对路由 flip 的敏感；GSPO 不依赖逐 token 似然对齐，故可关 Replay。若团队损失仍是 GRPO token 级，应开 R3/Replay；若已切 GSPO，应关 Replay 做对照以省资源。组合仅在「主损失序列级、辅损失 token 级」时有意义，并需分别论证。</details>
+      </li>
+      <li>
+        「直接用推理引擎 logprob 优化」怎样简化 partial rollout / 多轮 / 训推分离？它能否替代 TITO？
+        <details><summary>参考答案</summary>
+        免去训练引擎对同一 y 再前向，降低显存与调度耦合，partial / 多轮里尤其值钱。它替代的是「重算合同」，不是「y 是哪一条」的合同：若 harness re-tokenize 改了 ID，推理 logprob 再准也是对错误串取数。GSPO 提高对精度差的容忍，TITO 保证串的身份——两者叠用，而不是互相取消。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Qwen 博客 · GSPO：
+        <a href="https://qwenlm.github.io/blog/gspo/" target="_blank" rel="noopener">qwenlm.github.io/blog/gspo</a></li>
+      <li>Zheng et al. <em>Group Sequence Policy Optimization</em>：
+        <a href="https://arxiv.org/abs/2507.18071" target="_blank" rel="noopener">arXiv:2507.18071</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="rl-10-papers-series.html">10 篇导读</a> ·
+        <a href="rl-10-papers-detailed.html">10 篇详解</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1（R3）</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
