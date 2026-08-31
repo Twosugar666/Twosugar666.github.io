@@ -1,1 +1,100 @@
-PLACEHOLDER_LOAD_FROM_DISK_3
+{
+  "rotation": [
+    "rl",
+    "agent",
+    "infra",
+    "gpu",
+    "pc"
+  ],
+  "next": 0,
+  "daily_streams": [
+    "frontline",
+    "harness",
+    "algo"
+  ],
+  "history": [
+    {
+      "date": "2026-08-13",
+      "domain": "rl",
+      "topic": "过程奖励模型（PRM）：PRM800K / Math-Shepherd / OmegaPRM 自动过程监督",
+      "file": "posts/daily-2026-08-13-prm.html"
+    },
+    {
+      "date": "2026-08-14",
+      "domain": "agent infra",
+      "source": "frontline",
+      "topic": "DeepSeek Harness（dsh）：一切皆插件的 Agent 运行时底座",
+      "file": "posts/daily-2026-08-14-deepseek-harness.html"
+    },
+    {
+      "date": "2026-08-26",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "IBM Granite 4.2：开源推理模型家族与真实环境 Agentic RL 训练管线（异步 GRPO + TIS）",
+      "file": "posts/daily-2026-08-26-granite-4-2.html"
+    },
+    {
+      "date": "2026-08-27",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "特别篇：2026 新模型全景——十五个新旗舰的架构与训练方法拆解",
+      "file": "posts/special-2026-08-27-new-models-arch.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "agent rl harness",
+      "source": "frontline",
+      "topic": "Microsoft Agent Lightning v1.0：Harnessed Agentic RL（LLM endpoint proxy / ~3500 LOC / SWE-bench）",
+      "file": "posts/daily-2026-08-28-agent-lightning-v1.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "base infra agent",
+      "source": "base",
+      "topic": "腾讯混元 Hy4 preview：770B-A49B 开源旗舰基座（MoE / Gated DSA / iHC / MTP / 1M）",
+      "file": "posts/daily-2026-08-28-base-hy4.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "GLM-5.3 / GLM-5.3-Flash：同一基座全靠后训练，环境规模化方法论与混合注意力效率款",
+      "file": "posts/daily-2026-08-28-glm-5-3.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "Miles v0.1：生产级 LLM RL 后训练全栈（SGLang + Megatron + 全异步）",
+      "file": "posts/daily-2026-08-31-miles-v01.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "TITO：多轮 Agent Harness 里 Token-In-Token-Out 为什么决定 RL",
+      "file": "posts/daily-2026-08-31-harness-tito.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "GSPO：序列级重要性采样如何稳住 MoE 上的 RL",
+      "file": "posts/daily-2026-08-31-algo-gspo.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "gpu infra",
+      "source": "gpu",
+      "topic": "NVIDIA Rubin：Agentic 推理把数据中心改写成一台计算机（HBM4 / NVFP4 / NVLink 6 / NVL72）",
+      "file": "posts/daily-2026-08-31-gpu-rubin.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "pc gpu",
+      "source": "pc",
+      "topic": "12V-2×6 之后：ATX 3.1 / PCIe 5.1 配件如何决定 600W 级 GPU 能不能活",
+      "file": "posts/daily-2026-08-31-pc-atx31.html"
+    }
+  ]
+}
