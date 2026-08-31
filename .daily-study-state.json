@@ -1,7 +1,17 @@
 {
-  "rotation": ["rl", "agent", "infra", "gpu", "pc"],
-  "next": 2,
-  "daily_streams": ["frontline", "harness", "algo"],
+  "rotation": [
+    "rl",
+    "agent",
+    "infra",
+    "gpu",
+    "pc"
+  ],
+  "next": 3,
+  "daily_streams": [
+    "frontline",
+    "harness",
+    "algo"
+  ],
   "history": [
     {
       "date": "2026-08-13",
@@ -50,6 +60,27 @@
       "source": "frontline",
       "topic": "GLM-5.3 / GLM-5.3-Flash：同一基座全靠后训练，环境规模化方法论与混合注意力效率款",
       "file": "posts/daily-2026-08-28-glm-5-3.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "Miles v0.1：生产级 LLM RL 后训练全栈（SGLang + Megatron + 全异步）",
+      "file": "posts/daily-2026-08-31-miles-v01.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "TITO：多轮 Agent Harness 里 Token-In-Token-Out 为什么决定 RL",
+      "file": "posts/daily-2026-08-31-harness-tito.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "GSPO：序列级重要性采样如何稳住 MoE 上的 RL",
+      "file": "posts/daily-2026-08-31-algo-gspo.html"
     }
   ]
 }
