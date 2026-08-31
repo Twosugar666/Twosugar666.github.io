@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜TITO：多轮 Agent Harness 里 Token-In-Token-Out 为什么决定 RL · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜TITO：多轮 Agent Harness 里 Token-In-Token-Out 为什么决定 RL</h1>
+    <p class="post-meta">2026-08-31 · 收藏夹：Harness / Agent / RL · 学习笔记<br />
+      主来源：
+      <a href="https://www.lmsys.org/blog/2026-08-18-miles-v0-1/" target="_blank" rel="noopener">LMSYS · Miles v0.1</a>
+      的 Token-In-Token-Out（TITO）节，以及系列文
+      <em>No Token Left Behind: Demystifying Token-In-Token-Out in Miles</em>；
+      对照站内
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning proxy</a>、
+      <a href="daily-2026-08-14-deepseek-harness.html">dsh</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>。
+      文中机制描述对齐官方表述；<strong>未给出的数字一律不编造</strong>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      多轮 Agent 的 RL 有一个安静但致命的裂缝：rollout 时模型真正条件于其上的 token 序列，与 trainer 事后「拼出来」的序列，经常不是同一条。
+      裂缝不来自 loss 写错，而来自 harness：message parsing、tool 执行、chat-template 重渲染——每一步都可能改 tokenization、剪掉历史 reasoning、把 tool call 再序列化成另一种表面形式。
+    </p>
+    <p>
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 专文</a>已经标过光谱：mini 的「轨迹 = messages」最干净；OpenHands / dsh 的事件流投影引入第一层破裂；带 subagent / handoff 的「每次调用独立构造 prompt」是第二层破裂。
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 用 proxy 解决的是「部署 harness 是否仍在环内」；它没有自动保证 decode 出来的 token 与下一轮 re-tokenize 后的 token 一致。
+      Miles 把这个问题提升为一等公民，命名为 <strong>Token-In-Token-Out（TITO）</strong>：trainer 必须看见引擎当时真正生成过的那些 token IDs。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：TITO 不是又一种 chat template，而是一条纪律——保留 rollout 引擎产出的精确 token IDs，只对新增消息 tokenize，再与 prefix 合并；非模型生成 token 做 loss-mask，并保留原始 rollout logprob。没有它，R3 / OPD / zero-KL 的「token 级精确」在多轮里无从谈起。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 裂缝从哪来：parsing / tool / re-render</h3>
+    <p>官方对失败模式的归纳可以直接当检查清单：</p>
+    <table>
+      <thead><tr><th>环节</th><th>harness 常做的事</th><th>对 token 的破坏</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Message parsing</strong></td>
+          <td>从模型输出切 thought / tool_call / final answer</td>
+          <td>边界字符被吃掉或补上；特殊 token 在往返中丢失</td>
+        </tr>
+        <tr>
+          <td><strong>Tool 执行</strong></td>
+          <td>把 tool result 写成下一条 role=tool / observation</td>
+          <td>观察是新文本；若整段历史被重新套 chat template，旧生成段也可能被重编</td>
+        </tr>
+        <tr>
+          <td><strong>Chat-template 重渲染</strong></td>
+          <td>每轮把 messages[] 再 render 成字符串再 tokenize</td>
+          <td>tokenization 漂移；历史 reasoning 被策略性剪掉；tool call 被 reserialize</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 错误但常见的多轮路径（概念）
+out_tokens = engine.generate(prefix_ids)           # 引擎真实条件于此
+text       = tokenizer.decode(out_tokens)
+msg        = harness.parse(text)                   # 可能改边界
+obs        = env.tool(msg.tool_call)
+messages.append(assistant=msg, tool=obs)
+# 下一轮：
+new_text   = chat_template.render(messages)        # 整段重渲染
+new_ids    = tokenizer.encode(new_text)            # ≠ 旧 prefix_ids + out_tokens
+# trainer 若用 new_ids 当「轨迹」，logprob / ratio 对齐的是另一条世界线</code></pre>
+    <p>
+      文本上看「上一轮是下一轮的前缀」往往仍成立；<strong>token 上不必成立</strong>。
+      这正是 harness 文里「独立构造 prompt」那一格对 GRPO 的杀伤：1 rollout ≠ 1 contiguous sample，advantage 与 mask 会按错误边界分配。
+    </p>
+
+    <h3>② TITO session server：保留精确 token IDs</h3>
+    <p>Miles 的做法（官方表述）可以拆成五条不变式：</p>
+    <ol>
+      <li>Session server <strong>保留</strong>引擎产出的精确 token IDs，而不是只存 decode 后的文本；</li>
+      <li>新 turn <strong>只 tokenize 新增消息</strong>（observation / 用户追加等），再与已有 prefix 合并；</li>
+      <li>完整轨迹被组装成<strong>一条 contiguous 训练 sample</strong>；</li>
+      <li>非模型生成的 token（模板、tool result、系统拼接）做 <strong>loss-mask</strong>；</li>
+      <li><strong>保留原始 rollout logprob</strong>，而不是在 train 引擎上默认重算当真理。</li>
+    </ol>
+    <pre><code># TITO 路径（概念，对齐 Miles 官方描述）
+session.prefix_ids = tokenize(system + user0)      # 初始前缀
+out_ids, logp = sglang.generate(session.prefix_ids)
+session.append_generated(out_ids, logp)            # 原样追加，不经 decode→encode
+
+obs_text = env.execute(parse(out_ids))
+obs_ids  = tokenize(chat_template.fragment(obs)) # 只编新片段
+session.append_observation(obs_ids)                # mask=0（不进 policy loss）
+
+# 结束：session.ids 是 contiguous sample
+# loss 只落在 append_generated 的位置；logp 用 rollout 当时的值
+# 对每个模型家族：CPU round-trip + 真实 SGLang GPU session 校验</code></pre>
+    <p>
+      官方强调：对每个模型家族，TITO 会经 CPU round-trip 测试与真实 SGLang GPU session 验证，以守住 R3、OPD、zero-KL 所需的 token 级精确性。
+      换言之，TITO 是这些「数值合同」的前置条件，不是可选项插件。
+    </p>
+
+    <h3>③ 为什么 R3 / OPD / zero-KL 必须 TITO</h3>
+    <table>
+      <thead><tr><th>配方</th><th>它对 token 对齐的要求</th><th>没有 TITO 时会怎样</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>R3</strong>（Rollout Routing Replay）</td>
+          <td>训练前向必须在<strong>同一 token 位置</strong>回放 rollout 的 expert 路由</td>
+          <td>位置错位 → 回放的路由对不上当前 token；MoE 的「修数值差」变成「修错位置」</td>
+        </tr>
+        <tr>
+          <td><strong>OPD</strong>（On-Policy Distillation）</td>
+          <td>teacher 要给<strong>学生真实采样过的 token</strong>打分（可稀疏 per-position）</td>
+          <td>teacher 分数打在 re-tokenize 后的另一串 ID 上，reverse-KL「奖励」指错对象</td>
+        </tr>
+        <tr>
+          <td><strong>Zero-KL Alignment</strong></td>
+          <td>目标是 rollout / train 的 logprob 差在支持配置下可为 0</td>
+          <td>输入 token 都对不齐，谈「算子级对齐到零」没有意义</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      三者共享前提：<strong>sample 的 token 串是 rollout 世界里的那一条</strong>。
+      算法可以讨论要不要重算 logprob；不能讨论「先允许 harness 改写 token，再假装 on-policy」。
+    </p>
+
+    <h3>④ 黑盒 harness：轨迹树与 loss 归一化</h3>
+    <p>
+      Miles 在 TITO 之上推进针对 <strong>Claude Code / Codex</strong> 一类黑盒 harness 的训练 recipe。
+      这类 harness 运行时会拉起 subagent、动态压缩上下文，单任务的轨迹条数事先未知。
+      官方路径：经 session server 记录<strong>完整轨迹树</strong>；训练侧对变化的 batch size 做 <strong>loss 归一化</strong>，保持梯度尺度一致。
+    </p>
+    <p>
+      这与 Lightning 的问题正交：Lightning 解决「调用是否仍经过部署 harness」；TITO 黑盒路径解决「即便 harness 不透明，也能把引擎侧 token 与树形轨迹收回来」。
+      一个团队可以 proxy 进环却仍在 re-render 上丢 token；也可以 TITO 收 token 却仍在用训练专用玩具 harness——生产级后训练通常两者都要。
+    </p>
+
+    <h3>⑤ 交叉对比：Lightning / dsh / OpenHands</h3>
+    <table>
+      <thead><tr><th></th><th>核心动作</th><th>对 token 前缀的态度</th><th>和 TITO 的关系</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="daily-2026-08-28-agent-lightning-v1.html"><strong>Lightning proxy</strong></a></td>
+          <td>部署 harness 几乎零改动，OpenAI 兼容客户端改指训练 Gateway</td>
+          <td>承认独立构造 prompt；用 sample adapter / 统计粒度回到 rollout</td>
+          <td>互补：proxy 保 harness 同一性；TITO 保 token 同一性</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-08-14-deepseek-harness.html"><strong>dsh</strong></a></td>
+          <td>一切皆插件；会话日志仅追加，prompt 是投影</td>
+          <td>事件流是真相，LLM 视图可换</td>
+          <td>投影规则必须版本化；若投影含 decode→encode，需要 TITO 式 ID 通道，不能只存文本 log</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-08-28-harness-runtime.html"><strong>OpenHands</strong></a></td>
+          <td>严格 Action→Observation；事件流 + condenser</td>
+          <td>摘要替换旧事件 → token 前缀主动打断</td>
+          <td>RL 时要么不用有损 condenser，要么接受分段 sample + 明确 mask；TITO 至少保住「未摘要段」的 ID 忠实</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先做 round-trip 校验，再开大规模 RL。</strong> 最小探针：固定一条多轮轨迹，比较「引擎生成 IDs」与「decode → messages → chat_template → encode」的 IDs。有任何 diff，就还没有资格谈 token-level ratio。Miles 对每个模型家族做 CPU + GPU session 校验，是同一纪律的工业化版本。</li>
+      <li><strong>何时必须 TITO。</strong> 多轮 + tool/reserialize；要上 R3 / OPD / zero-KL；黑盒 harness 带 subagent / 动态轨迹树；训推分离且计划直接吃推理引擎 logprob。满足任一条，就不要赌「重渲染刚好不变」。</li>
+      <li><strong>何时重算 logprob 可能够用。</strong> 单轮或严格线性、无 tool reserialize、train 与 rollout 同栈同精度、且只做对 token 噪声不敏感的目标（例如序列级 IS，见 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>）。即便如此，仍建议抽样做 round-trip；「够用」是实证结论，不是默认假设。</li>
+      <li><strong>自己写 harness 时把 ID 通道做成一等 API。</strong> 会话对象应同时持有 <code>messages</code>（给人看）与 <code>token_ids / logprobs / loss_mask</code>（给 trainer）。只落盘文本 JSONL 的 Agent 日志，后训练阶段几乎必然返工。</li>
+      <li><strong>Loss 归一化与树形轨迹一起设计。</strong> subagent 使「每任务样本数」随机；若仍按 micro-batch 盲目 mean，梯度尺度会随树的宽度漂。官方在黑盒 recipe 里强调对变化 batch size 做归一化——自研时至少按 task 或按树做 scale。</li>
+      <li><strong>与 <a href="daily-2026-08-31-miles-v01.html">Miles 全栈文</a>分工。</strong> 那篇管 SGLang 环与异步；本篇管「环上每一条轨迹是否还是同一串 token」。排查「异步很满但 reward 乱抖」时，先跑 TITO round-trip，再动学习率。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「下一轮 prompt 的文本以上一轮结尾」不能推出「token IDs 以上一轮生成段为前缀」？举一个 tool call reserialize 就够用的反例骨架。
+        <details><summary>参考答案</summary>
+        Chat template 常把 tool call 规范成另一种 JSON 字段序、空白或特殊 token 包裹；decode 后再 render，表面文本可读且「接着写」，但 BPE 边界已变，ID 序列与引擎当时生成的不再一致。Trainer 用新 ID 算的 logπ_θ(y_t|…) 条件于错误前缀，ratio 相对的是另一条轨迹。文本前缀是给人类看的连续性；RL 需要的是 token 前缀。</details>
+      </li>
+      <li>
+        Loss-mask 掉 tool result 之后，策略梯度还如何依赖环境？若有人把 observation 也纳入 loss，会优化到什么退化行为？
+        <details><summary>参考答案</summary>
+        环境通过「下一轮模型生成段的条件上下文」影响策略：observation 改变前缀，从而改变后续 token 的 logprob 与 advantage 归因，但 observation 本身不是策略动作，不应对 π_θ 直接升权。若对 observation token 也算 CE/RL loss，模型会被激励去「复读或改写环境返回」，出现刷屏、模仿工具输出等退化，而不是学更好的 tool call。</details>
+      </li>
+      <li>
+        Lightning 已经把部署 harness 放进训练环，为何仍可能需要 TITO？两者分别闭合哪一种 train–serve 差？
+        <details><summary>参考答案</summary>
+        Lightning 闭合的是<strong>控制流 / 工具契约</strong>差：训练时不再另写一套 ReAct，调用仍走产品 harness。TITO 闭合的是<strong>token 世界线</strong>差：即便同一 harness，re-render 仍可能改 ID。没有 TITO，proxy 收回来的轨迹在文本层忠实、在 token 层仍可能离策。生产上两者叠加，而不是互相替代。</details>
+      </li>
+      <li>
+        黑盒 harness 产生动态轨迹树时，为什么「按 sample 做 mean loss」会悄悄改学习率？给出一种与官方「loss 归一化」同方向的修正思路。
+        <details><summary>参考答案</summary>
+        任务 A 生出 2 条轨迹、任务 B 生出 20 条（多 subagent）时，naive mean 让 B 在 batch 内占权更大，等价于按树宽度重加权任务，梯度范数随 harness 内部调度漂移。修正：按 task / 根会话归一化（先在树内平均，再在任务间平均），或使用与预期轨迹数无关的 scale；官方强调对变化 batch size 做 loss 归一化，指向同一问题。</details>
+      </li>
+      <li>
+        在何种设定下，可以接受「丢弃 TITO、训练引擎重算 logprob」？结合 GSPO 的序列级 IS 与 GRPO+R3 的 token 级需求对比。
+        <details><summary>参考答案</summary>
+        当优化目标只依赖序列似然（GSPO 的 length-normalized sequence ratio）、且实证上 re-tokenize 不改写入 loss 的那一段 ID（或改了也对序列级目标足够钝）时，重算 logprob 可能够用，基础设施更简单。一旦目标含 token-level ratio、Routing Replay、OPD 的逐位置 teacher 分、或 zero-KL，重算无法修复「输入 ID 已换」——必须 TITO。选择应写进实验卡：目标粒度 → 是否强制 TITO。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>LMSYS · Miles v0.1（含 TITO 节）：
+        <a href="https://www.lmsys.org/blog/2026-08-18-miles-v0-1/" target="_blank" rel="noopener">lmsys.org/blog/2026-08-18-miles-v0-1</a></li>
+      <li>Miles 系列：<em>No Token Left Behind: Demystifying Token-In-Token-Out in Miles</em>（官方索引 [6]）</li>
+      <li>站内交叉：
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1 全栈</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-08-14-deepseek-harness.html">DeepSeek Harness（dsh）</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
