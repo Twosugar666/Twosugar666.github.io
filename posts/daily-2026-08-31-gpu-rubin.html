@@ -1,1 +1,340 @@
-PLACEHOLDER_LOAD_FROM_DISK_0
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜NVIDIA Rubin：Agentic 推理把数据中心改写成一台计算机（HBM4 / NVFP4 / NVLink 6 / NVL72） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜NVIDIA Rubin：Agentic 推理把数据中心改写成一台计算机（HBM4 / NVFP4 / NVLink 6 / NVL72）</h1>
+    <p class="post-meta">2026-08-31 · 收藏夹：显卡 / Infra · 一线追踪<br />
+      主来源：
+      <a href="https://nvidianews.nvidia.com/news/rubin-platform-ai-supercomputer" target="_blank" rel="noopener">NVIDIA Newsroom · Rubin Platform（2026-01-05，CES）</a>；
+      <a href="https://developer.nvidia.com/blog/inside-nvidia-rubin-gpu-architecture-powering-the-era-of-agentic-ai/" target="_blank" rel="noopener">NVIDIA Tech Blog · Inside Rubin GPU Architecture</a>；
+      <a href="https://developer.nvidia.com/blog/nvidia-vera-rubin-and-blackwell-set-a-new-standard-for-agentic-ai-performance-per-watt/" target="_blank" rel="noopener">NVIDIA Tech Blog · AgentX / performance per watt</a>。
+      文中吞吐、能效、成本、装配倍数与 MoE 训练卡数均为 <strong>NVIDIA 官方自报</strong>；Vera Rubin NVL72 的 AgentX 数字由 NVIDIA 自己测、
+      <strong>尚待 SemiAnalysis 复审</strong>，本文不当成独立第三方成绩。
+      TDP、标价、消费级显存、SWE-bench 官方未给，一律不编。
+      同日 serving 全栈见
+      <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a>；
+      MoE 专家并行的模型侧动机见
+      <a href="daily-2026-08-28-base-hy4.html">Hy4</a>；
+      harness 的 token 税见
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      这不是一篇显卡导购。本博客写后训练、写 Agent、写 Infra——之所以给 Rubin 开一篇一线追踪，是因为它把我们每天在 serving / 训练环上撞到的那几堵墙，写成了芯片与机柜的设计约束：
+      decode 被内存子系统卡住、KV cache 往往比权重还难伺候、MoE 的 expert parallel 必须活在一个足够密的 GPU 域里、token 成本是机柜级的，不是某张卡的贴纸 TDP。
+      CES 2026（2026-01-05）NVIDIA 把 Vera Rubin 平台钉成「六颗共设计芯片」；通稿写明 Rubin 已进入量产，合作伙伴产品窗口在 <strong>2026 下半年</strong>。
+      今天写这篇，正好卡在这个窗口上：不是「哪张卡值得买」，而是「Agentic 推理把数据中心改写成一台计算机」之后，算法与 Infra 工程师该改哪些默认假设。
+    </p>
+    <p>
+      工作负载的单位已经换了。架构博客把 agentic 写成：跨许多推理步的<strong>持续推理</strong>——每步要低延迟、decode 要高吞吐、长上下文注意力要省、KV cache 要大、GPU 域要紧耦合。
+      NVIDIA 引用 OpenRouter State of AI：在约 100 万亿 token 的流量上，平均每次请求的 prompt token 大约变成原来的 4 倍；单次 agentic 请求消耗的 token 大约是普通 chat 的 15 倍。
+      这和站内
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a>
+      的观察是同一件事的硬件投影：多轮、工具、长上下文会把「一次 completion」胀成一条会生长的会话。
+      于是机柜不再是「72 张加速卡的货架」，而被重新想象成<strong>一台计算机</strong>。
+    </p>
+    <p>
+      平台以天文学家 Vera Florence Cooper Rubin 命名。产品线至少两条：机柜级 <strong>Vera Rubin NVL72</strong>，以及面向 x86 生成式 AI 的 <strong>HGX Rubin NVL8</strong>（8 颗 Rubin GPU 经 NVLink 互联）。
+      首批云：AWS、Google Cloud、Microsoft、OCI；NVIDIA Cloud Partners 点名 CoreWeave、Lambda、Nebius、Nscale。Microsoft Fairwater 将使用 Vera Rubin NVL72。
+      合作伙伴整机仍是 H2 2026 窗口——H200 / B200 现在就能订到，Rubin 还不能当「已经在你集群里」来排期。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Rubin = 两颗计算 die 经 NV-HBI 拼成的 GPU（最高 288 GB HBM4 / 22 TB/s、第三代 Transformer Engine、NVFP4 最高 50 PFLOPS）
+      + NVLink 6 把 72 GPU / 36 Vera CPU 收成一台计算机
+      + BlueField-4 的 KV 上下文存储与 Dynamo / SGLang 这一类 disagg serving。
+      10× token 成本、30× AgentX 每兆瓦吞吐，全部是 NVIDIA 自报；后者还在等 SemiAnalysis 签字。
+    </blockquote>
+
+    <h2>产品要点</h2>
+    <p>
+      先把「一颗 GPU」和「一台机柜计算机」分开。下面只收录 Newsroom 与架构博客写明的数字；没写的（TDP、售价、消费级显存）标成官方未给，而不是用二手爆料补齐。
+    </p>
+    <table>
+      <thead>
+        <tr><th>对象</th><th>规格</th><th>官方数字</th><th>口径</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td rowspan="8"><strong>Rubin GPU</strong></td>
+          <td>晶体管 / SM / Tensor Core</td>
+          <td>3360 亿；224 SM；896 Tensor Core</td>
+          <td>架构博客</td>
+        </tr>
+        <tr>
+          <td>计算 die</td>
+          <td>两颗 reticle-limited die，经 NV-HBI 合一</td>
+          <td>架构博客</td>
+        </tr>
+        <tr>
+          <td>HBM4</td>
+          <td>最高 288 GB；12-Hi；峰值带宽最高 22 TB/s</td>
+          <td>架构博客。HBM4 相对 HBM3e 把接口宽度加倍；相对 Blackwell / Blackwell Ultra 的 2.8× 带宽为 NVIDIA 自报</td>
+        </tr>
+        <tr>
+          <td>NVFP4 推理算力</td>
+          <td>最高 50 PFLOPS（第三代 Transformer Engine）</td>
+          <td>Newsroom / 架构博客。带硬件加速的自适应压缩</td>
+        </tr>
+        <tr>
+          <td>NVLink 6</td>
+          <td>每 GPU 3.6 TB/s（3600 GB/s）接到 NVLink Switch</td>
+          <td>Newsroom 写 3.6 TB/s，架构博客写 3600 GB/s，同一官方数字</td>
+        </tr>
+        <tr>
+          <td>NVLink-C2C</td>
+          <td>1800 GB/s 相干 CPU–GPU</td>
+          <td>架构博客</td>
+        </tr>
+        <tr>
+          <td>主机互连</td>
+          <td>x16 PCIe Gen 6，最高 256 GB/s</td>
+          <td>架构博客</td>
+        </tr>
+        <tr>
+          <td>TDP / 标价 / 消费级显存</td>
+          <td>官方未给</td>
+          <td>本文不引用二手 TDP、不发明 RTX 50 显存</td>
+        </tr>
+        <tr>
+          <td><strong>Vera CPU</strong></td>
+          <td>核心</td>
+          <td>88 颗 NVIDIA 自研 Olympus，Armv9.2，NVLink-C2C</td>
+          <td>Newsroom。AgentX 文把它写成工具执行与 KV-cache offload</td>
+        </tr>
+        <tr>
+          <td><strong>HGX Rubin NVL8</strong></td>
+          <td>拓扑</td>
+          <td>8 颗 Rubin GPU 经 NVLink；面向 x86 生成式 AI</td>
+          <td>Newsroom</td>
+        </tr>
+        <tr>
+          <td rowspan="3"><strong>Vera Rubin NVL72</strong></td>
+          <td>组成</td>
+          <td>72 Rubin GPU + 36 Vera CPU + NVLink 6 + ConnectX-9 + BlueField-4</td>
+          <td>Newsroom</td>
+        </tr>
+        <tr>
+          <td>机柜 NVLink</td>
+          <td>260 TB/s</td>
+          <td>Newsroom</td>
+        </tr>
+        <tr>
+          <td>机柜形态</td>
+          <td>第三代 MGX；无缆托盘；45°C 液冷；机柜级动态功率转向；Intelligent Power Smoothing</td>
+          <td>架构博客。装配 / 维护相对 Blackwell 最高 18× 更快，为 NVIDIA 自报</td>
+        </tr>
+        <tr>
+          <td><strong>六芯片平台</strong></td>
+          <td>共设计</td>
+          <td>Vera CPU、Rubin GPU、NVLink 6 Switch、ConnectX-9 SuperNIC、BlueField-4 DPU、Spectrum-6 Ethernet Switch</td>
+          <td>Newsroom。AgentX 文另把 Groq 3 LPX 写成平台上的超低延迟伴侣，不是 GPU 本身</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      相对 Blackwell 的平台级宣传（全部 NVIDIA 自报，不是第三方实测）：推理 token 成本最高降 10×；训 MoE 所需 GPU 数量最多减到 1/4；内部 2T MoE 工作负载上，每单位能量的 agentic 吞吐最高 10×（架构博客 Figure 1）。
+      Spectrum-X Ethernet Photonics CPO 相对传统方式：可靠性最高 10×、可用时间最长 5×、能效最高 5×——同样是官方宣称。
+      第三代 Confidential Computing 被写成「首个在 CPU、GPU、NVLink 上贯通机密计算的机柜级平台」（TEE-I/O）；另有第二代 RAS Engine。这些是产品能力声明，本文不展开成安全评测。
+    </p>
+    <p>
+      AgentX 上还有一组 <strong>NVIDIA 自报</strong>的跨代对照，必须和 Rubin 的 30× 分开读。
+      同一篇 performance-per-watt 博客写：在 AgentX 上，GB300 NVL72 相对 H200 NVL8，DeepSeek V4 Pro 1.6T 的每兆瓦吞吐最高 15×、每百万 token 成本最低可降到约 1/10；Kimi K3 2.8T 的每兆瓦吞吐最高 80×；GB300 的交互性前沿大约 215 tok/s/user。
+      Vera Rubin NVL72 相对 GB300 NVL72：在 AgentX DeepSeek V4-Pro、160 tok/s/user 上，每兆瓦 AI 工厂吞吐最高 30×——这一条由 NVIDIA 自己测，<strong>尚待 SemiAnalysis 复审</strong>。
+      30× 的对比物是 GB300 机柜，不是 H200；两段倍数不能连乘，官方也没有给出「相对 H200」的 Rubin 成绩。
+    </p>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 两颗计算 die + NV-HBI：reticle 上限被拼过去</h3>
+    <p>
+      3360 亿晶体管、224 SM、896 Tensor Core，不是「再刻一颗更大的单 die」。架构博客写明：两颗受到光刻 reticle 限制的计算 die，经 <strong>NV-HBI</strong>（NVIDIA High-Bandwidth Interface）收成一颗逻辑 GPU。
+      对算法工程师，这意味着「一张 Rubin」内部已经是一个小规模的 chiplet 域——SM 数、Tensor Core 数、HBM 控制器都按统一 GPU 暴露，而不是让你在软件里管两张卡。
+      真正要在软件里管的域，在下一层：NVLink 6 的 NVL8 / NVL72。
+    </p>
+
+    <h3>② HBM4 288 GB / 22 TB/s：decode 为什么在乎容量和带宽两件事</h3>
+    <p>
+      最高 288 GB HBM4、12-Hi 堆叠、专用 HBM 控制器、峰值带宽最高 22 TB/s。HBM4 相对 HBM3e 把接口宽度加倍；NVIDIA 称相对 Blackwell / Blackwell Ultra 带宽 2.8×。
+      架构博客把 decode 钉成 <strong>内存子系统受限</strong>，并拆开两个角色：
+    </p>
+    <ul>
+      <li><strong>容量</strong>：模型权重 + 上下文 + KV + 并发，能不能不 offload 地塞进 HBM。</li>
+      <li><strong>带宽</strong>：逐 token 生成时，每一步都要把该读的 KV / 权重再搬一遍。</li>
+    </ul>
+    <p>
+      这就是这篇「显卡文」属于本博客的原因。Agent 会话的 KV 会随工具轮次生长（对照
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>
+      里「harness 每一步都是一次 completion」）；288 GB 决定你能把多少会话的 KV 留在卡上，22 TB/s 决定每个用户的 tok/s。
+      算力海报上的 50 PFLOPS NVFP4 在 decode 上经常不是瓶颈——喂不饱，Tensor Core 再快也在空转。
+      容量不够时，路就分叉：要么降并发 / 截断上下文，要么把 KV 卸到 Vera CPU 或 BlueField-4 的上下文存储，再靠 Dynamo 的 KV-aware 路由把会话粘回去。
+    </p>
+
+    <h3>③ 第三代 Transformer Engine：NVFP4、K 维加倍、3-bit LUT</h3>
+    <p>
+      第三代 Transformer Engine 给出最高 50 PFLOPS NVFP4 推理算力，并带硬件加速的自适应压缩。
+      Tensor Core 每个时钟处理的 K 维数据量加倍，于是 K 方向的循环迭代变少——架构博客给的例子是 Blackwell 上 4 次、Rubin 上 2 次。
+      矩阵 B 支持 3-bit LUT 格式；NVIDIA 称 LUT 可保留最高到 MXFP8 的精度。这是厂商精度声明，不是第三方量化误差表。
+    </p>
+    <p>
+      对 MoE serving，低精度不是「把 dtype 开关拧到 4-bit」就结束。
+      <a href="daily-2026-08-31-miles-v01.html">Miles</a>
+      把 FP8 rollout / BF16 train 的漂移写成跨栈合同；AgentX 文点名的 serving 配方是 SGLang / TensorRT-LLM / vLLM、Wide Expert Parallelism、DeepEP、DeepGEMM、MXFP4 / MXFP8。
+      NVFP4 是这条合同在 Rubin 上的硬件档位。训练环若仍按 BF16 合同走，不要假设卡上的 50 PF 会自动变成稳定的 on-policy logprob。
+    </p>
+
+    <h3>④ 注意力：激活稀疏 + 自适应压缩，以及更快的 exp</h3>
+    <p>
+      注意力路径被写成：激活稀疏 + 自适应压缩；先做 dense QK，再把分数压成 2:4 稀疏；softmax 只打在非零上；再与 V 做稀疏 MMA。
+      「2:4 打在 attention score 上」和「2:4 打在权重上」不是同一件事——分数已经过 QK，被丢掉的是 softmax 本来就会压扁的小值，而不是把预训练权重挖掉一半。
+      安全与否取决于压缩是否真自适应、以及你的长上下文分布会不会把质量摊平（长 MoE Agent 轨迹比短 chat 更不宽容）。NVIDIA 没给独立的质量掉点表，本文也不编。
+    </p>
+    <p>
+      指数运算吞吐相对 Blackwell：FP32 每时钟每 SM 2×，BF16 / FP16 4×；相对 Blackwell Ultra 则是 2× / 2×。
+      Softmax 里的 exp 在注意力热路径上不再是「小操作」，长上下文 decode 会反复走它。这项加速和 2:4 压缩绑在同一条注意力管道里，不是另一张 FLOPS 海报。
+    </p>
+
+    <h3>⑤ TMA 内联描述符：MoE 为什么终于能少一次指针来回</h3>
+    <p>
+      Enhanced TMA 允许在 TMA 指令里覆盖 pointer / stride，给 MoE 做内联描述符更新。
+      专家被选中之后，下一跳 GEMM 的源地址跟着路由走——过去这常常是「先写一张描述符表，再等一次同步，再发起拷贝」；内联覆盖把「路由结果 → 数据搬移」收进同一条指令流。
+    </p>
+    <p>
+      这直接对应
+      <a href="daily-2026-08-28-base-hy4.html">Hy4 770B-A49B</a>
+      那种「256 routed + 1 shared、top-8」的 serving 形状：token 级路由会把 pointer 打散，EP 的 all-to-all 已经贵，描述符更新再变成同步气泡就更贵。
+      训练侧
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>
+      讨论的是 MoE 上重要性采样的单位；推理侧 TMA 讨论的是被选中的专家权重怎么被及时喂进 Tensor Core。两边都在为「路由是动态的」付账，只是账本不同。
+    </p>
+
+    <h3>⑥ NVLink 6 与 counted writes：融合通信不再等主机发号</h3>
+    <p>
+      NVLink 6：每 GPU 3.6 TB/s 接到 Switch；NVL72 机柜 260 TB/s。另有 tile 级触发消费者 kernel（相对 Blackwell 的 bulk programmatic dependent launch），以及 <strong>counted writes</strong>：设备发起的 NVLink 融合通信。
+      Counted write 的意思很硬：GPU 自己往对端写，写满计数再放行下游——all-to-all / dispatch-combine 可以和计算叠在同一条 device 路径上，而不是「kernel 结束 → 主机或 launch 再发一次通信」。
+    </p>
+    <p>
+      Wide EP、DeepEP、DeepGEMM 被 AgentX 文点名为 serving 栈的一部分，前提是它们活在这个 NVLink 域里。
+      NVL8 是 8 卡域，NVL72 是 72 卡域。把一个 DeepSeek V4 Pro 1.6T / Kimi K3 2.8T 这一档 MoE 的专家切到跨机柜 Ethernet 上，再指望 Rubin 的 counted writes 把气泡抹平，是把两层网络叠错了。
+    </p>
+
+    <h3>⑦ NVL72 当作一台计算机：Vera、BlueField-4、功率平滑与 MaxLPS</h3>
+    <p>
+      NVL72 的物料清单是 72 GPU + 36 Vera CPU + NVLink 6 + ConnectX-9 SuperNIC + BlueField-4，落在第三代 MGX 机柜：无缆托盘、45°C 液冷、机柜级动态功率转向、Intelligent Power Smoothing。
+      NVIDIA 称功率平滑相对上一代：平均功率约低 10%，50 ms 峰值功率约低 20%。
+      DSX MaxLPS：在能效工作点、对负载影响很小的前提下，运营方可在同一功率预算里最多多部署 40% 的 GPU。这些是设施级数字，单位是瓦和机柜，不是单卡 tok/s。
+    </p>
+    <p>
+      角色分工按官方叙述是：
+    </p>
+    <ul>
+      <li><strong>Rubin GPU</strong>：大上下文与 decode。</li>
+      <li><strong>Vera CPU</strong>：工具执行、KV-cache offload（88 Olympus、Armv9.2、NVLink-C2C 1800 GB/s）。</li>
+      <li><strong>BlueField-4</strong>：Inference Context Memory Storage Platform，给 KV-cache 做共享 / 复用。</li>
+      <li><strong>NVIDIA Dynamo</strong>：prefill / decode 分离、session ID、KV-cache-aware 路由。</li>
+      <li><strong>Groq 3 LPX</strong>：平台上的超低延迟伴侣，用来解锁极高交互性——它不是 Rubin GPU，也不在六芯片清单里当「第七颗 GPU」。</li>
+    </ul>
+    <p>
+      软件上，这正是
+      <a href="daily-2026-08-31-miles-v01.html">Miles</a>
+      选 SGLang 做 rollout、以及 AgentX 文同时点名 SGLang / TensorRT-LLM / vLLM 的原因：机柜提供了 disagg 与 session 粘性的硬件假设，引擎必须真的按 session ID 和 KV 位置调度，而不是把 72 张卡当成 72 个独立的 HTTP 后端。
+      第三代机密计算贯通 CPU / GPU / NVLink，是把「一台计算机」从性能域延伸到信任域；对需要机密推理的业务有意义，对 MoE kernel 调优不是第一约束。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>H200 / B200 现在就能干活，Rubin 按 H2 2026 窗口排期。</strong>
+        Newsroom 写的是量产 + 合作伙伴产品 2026 下半年 + 首批云今年落地。做后训练、做 Agent serving 的团队，2026 年三季度的容量规划仍以已经在机架上的 Hopper / Blackwell 为准；把里程碑写成「等 Rubin 再训 Hy4 级 MoE」，是把供应链窗口当成算法阻塞。NVL8 / NVL72 到货后，先验收的是 NVLink 域和 Dynamo 路由，不是海报上的 50 PF。</li>
+      <li><strong>不要把 30× 当福音，直到 SemiAnalysis 签字。</strong>
+        Vera Rubin NVL72 在 AgentX DeepSeek V4-Pro、160 tok/s/user 上相对 GB300 NVL72「每兆瓦 AI 工厂吞吐最高 30×」，是 NVIDIA 自测、pending SemiAnalysis review。
+        AgentX 本身是 SemiAnalysis InferenceX 的 agentic-coding 场景：用 AIPerf 回放预录的 Claude Code 会话（推理与工具交错），同一份流量打到所有系统——方法论是第三方的，成绩单这一张还不是。
+        规划书里应写成「厂商在指定交互性点上的自报」，并准备被复审改写。</li>
+      <li><strong>288 GB 是「能不能不 offload」的容量账，不是「上下文无限」。</strong>
+        能把模型 + 当前会话 KV + 目标并发留在 HBM 里，decode 就走 22 TB/s 的本地带宽；塞不下，才轮到 Vera / BlueField-4 / 主机。
+        Offload 换的是容量，付的是 C2C / DPU 路径延迟。Agent 多轮里 prefix 是否还能命中，取决于 Dynamo 的 session 路由，而不是「CPU 内存很大所以没事」。先算自己的 KV 足迹（层数 × KV head × 精度 × 会话长度 × 并发），再决定 packing 还是 offload。</li>
+      <li><strong>MoE 的 EP 需要 NVLink 域，TMA 描述符更新不是万能胶。</strong>
+        Hy4 这一类宽专家池，Wide EP + DeepEP 只有在 NVL8 / NVL72 的 scale-up 域里才是架构博客假定的形状。
+        跨机柜走 Spectrum-6 / 普通 Ethernet 时，counted writes 与内联 TMA 帮的是域内气泡，帮不了域间。
+        训练侧若走
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>
+        的序列级 IS，通信形态仍是 EP；不要因为 loss 粒度变了就以为拓扑约束消失。</li>
+      <li><strong>消费级 RTX 50 是另一条产品线。</strong>
+        桌面上在售的是 Blackwell 世代的表亲，不是 Rubin，也不是 NVL72 的缩小版。官方未给消费卡在本文范围内的显存 / TDP，本文不发明任何 RTX 50 的显存或功耗数字，也不把 288 GB HBM4 抄到桌上。本地实验、单机 RL、小模型迭代继续用现役桌面卡；把 Agent 工厂的 token 成本模型套到一张游戏卡上，是把机柜经济学误读成购物车。</li>
+      <li><strong>10× token 成本是机柜叙事，租一张卡买不到这个分数。</strong>
+        Newsroom 的「推理 token 成本最高降 10×」叠了 NVFP4、NVL72 域、KV 共享、功率平滑和 MoE 训练卡数。云上按单 GPU 时租、没有 session 粘性、没有 disagg prefill/decode 的实例，不继承这张海报。对比基线也是 Blackwell 平台，不是「相对你现在的 H200 8 卡」。算成本时把单位写清楚：$/百万 token @ 某 tok/s/user @ 某模型，而不是「Rubin = 便宜 10 倍」。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        架构博客说 decode 是内存子系统受限，并区分容量与带宽。为什么多给 Tensor Core、把 NVFP4 堆到 50 PFLOPS，常常仍抬不起每个用户的 tok/s？容量不够时，把 KV 卸到 Vera / BlueField-4，解的是哪一个约束、不解哪一个？
+        <details><summary>参考答案</summary>
+        自回归 decode 每步只为<strong>一个</strong>（或一小批）新 token 做注意力，算术强度低：计算量随 hidden 增长，搬移量随「层数 × KV 长度 × 并发」增长。HBM 喂不饱时，SM 上的 Tensor Core 在等数据，50 PFLOPS 只是峰值口径。容量决定「模型 + 上下文 + KV + 并发」能否驻留；带宽决定驻留之后每步能搬多少。Offload 解的是容量——会话不至于因为 288 GB 用尽而被杀掉或降并发；它不把 22 TB/s 的本地 HBM 带宽复制到 C2C / DPU 路径上，所以单用户 tok/s 往往掉，只是掉得比「换主机 PCIe」好（C2C 官方 1800 GB/s，相对 HBM 22 TB/s 仍低一个数量级）。正确用法是：热会话 KV 留在 HBM，冷前缀或工具间歇的会话才卸出去，并靠 Dynamo 的 session 路由保证下一轮还能找回。</details>
+      </li>
+      <li>
+        注意力路径是 dense QK → 2:4 稀疏分数 → 只对非零做 softmax → 与 V 稀疏 MMA。为什么说这种 2:4「相对安全」，它和权重 2:4 稀疏、和 MoE 专家稀疏各差在哪？什么样的 agentic 轨迹会让「安全」失效？
+        <details><summary>参考答案</summary>
+        安全来自操作对象：QK 已经算出完整相似分数，2:4 丢掉的是同一小组里较小的 score。Softmax 本身就会把质量集中到峰值，砍掉小值近似于忽略本来就接近零的权重，不是把预训练矩阵挖洞。权重 2:4 改的是模型参数，误差会进入每一次 GEMM，需要训练 / 校准来托精度；MoE 专家稀疏改的是「这一 token 调用哪几路 FFN」，是路由选择而非数值近似。失效场景：长上下文里分数分布被摊平（检索型 Agent 的多文件 prompt、工具结果噪声大），峰值不显著，2:4 可能砍到仍有质量的连接；自适应压缩若按短 chat 标定，Agent 会话后期 KV 很长时分布会漂。NVIDIA 未给这类掉点表，工程上应用长轨迹做对照，而不是把「score 稀疏很安全」当成定理。</details>
+      </li>
+      <li>
+        Counted writes 被写成设备发起的 NVLink 融合通信。为什么这对 Wide EP / DeepEP 重要？若通信仍由主机或独立 launch 触发，MoE decode 的气泡会出现在哪？TMA 内联描述符解决的是同一条路径上的哪一段？
+        <details><summary>参考答案</summary>
+        Decode 步已经很短，EP 的 dispatch / combine 若按「计算 kernel 结束 → 再 launch 通信 → 再 launch 下一跳 GEMM」串起来，启动开销和同步会吃掉步时间。Counted writes 让 GPU 对端写满计数再放行，通信与计算在 device 侧融合，不必每步回到主机或额外 launch。Wide EP 把专家铺在整个 NVLink 域，all-to-all 是热路径；没有融合，72 卡域的同步比 8 卡域更疼。TMA 内联描述符解决的是融合之前的「地址从哪来」：路由一出，pointer / stride 直接覆盖进 TMA，不必先写描述符表再等。两者叠起来才是「路由 → 搬数据 → 对端收齐 → 专家 GEMM」的一条 device 管道。跨 Ethernet 的机柜间通信不在这条管道上，不能指望 counted writes 拯救。</details>
+      </li>
+      <li>
+        Newsroom 称相对 Blackwell，推理 token 成本最高降 10×。为什么这个数字可以在机柜叙事里成立，却仍然不能写进「我租一张 Rubin GPU」的报价单？把单位拆开看，10× 可能叠了哪些你在单卡租户里拿不到的东西？
+        <details><summary>参考答案</summary>
+        10× 是平台相对 Blackwell 的官方上限，分母是 token 成本，分子叠了：NVFP4 把每 token 的计算 / 搬移变小；NVL72 的 260 TB/s 让 MoE EP 不必走机柜间网；BlueField-4 让 KV 跨请求复用；功率平滑与 MaxLPS 让同一兆瓦能塞更多有效吞吐；训 MoE「卡数最多减到 1/4」还会进训练摊销。单卡租户通常没有 72 GPU NVLink 域、没有会话级 KV 路由、没有机柜功率转向，精度合同也不一定是 NVFP4。基线若是 H200 NVL8 而不是 Blackwell 机柜，倍数更对不上。正确写法是：在指定模型、指定 tok/s/user、指定并发与是否 disagg 的前提下测 $/百万 token；把 10× 当「机柜设计目标的上限口号」，不当报价器。</details>
+      </li>
+      <li>
+        MaxLPS 说同一功率预算最多可多部署 40% GPU；AgentX 说在 160 tok/s/user 上 Vera Rubin NVL72 相对 GB300 NVL72 每兆瓦吞吐最高 30×。为什么这两个数字不能互相换算？若 SemiAnalysis 复审后 30× 被改写，40% 是否一起作废？
+        <details><summary>参考答案</summary>
+        单位不同。MaxLPS 的分子是「能装下的 GPU 数量」，分母是设施功率预算，条件是跑在能效工作点、负载影响很小——它是供电与配平的运营杠杆，官方大约 40%。AgentX 30× 的分子是 AI 工厂吞吐，分母是兆瓦，条件是 DeepSeek V4-Pro、160 tok/s/user、NVIDIA 自测的 serving 栈（SGLang / TRT-LLM / vLLM + Wide EP + Dynamo + NVFP4 等），对比物是 GB300 NVL72。30× 里已经包含架构（HBM4、NVLink 6、TE）、精度、调度与 disagg，不是「多插 40% 卡」的算术延伸。40% 即使完全兑现，也只解释同一代卡在功率封顶下的装箱密度，解释不了跨代 × 跨栈的 30×。SemiAnalysis 复审针对的是 AgentX 成绩单；MaxLPS 是另一篇架构博客里的功率管理声明，一份被改写不会自动取消另一份，但两份目前都是 NVIDIA 自报，都要等独立设施与独立基准来钉。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>NVIDIA Newsroom · NVIDIA Unveils Rubin: The AI Supercomputer for the Next Era of AI（CES，2026-01-05）：
+        <a href="https://nvidianews.nvidia.com/news/rubin-platform-ai-supercomputer" target="_blank" rel="noopener">nvidianews.nvidia.com/news/rubin-platform-ai-supercomputer</a></li>
+      <li>NVIDIA Technical Blog · Inside NVIDIA Rubin GPU Architecture: Powering the Era of Agentic AI：
+        <a href="https://developer.nvidia.com/blog/inside-nvidia-rubin-gpu-architecture-powering-the-era-of-agentic-ai/" target="_blank" rel="noopener">developer.nvidia.com/blog/inside-nvidia-rubin-gpu-architecture-…</a></li>
+      <li>NVIDIA Technical Blog · NVIDIA Vera Rubin and Blackwell Set a New Standard for Agentic AI Performance per Watt（AgentX 数字为 NVIDIA 自测，pending SemiAnalysis review）：
+        <a href="https://developer.nvidia.com/blog/nvidia-vera-rubin-and-blackwell-set-a-new-standard-for-agentic-ai-performance-per-watt/" target="_blank" rel="noopener">developer.nvidia.com/blog/nvidia-vera-rubin-and-blackwell-set-a-new-standard-…</a></li>
+      <li>SemiAnalysis InferenceX · AgentX（基准方法论；不是 NVIDIA 那张 30× 成绩单的第三方背书）：
+        <a href="https://inferencex.semianalysis.com/agentx/methodology" target="_blank" rel="noopener">inferencex.semianalysis.com/agentx/methodology</a>
+        · 介绍文
+        <a href="https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat" target="_blank" rel="noopener">AgentX / InferenceXv3</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1（SGLang + Megatron + 全异步）</a> ·
+        <a href="daily-2026-08-28-base-hy4.html">Hy4 770B-A49B MoE</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
