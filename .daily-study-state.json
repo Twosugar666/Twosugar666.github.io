@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 2,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -123,6 +123,13 @@
       "source": "algo",
       "topic": "Gumbel-Softmax / Concrete：离散采样的可微松弛与 Straight-Through",
       "file": "posts/daily-2026-09-01-algo-gumbel-softmax.html"
+    },
+    {
+      "date": "2026-09-01",
+      "domain": "infra",
+      "source": "rotation",
+      "topic": "KV cache 的一生：显存账本 / PagedAttention / continuous batching / prefix caching / PD 分离（Mooncake）",
+      "file": "posts/daily-2026-09-01-kv-cache.html"
     }
   ]
 }

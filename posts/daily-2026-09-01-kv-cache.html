@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜KV cache 的一生：显存账本、PagedAttention 与 PD 分离 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜KV cache 的一生：显存账本、PagedAttention、prefix caching 与 PD 分离</h1>
+    <p class="post-meta">2026-09-01 · 收藏夹：Infra · 领域轮更（infra）<br />
+      主要依据：Kwon et al.（vLLM / PagedAttention，<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a>，SOSP 2023）、
+      Yu et al.（Orca，OSDI 2022）、Zheng et al.（SGLang / RadixAttention，<a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arXiv:2312.07104</a>）、
+      Qin et al.（Mooncake，<a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">arXiv:2407.00079</a>，Moonshot AI &amp; 清华）</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3-Flash 笔记</a>里有一个容易被划过去的数字：新架构把 <strong>KV cache 缩小到 GLM-5.3 的 1/4.4</strong>。
+      为什么「KV cache 大小」值得写进模型发布的头条？因为它是 LLM 推理系统里<strong>最贵的资源</strong>：
+      权重大小是固定的，KV cache 却随上下文长度 × 并发数线性膨胀，直接决定一张卡能同时服务多少请求、
+      长上下文是「特性」还是「成本黑洞」。搞推理优化、做 agent 产品容量规划、乃至理解为什么新架构都在卷线性注意力和 MLA，
+      都绕不开同一个问题：<strong>KV cache 到底是怎么被管理的？</strong>
+    </p>
+    <p>
+      本篇把这条线完整走一遍：先算清显存账本，再讲三个环环相扣的系统技术——
+      <strong>PagedAttention</strong>（显存管理）→ <strong>continuous batching</strong>（调度）→ <strong>prefix caching</strong>（共享），
+      最后到 2024～2025 年的架构级答案 <strong>PD 分离</strong>（Mooncake）。这是一切推理 infra 讨论的共同地基。
+    </p>
+
+    <h2>核心概念</h2>
+
+    <h3>1. KV cache 是什么，为什么这么贵</h3>
+    <p>
+      自回归解码时，每生成一个新 token 都要对它之前的所有 token 做注意力。为了不重算，系统把每层每头的 Key、Value 张量缓存下来——这就是 KV cache。
+      它的显存占用公式（自己可推）：
+    </p>
+    <pre><code>每 token 的 KV cache 字节数 = 2（K 和 V）× 层数 × KV 头数 × head_dim × 每元素字节数
+
+例：Qwen2.5-32B（64 层，GQA 8 个 KV 头，head_dim 128，bf16=2 字节）
+  = 2 × 64 × 8 × 128 × 2 B = 262,144 B ≈ 256 KiB / token
+  → 一条 32K 上下文的请求：256 KiB × 32,768 ≈ 8 GiB
+  → 一张 80G 卡，扣掉 32B 权重（bf16 ≈ 64 GiB，TP 分摊）后，KV cache 预算只剩十几 GiB——
+    只够 1～2 条 32K 长上下文并发请求</code></pre>
+    <p>
+      两个推论：① <strong>decode 是 memory-bound</strong>——每步都要把权重和整个 KV cache 从 HBM 读一遍，却只做一个 token 的计算，
+      算术强度极低，TPOT（每输出 token 时间）由显存带宽决定；② <strong>prefill 是 compute-bound</strong>——prompt 的 N 个 token 并行过 GEMM，
+      TTFT（首 token 时间）主要由算力决定。这两个阶段瓶颈不同，是后文 PD 分离的物理基础。
+    </p>
+
+    <h3>2. 早期系统的三重浪费</h3>
+    <table>
+      <thead><tr><th>问题</th><th>机制</th><th>量级（论文口径）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>预分配碎片</strong></td><td>为每个请求按 max_seq_len 预留连续显存，实际生成远短于预留；内部碎片 + 外部碎片</td><td>PagedAttention 论文实测：KV cache 显存 <strong>60%～80% 被浪费</strong></td></tr>
+        <tr><td><strong>静态批处理</strong></td><td>一批请求必须整体跑完，30 条已结束的请求等 2 条最长的；GPU 空转</td><td>混合长度负载下 GPU 利用率仅 <strong>20%～40%</strong></td></tr>
+        <tr><td><strong>前缀重复</strong></td><td>同一 system prompt、同一 few-shot 前缀在每个请求里各存一份 KV</td><td>多轮对话/共享 prompt 场景下成倍冗余</td></tr>
+      </tbody>
+    </table>
+
+    <h2>技术要点</h2>
+
+    <h3>1. PagedAttention：把操作系统的虚拟内存搬进 GPU</h3>
+    <p>
+      Kwon et al.（SOSP 2023）的方案直接类比 OS 的分页虚拟内存：
+    </p>
+    <ul>
+      <li>KV cache 切成<strong>固定大小的 block</strong>（页，如 16 token/页），物理上可以不连续；</li>
+      <li>每个请求维护一张 <strong>block table</strong>（页表），把逻辑 token 位置映射到物理块；</li>
+      <li>页<strong>按需分配</strong>：生成到哪领到哪，不再预占 max_seq_len；浪费只剩最后一个没写满的页——全系统浪费压到 <strong>&lt;4%</strong>（对照此前的 60%～80%）；</li>
+      <li>页可以<strong>跨请求共享 + copy-on-write</strong>：parallel sampling、beam search 里同前缀的分支共享物理页，分叉时才复制——这是 prefix caching 的底层使能。</li>
+    </ul>
+    <p>
+      效果（论文实测）：同等延迟下，vLLM 吞吐是当时最强系统 FasterTransformer / Orca 的 <strong>2～4×</strong>，
+      且序列越长、模型越大、解码算法越复杂，优势越大。
+      <strong>归因提醒</strong>：流传很广的「24×」数字来自 vLLM 发布博客、基线是裸 HuggingFace <code>generate()</code>（无任何批处理优化），
+      与论文里对生产级系统的 2～4× 不是一回事，引用时别混。
+    </p>
+
+    <h3>2. Continuous batching：让 GPU 没有「等齐」这回事</h3>
+    <p>
+      来自 Orca（OSDI 2022）的迭代级调度：<strong>每生成一步就重新调度一次</strong>——
+      这一步结束的请求立刻离场、释放页，等待队列里的新请求立刻入场，而不是等整批跑完。
+      它解决的是利用率问题，但有一个隐含依赖：如果显存还是按 max_seq_len 预分配的，
+      新请求根本挤不进来。所以 continuous batching 的实际收益要乘上 PagedAttention 的显存回收能力——
+      <strong>一个管「时间复用」，一个管「空间复用」</strong>，两者合起来才把 GPU 利用率从 20%～40% 拉到可用水位。
+    </p>
+
+    <h3>3. Prefix caching / RadixAttention：共享前缀只存一份</h3>
+    <p>
+      分页 + 引用计数让「共享」变便宜之后，下一步是主动复用：相同前缀（system prompt、agent 的固定指令头、多轮对话的历史）的 KV 页只存一份。
+      SGLang 的 <strong>RadixAttention</strong> 用 <strong>radix tree（基数树）+ LRU</strong> 组织缓存：树边是 token 序列，
+      新请求进来沿树匹配最长前缀，命中部分直接引用已有页，未命中部分才 prefill。
+      对 agent 场景这是数量级级的优化——固定指令头几千 token 的 prefill 被完全省掉，TTFT 里最大的一块直接消失。
+    </p>
+
+    <h3>4. PD 分离与 Mooncake：把「两种瓶颈」拆到「两种机器」上</h3>
+    <p>
+      既然 prefill 是 compute-bound、decode 是 memory-bound，把它们塞进同一种 GPU 配置就是两边都不讨好。
+      <strong>PD 分离（prefill/decode disaggregation）</strong>：prefill 集群和 decode 集群分开部署、独立扩缩容，中间只传一样东西——KV cache。
+      Moonshot AI 与清华的 <strong>Mooncake</strong>（Kimi 的生产平台）把这个思路做到了极致：
+    </p>
+    <ul>
+      <li><strong>KVCache-centric</strong>：不只分离 prefill/decode，还把集群里闲置的 CPU、DRAM、SSD、RDMA 组织成一个<strong>分布式 KV cache 池</strong>（分页存储、按前缀哈希去重、LRU/LFU 淘汰），近乎零成本地放大了 prefix caching 的容量；</li>
+      <li><strong>Conductor</strong> 全局调度器按 KV cache 分布和负载选 prefill/decode 节点对；<strong>Messenger</strong>（GPUDirect RDMA）负责跨节点传 KV——prefill 边算边逐层流出 KV，decode 异步加载避免 GPU 空转；</li>
+      <li>面向超载现实：<strong>预测式早拒</strong>策略，在入口就拒掉大概率违约的请求，保 SLO；</li>
+      <li>论文数据：模拟场景吞吐最高 <strong>+525%</strong>（满足 SLO 前提）；真实负载让 Kimi 多承载 <strong>75%</strong> 请求；公开数据集上 Mooncake-[3P+1D] 比 4 实例 vLLM 高 20%～40%。</li>
+    </ul>
+    <p>
+      同一条线上的工作还有 Splitwise、DistServe、TetriInfer——「按阶段瓶颈分资源」已是 2024 年后推理系统的共识方向；
+      SGLang/vLLM 目前也都提供 PD 分离部署形态。
+    </p>
+
+    <h3>5. 算法侧的呼应：为什么新架构都在压 KV cache</h3>
+    <p>
+      系统技术省的是「管理的浪费」，模型架构省的是「本来就小」：
+      MHA → <strong>GQA</strong>（KV 头数砍几倍，显存同比例降）→ <strong>MLA</strong>（DeepSeek 系，把 KV 压成低秩 latent 向量）→
+      <strong>线性/稀疏注意力混合</strong>（<a href="daily-2026-08-28-glm-5-3.html">GLM-5.3-Flash</a> 相对 GLM-5.3 注意力计算降 3.0×、KV cache 降 4.4×）。
+      读架构论文时可以把「每 token KV 字节数」当成和参数量并列的一阶指标——它直接决定长上下文服务的成本曲线。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>容量规划先算账</strong>：用上面的公式算「每 token KV 字节数」，再乘（P95 上下文长度 × 目标并发），加权重 + 激活余量，对照显卡显存。估出来一张 80G 卡只能扛 2 条 32K 并发，就别在销售页面上写「支持长上下文高并发」。</li>
+      <li><strong>SLO 拆成 TTFT 和 TPOT 分别定</strong>：TTFT 卡 prefill（受 prompt 长度、prefix cache 命中率影响），TPOT 卡 decode（受 batch 内 KV 总量影响）。用户体验差时先看是哪个指标违约，再决定加 prefill 算力还是减 decode 负载。</li>
+      <li><strong>为 prefix caching 设计 prompt</strong>：把不变的内容（system prompt、工具定义、few-shot）放在最前面且逐字节稳定——哪怕差一个空格，radix 树匹配也会断。agent 产品的「固定指令头」应该当作缓存键来设计，而不是随手拼接。</li>
+      <li><strong>何时考虑 PD 分离</strong>：单实例 vLLM/SGLang 已经压满、且 prefill 与 decode 负载比例长期失衡（如长 prompt 短输出的文档场景 vs 短 prompt 长输出的 reasoning 场景）。在此之前，chunked prefill 和调 batch 预算更便宜。</li>
+      <li><strong>别迷信单点数字</strong>：2～4×、24×、+525% 分别对应不同基线与场景（论文生产基线 / 裸 HF / 模拟超载）。选型压测要用自己的 prompt 长度分布、输出长度分布和并发模型，厂商数字只当方向参考。</li>
+      <li><strong>把「每 token KV 字节数」加入模型评审</strong>：GQA/MLA/线性注意力省的都是真金白银；同样是 32B 级模型，KV cache 差 4 倍意味着长上下文业务的显卡预算差 4 倍。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说 prefill 是 compute-bound 而 decode 是 memory-bound？请用算术强度（FLOPs/字节）说明，并指出这决定了哪两个不同的优化方向。
+        <details><summary>参考答案</summary>
+        prefill 一次处理 N 个 prompt token：注意力与前馈都是 N×d 级别的大 GEMM，权重只从 HBM 读一次却被复用 N 次，算术强度高，瓶颈在算力。decode 每步只生成 1 个 token：必须读全部权重 + 该请求全部 KV cache（几十 GB），却只完成 O(d²) 量级的向量化计算，算术强度极低，瓶颈在 HBM 带宽。由此分化出两个优化方向：prefill 要堆算力/并行度压 TTFT（或用 prefix caching 干脆不做重复 prefill）；decode 要减少每步读取量压 TPOT——PagedAttention 提高有效容量、GQA/MLA 缩 KV、大 batch 摊薄权重读取。PD 分离则直接承认「一种机器配不出两种最优」，按阶段拆集群。</details>
+      </li>
+      <li>
+        PagedAttention 为什么能把 KV cache 浪费从 60%～80% 压到 4% 以内？页（block）大小的选择权衡是什么？
+        <details><summary>参考答案</summary>
+        旧方案按 max_seq_len 为每个请求预留连续显存：短请求白占空间（内部碎片），长短不一的请求释放后留下无法利用的零散空隙（外部碎片）。PagedAttention 把 KV 切成定长页、按需领取、页表映射逻辑到物理——请求只为真实生成的 token 付显存，碎片只剩每请求最后一个未写满的页。页大小的权衡：页越大，页表越小、注意力内核对连续块的读取越高效，但内部碎片上限升高（每请求最多浪费一页）、共享粒度变粗（prefix 共享以页为单位，页越大命中越难）；页越小则反之，且页表开销与内核调度变碎。vLLM 默认 16 token/页就是这个权衡的折中点。</details>
+      </li>
+      <li>
+        Continuous batching 为什么必须和 PagedAttention 配合才能发挥全部收益？如果只有前者没有后者会怎样？
+        <details><summary>参考答案</summary>
+        Continuous batching 的收益来自「每一步都允许新请求入场、结束请求离场」，即时间维度的槽位复用。但入场的前提是有显存可分配：在 max_seq_len 预分配方案下，哪怕当前活跃 token 很少，显存也早被各请求的「理论最大长度」占满，新请求根本挤不进来——调度器想调度也没有资源。PagedAttention 把空间维度打通：按需分配让离场请求真正腾出显存、新请求按实际增长逐步领取。一个是时间复用、一个是空间复用，二者乘积才是吞吐提升；只有连续批处理没有分页管理，入场率被预分配锁死，利用率改善有限。</details>
+      </li>
+      <li>
+        Prefix caching 在 PagedAttention 出现之前就已经存在这个想法，为什么直到分页 + copy-on-write 之后才真正便宜？RadixAttention 又解决了什么 PagedAttention 没解决的问题？
+        <details><summary>参考答案</summary>
+        连续显存方案里，「共享前缀」要求多个请求的 KV 在物理上指向同一片区域，但每个请求的缓存是独立连续分配的，共享意味着重写整个内存布局，工程上不可行；只能在单请求内部（如 beam search 各分支）做有限的共享。分页之后，共享只是「页表里多个逻辑页指向同一个物理页 + 引用计数」，分叉时 copy-on-write 复制单页即可，共享的边际成本接近零。PagedAttention 解决的是「能不能共享」，RadixAttention 解决的是「怎么高效发现和管理共享」：用 radix 树按 token 前缀组织缓存，新请求沿树做最长前缀匹配，自动命中任意深度的历史前缀，并用 LRU 在容量压力下淘汰最久未用的分支——把 prefix caching 从「手工指定可复用段」变成「自动的、跨请求的、有淘汰策略的缓存系统」。</details>
+      </li>
+      <li>
+        Mooncake 把调度器设计成「KVCache-centric」而不是「GPU-centric」，这个视角转换具体带来了哪三个能力？它的「预测式早拒」在保护什么？
+        <details><summary>参考答案</summary>
+        三个能力：① <strong>按内容调度</strong>——Conductor 知道每块 KV cache 在哪里，能把请求派到「前缀已缓存」的节点，直接省掉 prefill；② <strong>分层存储扩容</strong>——把集群闲置的 CPU/DRAM/SSD/RDMA 组织成分布式 KV 池（分页 + 前缀哈希去重 + LRU/LFU 淘汰），prefix cache 的容量不再受单卡显存限制；③ <strong>流水线化传输</strong>——Messenger 用 GPUDirect RDMA 让 prefill 边算边逐层流出 KV、decode 异步预取，传输隐藏在计算之下。「预测式早拒」保护的是 SLO 下的有效吞吐：在超载场景，接纳一个大概率完不成延迟目标的请求，不只是它自己违约，还会挤占本可正常完成请求的资源（排队、KV 空间、带宽），把系统拖入「全部超时」的崩溃模式；入口处基于预测拒绝高风险请求，是把稀缺资源留给能满足 SLO 的请求——这是生产系统与论文基准的关键差别。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Kwon et al. <em>Efficient Memory Management for Large Language Model Serving with PagedAttention</em>（SOSP 2023）：<a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">arXiv:2309.06180</a> · <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vLLM</a></li>
+      <li>Yu et al. <em>Orca: A Distributed Serving System for Transformer-Based Generative Models</em>（OSDI 2022，continuous batching 出处）：<a href="https://www.usenix.org/conference/osdi22/presentation/yu" target="_blank" rel="noopener">USENIX 页面</a></li>
+      <li>Zheng et al. <em>SGLang: Efficient Execution of Structured Language Model Programs</em>（RadixAttention）：<a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arXiv:2312.07104</a></li>
+      <li>Qin et al. <em>Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</em>（Moonshot AI &amp; 清华）：<a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">arXiv:2407.00079</a></li>
+      <li>相关笔记：<a href="daily-2026-08-31-miles-v01.html">Miles v0.1：RL 后训练全栈（rollout 侧的推理调度）</a> · <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3-Flash 的混合注意力与 KV cache 削减</a> · <a href="special-2026-08-27-new-models-arch.html">特别篇：2026 新模型架构全景（MLA / 线性注意力）</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
