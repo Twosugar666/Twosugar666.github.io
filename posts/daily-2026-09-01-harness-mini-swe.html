@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜mini-SWE-agent：为什么「只有 bash + 无状态 subprocess」成了 RL 友好的 harness 基线 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜mini-SWE-agent：为什么「只有 bash + 无状态 subprocess」成了 RL 友好的 harness 基线</h1>
+    <p class="post-meta">2026-09-01 · 收藏夹：Harness / Agent · 学习笔记<br />
+      主来源：
+      <a href="https://mini-swe-agent.com/latest/faq/" target="_blank" rel="noopener">mini-SWE-agent · FAQ</a>；
+      对照站内
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-08-14-deepseek-harness.html">DeepSeek Harness（dsh）</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      同日
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>。
+      机制描述对齐官方 FAQ；未编造 SWE-Bench 分数。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      做 Agent RL / FT 时，scaffold 本身会变成训练集的一部分。
+      工具 schema、事件流投影、condenser、持久 shell 会话——每一层都在塑造「什么叫一步动作、什么叫一条轨迹」。
+      模型若过拟合某套丰富工具或某份 YAML 历史处理器，换到部署 harness 就会掉点；换到另一套训练环境又要重洗数据。
+    </p>
+    <p>
+      <strong>mini-SWE-agent</strong>（下称 mini）把默认设定压到近乎最小：
+      只有 bash、不用 LM tool-calling API、历史完全线性 append、动作用 <code>subprocess.run</code> 无状态执行、动作从 triple-backtick 解析。
+      FAQ 写得很直白：若在做 FT / RL，且<strong>不想过拟合特定 agent scaffold</strong>，就用 mini；若要实验多种工具与历史处理器，再回 SWE-agent。
+    </p>
+    <p>
+      站内 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>已标过光谱：mini 一端「轨迹 ≈ messages」最干净；OpenHands / dsh 的事件流是中间态；带 subagent 的独立构 prompt 是另一端。
+      本篇把 FAQ 里的工程选择钉到 RL 友好性上，并与 <a href="daily-2026-08-31-harness-tito.html">TITO</a> 分层：无状态 subprocess 解决的是<strong>环境执行合同</strong>；TITO 解决的是<strong>token ID 合同</strong>——两者不是同一层问题。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：mini = bash-only + 线性 messages + 无状态 subprocess + 三联反引号解析动作；用「少接口」换「轨迹干净、环境零依赖、避开持久 shell 三大坑」，从而成为 FT/RL 的默认 scaffold 基线。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 只有 bash：环境零依赖安装</h3>
+    <p>
+      FAQ：mini <strong>没有任何 bash 以外的工具</strong>，甚至不走 LM 的 tool-calling 接口。
+      含义是：目标环境里不必为 Agent 预装特殊 tool server、不必对齐各家 function-calling schema；有 bash（或 Docker / Singularity / Apptainer 等模拟出的 bash）即可跑。
+    </p>
+    <table>
+      <thead><tr><th></th><th>依赖 tool-calling API</th><th>mini（bash-only）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>环境侧</strong></td><td>常需工具守护进程 / schema 注册</td><td>零额外安装</td></tr>
+        <tr><td><strong>模型侧</strong></td><td>绑定特定 tool JSON / 特殊 token</td><td>普通文本里写命令</td></tr>
+        <tr><td><strong>RL 风险</strong></td><td>过拟合某家 API 与参数名</td><td>过拟合面缩到「会写 shell」</td></tr>
+      </tbody>
+    </table>
+    <p>
+      代价也清楚：不能原生挂浏览器专用工具、结构化编辑器 API 等；要那些能力应切回 SWE-agent 或自扩。
+      对「先训一个不绑死 scaffold 的 coding policy」这个目标，少工具是特性，不是功能残缺。
+    </p>
+
+    <h3>② 完全线性 history：每步只 append messages</h3>
+    <pre><code># mini 控制流（概念）
+messages = [system, user_task]
+while not done:
+  reply = lm.complete(messages)          # 无独立「投影视图」
+  action = parse_triple_backtick(reply)  # 见下节
+  obs    = subprocess.run(action, ...)   # 无状态
+  messages.append(assistant=reply)
+  messages.append(user=obs)            # 或等价 role
+# 轨迹 ≈ messages 列表本身</code></pre>
+    <p>
+      对比 <a href="daily-2026-08-14-deepseek-harness.html">dsh</a>：「会话日志仅追加，prompt 是投影」——事件流是真相，LLM 视图可换。
+      mini 选择更极端：<strong>不做第二套投影</strong>，messages 既是人读日志也是模型上下文。
+      对 on-policy RL，这意味着 1 rollout ≈ 1 条连续对话样本的假设更容易成立；advantage / mask 的边界与「模型当时看见的前缀」对齐成本更低。
+    </p>
+    <p>
+      这并不自动等于 TITO：线性 messages 仍可能每轮 decode→chat_template→encode。
+      但「没有 condenser 摘要替换旧事件、没有多工具事件总线」已经删掉一大类前缀断裂源。
+    </p>
+
+    <h3>③ subprocess.run 无状态：躲开持久 shell 三大坑</h3>
+    <p>FAQ 单独开节解释「为什么不需要 running shell session 是大事」。持久会话常见三类故障：</p>
+    <table>
+      <thead><tr><th>坑</th><th>持久 shell 里发生什么</th><th>mini 的规避</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>命令何时结束</strong></td>
+          <td>往 session 里贴输入后，靠 PID / prompt 启发式读输出，易抖</td>
+          <td>一次 <code>subprocess.run</code>，生命周期清晰</td>
+        </tr>
+        <tr>
+          <td><strong>坏命令杀掉 shell</strong></td>
+          <td>后续动作失去会话；恢复逻辑复杂</td>
+          <td>每次新进程，杀不垮「下一跳」</td>
+        </tr>
+        <tr>
+          <td><strong>中断污染</strong></td>
+          <td>Ctrl-C / timeout 搞乱 shell 状态，污染之后所有输出抽取</td>
+          <td>中断只影响当次 subprocess</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 无状态的代价与写法
+# 不能隐式依赖上一跳的 cwd / export
+# 错误：假设仍在 /repo 且 FOO 已 export
+pytest tests/
+
+# 正确：每条命令自带前缀
+cd /repo && export FOO=bar && pytest tests/
+# FAQ：部分 LM（如 Claude）即使不要求也会自己加前缀</code></pre>
+    <p>
+      RL 视角：无状态让「动作 → 观测」更接近独立 trial，轨迹里少一种「会话幽灵状态」。
+      持久 shell 的隐藏状态（cwd、env、后台 job）不会进 messages，却影响下一跳——这是典型的<strong>部分可观测</strong>，会把 credit assignment 搅浑（与同日 <a href="daily-2026-09-01-ahead.html">AHEAD</a> 要点名的 error step 叠加时更难诊断）。
+    </p>
+
+    <h3>④ 动作解析：triple-backtick，而非 tool-calling</h3>
+    <p>
+      默认从模型输出的三联反引号代码块解析动作，而不是假设 function-calling 格式。
+      好处：任意只吐文本的模型都能接入；坏处：解析规则本身成为 scaffold 的一部分，需要版本化，并在评测时固定。
+      FAQ 承认这是 limitation；需要更强工具/历史实验时用 SWE-agent。
+    </p>
+
+    <h3>⑤ 与 OpenHands / SWE-agent / TITO / Lightning 对照</h3>
+    <table>
+      <thead><tr><th></th><th>工具与执行</th><th>历史形态</th><th>对 RL 的含义</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>mini</strong></td>
+          <td>仅 bash；subprocess 无状态</td>
+          <td>线性 messages</td>
+          <td>轨迹最干净；适合 FT/RL 基线，少过拟合 scaffold</td>
+        </tr>
+        <tr>
+          <td><strong>SWE-agent</strong></td>
+          <td>可多工具；YAML 配置强</td>
+          <td>可挂不同 history processor</td>
+          <td>适合工具/历史消融；RL 时要防过拟合配置</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-08-28-harness-runtime.html"><strong>OpenHands</strong></a></td>
+          <td>丰富工具 + Docker；事件流</td>
+          <td>Action→Observation；可有 condenser</td>
+          <td>产品能力强；有损摘要会打断 token 前缀</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-08-31-harness-tito.html"><strong>TITO</strong></a></td>
+          <td>不规定工具集</td>
+          <td>保留引擎 token IDs</td>
+          <td>与「无状态」正交：解决 ID 忠实，不解决 shell 会话</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-08-28-agent-lightning-v1.html"><strong>Lightning</strong></a></td>
+          <td>部署 harness 进训练 proxy</td>
+          <td>取决于原 harness</td>
+          <td>保产品控制流；不自动给你 mini 的简洁轨迹</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      选型口诀：要<strong>可迁移的 coding policy</strong> → mini 当训练 scaffold；
+      要<strong>产品同款工具契约</strong> → Lightning 挂原 harness；
+      要<strong>token 级 R3 / OPD</strong> → 在任一 harness 上加 TITO，而不是指望「换成 mini 就自动 ID 对齐」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>FT/RL 默认从 mini 起基线。</strong> FAQ 原话指向「不想过拟合特定 scaffold」。先在 bash-only 线性历史上把算法跑稳，再逐步加工具，才能分清「算法增益」与「scaffold 增益」。</li>
+      <li><strong>命令模板强制自包含。</strong> 系统提示或后处理要求每条动作带 <code>cd</code> / <code>export</code> 前缀；评测脚本拒绝依赖隐式 cwd 的用例。</li>
+      <li><strong>解析器版本钉死。</strong> Triple-backtick 规则变更等于动作空间变更；数据集要记 parser commit hash。</li>
+      <li><strong>与 TITO 叠层，而不是互斥。</strong> mini 降低执行层噪声；若仍做 token-level ratio，照样做 decode→encode round-trip 探针（见 TITO 文）。</li>
+      <li><strong>需要丰富工具时显式「毕业」。</strong> 切 OpenHands / SWE-agent / 内部 coding harness 时，把工具 schema 与 condenser 策略写进实验卡；不要静默换 scaffold 还宣称同分布。</li>
+      <li><strong>和 Lightning 分工。</strong> 已有生产 Claude Code / 内部 Agent、只想收轨迹 → proxy；从零训可迁移 SWE policy → mini。两者可以先后：mini 冷启动，再蒸馏进产品 harness。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「不用 tool-calling API」能降低对特定 scaffold 的过拟合？过拟合会转移到哪里？
+        <details><summary>参考答案</summary>
+        Tool-calling 把参数名、JSON 壳、特殊 token 写进策略；换模型 API 或工具集即分布偏移。Bash-only 把接口缩到 shell 文本，过拟合面变窄。仍可能过拟合：triplet 解析习惯、提示词里的目录布局、测试框架命令风格——只是比「函数 schema」更容易在部署侧用同一 bash 对齐。</details>
+      </li>
+      <li>
+        无状态 subprocess 不能隐式 cd/export，这如何反而有利于信用分配？
+        <details><summary>参考答案</summary>
+        持久 shell 的 cwd/env 是隐藏状态：不在 messages 里，却改变下一跳转移。Advantage 会把「环境幽灵状态」的后果算到表面动作上。无状态迫使状态显式写进命令字符串，观测与动作的因果更可复述，error step 更好点名（对照 AHEAD）。</details>
+      </li>
+      <li>
+        「轨迹 ≈ messages」是否等于已经满足 TITO？举一个仍会 ID 漂移的路径。
+        <details><summary>参考答案</summary>
+        不等于。线性 append 只保证对话层连续；若每轮仍 decode 后再用 chat template 整段 re-encode，BPE 边界仍可能变。TITO 要求保留生成段 token IDs 并只 tokenize 新 observation。mini 删掉 condenser / 多工具投影，降低漂移概率，但不自动关闭 re-tokenize。</details>
+      </li>
+      <li>
+        何种实验必须离开 mini、改用 SWE-agent 或 OpenHands？
+        <details><summary>参考答案</summary>
+        需要非 bash 工具（浏览器、结构化编辑、专用 LSP）、要对比多种 history processor、或产品评测协议绑定事件流 / Docker 工作流时。继续用 mini 会把「工具能力不足」误读成「策略不行」。</details>
+      </li>
+      <li>
+        团队已用 Lightning 把部署 harness 接进训练，是否还需要 mini 基线？
+        <details><summary>参考答案</summary>
+        需要对照。Lightning 保的是产品控制流同一性；产品 harness 可能含持久 shell、condenser、subagent，轨迹并不干净。保留一条 mini 训练曲线，才能诊断掉点来自算法、来自 scaffold 过拟合，还是来自 token 不对齐。三者对照比单挂 proxy 更可解释。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>mini-SWE-agent FAQ：
+        <a href="https://mini-swe-agent.com/latest/faq/" target="_blank" rel="noopener">mini-swe-agent.com/latest/faq</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-08-14-deepseek-harness.html">dsh</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
