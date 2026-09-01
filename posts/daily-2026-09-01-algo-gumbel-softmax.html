@@ -1,1 +1,173 @@
-LOAD:/workspace/out-2026-09-01/posts/daily-2026-09-01-algo-gumbel-softmax.html
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Gumbel-Softmax：离散采样如何换一条可回传的路（Concrete / STE） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Gumbel-Softmax：离散采样如何换一条可回传的路（Concrete / STE）</h1>
+    <p class="post-meta">2026-09-01 · 收藏夹：算法 / RL · 学习笔记<br />
+      主来源：Jang, Gu, Poole · <em>Categorical Reparameterization with Gumbel-Softmax</em>（ICLR 2017），
+      <a href="https://arxiv.org/abs/1611.01144" target="_blank" rel="noopener">arXiv:1611.01144</a>；
+      Maddison, Mnih, Teh · <em>The Concrete Distribution</em>，
+      <a href="https://arxiv.org/abs/1611.00712" target="_blank" rel="noopener">arXiv:1611.00712</a>。
+      对照
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>。
+      公式用 <code>pre</code>；现代 GRADE / SofT-GRPO 仅作应用回响，主体仍是经典算法课。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      许多模型内部需要<strong>离散选择</strong>：从 K 类里采一个类别、选一条边、打开一个 expert、挑一个工具。
+      前向好写——<code>z ~ Categorical(π)</code> 或 <code>z = one_hot(argmax)</code>——反向却断：argmax / 离散采样对参数 π 的梯度是零或未定义。
+    </p>
+    <p>
+      经典出路有两条。一条是 <strong>score-function / REINFORCE</strong>：对 log π 求梯度，用蒙特卡洛估；无偏但高方差，常要 baseline。
+      另一条是 <strong>重参数化</strong>：把噪声挪到参数外面，让采样结果对 π 可微——高斯有 <code>μ+σ·ε</code>，离散分布长时间缺一个同样干净的技巧。
+    </p>
+    <p>
+      2016 年底几乎同时出现的 Gumbel-Softmax（Jang et al.）与 Concrete（Maddison et al.）给出第三条路：
+      用 Gumbel-Max trick 的连续松弛，把「采类别」写成温度 τ 下的 softmax，从而能走路径导数；τ→0 时逼近 one-hot categorical。
+      Straight-Through（STE）变体则在前向仍取硬离散，反向假装走了软版本。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Gumbel-Softmax / Concrete = Gumbel-Max 的 softmax 松弛；用可微的 y(π,g,τ) 近似离散 z，换一条低方差的路径导数，而不是只靠 REINFORCE。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Gumbel-Max：离散采样的噪声形式</h3>
+    <p>
+      设类别概率 <code>π_i &gt; 0</code>，<code>∑ π_i = 1</code>。Gumbel-Max trick 说：独立采 <code>g_i ~ Gumbel(0,1)</code>（可用 <code>g = -log(-log u)</code>，<code>u~Uniform(0,1)</code>），则
+    </p>
+    <pre><code>z = one_hot( argmax_i ( log π_i + g_i ) )
+# z 的分布恰好是 Categorical(π)
+# 噪声在外面，但 argmax 仍不可微 → 还不能直接反传</code></pre>
+    <p>
+      这一步的价值是：把「离散随机性」写成「固定 π 上的确定性 argmax + 外部噪声」，为后续把 argmax 换成 softmax 铺路。
+    </p>
+
+    <h3>② Softmax 温度松弛：Concrete / Gumbel-Softmax 向量</h3>
+    <pre><code># Gumbel-Softmax / Concrete 样本（K 维）
+y_i = exp( (log π_i + g_i) / τ ) / Σ_j exp( (log π_j + g_j) / τ )
+# 即 y = softmax( (log π + g) / τ )
+
+# τ → 0⁺ ：y 逼近 one-hot，接近真正的 categorical 样本
+# τ → ∞  ：y 变平坦，接近均匀，梯度稳但离散性弱
+# 训练时常从较高 τ 退火到较低 τ</code></pre>
+    <p>
+      y 落在概率单纯形上，对 <code>log π</code>（从而对产生 π 的网络参数）可微；给定 g 时是确定性映射，因此可以走 <strong>reparameterization / pathwise</strong> 梯度，方差通常远低于裸 REINFORCE。
+      Maddison et al. 从连续分布（Concrete）角度推导同一族对象；Jang et al. 从 Gumbel-Softmax 命名并强调 categorical 重参数化与半监督等实验——核心公式同构。
+    </p>
+    <table>
+      <thead><tr><th></th><th>REINFORCE</th><th>Gumbel-Softmax</th></tr></thead>
+      <tbody>
+        <tr><td><strong>前向</strong></td><td>真离散 z</td><td>软 y（或 STE 硬前向）</td></tr>
+        <tr><td><strong>梯度</strong></td><td>score-function；无偏、高方差</td><td>pathwise；有偏（相对真离散）、低方差</td></tr>
+        <tr><td><strong>温度 τ</strong></td><td>无</td><td>偏差–方差 / 离散度旋钮</td></tr>
+        <tr><td><strong>极限</strong></td><td>始终离散</td><td>τ→0 逼近离散</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ Straight-Through：前向硬、反向软</h3>
+    <pre><code># Straight-Through Gumbel-Softmax（示意）
+y_soft = softmax( (log π + g) / τ )
+z_hard = one_hot( argmax(y_soft) )   # 前向用硬类别
+# 反向：把 ∂L/∂z_hard 当作 ∂L/∂y_soft 传回
+# 实现上常见：z = y_soft + stop_gradient(z_hard - y_soft)
+# 前向值 = z_hard；梯度通道 = y_soft</code></pre>
+    <p>
+      STE 让下游模块在前向看见真正的离散选择（匹配部署），同时仍能从软松弛拿梯度。
+      代价是额外偏差：反向通道与前向函数不一致。工程上常与温度退火、多采样平均一起用。
+    </p>
+
+    <h3>④ 和策略梯度课的关系（PPO / GRPO / GSPO）</h3>
+    <p>
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a> / <a href="grpo-notes.html">GRPO</a> / <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 优化的是<strong>已采样 token 序列</strong>上的 surrogate；token 本身来自自回归 categorical，但损失建在 log π(y_t|…) 的 score-function 结构上（再配 clip / 组内 A / 序列 IS），并不需要把每个 token 换成 Gumbel-Softmax 样本。
+    </p>
+    <p>
+      Gumbel-Softmax 更常出现在：潜变量离散、工具 / 专家路由的可微松弛、结构化离散门控、以及「想把离散决策塞进端到端可微图」的场景。
+      与 RL 后训练的关系是：同一套「离散 vs 可微」张力；解决工具不同——后训练主路径仍是 likelihood ratio + advantage，而不是默认对每个生成 token 做 Concrete 重参数。
+    </p>
+
+    <h3>⑤ 应用回响（点到为止）：GRADE / SofT-GRPO</h3>
+    <p>
+      近年来若干工作把「软离散 / 温度」思想带回 LLM RL 与路由：例如用更软的选择或分数化门控稳定更新（公开讨论中可见 GRADE、SofT-GRPO 等名号）。
+      读法建议：把它们当成 <strong>Gumbel-Softmax / Concrete 课的当代回声</strong>——温度、直通估计、离散–连续折中——而不是本课的主体证明对象。
+      若主损失已是 GRPO/GSPO 的 token/序列 ratio，再叠一层软路由时，应单独做消融：松弛改的是动作表示还是只改梯度通道。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先写清：要无偏离散，还是要低方差可微。</strong> 部署必须硬类别且能接受高方差 → REINFORCE + baseline；要端到端 downstream 可微 → Gumbel-Softmax / STE，并接受 τ 带来的偏差。</li>
+      <li><strong>温度当一等超参。</strong> 过高：梯度稳但学不像离散；过低：数值尖、梯度病态。从较大 τ 退火是默认剧本；固定极低 τ 往往只是「假离散」。</li>
+      <li><strong>STE 与纯软分开记录。</strong> 前向硬/反向软会改行为分布；评测应同时报硬采样指标与软目标上的训练曲线，避免只看可微代理损失。</li>
+      <li><strong>多类（K 大）时注意归一化与噪声。</strong> log π 建议用 log-softmax 稳定；gumbel 噪声与 τ 的尺度要一起看，避免某类数值淹没。</li>
+      <li><strong>别默认用它替换 LLM-RL 的 token 采样。</strong> PPO/GRPO 族已经在离散 token 上用 likelihood ratio 工作；乱加 Gumbel-Softmax 重参数通常不降低方差，反而改写生成过程。</li>
+      <li><strong>阅读顺序。</strong> 本课建立松弛直觉 → 回 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 看 score-function + clip → <a href="grpo-notes.html">GRPO</a> / <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 看现代 LLM-RL 如何在不松弛 token 的前提下做稳定更新。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么 Gumbel-Max 本身还不够反传？Softmax 替换掉的是哪一个不可微环节？
+        <details><summary>参考答案</summary>
+        Gumbel-Max 把随机性外置，但决策仍是 argmax，对输入的次梯度在几乎处处为零。Softmax((logπ+g)/τ) 用光滑映射替换 argmax，使 y 对 logπ 有非零路径导数。噪声形式保留，不可微的是 argmax。</details>
+      </li>
+      <li>
+        τ→0 时逼近 categorical，为何训练很少直接把 τ 钉在 0？
+        <details><summary>参考答案</summary>
+        τ→0 时 softmax 变尖，梯度趋于 0 或数值不稳，路径导数失效。需要非零温度提供光滑桥梁；再通过退火逐步靠近离散部署行为。τ=0 是极限叙述，不是可训工作点。</details>
+      </li>
+      <li>
+        Straight-Through 的前向与反向不一致，会引入什么风险？如何检测？
+        <details><summary>参考答案</summary>
+        优化的是「软通道上的代理梯度」，评估/部署用的是硬离散——可能出现代理损失下降但硬指标不动或变差。检测：同时跟踪硬采样任务指标与 y_soft 上的目标；做 STE on/off 与 τ 消融。</details>
+      </li>
+      <li>
+        相对 REINFORCE，Gumbel-Softmax 降方差的代价是什么「有偏」？
+        <details><summary>参考答案</summary>
+        路径导数对应的是松弛分布（Concrete）或 STE 代理，不是原始 Categorical 上的无偏 score-function 期望。估计量方差更低，但目标已偏移。是否可接受取决于下游是否容忍软样本，或是否用退火/STE 把行为拉回硬离散。</details>
+      </li>
+      <li>
+        若有人主张「对 GRPO 的每个 token 改用 Gumbel-Softmax 重参数以稳训练」，问题在哪？
+        <details><summary>参考答案</summary>
+        GRPO/PPO 的优势在于对已采样离散 token 用 importance ratio 与 clip；生成过程仍是自回归 categorical。改成 Gumbel-Softmax 会改变采样与似然定义，和现成 KL/clip/组内 A 的合同不一致，且长序列上重参数并不自动比 baseline-REINFORCE 式的 policy gradient 更稳。应把 Gumbel-Softmax 留给真正需要可微离散潜变量/路由的模块，而不是替换 LLM-RL 主损失。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Jang, Gu, Poole · Gumbel-Softmax：
+        <a href="https://arxiv.org/abs/1611.01144" target="_blank" rel="noopener">arXiv:1611.01144</a></li>
+      <li>Maddison, Mnih, Teh · Concrete：
+        <a href="https://arxiv.org/abs/1611.00712" target="_blank" rel="noopener">arXiv:1611.00712</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
