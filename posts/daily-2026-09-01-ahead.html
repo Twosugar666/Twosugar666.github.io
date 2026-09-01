@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜AHEAD：多轮 Agent RL 的 step-aware 信用分配（环境反馈 + 纠错提示） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜AHEAD：多轮 Agent RL 的 step-aware 信用分配（环境反馈 + 纠错提示）</h1>
+    <p class="post-meta">2026-09-01 · 收藏夹：Agent / RL · 一线追踪<br />
+      主来源：Jin et al. <em>Ahead: Adaptive Hindsight with Environment-Augmented Distillation for Agentic RL</em>，
+      <a href="https://arxiv.org/abs/2608.24114" target="_blank" rel="noopener">arXiv:2608.24114</a>
+      （提交 2026-08-25；HTML
+      <a href="https://arxiv.org/html/2608.24114v1" target="_blank" rel="noopener">arxiv.org/html/2608.24114v1</a>；
+      AWS AI Labs / Purdue）。
+      文中成功率数字均标注为<strong>论文 Table 1 / 作者自报</strong>；未复现第三方评测。
+      交叉：
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="rl-10-papers-detailed.html">10 篇详解</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      多轮 Agent 的 RL 大多仍吃<strong>轨迹级 outcome reward</strong>：
+      <a href="grpo-notes.html">GRPO</a> 对同题一组轨迹算相对 advantage <code>A^ep</code>，再广播到该轨迹每一个 token。
+      这对「整段更好 / 更差」是对的，但对「哪一步把任务搞砸」几乎失明——routine step（合理推进）与 error step（选错物体、无效动作、离谱搜索）吃到同一标量梯度。
+    </p>
+    <p>
+      On-policy self-distillation 试图用 privileged information（PI）给 teacher 开小灶，再用 teacher–student 的 token 级 log-prob gap 当稠密信用。
+      既有做法（SDAR / Skill-SD / RLSD 等）常把<strong>同一种</strong> task-level PI（技能摘要、参考答案）均匀灌进每一步：routine 步其实只需要确认，error 步却需要「当时该怎么做」的纠错方向——环境反馈往往只能说「Nothing happens」，说不出正确替代动作。
+    </p>
+    <p>
+      <strong>Ahead</strong>（Adaptive Hindsight with Environment-Augmented Distillation）把这条不对称写进方法：
+      失败轨迹才走 PI；每步注入环境反馈 <code>Φ^env</code>；analyzer 标出的 error 步再叠加 LLM 纠错提示 <code>Φ^llm</code>；
+      用 RLSD 风格的 clip-exp 把 gap <code>δ</code> 乘回 <code>A^ep</code> 得到 <code>Ã</code>；成功轨迹直接保留 vanilla GRPO。
+      推理时无 PI、无 analyzer、无反馈注入。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Ahead = 失败轨迹上的 step-aware PI（全步 env feedback + error 步 corrective hint）→ token 级 δ 再权重 GRPO 的 A^ep；成功轨迹不动；训推边界干净。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① GRPO 的广播：A^ep 为何分不清 routine / error</h3>
+    <pre><code># GRPO（示意）
+A^ep = (R(τ) - μ_q) / σ_q          # 整条轨迹一个标量
+for every token in τ:
+  loss += clipped_surrogate(ρ_token, A^ep)
+# 同一 A^ep 覆盖「拿对杯子」与「走进空柜子」——无法点名致命步</code></pre>
+    <p>
+      多轮交互里，大多数步只是正常推进；少数步决定成败。
+      广播式 advantage 等于把「结局信用」按 token 均匀摊开，纠错信号被 routine 段稀释，error 段也得不到额外方向。
+      这与站内对 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 讨论的「奖励粒度 vs IS 粒度」是正交问题：GSPO 改的是 importance ratio 的单位；Ahead 改的是<strong>同一 outcome A 在失败轨迹内部如何按步再加权</strong>。
+    </p>
+
+    <h3>② 三阶段：标错 → 造 PI → 蒸馏再权重</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>输入</th><th>产出</th><th>关键约束</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>1. Error identification</strong></td>
+          <td>失败轨迹全文（obs / action / env feedback / outcome）</td>
+          <td>error step 集合 E_τ + 每步 corrective hint</td>
+          <td>仅失败轨迹调用 LLM analyzer</td>
+        </tr>
+        <tr>
+          <td><strong>2. Step-aware PI</strong></td>
+          <td>h_t；Φ^env_t = o_{t+1}；若 t∈E_τ 再加 Φ^llm_t</td>
+          <td>teacher 上下文 tilde h_t</td>
+          <td>routine：仅 env；error：env + hint</td>
+        </tr>
+        <tr>
+          <td><strong>3. δ → Ã</strong></td>
+          <td>同一 π_old 在 h 与 tilde h 上对已采样 token 的 logprob</td>
+          <td>token 级权重 w，再与 A^ep 混合</td>
+          <td>跟随 RLSD；sign(Ã)=sign(A^ep)</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># PI 构造（论文 Eq.4 示意）
+if t in E_τ:
+  tilde_h_t = H(h_t, Φ^env_t, Φ^llm_t)   # 失败信号 + 「本该怎么做」
+else:
+  tilde_h_t = H(h_t, Φ^env_t)            # 只确认后果
+
+# 蒸馏 gap（Eq.3）
+δ_{t,ℓ} = log π_old(y_{t,ℓ} | tilde_h_t, y_&lt;ℓ)
+        - log π_old(y_{t,ℓ} | h_t,      y_&lt;ℓ)
+# δ&gt;0：PI 下更支持该 token；δ&lt;0：PI 下更抑制</code></pre>
+    <p>
+      环境反馈是天然 PI：决策时学生看不到下一步 observation。
+      对 routine，「You arrived at shelf 2」已够确认；对 error，「Nothing happens」只报失败，不给替代动作——hint（如「先去 diningtable 1 找目标物」）补上方向。
+      Teacher 在 error 步看到更富 PI，|δ| 往往更大，从而<strong>无需显式 per-step 系数</strong>也能把更强信号压在致命步上。
+    </p>
+
+    <h3>③ 再权重：clip(exp(sgn(A)·sg(δ))) · A^ep，λ 衰减</h3>
+    <pre><code># 跟随 RLSD（论文 Eq.6–7）；ε=0.2
+w_{t,ℓ} = clip( exp( sgn(A^ep) * sg(δ_{t,ℓ}) ) , 1-ε, 1+ε )
+Ã_{t,ℓ} = A^ep * [ (1 - λ_k) + λ_k * w_{t,ℓ} ]
+
+# λ_k：从 λ0=0.5 线性衰减到 0，衰减视界 D=50 step
+# 失败轨迹上 A^ep&lt;0：
+#   δ&lt;0（teacher 不喜欢）→ 惩罚加大
+#   δ&gt;0（teacher 仍认可）→ 惩罚减弱
+# exp&gt;0 且 clip 保正 → sign(Ã) 永远跟环境奖励走</code></pre>
+    <p>
+      设计要点有三：
+      （1）δ 只调<strong>幅度</strong>，不改更新方向——避免 OPSD 类「蒸馏梯度淹没 RL」的崩溃；
+      （2）成功轨迹 <code>M_τ=∅</code>，直接 <code>Ã=A^ep</code>，防止 PI 在已正确梯度上掺噪；
+      （3）λ 前密后稀：早期用稠密信用加速纠错，后期退回 vanilla GRPO，降低对 PI / analyzer 的过拟合。
+    </p>
+
+    <h3>④ 训推边界与和站内其它文的位置</h3>
+    <table>
+      <thead><tr><th></th><th>Ahead</th><th>对照</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>改什么</strong></td>
+          <td>失败轨迹的 advantage 再权重</td>
+          <td><a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 改序列级 IS；<a href="daily-2026-08-28-algo-ppo.html">PPO</a> 改 clip surrogate 外形</td>
+        </tr>
+        <tr>
+          <td><strong>PI 从哪来</strong></td>
+          <td>env feedback + error-step hint</td>
+          <td>Skill-SD / SDAR：技能等 task-level PI 均匀灌步</td>
+        </tr>
+        <tr>
+          <td><strong>推理时</strong></td>
+          <td>无 PI / 无 analyzer</td>
+          <td>Skill-GRPO* 等可在验证时仍挂技能</td>
+        </tr>
+        <tr>
+          <td><strong>与 harness</strong></td>
+          <td>假定轨迹可回放逐步 obs</td>
+          <td><a href="daily-2026-08-31-harness-tito.html">TITO</a> 保证 token 世界线；<a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 保证部署 harness 在环</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Ahead 不替代 TITO：若 re-tokenize 已改写 token ID，δ 对齐的是错误前缀。
+      也不替代 Lightning：analyzer 与 hint 是训练期特权，产品 harness 仍需自己决定如何记录逐步 env feedback。
+    </p>
+
+    <h3>⑤ 自报结果（Table 1）与消融要点</h3>
+    <p>论文 Table 1（作者自报；Val-128 / 固定 WebShop 128 任务等设定见原文）：</p>
+    <table>
+      <thead><tr><th>骨干</th><th>设定</th><th>GRPO</th><th>Ahead</th><th>Δ（作者）</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen2.5-7B</td><td>ALFWorld Avg</td><td>81.2</td><td><strong>94.5</strong></td><td>+13.3</td></tr>
+        <tr><td>Qwen2.5-7B</td><td>WebShop-Succ</td><td>72.6</td><td><strong>83.6</strong></td><td>+11.0</td></tr>
+        <tr><td>Qwen2.5-3B</td><td>ALFWorld / WebShop-Succ</td><td>75.0 / 63.3</td><td>87.5 / 73.4</td><td>+12.5 / +10.1</td></tr>
+        <tr><td>Qwen3-1.7B</td><td>ALFWorld / WebShop-Succ</td><td>46.1 / 38.3</td><td>67.2 / 64.8</td><td>+21.1 / +26.5</td></tr>
+      </tbody>
+    </table>
+    <p>
+      7B 上 Ahead 的 ALFWorld 94.5 高于 SDAR 85.9、Skill-SD 85.1、RLSD 82.0（同表）；
+      WebShop-Succ 83.6 略高于 SDAR 82.8。
+      小模型增益更大：作者解释为更易出错 → 更多 error step 可供 hint 监督。
+      样本效率上，Ahead 更早摸到 GRPO 终局成功率并继续抬高（文中 Figure 3）；测试时在更紧的交互步数预算内也能解更多题（Figure 4）。
+    </p>
+    <p>
+      消融（Table 2，作者自报）可记三条工程直觉：
+      去掉 λ decay → ALFWorld 掉 7.0–16.4 点量级；
+      不对「仅失败」过滤、把 PI 打到成功轨迹 → 1.7B 伤害最大（约 −18.8）；
+      去掉 hints、只留 env feedback → ALFWorld 掉 7.0–14.1 点量级——说明「失败信号」≠「纠错方向」。
+      Analyzer 可换成 Sonnet / Kimi / GLM 等，均仍明显高于 GRPO 地板（Table 3）；更小骨干上不同 analyzer 差距收窄。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先保证逐步 env feedback 可回放。</strong> Ahead 的 Φ^env 就是下一步 observation；若 harness 只落盘最终 reward，没有逐步 o_{t+1}，这套 PI 建不起来。对照 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> / <a href="daily-2026-08-31-harness-tito.html">TITO</a>：日志字段要比「messages 文本」多一层逐步观测。</li>
+      <li><strong>PI 只打失败轨迹。</strong> 成功轨迹的正 A 已经指向正确方向；再灌 hint 容易和 outcome 打架。复现时把 fail-only 写成硬开关，不要「全部轨迹更公平」。</li>
+      <li><strong>λ 必须衰减。</strong> 作者默认 0.5→0 / D=50。长期把 PI 权重钉死，等于训练依赖特权上下文，推理却拿不到——典型 train–serve 隐形差。</li>
+      <li><strong>Analyzer 成本记账。</strong> 默认用外部 LLM 只在失败轨迹上跑；推理零开销。小骨干可先用更便宜 analyzer（Table 3 显示 1.7B 对 analyzer 质量不敏感）。</li>
+      <li><strong>与 GSPO / GRPO 组合时想清楚粒度。</strong> Ahead 再权重的是广播后的 A；若主损失已切序列级 IS（GSPO），仍可对序列 Â 做类似混合，但 δ 的 token 对齐假设要重新论证——不要默认「两篇都开更强」。</li>
+      <li><strong>排查顺序。</strong> reward 乱抖 → 先看 TITO round-trip；信用摊太匀 → 再考虑 Ahead 式 step-aware PI；不要一上来就加大组内 N 指望 GRPO 自己学会点名 error step。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「环境反馈已经逐步可见」仍不够当 error 步的 PI？hint 补的是哪一类信息？
+        <details><summary>参考答案</summary>
+        Env feedback 描述的是后果（失败 / 无事发生），不规定正确替代动作。Error 步需要的是 counterfactual 方向（本该去哪、该搜什么）。Hint 提供 prescription；env 提供 grounded failure signal。两者叠用才同时有「错了」与「该怎样」。</details>
+      </li>
+      <li>
+        Ahead 坚持 sign(Ã)=sign(A^ep)。若允许 δ 翻转让 advantage 变号，会破坏什么合同？
+        <details><summary>参考答案</summary>
+        环境 outcome 是稀疏但权威的对错标签。若蒸馏 gap 能翻转符号，策略可能在失败轨迹上强化某些 token、或在成功轨迹上抑制关键 token——优化目标从「提高环境成功」滑向「讨好 teacher 上下文」。Clip-exp 保正正是为了让 PI 只调力度。</details>
+      </li>
+      <li>
+        成功轨迹为何绕过 PI？在 1.7B 消融里「非 fail-only」伤害最大，说明什么？
+        <details><summary>参考答案</summary>
+        成功轨迹的正 A 已给正确方向；PI 若与「真正促成成功的 token」不对齐，会把梯度拉歪。小模型更脆弱，错误 hint / 噪声 δ 更容易压过本就稀疏的正确信号，故 fail-only 在小骨干上更关键。</details>
+      </li>
+      <li>
+        Ahead 的 step-aware 再权重与 GSPO 的序列级 IS 分别修复哪一种错配？能否简单相加？
+        <details><summary>参考答案</summary>
+        Ahead：outcome A 在轨迹内部 routine/error 之间的信用错配。GSPO：序列级 reward 与 token 级 importance ratio 的单位错配。可组合，但必须重新定义「δ 作用在 token 还是序列」以及 clip 作用对象；盲目双开可能双重缩放同一信号。</details>
+      </li>
+      <li>
+        推理无 PI，却要求训练日志保留逐步 env feedback。这对 harness / 数据管线提出什么最低字段集？
+        <details><summary>参考答案</summary>
+        每步至少：h_t（或可重建的 messages）、y_t、o_{t+1}、终局 R、以及可复现 tokenization 的 ID（见 TITO）。Analyzer 输入依赖完整失败记录；缺 o_{t+1} 则 Φ^env 无法构造。产品推理路径不必存 hint，但训练路径必须能重放逐步观测。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Jin et al. Ahead · arXiv:2608.24114：
+        <a href="https://arxiv.org/abs/2608.24114" target="_blank" rel="noopener">abs</a> ·
+        <a href="https://arxiv.org/html/2608.24114v1" target="_blank" rel="noopener">HTML</a></li>
+      <li>对照基线（文中）：GRPO · RLSD · SDAR · Skill-SD · OPSD</li>
+      <li>站内交叉：
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="rl-10-papers-detailed.html">10 篇详解</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
