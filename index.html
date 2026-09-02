@@ -1,1 +1,342 @@
-PLACEHOLDER
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Xuanbo Guo · Personal Blog</title>
+  <meta name="description" content="Xuanbo Guo — Master's student at Beihang University. Post-training, Vertical Agents, Multimodal LLMs, Neural Rendering." />
+  <link rel="icon" href="https://github.com/Twosugar666.png" />
+  <link rel="stylesheet" href="assets/style.css" />
+</head>
+<body>
+  <div class="layout" id="top">
+
+    <!-- 左栏：个人信息 -->
+    <aside class="sidebar">
+      <div class="profile-card">
+        <img class="avatar" src="https://github.com/Twosugar666.png" alt="Xuanbo Guo" />
+        <h1>Xuanbo Guo</h1>
+        <p class="subtitle"><img class="card-icon" src="assets/logos/wechat.svg" alt="微信" /> Algorithm Engineer<br />@ Tencent WeChat · 小微</p>
+        <p class="subtitle"><img class="card-icon" src="assets/logos/buaa.png" alt="北航" /> 北京航空航天大学 · 计算机科学硕士</p>
+        <p class="tagline">Post-training · Vertical Agents<br />Multimodal LLMs · Neural Rendering</p>
+        <div class="social">
+          <a href="https://github.com/Twosugar666" target="_blank" rel="noopener"><img class="card-icon" src="assets/logos/github.svg" alt="GitHub" /> GitHub</a>
+          <a href="mailto:1403222698@qq.com"><img class="card-icon" src="assets/logos/qqmail.png" alt="QQ 邮箱" /> QQ 邮箱</a>
+          <button id="theme-toggle" aria-label="切换主题">◐</button>
+        </div>
+      </div>
+
+      <section id="about">
+        <h2>About</h2>
+        <p>
+          北航计算机科学硕士，研究方向为<strong>多模态信息融合</strong>。
+          现任<strong>腾讯微信 · 小微</strong>算法工程师，专注于<strong>大模型后训练</strong>与
+          <strong>垂类 Agent</strong> 的搭建。关注 AI Agents、视觉语言模型（VLMs）
+          与 3D 感知的交叉方向。
+        </p>
+      </section>
+
+      <section id="publications">
+        <h2>Publications</h2>
+        <ul class="pubs">
+          <li>
+            <img class="pub-logo" src="assets/logos/ieee.svg" alt="IEEE" title="IEEE · ICASSP 2026" />
+            <strong>Xuanbo Guo</strong>, Yanjie Liang, Jianxiang Zhou, Baqun Sun, Ke Wang.
+            “MTAD: A Three-Stage Framework for Machine Translation Agents Distillation.”
+            <em>ICASSP 2026</em>.
+            <a href="https://ieeexplore.ieee.org/document/11462599/" target="_blank" rel="noopener">[paper]</a>
+          </li>
+          <li>
+            <img class="pub-logo" src="assets/logos/ieee.svg" alt="IEEE" title="IEEE · ISPP 2026" />
+            <strong>Xuanbo Guo</strong>, Xingwen Fu, Ling Li, Wei Li.
+            “VFMReg: Vision Foundation Model Regression for End-to-End OPM-MEG
+            Helmet-to-MRI Co-Registration from Multi-View RGB.”
+            <em>ISPP 2026</em>.
+            <a href="https://ieeexplore.ieee.org/document/11542846" target="_blank" rel="noopener">[paper]</a>
+          </li>
+          <li>
+            <img class="pub-logo" src="assets/logos/elsevier.svg" alt="Elsevier" title="Elsevier · Information Fusion" />
+            <em>Information Fusion</em> (Accepted):
+            “Magnetic source imaging registration based on self-supervised learning
+            and multi-view differentiable rendering”
+          </li>
+        </ul>
+      </section>
+    </aside>
+
+    <!-- 中栏：博客 -->
+    <main class="col-main">
+      <section id="blog">
+        <h2>Blog</h2>
+        <div class="blog-filters">
+          <button class="chip active" data-filter="all">全部</button>
+          <button class="chip" data-filter="infra">Infra</button>
+          <button class="chip" data-filter="base">基座</button>
+          <button class="chip" data-filter="agent">Agent</button>
+          <button class="chip" data-filter="rl">RL</button>
+          <button class="chip" data-filter="harness">Harness</button>
+          <button class="chip" data-filter="algo">算法</button>
+          <button class="chip" data-filter="gpu">显卡</button>
+          <button class="chip" data-filter="pc">配件</button>
+        </div>
+        <ul class="post-list">
+          <li data-cat="agent rl">
+            <a href="posts/daily-2026-09-02-wmrl.html">一线追踪｜WMRL：用 World Model 拆掉 AutoResearch Agent RL 的执行瓶颈（Online Debiasing / Inverse-Variance Denoising）</a>
+            <span class="post-side">
+              <span class="post-cat">Agent</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-09-02</span>
+            </span>
+          </li>
+          <li data-cat="harness agent">
+            <a href="posts/daily-2026-09-02-harness-envharness.html">学习笔记｜EnvHarness：给静态环境套一层可编程 harness（Stage / Contract / Chain + EnvRigger）</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-09-02</span>
+            </span>
+          </li>
+          <li data-cat="algo rl">
+            <a href="posts/daily-2026-09-02-algo-gae.html">学习笔记｜GAE：广义优势估计如何在偏差与方差之间拧旋钮（λ-return / TD(λ)）</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-09-02</span>
+            </span>
+          </li>
+          <li data-cat="infra">
+            <a href="posts/daily-2026-09-01-kv-cache.html">学习笔记｜KV cache 的一生：显存账本、PagedAttention、prefix caching 与 PD 分离</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span>
+              <span class="post-date">2026-09-01</span>
+            </span>
+          </li>
+          <li data-cat="agent rl">
+            <a href="posts/daily-2026-09-01-ahead.html">一线追踪｜AHEAD：多轮 Agent RL 的 step-aware 信用分配（环境反馈 + 纠错提示）</a>
+            <span class="post-side">
+              <span class="post-cat">Agent</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-09-01</span>
+            </span>
+          </li>
+          <li data-cat="harness agent">
+            <a href="posts/daily-2026-09-01-harness-mini-swe.html">学习笔记｜mini-SWE-agent：为什么「只有 bash + 无状态 subprocess」成了 RL 友好的 harness 基线</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-09-01</span>
+            </span>
+          </li>
+          <li data-cat="algo rl">
+            <a href="posts/daily-2026-09-01-algo-gumbel-softmax.html">学习笔记｜Gumbel-Softmax：离散采样如何换一条可回传的路（Concrete / STE）</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-09-01</span>
+            </span>
+          </li>
+
+          <li data-cat="rl agent">
+            <a href="posts/daily-2026-08-31-supo.html">学习笔记｜SUPO：把「写总结」训练进策略，让多轮 RL 突破上下文墙（ACL 2026）</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-08-31</span>
+            </span>
+          </li>
+          <li data-cat="gpu infra">
+            <a href="posts/daily-2026-08-31-gpu-rubin.html">一线追踪｜NVIDIA Rubin：Agentic 推理把数据中心改写成一台计算机（HBM4 / NVFP4 / NVLink 6 / NVL72）</a>
+            <span class="post-side">
+              <span class="post-cat">显卡</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-08-31</span>
+            </span>
+          </li>
+          <li data-cat="pc gpu">
+            <a href="posts/daily-2026-08-31-pc-atx31.html">学习笔记｜12V-2×6 之后：ATX 3.1 / PCIe 5.1 配件如何决定 600W 级 GPU 能不能活</a>
+            <span class="post-side">
+              <span class="post-cat">配件</span><span class="post-cat">显卡</span>
+              <span class="post-date">2026-08-31</span>
+            </span>
+          </li>
+          <li data-cat="infra rl">
+            <a href="posts/daily-2026-08-31-miles-v01.html">一线追踪｜Miles v0.1：生产级 LLM RL 后训练全栈（SGLang + Megatron + 全异步）</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-08-31</span>
+            </span>
+          </li>
+          <li data-cat="harness agent rl">
+            <a href="posts/daily-2026-08-31-harness-tito.html">学习笔记｜TITO：多轮 Agent Harness 里 Token-In-Token-Out 为什么决定 RL</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-08-31</span>
+            </span>
+          </li>
+          <li data-cat="algo rl">
+            <a href="posts/daily-2026-08-31-algo-gspo.html">学习笔记｜GSPO：序列级重要性采样如何稳住 MoE 上的 RL</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-08-31</span>
+            </span>
+          </li>
+          <li data-cat="rl agent">
+            <a href="posts/daily-2026-08-28-glm-5-3.html">一线追踪｜GLM-5.3：同一基座、全靠后训练——环境规模化时代的 RL 样本</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-08-28</span>
+            </span>
+          </li>
+          <li data-cat="base infra agent">
+            <a href="posts/daily-2026-08-28-base-hy4.html">一线追踪｜腾讯混元 Hy4 preview：770B-A49B 基座如何把 Agent 干活写进开源旗舰（MoE / Gated DSA / iHC / MTP / 1M 上下文）</a>
+            <span class="post-side">
+              <span class="post-cat">基座</span><span class="post-cat">Infra</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-08-28</span>
+            </span>
+          </li>
+          <li data-cat="algo rl">
+            <a href="posts/daily-2026-08-28-algo-ppo.html">学习笔记｜PPO：Clipped Surrogate 为什么成了后训练的默认起点（policy gradient / TRPO / GAE）</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-08-28</span>
+            </span>
+          </li>
+          <li data-cat="harness agent">
+            <a href="posts/daily-2026-08-28-harness-runtime.html">学习笔记｜Agent Harness：运行时如何接管工具、上下文与环境</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-08-28</span>
+            </span>
+          </li>
+          <li data-cat="agent rl harness">
+            <a href="posts/daily-2026-08-28-agent-lightning-v1.html">一线追踪｜Microsoft Agent Lightning v1.0：把部署时 harness 放进训练环（LLM proxy / GRPO / SWE-bench）</a>
+            <span class="post-side">
+              <span class="post-cat">Agent</span><span class="post-cat">RL</span><span class="post-cat">Harness</span>
+              <span class="post-date">2026-08-28</span>
+            </span>
+          </li>
+          <li data-cat="infra rl">
+            <a href="posts/special-2026-08-27-new-models-arch.html">特别篇｜2026 新模型全景：十五个新旗舰的架构与训练方法拆解（MoE / 线性注意力 / QAT / Agentic RL）</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-08-27</span>
+            </span>
+          </li>
+          <li data-cat="rl agent">
+            <a href="posts/daily-2026-08-26-granite-4-2.html">一线追踪｜IBM Granite 4.2：把 RL 搬进真实环境的开源推理模型家族（异步 GRPO / Agentic RL 管线）</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-08-26</span>
+            </span>
+          </li>
+          <li data-cat="agent infra harness">
+            <a href="posts/daily-2026-08-14-deepseek-harness.html">一线追踪｜DeepSeek Harness（dsh）：一切皆插件的 Agent 运行时底座</a>
+            <span class="post-side">
+              <span class="post-cat">Agent</span><span class="post-cat">Infra</span><span class="post-cat">Harness</span>
+              <span class="post-date">2026-08-14</span>
+            </span>
+          </li>
+          <li data-cat="rl algo">
+            <a href="posts/daily-2026-08-13-prm.html">学习笔记｜过程奖励模型（PRM）：给每一步推理打分（PRM800K / Math-Shepherd / OmegaPRM）</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">算法</span>
+              <span class="post-date">2026-08-13</span>
+            </span>
+          </li>
+          <li data-cat="rl agent algo">
+            <a href="posts/rl-10-papers-detailed.html">详解笔记｜复现 10 篇 RL 论文·逐篇技术细节（公式 / 配置 / 结果 / 成本）</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Agent</span><span class="post-cat">算法</span>
+              <span class="post-date">2026-08-13</span>
+            </span>
+          </li>
+          <li data-cat="rl agent algo">
+            <a href="posts/rl-10-papers-series.html">学习笔记｜「复现 10 篇强化学习论文」系列导读（GRPO → GSPO → Agentic RL）</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Agent</span><span class="post-cat">算法</span>
+              <span class="post-date">2026-08-13</span>
+            </span>
+          </li>
+          <li data-cat="rl agent algo">
+            <a href="posts/grpo-notes.html">GRPO 微调实践笔记：从公式到多智能体协作</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Agent</span><span class="post-cat">算法</span>
+              <span class="post-date">2026-08-13</span>
+            </span>
+          </li>
+          <li data-cat="">
+            <a href="posts/hello-blog.html">你好，博客！为什么我开始写技术博客</a>
+            <span class="post-side">
+              <span class="post-date">2026-08-13</span>
+            </span>
+          </li>
+        </ul>
+        <p class="empty-hint" hidden>这个收藏夹还没有文章，敬请期待 🌱</p>
+      </section>
+    </main>
+
+    <!-- 右栏：经历 + 论文 -->
+    <aside class="col-side">
+      <section id="experience">
+        <h2>工作经历</h2>
+        <ul class="timeline">
+          <li>
+            <span class="time">2026 – 至今</span>
+            <div class="exp-item">
+              <img class="company-logo" src="assets/logos/wechat.svg" alt="微信" />
+              <div><strong>微信 · 小微</strong><br />算法工程师 · 大模型后训练与垂类 Agent</div>
+            </div>
+          </li>
+          <li>
+            <span class="time">2025.04 – 2026</span>
+            <div class="exp-item">
+              <img class="company-logo" src="assets/logos/bytedance.svg" alt="字节跳动" />
+              <div><strong>字节跳动 · Flow</strong><br />算法工程师（Intern）</div>
+            </div>
+          </li>
+          <li>
+            <span class="time">2025.01 – 2025.04</span>
+            <div class="exp-item">
+              <img class="company-logo" src="assets/logos/kuaishou.svg" alt="快手" />
+              <div><strong>快手 · 电商</strong><br />算法工程师（Intern）</div>
+            </div>
+          </li>
+          <li>
+            <span class="time">2024.10 – 2025.01</span>
+            <div class="exp-item">
+              <img class="company-logo" src="assets/logos/netease.png" alt="网易" />
+              <div><strong>网易 · 云音乐</strong><br />算法工程师（Intern）</div>
+            </div>
+          </li>
+          <li>
+            <span class="time">2024.05 – 2024.09</span>
+            <div class="exp-item">
+              <img class="company-logo" src="assets/logos/nio.png" alt="蔚来" />
+              <div><strong>蔚来 · 多模态基座</strong><br />算法工程师（Intern）</div>
+            </div>
+          </li>
+          <li>
+            <span class="time">2023.12 – 2024.05</span>
+            <div class="exp-item">
+              <img class="company-logo" src="assets/logos/4paradigm.png" alt="第四范式" />
+              <div><strong>第四范式</strong><br />算法工程师（Intern）</div>
+            </div>
+          </li>
+        </ul>
+      </section>
+
+      <section id="repo">
+        <h2>Repo</h2>
+        <div class="cards">
+          <a class="card card-link" href="https://github.com/datawhalechina/self-llm" target="_blank" rel="noopener">
+            <h3><img class="repo-logo" src="assets/logos/github.svg" alt="GitHub" /> self-llm</h3>
+            <p class="card-meta">LLM · Reinforcement Learning · 25k+ ⭐</p>
+            <p>
+              开源大模型食用指南——强化学习模块核心贡献者，
+              开发了基于 GRPO 的微调方案与多智能体协作框架。
+            </p>
+          </a>
+        </div>
+      </section>
+    </aside>
+  </div>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="assets/main.js"></script>
+</body>
+</html>
