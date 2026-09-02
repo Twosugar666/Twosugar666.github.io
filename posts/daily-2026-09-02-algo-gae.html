@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜GAE：广义优势估计如何在偏差与方差之间拧旋钮（λ-return / TD(λ)） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜GAE：广义优势估计如何在偏差与方差之间拧旋钮（λ-return / TD(λ)）</h1>
+    <p class="post-meta">2026-09-02 · 收藏夹：算法 / RL · 学习笔记<br />
+      主来源：Schulman et al. <em>High-Dimensional Continuous Control Using Generalized Advantage Estimation</em>（ICLR 2016），
+      <a href="https://arxiv.org/abs/1506.02438" target="_blank" rel="noopener">arXiv:1506.02438</a>。
+      经典算法课，非刷题向。对照站内
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>（文中轻点过 GAE）、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a>。
+      公式一律用 <code>pre</code>，不用 LaTeX。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      策略梯度要的是优势 <code>A(s,a) = Q(s,a) - V(s)</code>：在状态 s 上，动作 a 比「平均水平」好多少。
+      Q 与 V 都未知，必须从轨迹估计。两条极端路线早就写在教科书里：
+    </p>
+    <ul>
+      <li><strong>Monte Carlo</strong>：用整段回报 <code>G_t = r_t + γ r_{t+1} + …</code> 减 V；近似无偏（相对真折扣回报），但方差随轨迹长度爆炸。</li>
+      <li><strong>1-step TD</strong>：用 <code>δ_t = r_t + γ V(s_{t+1}) - V(s_t)</code>；方差低，但 V 不准时偏差大。</li>
+    </ul>
+    <p>
+      <strong>GAE</strong>（Generalized Advantage Estimation）用单个旋钮 <code>λ ∈ [0,1]</code> 把多步 TD 残差指数加权，得到一族估计量：
+      <code>λ=0</code> 退回 TD(0)，<code>λ=1</code> 接近 MC 风格。
+      PPO 等现代实现几乎默认挂 GAE；站内 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 文只点到为止——本课把偏差–方差旋钮拧开讲清。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：GAE(γ,λ) = Σ_l (γλ)^l δ_{t+l}；用 λ 在「低方差高偏」的 TD 与「高方差低偏」的 MC 之间连续插值。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 优势：A = Q − V，策略梯度吃的是相对好坏</h3>
+    <pre><code># 策略梯度（示意）
+∇ J ≈ E[ ∇ log π(a|s) * A(s,a) ]
+
+# A(s,a) = Q(s,a) - V(s)
+# 减 V：baseline，不改最优性（在适当条件下），但降方差
+# 若用原始回报 G_t 代替 A：等价于用一个很吵的 Q 估计，且无状态基线
+</code></pre>
+    <p>
+      关键不是「奖励工程」，而是估计问题：同一条轨迹，如何构造低方差、可控偏差的 Â，再乘进 score-function。
+    </p>
+
+    <h3>② 两极：MC 高方差 vs 1-step TD 高偏差</h3>
+    <table>
+      <thead><tr><th></th><th>估计</th><th>偏差</th><th>方差</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>MC</strong></td>
+          <td>Â_t = G_t − V(s_t)</td>
+          <td>V 准时偏低偏（相对真 A）</td>
+          <td>高：整段噪声累加</td>
+        </tr>
+        <tr>
+          <td><strong>TD(0)</strong></td>
+          <td>Â_t = δ_t</td>
+          <td>高：依赖 V 的 bootstrapping</td>
+          <td>低：只看一步</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code>δ_t = r_t + γ V(s_{t+1}) - V(s_t)   # TD residual
+
+# n-step：先走 n 步真实奖励，再 bootstrap
+A_t^(n) = δ_t + γ δ_{t+1} + … + γ^{n-1} δ_{t+n-1}
+# n=1 → TD；n→∞ → MC（有限轨迹上到终止）
+</code></pre>
+
+    <h3>③ GAE：对 n-step 优势做 λ 指数混合</h3>
+    <pre><code># GAE(γ, λ)
+A_t^GAE = Σ_{l=0}^{∞} (γ λ)^l  δ_{t+l}
+
+# 展开直觉：
+# λ=0 → 只留 δ_t          → TD(0)
+# λ=1 → Σ γ^l δ_{t+l}     → 等价于 MC 优势（到终止的 λ-return 形式）
+# 0&lt;λ&lt;1 → 近处残差权重大，远处指数衰减
+
+# 有限轨迹实现（从后往前扫，O(T)）
+gae = 0
+for t = T-1 … 0:
+  delta = r[t] + γ * V[t+1] * (1-done[t]) - V[t]
+  gae   = delta + γ * λ * (1-done[t]) * gae
+  A[t]  = gae
+# 常再令  return[t] = A[t] + V[t]  作为价值目标
+</code></pre>
+    <p>
+      这与 TD(λ) / λ-return 是同一家族：GAE 论文把「给 actor 用的优势估计」写成对 δ 的滤波，工程上极好实现——一条反向循环同时产出 Â 与价值回归目标。
+    </p>
+
+    <h3>④ λ 旋钮：偏差–方差的操作手册</h3>
+    <table>
+      <thead><tr><th>λ</th><th>行为</th><th>适用直觉</th></tr></thead>
+      <tbody>
+        <tr><td><strong>→ 0</strong></td><td>更信 V；低方差、高偏</td><td>V 已准、奖励密、要稳</td></tr>
+        <tr><td><strong>中等（常见 0.9–0.97）</strong></td><td>多步残差折中</td><td>PPO 连续控制 / 许多默认超参</td></tr>
+        <tr><td><strong>→ 1</strong></td><td>更信真实回报；高方差、低偏</td><td>V 差、短轨迹、可加大 batch 降方差</td></tr>
+      </tbody>
+    </table>
+    <p>
+      γ 与 λ 常被一起拧：γ 管「多远的未来算进回报」；λ 管「多远的 TD 残差算进优势」。
+      两者都靠近 1 时，长程信用保留多，但估计更吵——这正是为什么大模型 RL 有时改用组内相对奖励（<a href="grpo-notes.html">GRPO</a>）弱化对 V 的依赖。
+    </p>
+
+    <h3>⑤ 和 PPO / GRPO / GSPO 的关系</h3>
+    <table>
+      <thead><tr><th></th><th>优势从哪来</th><th>和 GAE 的关系</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="daily-2026-08-28-algo-ppo.html"><strong>PPO</strong></a></td>
+          <td>通常 Critic V + GAE</td>
+          <td>默认搭档；clip 的是 ratio，GAE 提供 Â</td>
+        </tr>
+        <tr>
+          <td><a href="grpo-notes.html"><strong>GRPO</strong></a></td>
+          <td>同题组内相对 outcome</td>
+          <td>常<strong>不</strong>训 V；组统计代替 GAE 的 baseline 角色</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-08-31-algo-gspo.html"><strong>GSPO</strong></a></td>
+          <td>序列级 IS + 组内 A</td>
+          <td>改的是 ratio 粒度；优势来源仍可是组内或 GAE</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      读 PPO 源码时看到的 <code>gae_lambda</code>，就是本课的 λ。
+      读 GRPO 时若找不到 GAE，不是实现漏了，而是方法论切换：用组内均值/方差当 baseline，避开不可靠的 token-level V。
+      两者解决的都是「A 怎么估」；工具箱不同——连续控制 / 单轨迹 dense reward 仍常回 GAE；LLM 稀疏 outcome 更常回组相对。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先固定 γ，再扫 λ。</strong> γ 由任务地平线决定；λ 是估计旋钮。同时乱扫两者会把「折扣定义」和「估计偏差」搅在一起。</li>
+      <li><strong>V 很差时不要迷信小 λ。</strong> λ→0 把错误全都推给 bootstrap；此时宁肯 λ 偏大并加大 batch，或先预训练价值。</li>
+      <li><strong>规范化 Â。</strong> 实现里常对 batch 内 advantage 做标准化；改 λ 后重新检查梯度尺度与 clip 触发率。</li>
+      <li><strong>终止与截断分清。</strong> done / truncation 对 bootstrap 的 mask 不同：超时截断仍应 bootstrap，真终止才乘 0——写错会系统性地偏 Â。</li>
+      <li><strong>LLM-RL 选型。</strong> 有可靠过程奖励 / 逐步 V 时 GAE 仍有用；纯 outcome 且可组采样时，优先理解 GRPO 的组 baseline，再决定是否混 GAE。</li>
+      <li><strong>阅读顺序。</strong> 本课 → <a href="daily-2026-08-28-algo-ppo.html">PPO</a>（看 clip 如何吃 Â）→ <a href="grpo-notes.html">GRPO</a> / <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>（看无 V 或序列 IS 的当代替代）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么减 V 能降方差却（在合适条件下）不改变策略梯度的期望方向？
+        <details><summary>参考答案</summary>
+        V(s) 不依赖当前采样的 a 时，E[∇ log π(a|s) V(s) | s] = V(s) ∇_θ Σ_a π(a|s) = 0。减去状态基线不引入额外偏差项，但去掉了与动作无关的回报公共噪声，从而降方差。</details>
+      </li>
+      <li>
+        λ=0 与 λ=1 分别退化成什么？若 V 严重高估会怎样？
+        <details><summary>参考答案</summary>
+        λ=0 → Â=δ_t（纯 TD）；λ=1 → 多步残差合成 MC 风格优势。V 严重高估时，小 λ 会把错误 bootstrap 直接写进 Â，策略被错误价值带偏；增大 λ 更依赖真实奖励序列，用方差换偏差。</details>
+      </li>
+      <li>
+        GAE 与「直接用 n-step return 固定 n」相比，λ 混合的好处是什么？
+        <details><summary>参考答案</summary>
+        单一 n 是硬切：小于 n 的偏差–方差折中无法表达。λ 对所有 n 的 A^(n) 做指数加权，得到平滑插值，且可用一次反向扫描实现，超参是连续的 λ 而非离散 n。</details>
+      </li>
+      <li>
+        PPO 默认 GAE，GRPO 常不用 V——这是否说明 GAE 过时？
+        <details><summary>参考答案</summary>
+        不过时。问题分布变了：PPO 连续控制常有稠密奖励与可学习 V；LLM 任务多为稀疏 outcome，同题可采多条，组内相对 A 更稳。GAE 仍是有 Critic 时的标准件；GRPO 是另一条 baseline 路线。</details>
+      </li>
+      <li>
+        实现里把 truncation 误当成 terminal（bootstrap 乘 0），会引入什么系统性偏差？
+        <details><summary>参考答案</summary>
+        超时截断后真实价值仍可能&gt;0；强制乘 0 等于教 V / Â「地平线外一无所有」，低估长程回报，策略变短视。正确做法：terminal 才断开 bootstrap，truncation 仍用 V(s_{t+1})。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Schulman et al. · GAE：
+        <a href="https://arxiv.org/abs/1506.02438" target="_blank" rel="noopener">arXiv:1506.02438</a>（ICLR 2016）</li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
