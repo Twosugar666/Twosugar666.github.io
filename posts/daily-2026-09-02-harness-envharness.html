@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜EnvHarness：给静态环境套一层可编程 harness（Stage / Contract / Chain + EnvRigger） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜EnvHarness：给静态环境套一层可编程 harness（Stage / Contract / Chain + EnvRigger）</h1>
+    <p class="post-meta">2026-09-02 · 收藏夹：Harness / Agent · 学习笔记<br />
+      主来源：Google Cloud AI Research et al. <em>EnvHarness: Awakening Static Worlds for Agent Learning</em>，
+      <a href="https://arxiv.org/abs/2608.19880" target="_blank" rel="noopener">arXiv:2608.19880</a>；
+      代码
+      <a href="https://github.com/google-research/envharness" target="_blank" rel="noopener">github.com/google-research/envharness</a>
+      （Apache-2.0）；站点
+      <a href="https://www.envharness.com" target="_blank" rel="noopener">www.envharness.com</a>。
+      文中 ALFWorld / SWE-bench 数字均为<strong>论文自报</strong>。
+      交叉：
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-08-14-deepseek-harness.html">dsh</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      站内已反复强调：Agent ≈ Model + Harness。
+      EnvHarness 把同一句式搬到环境侧：
+      <strong>Customized Env = Static Env + EnvHarness</strong>。
+      大量基准（ALFWorld、部分 gym / 仿真、代码仓库沙箱）本身是「静态世界」——任务分布、初始态、观测与奖励合同写死；想为课程学习、OOD、组合任务改环境，往往只能 fork 源码或重写模拟器。
+    </p>
+    <p>
+      EnvHarness 的约束很干净：<strong>只通过</strong> <code>reset()</code> / <code>step()</code> 操作底层环境，不侵入内部；保留人类可验的 verifier / 成功判定。
+      一层可编程包装即可改初始条件、改写动作–转移–观测合同、把两个环境链式组合——代码里对应 Setups / Rules / Link，论文抽象为 <strong>Stage / Contract / Chain</strong>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：EnvHarness = 静态环境外的可编程壳（Stage 改 s0、Contract 改写 A/T/O、Chain 合取奖励）；EnvRigger 用与 policy 同骨干的黑盒环自动写 harness；作者自报 ALFWorld / SWE-bench 均有增益。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 类比：Model+Harness 对 Static Env+EnvHarness</h3>
+    <table>
+      <thead><tr><th></th><th>Agent 侧</th><th>环境侧（EnvHarness）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>可换层</strong></td><td>Harness（工具、上下文、解析）</td><td>EnvHarness（Stage/Contract/Chain）</td></tr>
+        <tr><td><strong>尽量不动</strong></td><td>基座模型权重（部署时）</td><td>静态环境实现 / 模拟器内核</td></tr>
+        <tr><td><strong>接口</strong></td><td>消息 / 工具 API</td><td>仅 reset() / step()</td></tr>
+        <tr><td><strong>验真</strong></td><td>任务成功标准</td><td>保留 human verifier</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、<a href="daily-2026-09-01-harness-mini-swe.html">mini</a> 的差别：那些文管的是<strong>智能体怎么跟环境说话</strong>；EnvHarness 管的是<strong>环境本身如何被程序化改写</strong>，而智能体仍只看见标准 MDP 接口。
+    </p>
+
+    <h3>② 三组件：Stage / Contract / Chain</h3>
+    <table>
+      <thead><tr><th>抽象</th><th>代码名</th><th>做什么</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Stage</strong></td>
+          <td>Setups</td>
+          <td>reset 后执行 δ 个动作，把初始态从 s0 推到 s0′</td>
+          <td>课程起点 / 场景布置，不改转移法则</td>
+        </tr>
+        <tr>
+          <td><strong>Contract</strong></td>
+          <td>Rules</td>
+          <td>用 f_A, f_T, f_O 改写动作、转移、观测</td>
+          <td>动作别名、部分可观测、转移约束</td>
+        </tr>
+        <tr>
+          <td><strong>Chain</strong></td>
+          <td>Link</td>
+          <td>组合两个环境；R′ 为合取（conjunction）</td>
+          <td>多目标 / 多房间串联，必须都成功</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 概念伪代码（对齐论文接口，非官方 API）
+env = StaticEnv(...)
+
+# Stage：布置初始态
+env = Stage(env, delta_actions=[a1, a2, ...])  # reset 后先跑 δ 步
+
+# Contract：改写 A / T / O
+env = Contract(env,
+  f_A=...,   # 动作映射 / 掩码
+  f_T=...,   # 转移包装
+  f_O=...)   # 观测投影
+
+# Chain：合取成功
+env = Chain(env_a, env_b)   # R' = R_a ∧ R_b（示意）
+</code></pre>
+    <p>
+      关键点：底层仍可调用原 verifier——改的是「如何到达可判定状态」，不是偷偷换掉成功定义。
+      这对 RL 数据诚实很重要：标签仍锚定人类可验标准，而不是 harness 作者私自改分。
+    </p>
+
+    <h3>③ EnvRigger：Observe → Diagnose → Write → Validate</h3>
+    <pre><code># EnvRigger：黑盒写 harness 的环（与 policy 同骨干）
+loop:
+  Observe   # 看失败轨迹 / 覆盖空洞 / 静态任务分布
+  Diagnose  # 缺什么 Stage / 哪条 Contract / 是否该 Chain
+  Write     # 生成 Setups / Rules / Link 代码
+  Validate  # 在 reset/step 外包一层跑通；对照 verifier
+# 通过则进入训练课程；失败则回 Diagnose
+</code></pre>
+    <p>
+      与「人手写 YAML 课程」相比，Rigger 把环境定制本身当成可迭代程序合成。
+      与 policy 同骨干，意味着可以用同一套 LLM 能力：一边学做事，一边学「给自己造更难 / 更对齐的环境」。
+      仍必须 Validate：乱写 Contract 可能让观测不可逆或动作无效——黑盒环的出口是可运行 + 可验，而不是「生成即上线」。
+    </p>
+
+    <h3>④ 自报数字：ALFWorld / SWE-bench / RL 课程</h3>
+    <table>
+      <thead><tr><th>设定</th><th>基线 → EnvHarness（论文自报）</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr><td>ALFWorld Avg</td><td>62.4 → <strong>68.3</strong></td><td>整体平均</td></tr>
+        <tr><td>ALFWorld OOD</td><td>+9.0</td><td>作者报告的 OOD 增益</td></tr>
+        <tr><td>SWE-bench Verified</td><td>49.88 → <strong>52.58</strong></td><td>步数 55.01 → 49.61（约 −9.8%）</td></tr>
+        <tr><td>ALFWorld In-Dist（GRPO, Qwen3-8B）</td><td>81.4 → <strong>87.9</strong></td><td>在 EnvHarness 环境上 RL 优于原环境</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：EnvHarness 既当<strong>推理期</strong>的环境改写（提升 Avg / OOD / SWE），也当<strong>训练期</strong>的课程壳（GRPO 在定制环境上更高）。
+      SWE 上「分升、步数降」暗示：更好的 Stage/Contract 可能减少无效探索，而不只是刷分。
+    </p>
+
+    <h3>⑤ 与站内其它 harness 文的位置</h3>
+    <table>
+      <thead><tr><th></th><th>改谁</th><th>典型问题</th></tr></thead>
+      <tbody>
+        <tr><td><a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a></td><td>Agent scaffold</td><td>轨迹是否干净、是否过拟合工具</td></tr>
+        <tr><td><a href="daily-2026-08-31-harness-tito.html">TITO</a></td><td>Token ID 合同</td><td>多轮 re-tokenize 漂移</td></tr>
+        <tr><td><a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a></td><td>训练是否挂部署 harness</td><td>训推控制流不一致</td></tr>
+        <tr><td><strong>EnvHarness</strong></td><td>环境分布与合同</td><td>静态基准不够、课程难写</td></tr>
+      </tbody>
+    </table>
+    <p>
+      叠加口诀：用 EnvHarness 造课 → 用 mini / 产品 harness 采集 → 需要 token-level RL 再加 TITO → 要对齐产品控制流用 Lightning。
+      同日一线 <a href="daily-2026-09-02-wmrl.html">WMRL</a> 减少真执行次数；EnvHarness 改变「执行的是哪类环境」——一层是成本，一层是分布。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先 Stage，再 Contract，最后 Chain。</strong> 只改初始布置风险最低；一上来改 f_O / f_T 容易制造不可学习的部分可观测。</li>
+      <li><strong>Verifier 冻结。</strong> 成功标准变更必须单独记实验；EnvHarness 的价值在「同判定、异课程」。 </li>
+      <li><strong>Rigger 输出进版本库。</strong> Setups/Rules/Link 与 policy checkpoint 一并钉 hash，否则「环境在飘」无法复现。</li>
+      <li><strong>OOD 增益要配对原分布。</strong> 报告 +9.0 时同时留 In-Dist，避免只优化稀有 Stage。</li>
+      <li><strong>与 mini 的分工。</strong> 编码任务：mini 管 bash 轨迹形态；EnvHarness 管仓库初始态、测试暴露、多仓 Chain——不要把「环境布置」写进 agent 系统提示硬编码。</li>
+      <li><strong>RL 前做 Validate 门禁。</strong> 随机 policy / 短 rollout 检查 reset/step 不崩、奖励稀疏度合理，再开 GRPO。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么强调「只经 reset/step、保留 human verifier」？若允许改环境内部奖励函数，损失什么？
+        <details><summary>参考答案</summary>
+        接口约束保证可移植到任意标准 MDP 封装；保留 verifier 保证标签语义不变。若直接改内部奖励，分数可能与人类任务成功脱钩，出现「刷代理奖励、部署仍失败」；也更难与外部基准横向比。</details>
+      </li>
+      <li>
+        Stage 与 Contract 都能让任务变难，如何选择？
+        <details><summary>参考答案</summary>
+        Stage 改变起点（更远、更乱的 s0′），转移法则不变，适合课程与覆盖。Contract 改动作/转移/观测语义，适合对齐部署约束或制造 OOD 感知。先 Stage 做难度，确认学习信号还在，再动 Contract。</details>
+      </li>
+      <li>
+        Chain 的合取奖励 R′=R_a∧R_b 对信用分配有何影响？
+        <details><summary>参考答案</summary>
+        稀疏度上升：任一段失败则整条失败，outcome advantage 更难点名是 a 还是 b 段出错。可配合分段日志 / 类 AHEAD 的 step-aware，或阶段性先训单环境再 Chain。</details>
+      </li>
+      <li>
+        EnvRigger 与「用 LLM 写 agent harness」有何同构与风险？
+        <details><summary>参考答案</summary>
+        同构：都是 Observe–Diagnose–Write–Validate。风险：生成的 Contract 可能引入不可逆观测或非法动作，Validate 不足会污染整份 RL 数据。必须把验证器与单元测试当硬门禁，而不是信任同骨干模型的自洽。</details>
+      </li>
+      <li>
+        在 SWE-bench 上分升且步数降，可能对应哪类 Stage/Contract？
+        <details><summary>参考答案</summary>
+        例如 Stage 预置更贴近真实失败的仓库状态；Contract 限制危险动作或暴露更干净的测试观测，减少无效 shell 回合。需对照论文具体 Setups/Rules，不能从数字反推唯一机制——这里强调的是「环境壳」可以同时改成功率与效率。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>EnvHarness 论文：
+        <a href="https://arxiv.org/abs/2608.19880" target="_blank" rel="noopener">arXiv:2608.19880</a></li>
+      <li>代码 / 许可：
+        <a href="https://github.com/google-research/envharness" target="_blank" rel="noopener">google-research/envharness</a>（Apache-2.0）</li>
+      <li>站点：
+        <a href="https://www.envharness.com" target="_blank" rel="noopener">www.envharness.com</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-08-14-deepseek-harness.html">dsh</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-09-02-wmrl.html">WMRL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
