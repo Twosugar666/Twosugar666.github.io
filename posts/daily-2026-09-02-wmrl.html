@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜WMRL：用 World Model 拆掉 AutoResearch Agent RL 的执行瓶颈（Online Debiasing / Inverse-Variance Denoising） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜WMRL：用 World Model 拆掉 AutoResearch Agent RL 的执行瓶颈（Online Debiasing / Inverse-Variance Denoising）</h1>
+    <p class="post-meta">2026-09-02 · 收藏夹：Agent / RL · 一线追踪<br />
+      主来源：Yang et al. <em>Scaling Automatic Research Agents via World Models</em>（UIUC + Amazon），
+      <a href="https://arxiv.org/abs/2608.12564" target="_blank" rel="noopener">arXiv:2608.12564</a>。
+      文中加速比、模型规模对照与 VLA 迁移数字均标注为<strong>论文自报</strong>；未复现第三方评测。
+      交叉：
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a>、
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Automatic Research Agent 的 RL 往往卡在<strong>执行</strong>，而不是生成。
+      一批候选实验 / 补丁 / 脚本可以并行吐出来；真正跑通却需要<strong>独占 sandbox</strong>（独立容器、GPU、依赖、长时交互）。
+      生成吞吐随 batch 放大，执行吞吐却被「一台环境一次试验」钉死——组内 GRPO 越大，排队越长。
+    </p>
+    <p>
+      <strong>WMRL</strong>（World-Model RL）的核心替换：多数候选不再真跑，而用 world model 预测分数 <code>ˆr</code>，把执行从「每条必跑」降到「少数锚点」。
+      不完美的 WM 带来偏差 <code>b</code> 与噪声 <code>ξ</code>；论文用 <strong>Online Debiasing</strong>（锚点上的 isotonic 单调映射）与 <strong>Inverse-Variance Denoising</strong>（按逆方差融合真执行与 WM）把这两项压下去。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：WMRL = 用 world model 预测 reward 代替绝大多数独占执行；~10% 组做锚点真跑；Online Debiasing 收偏、Inverse-Variance 降噪；作者自报相对真 GRPO 约 3–4× 更少 GPU-hours。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 瓶颈：生成 batch 大，执行必须独占</h3>
+    <pre><code># AutoResearch / coding agent RL（示意）
+candidates = policy.sample(batch=B)     # 生成可并行
+for c in candidates:
+  r = exclusive_sandbox.execute(c)      # 独占：队列长度 ∝ B
+  # GRPO 组越大 → 等待越久 → GPU-hours 被执行吃掉
+</code></pre>
+    <p>
+      这与站内 <a href="daily-2026-08-31-miles-v01.html">Miles</a> 讨论的「rollout 异步」正交：Miles 优化的是训练栈吞吐；WMRL 优化的是<strong>是否还需要把每个候选送进真环境</strong>。
+      也与 <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 不同：Lightning 把部署 harness 接进训练；WMRL 假设 harness/sandbox 贵，要少调用。
+    </p>
+
+    <h3>② 不完美 World Model：ˆr = r + b + ξ</h3>
+    <table>
+      <thead><tr><th>项</th><th>含义</th><th>若不处理</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ˆr</strong></td><td>WM 预测分数</td><td>可直接进组内 advantage</td></tr>
+        <tr><td><strong>b</strong></td><td>系统性偏差（校准错、分布偏移）</td><td>策略被拉向 WM 偏好，而非真环境</td></tr>
+        <tr><td><strong>ξ</strong></td><td>预测噪声</td><td>组内排序抖，advantage 方差抬高</td></tr>
+      </tbody>
+    </table>
+    <p>
+      理论叙述（论文）：纯 WM、无校正时，误差会留下 <code>O(B²)</code> 与 <code>O(σ²)</code> 量级的地板；
+      WMRL 的在线校正收缩 bias，并用逆方差融合压低有效方差——从而让「少执行」不至于把 GRPO 信号打烂。
+    </p>
+
+    <h3>③ Online Debiasing：锚点上的 isotonic 映射</h3>
+    <pre><code># 每轮 / 窗口内：抽约 10% 组做真执行，得锚点对 (ˆr, r)
+# 拟合单调映射 ˆf（isotonic），把 WM 分数校准到真奖励尺度
+r_cal = ˆf(ˆr)
+
+# 直觉：只要求「更高的 ˆr 对应更高的真 r」的顺序结构，
+# 不强行假设线性；在线更新以跟踪非平稳策略分布
+</code></pre>
+    <p>
+      锚点比例约 <strong>10%</strong>（论文设定量级）：太少 → 校准欠定；太多 → 又回到执行瓶颈。
+      Isotonic 比随意 MLP 校准更稳：保留排序单调性，避免过拟合噪声 ξ。
+    </p>
+
+    <h3>④ Inverse-Variance Denoising：融合 g_E 与 g_WM</h3>
+    <pre><code># 概念：把「真执行梯度/信号」g_E 与「WM 信号」g_WM
+# 按各自估计方差的倒数加权
+w_E  = 1 / Var(g_E)
+w_WM = 1 / Var(g_WM)
+g    = (w_E * g_E + w_WM * g_WM) / (w_E + w_WM)
+
+# 锚点组：g_E 可用 → 参与融合并刷新校准
+# 非锚点组：主要靠校准后的 WM；方差大则自动降权
+</code></pre>
+    <p>
+      这与 <a href="daily-2026-09-01-ahead.html">AHEAD</a> 的「失败轨迹再权重」不同：Ahead 改信用在步内的分配；WMRL 改的是<strong>奖励从哪来</strong>（真环境 vs 模型）。
+      两者可叠加，但必须分清：Ahead 需要逐步 obs；WMRL 需要可校准的 outcome / 分数预测器。
+    </p>
+
+    <h3>⑤ 自报结果：算力、规模与 VLA 迁移</h3>
+    <table>
+      <thead><tr><th>维度</th><th>论文自报要点</th></tr></thead>
+      <tbody>
+        <tr><td><strong>算力</strong></td><td>相对真实执行的 GRPO，约 <strong>3–4× 更少 GPU-hours</strong></td></tr>
+        <tr><td><strong>规模</strong></td><td>4B / 9B 在 held-out 上可超过 48B / 120B 开源 agent 基线（作者表）</td></tr>
+        <tr><td><strong>迁移</strong></td><td>同思路迁到 VLA：MiniVLA + Robometer，LIBERO-Long（作者自报）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：小模型 + 更便宜的 reward 估计，有时胜过「更大模型但仍被 sandbox 队列卡住」的开源 agent。
+      这不等于「4B 绝对强于 120B」——比较的是特定 AutoResearch / agent 设定下的 held-out；引用时务必带设定与<strong>论文自报</strong>标签。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量化执行占比。</strong> 若 profiling 显示 GPU-hours 主要在 sandbox 排队而非 policy forward，再上 WM；若已是算力瓶颈在训练栈，先看 <a href="daily-2026-08-31-miles-v01.html">Miles</a> 类异步。</li>
+      <li><strong>锚点比例写成实验卡字段。</strong> 默认从 ~10% 起扫；同时盯校准残差与组内 advantage 方差，不要只看最终成功率。</li>
+      <li><strong>Debias 与 Denoise 分开消融。</strong> 只上 isotonic、或只上逆方差融合，才能知道是偏还是噪在主导。</li>
+      <li><strong>WM 分布必须跟踪策略。</strong> 离线拟合一次就冻住，等于把旧策略的 b 焊死；Online 是一等公民。</li>
+      <li><strong>与 GRPO / PPO 的合同。</strong> 组内相对 advantage（见 <a href="grpo-notes.html">GRPO</a>）对单调校准友好；若奖励尺度突变，先查 ˆf 是否过期。</li>
+      <li><strong>Harness 仍要可复现真跑。</strong> 锚点路径必须与部署执行一致（Lightning 思路）；WM 路径再快，评测与发布仍以真执行为准。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「生成可并行、执行需独占」会让单纯加大 GRPO 组规模反而更贵？
+        <details><summary>参考答案</summary>
+        组越大，需要同时或排队占用的 exclusive sandbox 越多；生成成本近似线性于 B，执行等待近似被独占资源串行化。GPU-hours 被环境队列主导时，加大 B 提高的是排队，而不是有效样本速率。</details>
+      </li>
+      <li>
+        Online Debiasing 为何偏好 isotonic（单调）而不是任意回归？
+        <details><summary>参考答案</summary>
+        组内 GRPO 主要吃相对排序；单调映射保留「更高 ˆr → 更高校准 r」的顺序结构，限制过拟合噪声 ξ 的自由度。任意回归更容易在锚点稀少时学出非单调伪关系，破坏 advantage 符号。</details>
+      </li>
+      <li>
+        Inverse-Variance 融合在「WM 很准但偶发尖刺」与「真执行少但方差大」时分别如何表现？
+        <details><summary>参考答案</summary>
+        WM 方差估计低 → w_WM 大，多数信号来自校准后的 ˆr；真执行方差低（足够锚点、奖励稳）→ w_E 大，拉回环境。尖刺会抬高估计方差，从而自动降权，避免单次坏预测主导梯度。</details>
+      </li>
+      <li>
+        理论里 WM-only 的 O(B²)+O(σ²) 地板，直观对应实验里什么失败模式？
+        <details><summary>参考答案</summary>
+        B 大时，未校正偏差在组内比较中被放大（错误地拉开相对 A）；σ 大时排序噪声让 advantage 抖动。表现就是：去掉 debias/denoise 后，增大 batch 不再涨点甚至掉点，且训练曲线抖。</details>
+      </li>
+      <li>
+        WMRL 与 AHEAD、Lightning 各解决哪一层瓶颈？能否同时上？
+        <details><summary>参考答案</summary>
+        WMRL：奖励获取成本（少真跑）。AHEAD：失败轨迹内 step 信用。Lightning：部署 harness 与训练环一致。可同时：Lightning 保锚点真跑合同；WMRL 减少非锚点执行；AHEAD 在真轨迹上再做 step-aware——但 PI / 逐步 obs 只存在于真跑路径，WM-only 轨迹通常没有逐步 env feedback。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Yang et al. · Scaling Automatic Research Agents via World Models：
+        <a href="https://arxiv.org/abs/2608.12564" target="_blank" rel="noopener">arXiv:2608.12564</a></li>
+      <li>站内交叉：
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
