@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜World Labs Atlas：把相机位姿写成「母语」的全模态世界模型 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜World Labs Atlas：把相机位姿写成「母语」的全模态世界模型</h1>
+    <p class="post-meta">2026-09-02 · 收藏夹：Agent · 一线追踪<br />
+      发布方：World Labs（李飞飞创立的空间智能公司），发布时间 <strong>2026-09-01</strong> · 信息来源：
+      <a href="https://www.worldlabs.ai/blog/atlas" target="_blank" rel="noopener">World Labs 官方博客：Atlas: A World Model for Spatial Intelligence</a>；
+      重建误差数字（AbsRel）来自 <a href="https://explainx.ai/blog/world-labs-atlas-multimodal-world-model-3d-2026" target="_blank" rel="noopener">explainx 对官方图表的转引</a>。
+      目前<strong>仅面向合作方 early access</strong>，无公开权重与定价</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      昨天（9 月 1 日）World Labs 发布了下一代世界模型 <strong>Atlas</strong>——将驱动未来版本的 Marble。
+      这个发布对本博客有双重相关性：
+    </p>
+    <ul>
+      <li>对我个人：Atlas 的主打能力「<strong>稀疏视角 3D 重建 + 新视角生成</strong>」正是我在多视角配准 / 神经渲染方向一直在啃的问题（2~3 张图即可忠实重建，是 NVS 领域几十年的老大难）；</li>
+      <li>对博客读者：Atlas 的架构是「<strong>多模态自回归扩散 Transformer</strong>」，官方明确说它能直接继承 LLM 推理系统的全部红利——KV caching、cache-aware routing、disaggregated serving——恰好接上昨天<a href="daily-2026-09-01-kv-cache.html">KV cache 笔记</a>讲的那套基础设施。</li>
+    </ul>
+    <blockquote>
+      先澄清一个术语陷阱：Atlas 的「world model」与 RL 里的 world model（如今天另一篇
+      <a href="daily-2026-09-02-wmrl.html">WMRL 笔记</a>里学习环境转移动力学、供策略「想象」rollout 的模型）不是同一个东西。
+      Atlas 是<strong>生成/重建/模拟</strong>意义上的世界模型——理解世界「看起来如何、如何演化」，输出像素与 3D 几何；
+      它不学习动作条件的状态转移来做规划。两者正在靠近（World Labs 自己的 taxonomy 文章也在讲 renderer/simulator/planner 的边界消融），但今天别混用。
+    </blockquote>
+
+    <h2>产品要点：一个模型，四类任务</h2>
+    <table>
+      <thead><tr><th>任务</th><th>输入 → 输出</th><th>官方给出的关键规格</th></tr></thead>
+      <tbody>
+        <tr><td><strong>相机可控生成</strong></td><td>1~6 张参考图 + 手工设计的相机轨迹 → 新视角图像/视频</td><td>相机几何是<strong>原生输入类型</strong>（不是靠文本描述「向左摇镜」）；最长 <strong>1 分钟 @ 1440p</strong>；场景在多次改轨迹后保持一致</td></tr>
+        <tr><td><strong>空间重建</strong></td><td>1 张到 100+ 张图 → 新视角 + 显式 3D（点云 / 3DGS）</td><td>通常 <strong>2~3 张图即忠实重建</strong>；联合生成新视角并估计几何，「看见的部分忠实、没看见的靠世界知识补全」；超过专用重建模型的开源 SOTA</td></tr>
+        <tr><td><strong>时空模拟</strong></td><td>普通手机视频 → 重取景 / Real-to-Sim</td><td>3~5 台手机即搭「子弹时间」；机器人场景用 <strong>24 帧手机视频</strong>重建环境，并生成机载相机视角的 RGB + 深度；支持刚体/关节/可变形物体的可控变体</td></tr>
+        <tr><td><strong>图像生成</strong></td><td>文本/图像 → 图像、360° 全景</td><td>非主业但能力完整：复杂提示、文字渲染、多风格</td></tr>
+      </tbody>
+    </table>
+
+    <h2>技术拆解</h2>
+
+    <h3>1. 核心抽象：spatial context（空间上下文）</h3>
+    <p>
+      Atlas 像 LLM 一样先把输入编码进上下文、再基于上下文生成，但有一个本质区别：
+      <strong>每张图像、每张深度图都被「钉」在一个显式 3D 相机位姿上</strong>，形成 spatial context。
+      这一设计解锁了两类以前做不到的操作：
+    </p>
+    <ul>
+      <li><strong>把两张毫不相关的图放进 3D 空间的两个位置</strong>，Atlas 生成一个在它们之间平滑过渡的世界（想象出门厅、走廊等连接结构）；</li>
+      <li><strong>重建时「看得越多、想象越少」</strong>：单图时大部分场景靠想象补全，加到两三张图后真实场景被精确锁定——上下文即约束，这是非常 LLM 式的交互哲学迁移到了 3D。</li>
+    </ul>
+
+    <h3>2. 架构：四个关键词各管一件事</h3>
+    <table>
+      <thead><tr><th>属性</th><th>含义</th><th>买到什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Multimodal</strong></td><td>原生处理文本、图像、相机位姿、3D 深度图；视频 = 图像序列</td><td>空间控制成为架构中心而非外挂</td></tr>
+        <tr><td><strong>Autoregressive</strong></td><td>多模态元素排成序列，逐个生成、条件于前序</td><td>任务 = 序列的排列组合（输入后接输出）；<strong>直接继承 LLM 服务栈：KV caching、cache-aware routing、disaggregated serving</strong></td></tr>
+        <tr><td><strong>Diffusion</strong></td><td>rectified flow 逐步去噪生成</td><td>擅长高维连续数据（图像/视频）；推理时可用去噪步数换速度/质量；可继承 diffusion distillation、classifier-free guidance、shifted noise schedule、VAE 改进</td></tr>
+        <tr><td><strong>Transformer</strong></td><td>大矩阵乘法为主干</td><td>适配现代硬件，鲁棒的 world-model 骨架</td></tr>
+      </tbody>
+    </table>
+    <p>
+      官方原话：Atlas 是「现代 LLM 与视频模型思想的混合体，能同时受益于两条技术线的架构、算法与系统进展」。
+      这句话的工程含义很实在——<a href="daily-2026-09-01-kv-cache.html">昨天讲的 KV cache 管理、PD 分离</a>理论上可以直接搬进 Atlas 的推理服务，
+      而扩散侧的蒸馏/调度算法决定它的延迟能不能压到可交互。
+    </p>
+
+    <h3>3. Benchmark：人评相机跟随 + 重建误差</h3>
+    <ul>
+      <li><strong>相机可控生成</strong>（第三方标注员 pairwise 评判，Atlas 被偏好的比例）：vs MiniMax H3 <strong>75%</strong>、vs Gemini Omni Flash <strong>81%</strong>、vs Happy Horse 1.1 <strong>86%</strong>、vs FLUX 3 <strong>93%</strong>、vs Seedance 2.5 <strong>94%</strong>；相机轨迹越复杂优势越大。
+        <strong>方法论提醒</strong>：Atlas 用原生相机输入，基线模型只能用文本描述相机路径——这是「母语 vs 外语」的不对称比较，官方也承认了这一点；</li>
+      <li><strong>3D 重建</strong>（稀疏视角 → 逐像素 3D 点预测，统一评测协议复现全部基线）：Atlas 优于最好的开源专用重建模型。官方图表数字（经 explainx 转引，mean AbsRel 越低越好）：<strong>Atlas 25.3</strong> vs Pi3X 28.7 vs VGGT-Ω 34.7；</li>
+      <li><strong>Scaling</strong>：官方称训练了一系列尺寸/算力递增的模型，「每一档算力都解锁新能力」，但未公布参数量与训练数据规模。</li>
+    </ul>
+
+    <h3>4. 生态位：Atlas → Marble → Spark 的产品链</h3>
+    <p>
+      Atlas 输出的 3D Gaussian splats 与 Marble 使用同一种表示，可无缝接入现有产品；
+      而 World Labs 早前的 <a href="https://www.worldlabs.ai/blog/spark-2.0" target="_blank" rel="noopener">Spark 2.0</a> 已经把 3DGS 的 Web 端渲染做成了系统工程：
+      LoD splat 树、注视点渲染，以及一套和 <a href="daily-2026-09-01-kv-cache.html">PagedAttention 神似的「虚拟内存」设计</a>——
+      GPU 上固定 16M splat 池 + 64K splat 一页 + 页表映射 + LRU 换入换出。生成模型（Atlas）、产品（Marble）、渲染运行时（Spark）三层都是同一家公司自研，这是它相对纯模型公司的结构性优势。
+    </p>
+
+    <h2>实践与使用建议</h2>
+    <ul>
+      <li><strong>现在能用吗</strong>：不能。Atlas 仅面向选定合作方 early access（官方博客有申请表单），无公开权重、无定价。想立即上手同类能力，Marble 是当前公开产品。</li>
+      <li><strong>做机器人/仿真团队值得关注 Real-to-Sim</strong>：24 帧手机视频 → 可导航/可操作仿真环境，且传感器视角（RGB+深度）由同一模型生成——这把「仿真环境采集」从专业设备压缩到一次手机拍摄。评估时重点测：几何一致性（多轨迹重渲染是否漂移）、动力学保真（可变形/关节物体的交互是否可信）。</li>
+      <li><strong>读它的方式</strong>：Atlas 目前只有博客、没有技术报告。架构一节（spatial context + 自回归扩散 Transformer）是全部硬核内容；benchmark 的相机跟随人评存在「输入模态不对称」问题，重建数字建议等第三方用公开 benchmark 复现后再引用。</li>
+      <li><strong>对做多模态/3D 的人</strong>：值得关注「位姿作为原生 token 类型」的接口设计——相机几何不再是 prompt 工程，而是序列里的一等元素。这个抽象很可能被后续工作沿用。</li>
+      <li><strong>与 WMRL 对照阅读</strong>：如果你关心的是「世界模型供 RL 策略想象/训练」，那是另一条技术线（见 <a href="daily-2026-09-02-wmrl.html">WMRL 笔记</a>）；Atlas 今天不解决动作条件预测，但其 Real-to-Sim 路线（重建真实环境 → 生成传感器数据）可能是两条线的交汇点。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        Atlas 把每张输入图像「ground 到 3D 位姿」形成 spatial context。这与普通多模态 LLM 的上下文（图像 patch 直接进序列）有何本质区别？为什么这个设计同时服务于「生成」与「重建」两类任务？
+        <details><summary>参考答案</summary>
+        普通多模态上下文里，图像是一串没有空间坐标的 patch，模型只能从内容推断「大概在哪儿」；spatial context 里每个元素自带显式 3D 位姿，几何关系成为输入的一部分而非待推断的隐变量。对生成：相机轨迹可以直接作为控制信号写入序列，实现「像素级」运镜而非文本近似的「向左摇一点」；对重建：多视角输入的位姿约束告诉模型各视图间的几何关系，「看到的部分忠实、未见的部分想象」才有明确边界——新信息进来时知道该覆盖哪部分想象。同一个抽象统一了两类任务：生成是「位姿引导的外推」，重建是「位姿约束下的内插 + 外推」。</details>
+      </li>
+      <li>
+        「自回归 + 扩散」混合架构中，两者各自负责什么？为什么说这个组合能同时吃到 LLM 系统和扩散模型两条技术线的红利？
+        <details><summary>参考答案</summary>
+        自回归负责<strong>序列结构</strong>：把多模态元素（文本、图像、位姿、深度图）排成序列，逐个元素生成，于是「任务 = 输入后跟输出的序列模式」，天然支持任意输入组合；扩散（rectified flow）负责<strong>单元素内部的高维连续内容</strong>：每个图像/深度图元素通过逐步去噪生成。红利来自解耦：序列维度上是标准自回归 Transformer，KV caching、cache-aware routing、PD 分离等 LLM 推理优化直接适用；元素维度上是 latent diffusion，diffusion distillation（少步数加速）、classifier-free guidance（可控性）、noise schedule、VAE 改进全部可用。任何一条线出新成果，Atlas 形态的系统都能吸收——这是架构层面刻意的「双栈兼容」设计。</details>
+      </li>
+      <li>
+        传统稀疏视角 NVS（如 few-shot NeRF/3DGS 优化）需要逐场景优化且容易崩，Atlas 用 2~3 张图就能给出忠实重建。从「优化 vs 先验」的角度解释这一差异。
+        <details><summary>参考答案</summary>
+        传统方法把重建当作纯几何优化问题：从少量视图反解 3D 结构，约束不足时（视角稀疏）问题是病态的，只能靠正则化硬撑，遮挡区和未见区域直接崩坏。Atlas 把重建变成<strong>条件生成</strong>：大规模多模态预训练给了它「世界通常长什么样」的强先验（back side of the robot、泳池旁应有草坪），2~3 张带位姿的图作为空间上下文把先验「锚定」到具体场景——未见区域由生成先验合理补全而非几何外推。用 100+ 张图时上下文约束变强，输出从「合理想象」滑向「忠实复刻」。这正是「the more it sees, the less it imagines」：信息量决定输出中先验与证据的比例。代价也随之而来——忠实度依赖输入覆盖度，关键区域没拍到时模型会「自信地想象」，重建类应用必须显式检查覆盖范围。</details>
+      </li>
+      <li>
+        相机跟随 benchmark 里，Atlas 用原生相机位姿输入，基线模型用文本描述相机路径。这个「不对称」对结论可信度有什么影响？该如何设计更公平的对比？
+        <details><summary>参考答案</summary>
+        影响是双向的。一方面，Atlas 的优势可能被高估：文本是有损通道——「crane up 30 度」无法精确编码连续轨迹，基线模型的失败可能来自「指令通道带宽不足」而非「模型空间能力差」。另一方面，这个不对称本身就是论点的一部分：Atlas 的主张恰恰是「相机几何应该是原生输入」，接口差异是设计差异而非评测作弊。更公平的补充实验：① 给基线模型更强的文本通道（如把轨迹离散成逐帧位姿文本、或代码形式的相机矩阵）看差距是否收敛——官方也承认「更精细的 prompt 工程可能改善部分模型」；② 逆向测试：把 Atlas 的相机输入降采样/加噪，测其精度敏感性，验证「原生位姿」的边际收益；③ 用可自动核验的几何指标（生成视频反推相机轨迹与目标轨迹的偏差）替代部分人评，减少标注主观性。读论文/博客时，人评 + 不对称接口的结论应视为「方向性证据」，数值优势幅度待复现。</details>
+      </li>
+      <li>
+        官方称 Atlas 作为自回归 Transformer 可复用 KV caching、cache-aware routing、disaggregated serving。请逐个说明这三项技术（参见<a href="daily-2026-09-01-kv-cache.html">昨天的 KV cache 笔记</a>）在一个「逐元素生成、每元素是扩散去噪的图像」的模型上各自对应什么。
+        <details><summary>参考答案</summary>
+        ① KV caching：自回归序列每生成一个新元素都要对前序元素做注意力——spatial context（参考图、位姿、已生成内容）的 K/V 可以缓存，避免每步重算；对 Atlas 尤其值钱，因为参考图像上下文在长视频生成中反复被 attend。② cache-aware routing：多轮/多轨迹生成共享同一批参考图时，把请求路由到已缓存该上下文的实例，等价于 prefix caching——「同一批输入图生成多条相机轨迹」的官方案例就是天然的缓存命中场景。③ disaggregated serving：Atlas 的生成有两个阶段性质迥异的负载——上下文编码（大批图像/深度图并行编码，compute-bound，类似 prefill）和逐元素扩散去噪（迭代步数多、带宽敏感，类似 decode）；PD 分离允许两侧独立扩缩容与调度。需要注意的适配点：扩散元素内部要多步去噪，缓存的粒度是「元素级」而非「token 级」，调度与批处理策略要重新设计——这也是官方说「可以受益」而非「开箱即用」的原因。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>World Labs 官方博客（2026-09-01）：<a href="https://www.worldlabs.ai/blog/atlas" target="_blank" rel="noopener">Atlas: A World Model for Spatial Intelligence</a></li>
+      <li>背景阅读（同厂）：<a href="https://www.worldlabs.ai/blog/taxonomy-of-world-models" target="_blank" rel="noopener">A Functional Taxonomy of World Models</a>（renderer / simulator / planner 边界消融）· <a href="https://www.worldlabs.ai/blog/spark-2.0" target="_blank" rel="noopener">Spark 2.0：3DGS 的 Web 流式渲染</a></li>
+      <li>二手解读（含重建 AbsRel 数字转引）：<a href="https://explainx.ai/blog/world-labs-atlas-multimodal-world-model-3d-2026" target="_blank" rel="noopener">explainx: World Labs Atlas</a>（2026-09-02）</li>
+      <li>相关笔记：<a href="daily-2026-09-01-kv-cache.html">KV cache 的一生（Atlas 声称复用的 LLM 服务栈）</a> · <a href="daily-2026-09-02-wmrl.html">WMRL：RL 意义上的 world model</a> · <a href="special-2026-08-27-new-models-arch.html">特别篇：2026 新模型架构全景</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

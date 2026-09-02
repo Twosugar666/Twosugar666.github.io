@@ -151,6 +151,13 @@
       "source": "algo",
       "topic": "GAE：广义优势估计 GAE(γ,λ)=Σ(γλ)^l δ；λ 在 TD 与 MC 之间拧偏差–方差",
       "file": "posts/daily-2026-09-02-algo-gae.html"
+    },
+    {
+      "date": "2026-09-02",
+      "domain": "agent",
+      "source": "frontline",
+      "topic": "World Labs Atlas：全模态世界模型（spatial context / 自回归扩散 Transformer / 稀疏视角 3D 重建 / Real-to-Sim）",
+      "file": "posts/daily-2026-09-02-atlas.html"
     }
   ]
 }
