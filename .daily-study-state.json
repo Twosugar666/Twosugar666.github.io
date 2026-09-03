@@ -179,6 +179,13 @@
       "source": "algo",
       "topic": "REINFORCE：似然比 ∇J=E[Σ∇logπ·G_t]；baseline→advantage；连到 PPO/GRPO/GSPO/GAE",
       "file": "posts/daily-2026-09-03-algo-reinforce.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "Mercor × SkyRL：397B 知识工作 Agent RL 全配方（六步法 / TITO / prompt_mean +3.9 / 跨 harness 泛化）",
+      "file": "posts/daily-2026-09-03-mercor-skyrl.html"
     }
   ]
 }

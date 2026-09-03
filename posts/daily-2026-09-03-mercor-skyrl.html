@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Mercor × SkyRL：397B 知识工作 Agent 的 RL 训练全配方开源 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Mercor × SkyRL：397B 知识工作 Agent 的 RL 训练全配方开源</h1>
+    <p class="post-meta">2026-09-03 · 收藏夹：RL / Agent · 一线追踪<br />
+      发布方：Mercor Research × SkyRL（Berkeley Sky Computing Lab / Anyscale），发布时间 <strong>2026-09-01</strong> · 信息来源：
+      <a href="https://www.mercor.com/blog/training-frontier-knowledge-work-agents-a-397b-rl-training-guide-with-skyrl/" target="_blank" rel="noopener">Mercor 官方博客</a>、
+      <a href="https://github.com/Mercor-Intelligence/ApexAgents-SkyRL-Recipe" target="_blank" rel="noopener">训练脚本（GitHub）</a>、
+      <a href="https://huggingface.co/collections/mercor/apexagents-skyrl-recipe" target="_blank" rel="noopener">模型权重与评测轨迹（Hugging Face）</a></p>
+
+    <h2>背景与动机</h2>
+    <p>
+      开源社区对「怎么训 coding agent」已有不少公开资料（27B～32B 级别），但<strong>知识工作 agent</strong>（咨询、投行、法务这类跨应用长任务）
+      几乎没有公开配方——真实环境建起来贵，长 horizon rollout 训起来更贵。
+      前天（9 月 1 日）Mercor 把这件事彻底开源了：用公开的 <strong>SkyRL</strong> 框架把 <strong>Qwen3.5-397B-A17B</strong>
+      在 APEX-Agents 上从 Pass@1 <strong>16.11% → 27.29%</strong>（相对 +70%），
+      <strong>训练脚本、模型权重、评测轨迹全部公开</strong>。
+    </p>
+    <p>
+      这篇博客的价值不在「又涨点了」，而在它把一次工业级 agentic RL 的<strong>完整决策链</strong>摆了出来：
+      六步流程里前三步全是 de-risking（不花大算力），第四步才上消融。
+      其中大量细节与本博客近期笔记互为印证：TITO token 保真（<a href="daily-2026-08-31-harness-tito.html">TITO 笔记</a>）、
+      全异步 + staleness 上限（<a href="daily-2026-08-26-granite-4-2.html">Granite 4.2 笔记</a>）、
+      token/sequence/prompt 三种 loss 聚合（<a href="daily-2026-08-31-algo-gspo.html">GSPO 笔记</a>的粒度问题）。
+      可以说：<strong>这是检验你是否读懂了近期这一波 agentic RL 工程文献的一份「综合应用题」</strong>。
+    </p>
+
+    <h2>核心内容：六步流程</h2>
+    <table>
+      <thead><tr><th>步骤</th><th>内容</th><th>性质</th></tr></thead>
+      <tbody>
+        <tr><td>Step 1</td><td>环境、harness 与 token 记账（TITO）</td><td rowspan="3">de-risking（不花大算力）</td></tr>
+        <tr><td>Step 2</td><td>RL 系统调优（Megatron / 集群切分 / 并发 / 一致性检查）</td></tr>
+        <tr><td>Step 3</td><td>过拟合试运行（32 题能过拟合，才谈得上训全量）</td></tr>
+        <tr><td>Step 4</td><td>35B 上做算法消融（5 组旋钮）</td><td>科学</td></tr>
+        <tr><td>Step 5</td><td>397B hero run（DPPO + prompt_mean + nudge）</td><td>放大</td></tr>
+        <tr><td>Step 6</td><td>评测与泛化（换 harness、换 benchmark、查回归）</td><td>验证</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Step 1：环境、harness、token 记账——「零训练涨 6 个点」</h3>
+    <ul>
+      <li><strong>环境鲁棒性</strong>：一切皆超时（文件下载、MCP 交互、容器销毁——没有超时的环节最终一定会挂住整条 rollout）；
+        RL 时 800+ 并发 rollout 会打爆 LLM judge 的限流（多 key 轮询 + 退避重试）；
+        MCP client 必须每进程隔离（数百个 agent loop 共享一个 Python 进程会疯狂断连）。
+        <strong>建议：训练前用 RL 预期的并发度（300～600）对整个训练集跑一遍评测，把非模型错误率压到接近零</strong>，别指望「训练时 mask 掉错误」；</li>
+      <li><strong>harness 修复</strong>：读轨迹找 harness 自身的 bug——沙箱缺 Python 包、PowerPoint MCP 工具成功也返回 <code>None</code>、PDF 工具把二维表格拍平（改引导用 pdfplumber）等。
+        这批修复把 Qwen3.6-35B-A3B 的 mean reward 从 <strong>22.74% → 28.69%，零训练</strong>——约等于在未修复 harness 上训一个 epoch 的收益；</li>
+      <li><strong>TITO（token-in-token-out）</strong>：词表里有 <code>0:&lt;</code>、<code>1:search</code>、<code>2:&lt;search</code>、<code>3:&gt;</code> 时，
+        模型实际生成 <code>0,1,3</code>，若 harness 把文本 <code>&lt;search&gt;</code> 交给 trainer 重新分词得到 <code>2,3</code>，
+        训练就在 silently off-policy。三条路线：harness 改用 <code>/completions</code>（控制力最强、工程量最大，他们选这条）；
+        <code>return_token_ids</code>（省力但多轮拼接处仍错位）；框架内置代理（最省事，SkyRL 正在做）。</li>
+    </ul>
+
+    <h3>Step 2：RL 系统调优——顺序比蛮力重要</h3>
+    <ol>
+      <li><strong>先调 Megatron</strong>：用 dummy 脚本扫 TP/EP/PP/CP、CPU offload 粒度、micro-batch（动态 micro-batching 对吞吐至关重要）——他们花了「一个通宵的 Claude Code 会话」；</li>
+      <li><strong>再切分集群</strong>：固定训练 GPU 数，rollout GPU 加到「trainer 不再等待」为止（SkyRL 的 <code>timing/wait_for_generation_buffer</code> 面板为 0）。实际比例：35B 用 12:4，397B 用 12:8（推理:训练节点）；</li>
+      <li><strong>rollout 并发取两个天花板的最小值</strong>：
+        <ul>
+          <li><em>系统天花板</em>（长 horizon 任务通常先碰到）：KV cache 总容量（token 数）÷ 平均轨迹长度；</li>
+          <li><em>算法天花板</em>（全异步的 staleness 容忍）：<code>(max_staleness_steps + 1) × mini_batch_size × n_samples_per_prompt</code>，他们算得 (3+1)×16×16 = <strong>1024</strong> 条。</li>
+        </ul>
+        实际两次都被系统天花板卡住：35B 设 550、397B 设 300；</li>
+      <li><strong>最后做 train-inference 一致性检查</strong>：跑几个 step 对比 trainer 与推理引擎的 logprob 差（&lt;0.03 为健康）。这一步抓到了 vLLM CPU offloading + GDN 模型 + in-flight 权重更新组合下的正确性 bug。</li>
+    </ol>
+
+    <h3>Step 3：过拟合试运行</h3>
+    <p>
+      正式 run 之前，先用 32 道题（离线评测中 reward 方差非零的）做小批同步训练：<strong>连 32 道题都过拟合不了，端到端 run 必败</strong>。
+      他们在此发现「以文件 diff 判分的任务」怎么都过拟合不了 → 定位到判分逻辑 → 换第三方 file-diff 工具后任务变得可学。
+      教训：<strong>过拟合失败时往 Step 1 找原因，通常是环境/判分而非算法</strong>。
+    </p>
+
+    <h3>Step 4：算法消融（35B，epoch-1，3 pass × 480 题）</h3>
+    <table>
+      <thead><tr><th>旋钮</th><th>结论（mean，±1~3 点为噪声带）</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>token 聚合方式</strong>：token_mean（全局 token 池，多数开源框架默认；Dr. GRPO 是其常数归一化变体）/ sequence_mean（原始 GRPO）/ prompt_mean（DAPO 目标式，ScaleRL 强调）</td>
+          <td><strong>prompt_mean +3.9</strong>（相对 token_mean 基线）</td>
+          <td>轨迹长度 2k～128k token，token_mean 让「碰巧 rollout 最长的 prompt」主导梯度；prompt_mean 消偏</td>
+        </tr>
+        <tr>
+          <td><strong>policy loss</strong>：DPPO（对 train/inference logprob 分歧大的 token 做 mask，TV 距离的二值近似）vs GLM-5 loss（截断重要性比）</td>
+          <td>epoch-1 得分在噪声内打平</td>
+          <td>两者都直接用 rollout logprob，免掉 TIS 的额外 forward（10 万 token 轨迹上很省）；DPPO 的行为效应显著：轮数 21→32、每轮 assistant token 834→588（更多、更短的轮次）</td>
+        </tr>
+        <tr>
+          <td><strong>context nudge</strong>：上下文余量剩 20% 时注入「请收尾」提示</td>
+          <td><strong>+3.0</strong>（纯训练期效应——评测均不带 nudge）</td>
+          <td>更少的 rollout 撑爆上下文被整批清零 → 每 batch 可用信号变多；按比例触发还顺带吸收了训/评上下文长度差（160k 训 vs 256k 评）</td>
+        </tr>
+        <tr>
+          <td><strong>没帮助的</strong>：overlong filtering（OLF）、adaptive length penalty（ALP）</td>
+          <td>OLF −1.5；ALP 各设置均中性偏负</td>
+          <td>OLF 结果与 Composer 2 的报告一致；ALP 可能训练 horizon 太短、或系数待调</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      读表的两条自律：单 pass 480 题评测有 ±1～3 分波动，<strong>全部数字取 3 pass 均值，差距小于 ~1 分视为平手</strong>；
+      不只看 reward，还看行为指标（轮数、每轮 token、工具调用成功率）——「看起来在认真多步干活」的 run 恰好也是分最高的。
+      最终 hero run 配置：<strong>DPPO + prompt_mean + nudge</strong>（不加长度惩罚、不加课程学习）。
+    </p>
+
+    <h3>Step 5～6：hero run 与泛化</h3>
+    <ul>
+      <li><strong>35B 与 397B 的唯一真实差别是 RL 系统工作</strong>——Step 2 已经 de-risk 过；hero run 初期 Pass@1/Pass@16 会先降（全异步动态：简单任务先完成），属预期；</li>
+      <li><strong>跨 harness 泛化</strong>：训练用 MCP 的 Archipelago，评测换成纯代码工具的 OpenCode（无 MCP server），提升大体保留；<strong>35B 迁移明显好于 397B</strong>——35B 在训练中越来越依赖代码执行，397B 始终偏好 MCP；</li>
+      <li>换数据集 + 换 harness 双换（Terminal-Bench 2.1 / terminus-2）仍有增益；HLE / GPQA 无回归（差异均在误差带内）；</li>
+      <li><strong>两条总 lesson</strong>：① 算法选择不如数据——最好的旋钮 +3.9 分，而 post-training 整体移动了 10～12 分；② 增益跨 harness 迁移，说明训后的开源模型是<strong>可复用资产</strong>，不是焊死在某个脚手架上的工件。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>照抄排期纪律</strong>：先环境、再系统、再过拟合，最后才消融与 hero run。「不花大算力直到 Step 4」是这份配方最反直觉也最省钱的一条——多数团队反过来，先烧卡再找 bug。</li>
+      <li><strong>harness 修复的 ROI 用一个 epoch 来计价</strong>：训练前先按「读轨迹 → 修 harness」循环迭代，把基线 reward 抬上去；在 buggy harness 上训练，模型学到的是「绕过你的 harness」，探索预算被白白烧掉。</li>
+      <li><strong>并发设置先算账再开跑</strong>：系统天花板（KV cache ÷ 平均轨迹长）与算法天花板（staleness 公式）取小值；参考 <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 的 staleness ≤1 + TIS 与本文 max_staleness=3 + DPPO/GLM-5 loss，都是「全异步 + 有界 off-policy」同一思想的不同参数化。</li>
+      <li><strong>轨迹长度分布宽的批量上，默认 prompt_mean</strong>：2k 与 128k token 的轨迹同 batch 时，token_mean 等于把梯度交给最长轨迹；这与 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 把重要性比提到序列级是同一方向的「防长轨迹主导」直觉。</li>
+      <li><strong>评测要报噪声带</strong>：480 题单 pass ±1～3 分意味着「+1 分」什么都不是；3 pass 均值 + 行为指标（轮数/token 分布/工具成功率）才是可信的读表方式。</li>
+      <li><strong>想要可迁移的 agent，引导它多用代码执行</strong>：35B 迁移更好的解释是它对 code execution 的偏好更高（代码工具在不同 harness 间是同构的，MCP server 不是）。设计 action space 时，「通用工具」（bash/文件）占比高的配方天然更抗 harness 漂移。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说「在 buggy harness 上做 RL，模型学到的是绕过 harness 而不是解决任务」？这与 reward hacking 有何异同？
+        <details><summary>参考答案</summary>
+        两者都是「策略在优化一个与真实目标错位的东西」，但错位来源不同。Reward hacking 是 reward 函数本身有洞（判分器被骗过）；harness bug 是环境与动作通道有洞（工具返回 None、解析失败、缺依赖），模型不得不消耗探索预算去学「这个 harness 里哪些动作是哑的、怎么绕」——这部分学习完全不可迁移，换 harness 即作废，还挤占了本应用于任务能力的梯度与样本。Mercor 的数字量化了这个代价：修好 harness 后基线 22.74%→28.69%，约等于白捡一个 epoch。实操含义：把 harness 修复当作训练的前置阶段而不是并行修复，且修复后重新测基线，否则你会把 harness 的红利误记成算法的功劳。</details>
+      </li>
+      <li>
+        TITO 错位（模型生成 token 序列 <code>0,1,3</code>，trainer 重新分词得到 <code>2,3</code>）为什么会让训练变成 off-policy？它污染的是 loss 里的哪个量？
+        <details><summary>参考答案</summary>
+        Policy gradient 的梯度项是 advantage × ∇log π_θ(token | context)。TITO 错位时，trainer 计算的 π_θ 作用在「重新分词后的 token 序列」上——它既不是采样策略实际输出的序列（∇log π 的变量错了），也让 ratio = π_θ/π_old 失去意义：π_old（推理引擎）产生的是 <code>0,1,3</code> 的概率，trainer 却在评估 <code>2,3</code> 的概率。这等价于行为策略与目标策略不一致，但你并没有任何 importance correction 来修它——是未经声明的 off-policy，且错位随轨迹变长累积。TITO 的本质就是保证「trainer 看到的 token 序列 == 引擎实际采样的 token 序列」，让 on-policy 假设在记账层面成立。</details>
+      </li>
+      <li>
+        在轨迹长度 2k～128k token 的 batch 里，为什么 token_mean 会偏、prompt_mean 能修正？sequence_mean 为什么不是最终答案？
+        <details><summary>参考答案</summary>
+        token_mean 把 batch 内所有 token 摊平求平均：一条 128k 轨迹贡献的梯度项是 2k 轨迹的 64 倍，于是「碰巧 rollout 很长的 prompt」主导更新——而轨迹长度与任务难度、策略行为强相关，这构成系统性偏置（长轨迹不是更「值得」，只是更「长」）。sequence_mean（每条序列等权）解决了轨迹间不均，但在同组内，一条被拆成长度悬殊的多条训练序列时（多轮 agent 的常见情况），长短序列等权又会让短序列的每个 token 权重虚高。prompt_mean（DAPO 式）按「rollout 组」等权、组内 token 等权：每个 prompt 对总梯度的贡献相同，组内 token 均摊——既不被长轨迹绑架，也不让组内切分方式影响权重。这与 GSPO 把 importance ratio 提到序列级是同一类「匹配梯度粒度与信用单位」的思想。</details>
+      </li>
+      <li>
+        全异步 RL 的 rollout 并发「算法天花板」为什么是 (max_staleness_steps + 1) × mini_batch_size × n_samples_per_prompt？系统天花板与算法天花板先碰哪一个，由什么决定？
+        <details><summary>参考答案</summary>
+        全异步下 trainer 每前进 max_staleness_steps+1 个 step，生成端权重必须刷新一次；在一个「staleness 窗口」内，trainer 最多消费 mini_batch_size × n_samples_per_prompt 条轨迹。如果生成端在窗口内产出的轨迹超过这个数，超出的部分必然由更老的权重采样、超过 staleness 容忍度而被丢弃或引入过大偏差——并发再高也只是生产废品，这就是算法天花板。系统天花板是 KV cache 容量 ÷ 平均轨迹长：并发再高，引擎装不下更多进行中的轨迹。先碰哪个取决于「轨迹长度 × 组大小」与「KV 预算 × 训练吞吐」的相对值：长 horizon（10 万 token 级）任务轨迹极长，KV 先耗尽——Mercor 两次 run 都是系统天花板先卡（550/300 &lt; 1024）；短轨迹数学类任务反过来，staleness 先卡。给你的管线定价时，两个数都要先算出来再定 concurrency。</details>
+      </li>
+      <li>
+        为什么 35B 的跨 harness 迁移明显好于 397B？这个发现对「垂类 agent 该选多大的基座做 RL」有什么启示？
+        <details><summary>参考答案</summary>
+        Mercor 的解释是工具偏好：35B（Qwen3.6 系，本身经过更重的 agentic post-training）在 RL 中越来越依赖代码执行——bash/文件这类通用工具在任何 harness 里语义相同，所以能力可迁移；397B 始终偏好 MCP server——一套特定 harness 的专有接口，换 harness 后接口消失，依赖它的策略部分失效。更一般地说：<strong>RL 会把模型推向「在当前环境里回报最高的动作子集」，这个子集的通用性决定迁移性</strong>。对基座选择的启示：① 基座本身的 agentic 训练史影响 RL 后的动作偏好（35B 更「代码原生」）；② 更大的模型可能更擅长利用专有工具的上限，但在异构部署里更脆；③ 若你的垂类 agent 未来要在多种 harness/客户端落地，训练时主动提高通用工具（代码、文件）在 action space 中的占比，比追求单一 harness 内的峰值分数更值。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Mercor 官方博客（2026-09-01）：<a href="https://www.mercor.com/blog/training-frontier-knowledge-work-agents-a-397b-rl-training-guide-with-skyrl/" target="_blank" rel="noopener">Training frontier knowledge work agents: A 397B RL training guide with SkyRL</a></li>
+      <li>开源物：<a href="https://github.com/Mercor-Intelligence/ApexAgents-SkyRL-Recipe" target="_blank" rel="noopener">训练脚本 GitHub</a> · <a href="https://huggingface.co/collections/mercor/apexagents-skyrl-recipe" target="_blank" rel="noopener">权重与评测轨迹 HF Collection</a></li>
+      <li>方法引用（文中提及）：DAPO <a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">arXiv:2503.14476</a> · Dr. GRPO <a href="https://arxiv.org/abs/2503.20783" target="_blank" rel="noopener">arXiv:2503.20783</a> · ScaleRL <a href="https://arxiv.org/abs/2510.13786" target="_blank" rel="noopener">arXiv:2510.13786</a> · AReaL <a href="https://arxiv.org/abs/2505.24298" target="_blank" rel="noopener">arXiv:2505.24298</a> · APEX-Agents <a href="https://arxiv.org/abs/2601.14242" target="_blank" rel="noopener">arXiv:2601.14242</a></li>
+      <li>相关笔记：<a href="daily-2026-08-31-harness-tito.html">TITO：token 保真为什么决定 RL</a> · <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2：异步 GRPO + TIS</a> · <a href="daily-2026-08-31-algo-gspo.html">GSPO：序列级重要性采样</a> · <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3：环境规模化</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
