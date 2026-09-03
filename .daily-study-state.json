@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 0,
   "daily_streams": [
     "frontline",
     "harness",
@@ -158,6 +158,27 @@
       "source": "frontline",
       "topic": "World Labs Atlas：全模态世界模型（spatial context / 自回归扩散 Transformer / 稀疏视角 3D 重建 / Real-to-Sim）",
       "file": "posts/daily-2026-09-02-atlas.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "ARISE-RL：rubric 共演化 + RG-SED（tool-grounded / difficulty-shaped / Δr>τ 门控蒸馏）",
+      "file": "posts/daily-2026-09-03-arise-rl.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "Lego-RL：原生 coding harness 接 PG（in-process proxy / Harbor / GSPO / R3 routing）",
+      "file": "posts/daily-2026-09-03-harness-lego-rl.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "REINFORCE：似然比 ∇J=E[Σ∇logπ·G_t]；baseline→advantage；连到 PPO/GRPO/GSPO/GAE",
+      "file": "posts/daily-2026-09-03-algo-reinforce.html"
     }
   ]
 }
