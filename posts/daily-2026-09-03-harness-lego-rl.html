@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Lego-RL：不改控制流，把原生 coding harness 接进 policy-gradient（in-process proxy / Harbor / GSPO） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Lego-RL：不改控制流，把原生 coding harness 接进 policy-gradient（in-process proxy / Harbor / GSPO）</h1>
+    <p class="post-meta">2026-09-03 · 收藏夹：Harness / Agent / RL · 学习笔记<br />
+      主来源：Du et al. <em>Lego-RL</em>，
+      <a href="https://arxiv.org/abs/2608.17393" target="_blank" rel="noopener">arXiv:2608.17393</a>。
+      代码：<a href="https://github.com/LegoX/Lego-RL" target="_blank" rel="noopener">LegoX/Lego-RL</a>。
+      SWE-bench Verified 涨点与 rollout–train Pearson 均标注为<strong>论文自报</strong>。
+      交叉：
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-02-harness-envharness.html">EnvHarness</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      生产级 coding agent 跑在 <strong>OpenHands SDK / Claude Code / OpenCode</strong> 这类原生 harness 上：自带 compaction、工具路由、会话状态。
+      把同一套控制流塞进 policy-gradient 训练时，常见三种错位：
+    </p>
+    <ul>
+      <li><strong>历史改写破坏 token 对齐</strong>：harness 压缩/改写 messages 后，trainer 重算的 logp 对不上 rollout 真采样。</li>
+      <li><strong>Sandbox 崩坏与 reward hacking</strong>：评测环境不稳定，或 agent 钻测试洞拿到假正奖励。</li>
+      <li><strong>MoE 路由不一致</strong>：rollout 与 train 的 expert 选择不同，序列级 IS（如 GSPO）相关性崩掉。</li>
+    </ul>
+    <p>
+      <strong>Lego-RL</strong> 的立场：不改 harness 内部控制流，只加轻量 adapter；用 in-process LLM proxy 捕获 raw 训练信号，用 Harbor 管 sandbox 与防 hacking，用 observability + Live UI 盯对齐。建在 <strong>verl + Harbor</strong> 上，并用 <strong>GSPO</strong> 训 Qwen3.5-35B-A3B。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Lego-RL = 原生 coding harness 保真接入 PG——in-process proxy 抓 raw tokens/logp/mask/routing + Harbor 沙箱与防 hack + GSPO；作者自报三家 harness 在 SWE-bench Verified 上约 +6–9 点，Pearson≥0.998。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 错位从哪来：控制流能跑，训练信号对不齐</h3>
+    <pre><code># 坏路径（示意）
+rollout:  harness.compact(history) → LLM.sample → tools...
+train:    rebuild_messages_from_logs() → model.forward → logp'
+# 若 compact / 截断 / 系统提示注入与 rollout 不一致 → token 错位
+# MoE: rollout routing ≠ train routing → GSPO 序列级 IS 失效
+</code></pre>
+    <p>
+      站内 <a href="daily-2026-08-31-harness-tito.html">TITO</a> 讲的是「Token-In-Token-Out」合同；Lego-RL 把合同落实到<strong>不改原生 harness 控制流</strong>仍能拿到对齐的 raw 轨迹。
+      对比 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>：后者用极简 bash-only 降低复杂度；Lego-RL 目标是<strong>直接 RL 三家生产 harness</strong>。
+    </p>
+
+    <h3>② 三支柱：proxy / Harbor / observability</h3>
+    <table>
+      <thead><tr><th>支柱</th><th>做什么</th><th>解决什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>In-process LLM proxy</strong></td>
+          <td>捕获 raw tokens、logp、mask、routing；harness compaction 后 trainer 仍可侧重算</td>
+          <td>历史改写 ≠ 丢失训练信号</td>
+        </tr>
+        <tr>
+          <td><strong>Harbor sandbox</strong></td>
+          <td>镜像缓存 + stage-wise reward-hack defenses</td>
+          <td>环境崩、假测通过、奖励洞</td>
+        </tr>
+        <tr>
+          <td><strong>Observability + Live UI</strong></td>
+          <td>插件化指标与实时面板</td>
+          <td>对齐漂移、hack、路由错位可观测</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      「只加轻量 adapter」是边界条件：OpenHands / Claude Code / OpenCode 的内部循环、工具调度、compaction 策略保持原样；adapter 负责把 LLM 调用换成可记录的 proxy，并把轨迹交还给 verl 训练环。
+    </p>
+
+    <h3>③ In-process proxy：即使 compaction 也能重算</h3>
+    <pre><code># 概念合同
+# harness 侧：照常 call llm.chat(messages) / stream
+# proxy 侧：记录
+#   - raw token ids（采样真实发生的序列）
+#   - token logprob
+#   - loss mask（哪些 token 参与 PG）
+#   - MoE routing（若适用）
+# trainer 侧：不依赖「重建后的 messages 文本」当唯一真相
+#   即使用户可见历史被 compact，仍可用 raw 轨迹做 GSPO/PG
+
+# 与 Lightning 的 LLM endpoint proxy 同族：
+# Lightning 强调部署 harness 进环；Lego-RL 强调 coding harness 保真 + 三家原生
+</code></pre>
+    <p>
+      这直接回应 TITO：训练目标必须吃到<strong>与采样一致的 token 级密度</strong>。文本日志重放若经过 harness 改写，就是另一条分布。
+    </p>
+
+    <h3>④ Harbor：缓存与分阶段防 reward hacking</h3>
+    <pre><code># 工程层（示意）
+# 1) image caching：重复 SWE 任务少冷启，吞吐稳定
+# 2) stage-wise defenses：按阶段限制危险能力 / 检测可疑奖励路径
+#    例：改测试文件、短路断言、污染评分脚本 → 触发防御或零奖励
+# 3) 与 EnvHarness 的「Contract」精神一致：环境壳要可编程、可检查
+</code></pre>
+    <p>
+      Coding RL 的奖励完整性往往比算法更先爆。Harbor 把「沙箱可用」和「奖励可信」绑在同一栈里，否则 GSPO 只是在优化 hack。
+      与 <a href="daily-2026-09-02-harness-envharness.html">EnvHarness</a> 对照：EnvHarness 给静态环境套 Stage/Contract/Chain；Lego-RL 的 Harbor 侧更贴 coding 评测与防 hack 流水线。
+    </p>
+
+    <h3>⑤ GSPO + R3 routing replay：MoE 上保住相关性</h3>
+    <pre><code># 训练设定（论文）
+# 模型：Qwen3.5-35B-A3B（MoE）
+# 算法：GSPO（序列级重要性采样）
+# R3 routing replay：train 时重放 rollout 的 expert 路由
+
+# 自报 SWE-bench Verified（同一 RL 配方，换 harness）
+#   OpenHands : 64.0 → 70.4
+#   Claude Code: 62.4 → 68.2
+#   OpenCode  : 57.2 → 66.6
+# rollout–train Pearson ≥ 0.998
+# 错位 replay（不用 R3 / 路由不一致）→ 相关性毁掉
+</code></pre>
+    <p>
+      站内 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 文解释了为何序列级 IS 对 MoE 更稳；Lego-RL 给出工程注脚：<strong>没有 routing replay，纸上的 GSPO 也会在实现里失效</strong>。
+      Pearson≥0.998 是对齐健康度指标——值得写进训练 dashboard，而不是只看最终 SWE 分。
+    </p>
+
+    <h3>⑥ 与 Agent Lightning 对照</h3>
+    <table>
+      <thead><tr><th></th><th>Lightning</th><th>Lego-RL</th></tr></thead>
+      <tbody>
+        <tr><td><strong>共同点</strong></td><td colspan="2">LLM proxy / harnessed RL；部署路径进训练</td></tr>
+        <tr><td><strong>重心</strong></td><td>~3500 LOC、通用 agent harness 接入</td><td>原生 coding harness 保真 + sandbox 奖励完整性</td></tr>
+        <tr><td><strong>覆盖</strong></td><td>强调把已有 harness 插进环</td><td>跨 OpenHands / Claude Code / OpenCode 三家</td></tr>
+        <tr><td><strong>MoE</strong></td><td>视具体栈</td><td>显式 R3 routing replay + GSPO</td></tr>
+      </tbody>
+    </table>
+    <p>
+      选型直觉：已有通用 agent 服务、要最快接入 RL → Lightning 路径；目标是「生产 coding CLI/SDK 原样 RL」且 MoE+SWE → Lego-RL 更贴。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量对齐，再谈涨点。</strong> Dashboard 挂 rollout–train logp / routing Pearson；跌破阈值先修 proxy，不先加大学习率。</li>
+      <li><strong>禁止「从 compact 后文本重建唯一真相」。</strong> Raw token ids + mask 必须落盘；compaction 只服务上下文窗口，不服务训练标签。</li>
+      <li><strong>MoE 必开 routing replay。</strong> 消融一次「错位 replay」——相关性崩了就不要相信该次 GSPO 曲线。</li>
+      <li><strong>Harbor 防 hack 分阶段打开。</strong> 先挡改测试/改评分器，再收紧网络与写权限；每层防御对应明确零奖励条件。</li>
+      <li><strong>三家 harness 共用同一奖励合同。</strong> 换 OpenHands / Claude Code / OpenCode 时，变的是 adapter，不变的是 SWE 判定与防 hack 策略。</li>
+      <li><strong>与站内栈对照阅读。</strong> TITO 定合同，Lightning 定 proxy 范式，GSPO 定 MoE 目标，Lego-RL 把三者焊进 coding 生产 harness。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么 harness compaction 会破坏朴素的「日志重放 → 重算 logp」？
+        <details><summary>参考答案</summary>
+        Compaction 改写/丢弃历史后，trainer 重建的 token 序列不再等于 rollout 采样时的序列；score-function 乘在错误 token 上，等价于 off-policy 且无正确 IS。Proxy 直接记录 raw 采样轨迹，才能在压缩后仍对齐。</details>
+      </li>
+      <li>
+        R3 routing replay 与「训练时重新路由」差在哪里？
+        <details><summary>参考答案</summary>
+        重新路由让 train 密度对应另一组 expert，与 rollout 行为分布不一致，序列级 IS 的重要性权重失真。R3 重放 rollout 路由，使 GSPO 的 π_θ/π_old 比在同一路由条件下计算，相关性才能接近 1。</details>
+      </li>
+      <li>
+        镜像缓存主要优化什么？它能替代防 reward hacking 吗？
+        <details><summary>参考答案</summary>
+        缓存降低重复任务冷启与环境抖动，提高吞吐与可复现性。它不检测「改测试骗分」；防 hack 需要 stage-wise 策略与合同检查，二者正交。</details>
+      </li>
+      <li>
+        Lego-RL 与 mini-SWE-agent 的设计目标如何分工？
+        <details><summary>参考答案</summary>
+        mini-SWE 用 bash-only + 无状态 subprocess 做 RL 友好最小基线，降低 harness 复杂度。Lego-RL 接受生产 harness 的复杂度，用 proxy/Harbor 把复杂度隔离在控制流之外，换取部署一致性与跨三家可迁移。</details>
+      </li>
+      <li>
+        若 Pearson 仍高但 SWE 分不涨，应优先查算法还是奖励完整性？
+        <details><summary>参考答案</summary>
+        对齐健康只说明训练信号一致，不保证奖励定义了正确行为。优先审计 Harbor 判定、测试泄漏、超时假阴/假阳；确认奖励可信后再调 GSPO/学习率。否则可能在高相关地下优化错误目标。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Du et al. · Lego-RL：
+        <a href="https://arxiv.org/abs/2608.17393" target="_blank" rel="noopener">arXiv:2608.17393</a></li>
+      <li>代码：
+        <a href="https://github.com/LegoX/Lego-RL" target="_blank" rel="noopener">github.com/LegoX/Lego-RL</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-02-harness-envharness.html">EnvHarness</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
