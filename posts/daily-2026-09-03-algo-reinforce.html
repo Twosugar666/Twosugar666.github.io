@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜REINFORCE：策略梯度从哪里来（似然比 / baseline / 方差） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜REINFORCE：策略梯度从哪里来（似然比 / baseline / 方差）</h1>
+    <p class="post-meta">2026-09-03 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典课：Williams 1992 <em>Simple Statistical Gradient-Following Algorithms for Connectionist Reinforcement Learning</em>（REINFORCE）。
+      连接现代 LLM RL：对照站内
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a>。
+      公式一律用 <code>pre</code>，不用 LaTeX。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      策略梯度家族（PPO / GRPO / GSPO / 各种「outcome RL」）共享同一骨架：对期望回报求梯度，用采样轨迹上的 score-function 估计。
+      这条路的教科书起点是 <strong>REINFORCE</strong>——Williams 1992 把「似然比技巧」写成可实现的连接主义更新。
+    </p>
+    <p>
+      本课不刷实现细节，只把三件事钉死：梯度公式从哪来、为什么无偏却高方差、baseline 如何不改期望却减方差——并说明 LLM 里「整段 completion 一个 reward」为何像单步 REINFORCE，而多轮 agent 才回到逐步求和。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：REINFORCE 用似然比把 ∇E[R] 变成 E[ Σ_t ∇log π(a_t|s_t) · G_t ]；无偏、高方差；baseline b(s) 引出 advantage；PPO/GRPO/GSPO 都是在这骨架上控方差与 off-policy。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 目标与似然比：∇E[R] → E[∇log π · R]</h3>
+    <pre><code># 目标
+J(θ) = E_{τ ~ π_θ}[ R(τ) ]
+
+# 轨迹概率（马尔可夫）
+p_θ(τ) = p(s_0) Π_t π_θ(a_t|s_t) P(s_{t+1}|s_t,a_t)
+
+# 似然比 / score-function 技巧（示意推导）
+∇J = ∇ ∫ p_θ(τ) R(τ) dτ
+   = ∫ p_θ(τ) ∇log p_θ(τ) R(τ) dτ
+   = E_τ[ ∇log p_θ(τ) · R(τ) ]
+
+# 环境转移与 p(s_0) 不含 θ →
+∇log p_θ(τ) = Σ_t ∇log π_θ(a_t|s_t)
+
+# 因果形式：时刻 t 之后的回报才该乘到 a_t 上
+∇J = E[ Σ_t ∇log π_θ(a_t|s_t) · G_t ]
+# G_t = r_t + γ r_{t+1} + ...   （从 t 起的回报）
+</code></pre>
+    <p>
+      这是「策略梯度从哪里来」的最短答案：不需要对环境动力学求梯度；只需能算 ∇log π，并用采样回报加权。
+      环境黑盒、离散动作、不可微奖励——只要能采样、能打分，这条式子就能写。
+    </p>
+
+    <h3>② 无偏但高方差：同一梯度，噪声可以很大</h3>
+    <table>
+      <thead><tr><th>性质</th><th>含义</th><th>实践后果</th></tr></thead>
+      <tbody>
+        <tr><td><strong>无偏</strong></td><td>期望等于真 ∇J（在适当假设下）</td><td>理论上可收敛到驻点附近</td></tr>
+        <tr><td><strong>高方差</strong></td><td>G_t 沿轨迹累加噪声；长 horizon 更炸</td><td>需要巨量样本或强降方差技巧</td></tr>
+        <tr><td><strong>同符号耦合</strong></td><td>整段好坏乘到每步 ∇log π</td><td>好动作与坏动作可能同向被推</td></tr>
+      </tbody>
+    </table>
+    <p>
+      「能算梯度」≠「梯度好用」。REINFORCE 的工程史，大半是在降方差、加 baseline、做优势估计——这正是站内
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a> 课的入口。
+    </p>
+
+    <h3>③ Baseline：不改期望，可减方差 → advantage 雏形</h3>
+    <pre><code># 对任意只依赖状态（或不依赖当前动作）的 b(s_t)：
+E[ ∇log π(a_t|s_t) · b(s_t) ] = 0   # 在适当条件下
+
+# 因此
+∇J = E[ Σ_t ∇log π(a_t|s_t) · (G_t - b(s_t)) ]
+
+# 选 b(s) ≈ V(s) 时：
+Â_t ≈ G_t - V(s_t)     # advantage 的 MC 形态
+# 相对「平均水平」好多少，而不是绝对回报多大
+</code></pre>
+    <p>
+      Baseline 不是「魔法减噪」，而是利用恒等式：score-function 对「与动作无关的项」期望为零，故减去它不引入（这类）偏差，却常大幅降方差。
+      把 G_t−V(s_t) 再换成多步 TD 混合，就走到 GAE；把「组内相对」当 baseline，就接近 GRPO 的精神。
+    </p>
+
+    <h3>④ MC return vs TD：为何还需要 GAE</h3>
+    <pre><code># MC：Â_t = G_t - V(s_t)        # 低偏高方
+# TD(0)：Â_t = δ_t
+#        δ_t = r_t + γ V(s_{t+1}) - V(s_t)   # 高偏低方
+
+# GAE：Â_t = Σ_l (γλ)^l δ_{t+l}  # λ 拧偏差–方差
+# 详见昨日：daily-2026-09-02-algo-gae.html
+</code></pre>
+    <p>
+      REINFORCE 经典写法偏 MC。现代 LLM RL 若有逐步价值或逐步奖励，多用 GAE/TD 混合；若只有终点 outcome，则退回「整段一个标量」——方差问题换皮再现。
+    </p>
+
+    <h3>⑤ 现代变体：PPO / GRPO / GSPO 都在同一骨架上</h3>
+    <table>
+      <thead><tr><th>方法</th><th>在 REINFORCE 骨架上多了什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>PPO</strong></td><td>importance ratio + clip：限制 off-policy 更新幅度</td></tr>
+        <tr><td><strong>GRPO</strong></td><td>同 prompt 组内相对 advantage：用组统计当 baseline</td></tr>
+        <tr><td><strong>GSPO</strong></td><td>序列级 IS：MoE/长序列上稳住权重，而非 token 级乱跳</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 骨架不变的部分
+weight ≈ ∇log π(a|s)   或   ratio * ∇log π ...
+signal ≈ advantage / 组相对分数 / 序列回报
+
+# 变的是：signal 怎么估、ratio 怎么裁、在哪一级做 IS
+</code></pre>
+    <p>
+      读新论文时先问：它的 score-function 乘的是什么信号？有没有 baseline/组相对？有没有 clip 或序列级 IS？——多数「新算法」是这三件事的重组。
+    </p>
+
+    <h3>⑥ LLM 视角：整段 reward ≈ 单步；多轮 agent 才回到 Σ_t</h3>
+    <pre><code># 常见 LLM RLHF / outcome RL
+# 一次采样整段 completion y ~ π(·|x)
+# 给一个标量 R(x,y)
+# 更新 ∝ ∇log π(y|x) · (R - b)     # 像「单步」REINFORCE
+
+# 多轮 tool agent
+# τ = (a_0, obs_0, a_1, obs_1, ..., a_T)
+# 若逐步有奖励或要做步级信用：
+#   ∇ ∝ Σ_t ∇log π(a_t|s_t) · Â_t     # 回到逐步求和
+# 若仍只有终点 R：常把 R 广播到各 token / 各 turn（方差大）
+</code></pre>
+    <p>
+      这解释了为何 agent RL 文献反复谈 credit assignment（AHEAD 等）：终点标量乘回长轨迹，就是高方差 REINFORCE；要稳，就得 baseline、组相对、步级重加权或更好的优势估计。
+      Gumbel-Softmax 走的是另一条路——让离散采样可微，用 pathwise 梯度；与 score-function 是两条平行选项，不是互相替代的「升级版」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先写清 J 与采样分布。</strong> on-policy 还是带 IS；token 级还是序列级；有没有组。</li>
+      <li><strong>任何新奖励先查方差。</strong> 组内 R 几乎常数 → 先修奖励/课程，再调 clip。</li>
+      <li><strong>Baseline 与优势分开消融。</strong> 减常数、减 V、减组均值，对方差的贡献不同；日志里盯 Â 的标准差。</li>
+      <li><strong>长轨迹优先谈信用，而不是堆模型。</strong> 多轮 agent 上广播终点 R ≈ 高方差 REINFORCE；考虑 GAE、步级重加权或 rubric 分项。</li>
+      <li><strong>读 PPO/GRPO/GSPO 时回到本课骨架。</strong> 问「乘在 ∇log π 上的信号是什么」比背超参表更有用。</li>
+      <li><strong>公式落地用 pre/code。</strong> 实现时对齐 mask：哪些 token 参与 loss，哪些只是上下文。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        似然比技巧为什么让环境转移概率从梯度里消失？
+        <details><summary>参考答案</summary>
+        ∇log p_θ(τ) 只对含 θ 的因子求导；转移核 P(s'|s,a) 与 p(s_0) 不含策略参数，故其对数梯度为零。最终只剩 Σ_t ∇log π(a_t|s_t)。</details>
+      </li>
+      <li>
+        为什么可以说 baseline「不改期望」却常能降方差？
+        <details><summary>参考答案</summary>
+        在适当条件下 E[∇log π(a|s)·b(s)]=0，减去 b 不引入该类偏差；若 b 与回报正相关（如 V(s)），(G−b) 的波动更小，蒙特卡洛估计方差下降。</details>
+      </li>
+      <li>
+        「整段 completion 一个 reward」为何像单步 REINFORCE？
+        <details><summary>参考答案</summary>
+        把整段 y 当成一个复合动作，采样一次、得一个标量 R，更新 ∝ ∇log π(y|x)·(R−b)。没有逐步 Σ_t 的信用结构，等价于 horizon=1 的 REINFORCE。</details>
+      </li>
+      <li>
+        GRPO 的组相对优势，相对经典 baseline 多解决了什么？
+        <details><summary>参考答案</summary>
+        经典 b(s) 需要价值函数或手工基线；GRPO 用同 prompt 多样本的组统计构造相对分数，弱化对绝对奖励尺度与 critic 的依赖，同时在组内提供可分信号——仍是「减基线」思想的变体。</details>
+      </li>
+      <li>
+        若只有终点奖励的多轮 agent，广播 R 到每步会有什么症状？如何接到 GAE/AHEAD？
+        <details><summary>参考答案</summary>
+        症状：梯度噪声大、好坏动作同向更新、训练抖。GAE 在有 V 或可学价值时用多步 TD 混合降方差；AHEAD 类方法在失败轨迹上做步级再权重。二者都是在 REINFORCE 骨架上改 Â_t，而不是换一套无关目标。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Williams · REINFORCE（1992）：经典策略梯度 / 似然比算法</li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
