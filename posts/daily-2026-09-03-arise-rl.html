@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜ARISE-RL：开放式 Agent 的 rubric 共演化与 Reward-Gated Self-Evolution Distillation · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜ARISE-RL：开放式 Agent 的 rubric 共演化与 Reward-Gated Self-Evolution Distillation</h1>
+    <p class="post-meta">2026-09-03 · 收藏夹：Agent / RL · 一线追踪<br />
+      主来源：Zhang et al. <em>ARISE-RL</em>，
+      <a href="https://arxiv.org/abs/2609.01058" target="_blank" rel="noopener">arXiv:2609.01058</a>（2026-09-01）。
+      代码：<a href="https://github.com/Alibaba-NLP/qqr" target="_blank" rel="noopener">Alibaba-NLP/qqr</a>。
+      文中 ECR-Bench 分数、消融与蒸馏正增益比例均标注为<strong>论文自报</strong>；未复现第三方评测。
+      交叉：
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="daily-2026-09-02-wmrl.html">WMRL</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      开放式 Agent 任务（深度调研、行程规划、多工具协作）往往<strong>没有 gold answer</strong>。
+      奖励只能来自「是否满足一套可检查的 rubric」或稀疏的 outcome 信号；一旦 rubric 过脆、过松或与工具事实脱节，组内相对优势就会塌成噪声——这就是论文强调的 <strong>advantage collapse</strong>。
+    </p>
+    <p>
+      固定人工 rubric 跟不上策略变强；纯 outcome RL 又缺可分解信用。
+      <strong>ARISE-RL</strong> 的回答：让 <strong>Generator</strong>（同时产出任务 + rubric）与 <strong>Solver</strong> 共演化，把 rubric 当作二者之间的接口；再叠加 <strong>RG-SED</strong>（Reward-Gated Self-Evolution Distillation），只在瞬时 teacher 明显更强时蒸馏。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：ARISE-RL = Generator/Solver 共演化（rubric 作接口）+ tool-grounded / difficulty-shaped 奖励 + 仅当 Δr&gt;τ 才做 token-level reverse KL 的 RG-SED；作者自报 Qwen3.5-9B 在 ECR-Bench Avg 0.569。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 开放式任务：无 gold → 奖励脆 → advantage collapse</h3>
+    <pre><code># 典型失败模式（示意）
+# 1) rubric 过松：几乎人人满分 → 组内 A≈0 → GRPO 无梯度
+# 2) rubric 过脆/与工具无关：Solver 学「糊弄文本」而非调工具
+# 3) 难度失配：任务全太易或全太难 → 成功数 c→0 或 c→K → 同样塌
+
+# 站内对照：GRPO 吃的是组内相对；奖励尺度塌了，clip/组相对都救不了
+</code></pre>
+    <p>
+      这与 <a href="daily-2026-09-01-ahead.html">AHEAD</a> 的「失败轨迹再权重」互补：AHEAD 假设已有可用轨迹奖励，改的是步内信用；ARISE 先解决<strong>奖励从哪来、如何不塌</strong>。
+      也与 <a href="daily-2026-09-02-wmrl.html">WMRL</a> 不同：WMRL 省执行；ARISE 省的是「人工 rubric / 金标」。
+    </p>
+
+    <h3>② 共演化：Generator 出任务+rubric，Solver 按 rubric 解题</h3>
+    <table>
+      <thead><tr><th>角色</th><th>产出</th><th>吃什么奖励</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Generator</strong></td><td>开放式任务 + 可检查 rubric</td><td>R_G = R_tool · R_fmt · (1+R_diff)</td></tr>
+        <tr><td><strong>Solver</strong></td><td>多轮工具调用轨迹 / 答案</td><td>rubric 满足率 s + 全完成 bonus（α≈0.8 偏分）</td></tr>
+        <tr><td><strong>接口</strong></td><td>rubric 文本与检查逻辑</td><td>双方都围着同一契约优化</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Rubric 不是旁注，而是<strong>可训练的合同</strong>：Generator 被激励写出「有工具事实支撑、格式可解析、难度居中」的检查项；Solver 被激励满足这些项。
+      共演化避免「固定题库被刷穿」与「固定评分被钻空」。
+    </p>
+
+    <h3>③ Generator 奖励：tool-grounded × format × difficulty-shaped</h3>
+    <pre><code># 论文形式（示意）
+R_G = R_tool * R_fmt * (1 + R_diff)
+
+# R_tool：tool-grounded 门控
+#   必须先调用相关工具、拿到可核验事实，再写工具相关 rubric 条目
+#   未调工具就写「事实型」条目 → R_tool 拉低 / 置零
+
+# R_fmt：rubric / 任务格式可解析、可自动检查
+
+# R_diff：difficulty-shaped（三角奖励）
+#   对同一任务让 Solver 试跑 K 次，成功数记为 c
+#   c ≈ K/2 时 R_diff 最大；c→0 或 c→K 时 R_diff→0
+#   直觉：太难/太易都会让后续 Solver 优势塌缩，Generator 不该拿高分
+</code></pre>
+    <p>
+      三角难度塑形直接对准 advantage collapse：把 Generator 的最优区钉在「半对半错」附近，给 Solver 留出可学的相对信号。
+      Tool-grounded 门控则对准「幻觉式 rubric」——没有工具足迹的条目不应成为奖励源。
+    </p>
+
+    <h3>④ Solver 奖励：满足率 s + 全完成 bonus</h3>
+    <pre><code># 示意
+s = (# satisfied rubric items) / (# items)
+R_S = α * s + (1-α) * 1[all satisfied]     # α≈0.8 偏「分项」
+
+# 偏分（α 大）：细粒度满足率可导/可区分组内好坏
+# 全完成 bonus：防止永远只啃容易条目、不碰硬约束
+</code></pre>
+    <p>
+      α≈0.8 是论文设定量级：更偏连续满足率，保留组内排序；bonus 防止局部最优。
+      与固定 outcome「过/不过」相比，rubric 满足率天然更适合组相对方法（见 <a href="grpo-notes.html">GRPO</a>）。
+    </p>
+
+    <h3>⑤ RG-SED：同策略 + coach memory → 瞬时 teacher，门控再蒸馏</h3>
+    <pre><code># Reward-Gated Self-Evolution Distillation（示意）
+# 1) 同策略 rollout；coach memory 缓存高分片段 / 轨迹
+# 2) 构造瞬时 teacher（同策略族，非另训大模型）
+# 3) 仅当 Δr = R̄_m - R̄_s > τ 才蒸馏
+#    R̄_m：teacher / mentor 侧平均奖励
+#    R̄_s：student 侧平均奖励
+# 4) 目标：token-level reverse KL（student → teacher）
+
+# 作者自报：约 72% 组正增益，~28% 中性/负
+# → 无门控时会把坏 teacher 信号灌进去；门控必要
+</code></pre>
+    <p>
+      这不是「另找一个闭源强模型当 teacher」，而是<strong>自演化</strong>：瞬时更强的同策略样本当 mentor。
+      ~28% 中性/负增益说明：无条件蒸馏会伤害策略；τ 门控是一等公民，不是可选技巧。
+      与 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 的 clip 类似——都是在「用更好样本更新」时限制坏方向。
+    </p>
+
+    <h3>⑥ ECR-Bench 与消融（论文自报）</h3>
+    <table>
+      <thead><tr><th>项</th><th>论文自报要点</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ECR-Bench</strong></td><td>ECR-DeepResearch(100) + ECR-Travel(5 类 ×100)</td></tr>
+        <tr><td><strong>主结果</strong></td><td>Qwen3.5-9B + ARISE-RL Avg <strong>0.569</strong>；作者表超过若干闭源与 Dr.Zero / Absolute Zero</td></tr>
+        <tr><td><strong>消融</strong></td><td>去掉 RG-SED 掉最多；去掉 reward gating 也明显掉</td></tr>
+        <tr><td><strong>蒸馏统计</strong></td><td>~72% 组正增益，~28% 中性/负 → 支撑门控设计</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：开放式 Agent 评测高度设定依赖；引用务必带 ECR-Bench 构成与<strong>论文自报</strong>标签。
+      消融结论对工程更可迁移：共演化给信号，RG-SED 的门控决定「哪些信号值得蒸馏」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先测 advantage 是否塌。</strong> 看组内奖励方差 / 满足率分布；若几乎全 0 或全 1，先调难度塑形与 rubric 粒度，再堆蒸馏。</li>
+      <li><strong>Tool-grounded 写成硬门控。</strong> 「先工具后写事实型条目」应进 reward 合同，而不是 prompt 软建议。</li>
+      <li><strong>R_diff 的 K 与三角峰写进实验卡。</strong> K 太小峰不稳；太大成本高。盯 c 的直方图是否集中在 K/2 附近。</li>
+      <li><strong>RG-SED 必须带 τ。</strong> 日志里分别统计 Δr&gt;τ / ≤τ 的组占比与后续回报；对齐全篇 ~72% / ~28% 量级时再谈「蒸馏有效」。</li>
+      <li><strong>与 harness 合同对齐。</strong> Rubric 检查与部署工具路径要一致（<a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 思路）；训练时能检查的项，线上也要能检查。</li>
+      <li><strong>别把共演化当成无限刷题。</strong> Generator 过拟合「刁难 Solver」或「讨好自己」时，用 held-out ECR 类集与人工抽检 rubric 质量双盯。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么开放式任务上「固定人工 rubric」容易走向 advantage collapse？
+        <details><summary>参考答案</summary>
+        策略变强后，固定检查项会被刷到接近满分或被系统性钻空；组内相对优势消失或变成噪声。没有金标时又难以用外部 outcome 校正，于是 GRPO/组相对更新失去可分信号。</details>
+      </li>
+      <li>
+        R_diff 为何在 c≈K/2 取峰，而不是奖励「越难越好」？
+        <details><summary>参考答案</summary>
+        过难（c→0）或过易（c→K）都会让 Solver 侧奖励方差塌缩，后续优势估计失效。三角峰把 Generator 最优钉在可学难度带，服务共演化，而不是单方面炫耀难度。</details>
+      </li>
+      <li>
+        Tool-grounded 门控挡住的是哪类奖励 hacking？
+        <details><summary>参考答案</summary>
+        未调用工具就编写「看起来可检查」的事实型 rubric，让 Solver 用文本幻觉满足条目。门控要求先有工具足迹，切断「空壳事实 → 假满足 → 假优势」链路。</details>
+      </li>
+      <li>
+        为何 ~28% 中性/负增益说明 RG-SED 的门控必要？
+        <details><summary>参考答案</summary>
+        瞬时 teacher 并不总是更好；无条件 reverse KL 会把坏方向灌进 student。仅当 Δr&gt;τ 才蒸馏，等于用奖励差做样本级门控，避免「自演化」变成「自污染」。</details>
+      </li>
+      <li>
+        ARISE-RL 与 AHEAD、WMRL、Lightning 各卡在哪一层？能否叠加？
+        <details><summary>参考答案</summary>
+        ARISE：无金标下的奖励/课程生成与门控蒸馏。AHEAD：已有轨迹上的步级信用。WMRL：降低真执行成本。Lightning：部署 harness 进训练环。可叠加：Lightning 保证工具/检查合同；ARISE 生成与评分；AHEAD 在真多轮轨迹上再分配；WMRL 仅在执行成为瓶颈时介入——但 WM 预测的是 outcome/分数，不能替代 tool-grounded rubric 的事实门控。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Zhang et al. · ARISE-RL：
+        <a href="https://arxiv.org/abs/2609.01058" target="_blank" rel="noopener">arXiv:2609.01058</a></li>
+      <li>代码：
+        <a href="https://github.com/Alibaba-NLP/qqr" target="_blank" rel="noopener">github.com/Alibaba-NLP/qqr</a></li>
+      <li>站内交叉：
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-09-02-wmrl.html">WMRL</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
