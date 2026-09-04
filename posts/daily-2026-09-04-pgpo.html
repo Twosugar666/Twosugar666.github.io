@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜PGPO：用经验状态势函数给失败轨迹里的好动作正名（anchor-state / potential difference） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜PGPO：用经验状态势函数给失败轨迹里的好动作正名（anchor-state / potential difference）</h1>
+    <p class="post-meta">2026-09-04 · 收藏夹：RL / Agent · 一线追踪<br />
+      主来源：Zheng et al. <em>PGPO: Potential-Guided Policy Optimization for Multi-Turn Agentic Tasks</em>，
+      <a href="https://arxiv.org/abs/2609.02236" target="_blank" rel="noopener">arXiv:2609.02236</a>（2026-09-02）。
+      作者单位含 Fudan / 作业帮等。文中 ALFWorld / WebShop 分数、消融与 FTD/FGD 均标注为<strong>论文自报</strong>；未复现第三方评测。
+      交叉：
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      多轮 Agent 在 ALFWorld / WebShop 这类环境里，奖励往往是<strong>稀疏终端 outcome</strong>：整条轨迹成功才给正回报，中间步几乎没有过程标签。
+      轨迹级 <a href="grpo-notes.html">GRPO</a> 只能把同一终局标量广播到所有 token / turn——粗。
+      GiGPO 一类工作用 <strong>anchor-state grouping</strong> 做 step-level advantage <code>AS</code>，粒度细了，但 step return 仍继承<strong>本条轨迹的终局</strong>：失败轨迹里，有效动作与错误动作同吃负分。论文把这叫 <strong>failure-side credit degeneracy</strong>。
+    </p>
+    <p>
+      <strong>PGPO</strong>（Potential-Guided Policy Optimization）的回答：在同 batch 的 anchor-state 组上估<strong>经验状态势</strong> Φ(s̃)，用相邻势差构造跨轨迹可比较的 <code>Aϕ</code>，再与 <code>AS</code> 做 success-adaptive 加权。无 critic、无额外 env rollout、无额外模型推理。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：PGPO = 同 anchor 组经验势 Φ → 势差 δ 标准化得 Aϕ → A = AS + w(x) Aϕ（默认 γ=1，省略粗粒度 AE）；作者自报 1.5B 上 ALFWorld Seen 93.03±0.59、WebShop 该尺度最强。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 失败侧退化：AS 仍绑在本条终局上</h3>
+    <pre><code># 稀疏终端奖励（示意）
+R(τ) = r_final(τ)          # 中间 r_t ≈ 0
+# 轨迹级 AE（GRPO）：同轨迹内所有动作共享同一组相对分数
+# GiGPO 的 AS：按 anchor-state key 分组做 step-level 相对，
+#   但每步 step return 仍来自「本条轨迹」的终局 →
+#   若 r_final=0，失败轨迹内有效动作 ≈ 错误动作（组内方差塌）
+
+# failure-side credit degeneracy：
+#   Var[AE | r_final=0] → 0
+#   同 anchor、同失败侧：AS 也难区分「差一点就对」与「跑偏」
+</code></pre>
+    <p>
+      这与站内 <a href="daily-2026-09-01-ahead.html">AHEAD</a> 同属「多轮稀疏奖励的步级信用」问题族：AHEAD 用环境反馈/纠错提示做 step-aware 再权重；PGPO 用<strong>同 batch 跨轨迹势差</strong>给失败侧补方向。二者可互补，不是互相替代。
+    </p>
+
+    <h3>② 三步：经验势 → 势差优势 → success-adaptive 融合</h3>
+    <pre><code># ① 对每个 anchor-state key s̃，用 Gs̃ 内 visit 的 step return 均值估经验势
+Φ(s̃) = mean{ step_return(visits in Gs̃) }
+
+# ② 动作 at：当前 key s̃m = g(st)，后继 key s̃n = g(st+1)
+δt = γ Φ(s̃n) − Φ(s̃m)     # 默认 γ=1（势差折扣，≠ return 折扣 η）
+# 终步无后继：用 r_final 替换 Φ(s̃n)
+# 在同 anchor 组 Gs̃m 内对 δ 做标准化 → Aϕ(at)
+#   singleton / 零方差组 → Aϕ=0
+
+# ③ 与 step-level AS 组合（省略粗粒度 AE）
+w(x) = β (1 − psucc(x))^α     # task-level success-adaptive
+A(at) = AS(at) + w(x) Aϕ(at)
+# 成功率高 → w 小 → 减弱势引导；全失败时 w 最大
+# 论文默认匹配设定：α=2.0，β=1.0（消融除非另注）
+</code></pre>
+    <p>
+      势差把「这一步是否把 agent 推向更高经验势状态」从<strong>跨轨迹同 anchor 统计</strong>里读出来：失败轨迹里的「成功轨迹也曾走过的好动作」可以拿到相对正的 <code>Aϕ</code>，而不必等本条终局翻盘。
+      省略 AE：作者写明 HGPO 已显示在强 step-level 骨干上再叠粗轨迹信号易伤性能；Table 2 里加 AE 反而掉点。
+    </p>
+
+    <h3>③ 主结果 Table 1（论文自报，± 为论文给出的方差）</h3>
+    <table>
+      <thead>
+        <tr><th>模型</th><th>方法</th><th>ALF Seen</th><th>ALF Unseen</th><th>WebShop Success</th><th>WebShop Score</th></tr>
+      </thead>
+      <tbody>
+        <tr><td rowspan="3">Qwen2.5-1.5B-Instruct</td><td>GiGPO</td><td>90.16±0.22</td><td>84.76±2.83</td><td>66.53±1.92</td><td>84.95±2.57</td></tr>
+        <tr><td>HGPO</td><td>92.77±1.08</td><td><strong>90.16±0.78</strong></td><td>71.54±4.00</td><td>85.56±2.86</td></tr>
+        <tr><td><strong>PGPO</strong></td><td><strong>93.03±0.59</strong></td><td>88.73±0.49</td><td><strong>75.00±2.03</strong></td><td><strong>87.99±1.37</strong></td></tr>
+        <tr><td rowspan="3">Qwen2.5-7B-Instruct</td><td>GiGPO</td><td>93.29±0.40</td><td><strong>92.18±0.39</strong></td><td>77.60±1.68</td><td>88.93±1.49</td></tr>
+        <tr><td>HGPO</td><td>95.44±0.62</td><td>92.05±0.22</td><td>78.51±1.40</td><td>88.96±1.04</td></tr>
+        <tr><td><strong>PGPO</strong></td><td><strong>96.48±0.89</strong></td><td>90.82±0.67</td><td><strong>79.10±2.30</strong></td><td><strong>91.73±1.23</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法要对齐论文表述：1.5B 上 Seen 与 WebShop 该尺度最强；Unseen 上 HGPO 更高（90.16 vs PGPO 88.73）。7B 上 Seen / WebShop 仍最强，Unseen 不及 GiGPO/HGPO。
+      <strong>不支持「均匀 OOD 碾压」</strong>——PGPO 是互补的局部信用信号，收益随尺度与任务类型变化。
+    </p>
+
+    <h3>④ 消融 Table 2：完整式 = AS + w(x)Aϕ</h3>
+    <table>
+      <thead><tr><th>变体（ALFWorld，论文自报）</th><th>Seen</th><th>Unseen</th></tr></thead>
+      <tbody>
+        <tr><td>AE（GRPO）</td><td>72.8±3.6</td><td>70.1±2.5</td></tr>
+        <tr><td>AS</td><td>89.71±0.69</td><td>83.65±1.12</td></tr>
+        <tr><td>Aϕ 单独</td><td>80.33±1.96</td><td>74.41±1.75</td></tr>
+        <tr><td>AS + AE（GiGPO）</td><td>90.16±0.22</td><td>84.76±2.83</td></tr>
+        <tr><td>AS + Aϕ（无 w(x)）</td><td>87.57±0.68</td><td>84.64±0.96</td></tr>
+        <tr><td>AE + w(x)Aϕ</td><td>78.02±1.10</td><td>74.94±1.39</td></tr>
+        <tr><td><strong>AS + w(x)Aϕ（完整 PGPO）</strong></td><td><strong>93.03±0.59</strong></td><td><strong>88.73±0.49</strong></td></tr>
+        <tr><td>AS + w(x)Aϕ + AE</td><td>87.30±4.36</td><td>83.60±1.12</td></tr>
+      </tbody>
+    </table>
+    <p>
+      三点工程结论：① <code>Aϕ</code> 单独不够，必须配强 step-level 骨干 <code>AS</code>；② 去掉 <code>w(x)</code> 掉点——高成功率任务上硬灌势引导有害；③ 再加粗粒度 <code>AE</code> 掉点且方差变大。完整 PGPO 就是阴影行那一行。
+    </p>
+
+    <h3>⑤ 机制证据与开销</h3>
+    <pre><code># FTD / FGD（论文 Figure 3 方向）：失败侧同 anchor 组内，
+#   Aϕ 能区分「成功轨迹也曾支持的动作」vs 无支持替代动作
+#   AE / AS 在排除平局后无明显偏好 → Aϕ 提供方向性信用，不止加方差
+
+# 相对开销：无 critic / 无额外 env / 无额外模型推理
+#   势来自同 batch rollout 统计；相对 GiGPO 式 step-level 训练可忽略
+</code></pre>
+    <p>
+      连回 <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> / <a href="daily-2026-09-02-algo-gae.html">GAE</a>：势差 δ 像在用 batch 经验 V 做一步 shaping，但不训参数 critic；组内标准化又保留 GRPO 家族的相对性。
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 管的是序列级 IS / MoE 稳定性；PGPO 管的是稀疏多轮里失败侧的局部信用——栈上正交。
+    </p>
+
+    <h3>⑥ 局限（论文与读法）</h3>
+    <ul>
+      <li><strong>exact text match 的 anchor</strong>：模板环境（ALFWorld/WebShop）好用；开放、口语化、视觉状态脆。</li>
+      <li><strong>同 batch 小样本势估计</strong>：N 不大时 Φ 有噪声；singleton 组直接 Aϕ=0。</li>
+      <li><strong>评测面窄</strong>：仅 ALFWorld / WebShop；OOD Unseen 并非全面领先。</li>
+      <li><strong>与开放式 rubric 任务</strong>：<a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a> 解决的是「奖励从哪来」；PGPO 假设已有稀疏 outcome，改的是失败侧分配。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先确认 failure-side 是否真退化。</strong> 日志看 r_final=0 子集上 AS/AE 的组内方差；若已近零，再上 Aϕ。</li>
+      <li><strong>保留 AS，不要只跑 Aϕ。</strong> 消融写得很清楚：势分支是补丁，不是替代骨干。</li>
+      <li><strong>w(x) 必开，并盯 psucc。</strong> 易任务上把 β/α 打太大等于加噪声；难任务 / 全失败组才该拉满势引导。</li>
+      <li><strong>别叠 AE「图个保险」。</strong> Table 2 显示 AS+w(x)Aϕ+AE 掉点；粗轨迹信号与局部势可能互相打架。</li>
+      <li><strong>anchor key 合同要写进实验卡。</strong> exact match / 抽象状态 / 历史前缀——换环境先验证分组覆盖与 singleton 比例。</li>
+      <li><strong>与站内信用栈对照。</strong> AHEAD=步级再权重；GAE=有 V 时的偏差–方差旋钮；GRPO/GSPO=组相对与序列 IS；PGPO=失败侧跨轨迹势差。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么 GiGPO 的 step-level AS 仍可能在失败轨迹内「好坏动作同分」？
+        <details><summary>参考答案</summary>
+        AS 的 step return 仍继承本条轨迹终局。稀疏奖励下失败轨迹 r_final=0，同 anchor 组内若比较的是「失败侧对失败侧」，有效中间动作与错误动作共享同一不利 outcome，相对优势塌缩——即 failure-side credit degeneracy。</details>
+      </li>
+      <li>
+        δt = γΦ(s̃n)−Φ(s̃m) 如何给失败轨迹里的好动作「正名」？
+        <details><summary>参考答案</summary>
+        Φ 来自同 batch 跨轨迹 visit 的平均 step return。若某失败轨迹中的动作把状态推到「成功轨迹也常到达、经验势更高」的后继，δ 可为正，组内标准化后 Aϕ&gt;0，即使本条终局仍失败。信用来自跨轨迹势差，而非本条终局翻盘。</details>
+      </li>
+      <li>
+        为何需要 w(x)=β(1−psucc)^α，而不是固定权重混 Aϕ？
+        <details><summary>参考答案</summary>
+        高成功率任务上 AS 已有足够可分信号，强势引导易过调/引入 batch 噪声。自适应权重在难任务/全失败时加大 Aϕ，在易任务时减弱。消融 AS+Aϕ（无 w）Seen/Unseen 均低于完整 PGPO。</details>
+      </li>
+      <li>
+        消融里加 AE 为何掉点？这对实现有什么含义？
+        <details><summary>参考答案</summary>
+        粗粒度轨迹优势与局部势差可能冲突：AE 按整段终局拉齐，Aϕ 按转移质量细分。叠在一起增加噪声与方差（Seen 87.30±4.36）。实现上应默认 AS+w(x)Aϕ，不要「三个 advantage 全开」。</details>
+      </li>
+      <li>
+        PGPO 与 AHEAD、ARISE-RL、GAE 各卡在信用栈的哪一层？
+        <details><summary>参考答案</summary>
+        PGPO：已有稀疏 outcome 时，用 batch 经验势差修补失败侧步级信用。AHEAD：用环境反馈/纠错做 step-aware 再权重。ARISE：先解决开放式任务的奖励/rubric 从哪来。GAE：有（可学）价值函数时拧偏差–方差。可叠加：ARISE 产奖励 → PGPO/AHEAD 分配 → 有 critic 时再用 GAE；anchor 合同与 harness 观测要对齐。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Zheng et al. · PGPO：
+        <a href="https://arxiv.org/abs/2609.02236" target="_blank" rel="noopener">arXiv:2609.02236</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
