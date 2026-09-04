@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜OpenHands V1 SDK：可选沙箱、单一可变状态与 Workspace 工厂（Local / Docker / Remote） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜OpenHands V1 SDK：可选沙箱、单一可变状态与 Workspace 工厂（Local / Docker / Remote）</h1>
+    <p class="post-meta">2026-09-04 · 收藏夹：Harness / Agent · 学习笔记<br />
+      主来源：OpenHands Software Agent SDK 设计文档
+      <a href="https://docs.openhands.dev/sdk/arch/design" target="_blank" rel="noopener">Design Principles</a>
+      与
+      <a href="https://docs.openhands.dev/sdk/arch/sdk" target="_blank" rel="noopener">SDK Package</a>；
+      Workspace 见
+      <a href="https://docs.openhands.dev/sdk/arch/workspace" target="_blank" rel="noopener">Workspace Architecture</a>。
+      可辅 MLSys 2026 OpenHands SDK / SandBase 解读。文中架构描述以官方文档为准。
+      交叉：
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      OpenHands V0 成长为广泛使用的开源 coding agent 后，暴露出几类结构性摩擦：研究与生产耦合、
+      <strong>强制 Docker 沙箱</strong>导致 agent/工具分进程与状态易漂移、可变 Python 对象满天飞、配置膨胀。
+      同时 MCP（Model Context Protocol）默认假设<strong>本地执行、直连用户环境</strong>——与「一切进容器」硬隔离冲突。
+    </p>
+    <p>
+      V1 的 Software Agent SDK 按四条原则重写：<strong>Optional Isolation</strong>、<strong>Stateless by default（唯一可变是 conversation state）</strong>、
+      Agent 与应用边界清晰、组件可组合。对做 RL / 后训练的读者，这套 harness 往往是
+      <a href="daily-2026-08-26-granite-4-2.html">Granite</a> / <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>
+      训练侧要对齐的「部署时真相」。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：OpenHands V1 SDK = 默认同进程可选隔离 + 不可变 Pydantic 组件 + 唯一可变可序列化 conversation state + Workspace 工厂（Local / Docker / Remote）换执行面不换 agent 代码。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① V0→V1：强制沙箱 → Optional Isolation</h3>
+    <pre><code># V0 摩擦（文档归纳）
+# - 每次工具调用默认进 Docker：agent 与 sandbox 分进程，状态易分叉
+# - 多租户互相拖垮；本地调试成本高
+# - MCP 假设 local execution → 与「强制隔离」不兼容
+
+# V1 原则：Sandboxing is opt-in, not universal
+# 默认：agent 与 tool 同进程（对齐 MCP）
+# 需要隔离时：同一套栈透明容器化（DockerWorkspace / Remote）
+</code></pre>
+    <p>
+      这与站内 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> 的「无状态 subprocess」不同路径：mini-SWE 用极简降复杂度；OpenHands V1 保留完整 coding agent 能力，把隔离做成<strong>部署选项</strong>而非控制流前提。
+    </p>
+
+    <h3>② Stateless by default：唯一可变是 conversation state</h3>
+    <table>
+      <thead><tr><th>对象</th><th>可变性</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>Agent / Tools / LLM / Config</td><td>不可变 Pydantic</td><td>构造时校验；无静默漂移</td></tr>
+        <tr><td><strong>Conversation state</strong></td><td>唯一可变源</td><td>可序列化、可持久化、可重放</td></tr>
+        <tr><td>Events</td><td>不可变快照</td><td>观测、日志、调试时间线</td></tr>
+      </tbody>
+    </table>
+    <p>
+      「一个真相源」直接服务 RL 友好性：轨迹落盘、pause/resume、time-travel debug，都要求状态可重建。
+      若每个子系统各自藏一份 transient state，TITO 合同再漂亮也会在恢复时对不齐。
+    </p>
+
+    <h3>③ 分层：SDK / Tools / Workspace / Agent Server</h3>
+    <table>
+      <thead><tr><th>层</th><th>职责</th><th>边界</th></tr></thead>
+      <tbody>
+        <tr><td><strong>SDK</strong></td><td>Agent 推理环、Conversation、LLM、Skills、Condenser</td><td>不绑死某一 UI / 某一评测</td></tr>
+        <tr><td><strong>Tools</strong></td><td>Action–Observation 类型化能力</td><td>定义与执行分离（Executor）</td></tr>
+        <tr><td><strong>Workspace</strong></td><td>执行面：命令与文件 I/O 抽象</td><td>Local / Docker / Remote 可替换</td></tr>
+        <tr><td><strong>Agent Server</strong></td><td>沙箱内 API + WebSocket</td><td>远程/多租户时的进程边界</td></tr>
+      </tbody>
+    </table>
+    <p>
+      应用（CLI / Web / GitHub 集成）应通过 API 与 agent 对话，而不是把入口条件写进 agent 核心——这是 V0「应用条件污染核心」的反面教材。
+      对照 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>：Workspace + Tool Executor 就是「运行时接管工具与环境」的具体落点。
+    </p>
+
+    <h3>④ Workspace 工厂：同一 agent，换执行面</h3>
+    <pre><code># 统一接口（概念）
+# execute_command() / file_upload() / file_download()
+# 上下文管理器：__enter__ / __exit__
+
+LocalWorkspace      # in-process / 本地 subprocess；开发与可信代码最快
+DockerWorkspace     # 自动拉起带 agent-server 的容器；多用户 / 不可信代码
+RemoteAPIWorkspace  # 连已有远程 Agent Server；分布式 / 云端多租户
+
+# 同一 Agent 代码：换 workspace 类型即可
+# notebook 原型 → 本地 CLI → Docker 评测 → 远程多租户
+# agent 推理环与 tool schema 不变
+</code></pre>
+    <p>
+      工厂模式的价值给 RL 人更直观：训练/评测可以强制 Docker，日常迭代用 Local，线上用 Remote——
+      <strong>控制流与工具 schema 不变</strong>，变的是执行面。这正是 Lego-RL 强调「不改原生 harness 控制流」时要对齐的部署对象之一。
+    </p>
+
+    <h3>⑤ Agent loop：Conversation → Agent → LLM → Tool → Workspace</h3>
+    <pre><code># 推理环（文档）
+1. Conversation 收用户消息 / 维护生命周期
+2. Agent 把上下文交给 LLM
+3. 若 LLM 返回 tool call → validate → Workspace 执行 → Observation
+4. Observation 写回上下文 → 回到 2
+5. 若 LLM 返回最终回复 → 结束本轮
+
+# 横切能力
+Events     # 可观测时间线（消息 / action / observation / error）
+Condenser  # 上下文过长时压缩，保语义
+Skills     # 声明式改行为 / 系统提示（原 Microagents）
+MCP        # 外部工具服务器 → 对 Agent 仍呈现为普通 Tool
+Security   # 路径 / 命令 / 资源校验
+</code></pre>
+    <p>
+      Action–Observation 是整条环的对外合同：类型化 schema 既服务 LLM tool calling，也服务测试与审计。
+      Condenser / Skills / MCP 都是<strong>可插拔横切</strong>，不应塞进 Agent 子类继承树——文档明确 composition over inheritance。
+    </p>
+
+    <h3>⑥ 对 RL / 后训练读者：部署时真相与 TITO</h3>
+    <table>
+      <thead><tr><th>训练侧常见做法</th><th>OpenHands V1 提醒</th></tr></thead>
+      <tbody>
+        <tr><td>另写一套「训练专用极简 agent」</td><td>部署 harness 有 Condenser/Skills/MCP；分布不一致 → 上线掉点</td></tr>
+        <tr><td>只存文本 transcript 再重建</td><td>compaction 后文本 ≠ 采样 raw tokens；需 proxy / TITO</td></tr>
+        <tr><td>强制沙箱导致 MCP 工具不可用</td><td>V1 默认同进程；隔离 opt-in，训练配方要写明 workspace 类型</td></tr>
+        <tr><td>多进程可变状态</td><td>唯一 conversation state 可序列化，才谈得上轨迹重放</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a> 要保住的，就是这条 action–observation 环上的 <strong>raw token / logp / mask</strong>。
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a> 的 LLM proxy、<a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a> 的 in-process proxy，都是把「部署时 harness」焊进 PG 环的工程答案；OpenHands V1 则是其中一类被 RL 的生产 coding harness 本体。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>开发 Local，评测/多租户再升隔离。</strong> 先跑通 Agent+Tools，再开 DockerWorkspace；避免一上来被沙箱摩擦挡住 schema 设计。</li>
+      <li><strong>把 workspace 类型写进实验卡与发布配置。</strong> 同一套 agent 在 Local vs Docker 上的文件路径、超时、网络策略可能不同——对 RL 就是环境分布。</li>
+      <li><strong>状态只认 conversation。</strong> 禁止在 Tool/Skill 里藏私有可变缓存当「第二真相」；需要记忆就进 state 或显式外部 store。</li>
+      <li><strong>Events 接 dashboard。</strong> RL 训练时至少记录 action/observation/error；对齐失败时先看环是否同构，再看奖励。</li>
+      <li><strong>Condenser 与 TITO 一起设计。</strong> 压缩可以服务上下文窗口，但不能成为 trainer 重建 logp 的唯一输入；raw 轨迹另存。</li>
+      <li><strong>接 RL 时优先 proxy，而不是 fork 控制流。</strong> 对照 Lightning / Lego-RL：换 LLM 调用面，不改 OpenHands 内部循环。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「强制 Docker」会与 MCP 的本地执行假设冲突？
+        <details><summary>参考答案</summary>
+        MCP 工具服务器常假设与 agent 同机、可直连用户环境与本地进程。强制沙箱把工具执行丢进另一容器/网络命名空间后，本地 MCP 连接、文件与凭证路径都会断或需复杂桥接。V1 改为默认同进程、隔离 opt-in，以兼容 MCP。</details>
+      </li>
+      <li>
+        「唯一可变 conversation state」如何帮助轨迹重放与 RL？
+        <details><summary>参考答案</summary>
+        组件不可变则行为由配置+state 决定；state 可序列化即可 pause/resume 与确定性重放。RL 需要稳定的 action–observation 轨迹；多处可变缓存会导致同输入不同环，破坏 off-policy 修正与调试。</details>
+      </li>
+      <li>
+        Workspace 工厂对「notebook → 多租户」意味着什么？
+        <details><summary>参考答案</summary>
+        Agent/Tool 代码与 schema 不变，只替换 LocalWorkspace → DockerWorkspace / RemoteAPIWorkspace。开发速度与生产隔离解耦，减少为部署再写一套控制流的分叉——也降低 train/serve harness 不一致风险。</details>
+      </li>
+      <li>
+        Condenser 为什么可能破坏朴素的「日志重放训练」？应如何与 TITO 共存？
+        <details><summary>参考答案</summary>
+        Condenser 改写/摘要历史后，可见 messages 不再等于采样时的 token 序列。TITO 要求另存 raw tokens/logp/mask；Condenser 只服务推理上下文，不充当训练标签真相。</details>
+      </li>
+      <li>
+        若用 OpenHands V1 做 coding RL，应优先抄哪套接入范式：改控制流，还是加 proxy？
+        <details><summary>参考答案</summary>
+        优先 proxy（Lightning / Lego-RL）：保留原生循环、Skills、MCP、Condenser，只在 LLM 调用边界捕获训练信号。改控制流易造成部署不一致。Workspace 类型与防 hack 策略仍要在评测合同里单独钉死。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>OpenHands · Design Principles：
+        <a href="https://docs.openhands.dev/sdk/arch/design" target="_blank" rel="noopener">docs.openhands.dev/sdk/arch/design</a></li>
+      <li>OpenHands · SDK Package：
+        <a href="https://docs.openhands.dev/sdk/arch/sdk" target="_blank" rel="noopener">docs.openhands.dev/sdk/arch/sdk</a></li>
+      <li>OpenHands · Workspace：
+        <a href="https://docs.openhands.dev/sdk/arch/workspace" target="_blank" rel="noopener">docs.openhands.dev/sdk/arch/workspace</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
