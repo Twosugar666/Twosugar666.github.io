@@ -1,1 +1,202 @@
-PLACEHOLDER
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜DAPO：给 GRPO 补上的四个训练细节（Clip-Higher / Dynamic Sampling / Token-level Loss / Overlong） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜DAPO：给 GRPO 补上的四个训练细节（Clip-Higher / Dynamic Sampling / Token-level Loss / Overlong）</h1>
+    <p class="post-meta">2026-09-04 · 收藏夹：算法 / RL · 学习笔记<br />
+      主来源：Yu et al. <em>DAPO: An Open-Source LLM Reinforcement Learning System at Scale</em>，
+      <a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">arXiv:2503.14476</a>。
+      可参考
+      <a href="https://blog.diffio.ai/grpo-dapo/" target="_blank" rel="noopener">diffio GRPO/DAPO 笔记</a>
+      交叉核对，但数字以论文为准并标<strong>自报</strong>。
+      交叉：
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长 Chain-of-Thought + rule-based ±1 奖励 + 多样本组相对，是当前数学推理 RL 的主流配方。
+      朴素 <a href="grpo-notes.html">GRPO</a> 在 Qwen2.5-32B 上作者自报 AIME 2024 avg@32 只有 <strong>30</strong>，远低于 DeepSeek-R1-Zero-Qwen-32B 自报的 <strong>47</strong>。
+      社区复现 R1 式结果时反复撞上熵塌缩、零优势 batch、长度偏置、截断噪声——说明「算法名」之外，还有一堆<strong>训练细节</strong>没写进短报告。
+    </p>
+    <p>
+      <strong>DAPO</strong>（Decoupled Clip and Dynamic sAmpling Policy Optimization）把四招钉死并开源（verl + 数据）：
+      Clip-Higher、Dynamic Sampling、Token-level Policy Gradient Loss、Overlong Filtering + Soft Overlong Punishment。
+      累计做到自报 <strong>50</strong>，且步数约为 R1-Zero-Qwen-32B 的一半。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：DAPO = 非对称 clip（ε_low=0.2 / ε_high=0.28）+ 滤零方差组 + 按 token 归一损失 + overlong 过滤/软惩罚；在 GRPO 骨架上把长 CoT RL 训稳训满。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① GRPO 回顾：组相对，无 critic——也会「全零优势」</h3>
+    <pre><code># 同 prompt 采 G 条 completion，奖励 r_i（常为 rule ±1）
+A_i = (r_i − mean(r)) / std(r)     # 组内标准化
+
+# 若组内奖励全相同（全对或全错）→ std≈0 或 A_i 全 0
+# → 该组对 policy gradient 无贡献（梯度饥饿）
+
+# 无 critic：省掉 V，但把「可分信号」完全押在组内奖励方差上
+# 骨架仍是 REINFORCE / PPO 式 score-function，见站内 REINFORCE / PPO 课
+</code></pre>
+    <p>
+      DAPO 的场景差异：长 CoT、多 update / sample reuse 让 <strong>clip 真正起作用</strong>；同时作者配方<strong>删 KL</strong>（相对经典 PPO/部分 GRPO 实现），更依赖 clip 与采样质量控更新。
+    </p>
+
+    <h3>② Clip-Higher：非对称上下界，给 exploration token 留抬头空间</h3>
+    <pre><code># 经典 PPO/GRPO 常对称 clip：ratio ∈ [1−ε, 1+ε]
+# 长 CoT 里：提高低概率「探索 token」的概率时，ratio 上冲易被 1+ε 掐死
+# → 策略熵塌缩，多样性死亡
+
+# Clip-Higher（解耦上下界）
+ε_low  = 0.2     # 向下（抑制过高概率动作）仍较紧
+ε_high = 0.28    # 向上放宽，允许探索 token 抬概率
+# clip(ratio, 1−ε_low, 1+ε_high)
+</code></pre>
+    <p>
+      「Decoupled Clip」名字里的解耦：上下界不再绑死同一 ε。工程直觉——对称 clip 在「需要抬尾部概率」时不友好；略放宽上界，换熵与探索，是长 CoT 上的第一剂。
+    </p>
+
+    <h3>③ Dynamic Sampling：过滤零方差组，直到 batch 满</h3>
+    <pre><code># 问题：全对 / 全错组 → advantage 全 0 → 有效 batch 变瘦 → 不稳定
+# Dynamic Sampling：
+#   持续采样，丢弃「组内奖励无方差」的 prompt 组
+#   直到有效组数凑满目标 batch
+
+# 代价：采样次数↑；作者观察：收敛时间未必变长——
+#   因为每次更新的梯度更「有信号」，无效 step 变少
+</code></pre>
+    <p>
+      这与「加大 G」不同：G 再大，若题太易/太难仍可能整组同奖励。动态过滤直接对准<strong>梯度饥饿</strong>。消融里它贡献了从 42→50 的最大单跳（累计设定下）。
+    </p>
+
+    <h3>④ Token-level Loss：按组内总 token 归一，别让长答稀释每 token 梯度</h3>
+    <pre><code># 样本级平均（示意问题）
+#   每条 completion 先在内部对 token 平均，再对 G 条平均
+#   → 长答每个 token 的有效权重被长度稀释
+#   → 模型可能偏好短/长的有偏模式，长 CoT 不稳定
+
+# Token-level Policy Gradient Loss：
+#   分子：所有样本、所有 token 的 clip-surrogate 之和
+#   分母：组内（或 batch 内）总 token 数
+# → 每个 token 梯度尺度与序列长度解耦得更干净
+</code></pre>
+    <p>
+      作者自报：token-level 单项涨点不大（41→42），但<strong>训练更稳、长度增长更健康</strong>。长 CoT RL 里「稳」往往比「多 1 分」更值钱。
+      对照 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>：GSPO 强调序列级 IS；DAPO 这里强调<strong>损失归一粒度</strong>——问题不同层，都可同时存在。
+    </p>
+
+    <h3>⑤ Overlong：过滤 + 软惩罚，压截断噪声</h3>
+    <pre><code># Overlong Filtering：
+#   超长截断样本奖励噪声大（没答完却被打 ±1）→ 训练中过滤 / 不计入
+
+# Soft Overlong Punishment：
+#   软帽 L_soft 之后开始线性惩罚，直到硬帽 L_hard
+#   未到软帽：不罚；超过硬帽：最大惩罚 / 截断逻辑按实现
+# → 比「一超长就 -1」更平滑，减少奖励悬崖
+</code></pre>
+    <p>
+      长生成是推理 RL 的一等公民：截断不是边界情况，而是日常。Overlong 两招把「长度噪声」从 outcome 信号里剥出去，否则 GRPO 组相对会学到「别写太长」或「赌截断」的歪策略。
+    </p>
+
+    <h3>⑥ 累计消融（论文自报，务必读作累计而非独立）</h3>
+    <table>
+      <thead><tr><th>配置（Qwen2.5-32B，AIME 2024 avg@32）</th><th>自报分数</th></tr></thead>
+      <tbody>
+        <tr><td>Naive GRPO</td><td>30</td></tr>
+        <tr><td>+ Overlong Filtering</td><td>36</td></tr>
+        <tr><td>+ Clip-Higher</td><td>38</td></tr>
+        <tr><td>+ Soft Overlong Punishment</td><td>41</td></tr>
+        <tr><td>+ Token-level Loss</td><td>42</td></tr>
+        <tr><td>+ Dynamic Sampling（= 完整 DAPO）</td><td><strong>50</strong></td></tr>
+        <tr><td>对照：R1-Zero-Qwen-32B</td><td>47（约 2× 步数）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>读消融三戒</strong>：① 这是<strong>累计</strong>加技，不是各自从 30 起的独立贡献；② 单 seed / 单 benchmark（AIME24 avg@32）叙事；③ 「半步数超 47」是论文效率主张，复现时对齐数据、长度帽与评测协议。
+      最大跳点来自 Dynamic Sampling（42→50），但前面四招把系统推到「梯度质量成为瓶颈」的位置——缺前序时只开动态采样，未必复制同幅增益。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画组内奖励方差曲线。</strong> 零方差组占比高 → 优先 Dynamic Sampling / 调难度，再谈学习率。</li>
+      <li><strong>对称 clip 熵塌就试 Clip-Higher。</strong> 记录 ε_high 与策略熵；上界不是越大越好，0.28 是论文锚点。</li>
+      <li><strong>长 CoT 默认改 token-level 归一。</strong> 对照样本级平均跑一次长度直方图与梯度范数，再决定是否回退。</li>
+      <li><strong>Overlong 软硬帽写进奖励合同。</strong> 过滤与软惩罚服务不同噪声；只罚不滤或只滤不罚都要单独消融。</li>
+      <li><strong>删 KL 不是免费午餐。</strong> DAPO 配方依赖 clip+采样质量；若 off-policy 很激进，先确认 reuse 次数与 clip 是否匹配。</li>
+      <li><strong>与站内笔记串读。</strong> PPO 讲 clip 起源，GRPO 讲组相对，REINFORCE 讲骨架，GSPO 讲序列 IS，GAE 讲有 V 时的优势；DAPO 是「无 critic 长 CoT」工程四件套。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么同组奖励全相同会让 GRPO「没梯度」？
+        <details><summary>参考答案</summary>
+        A_i=(r_i−mean)/std。全同奖励时偏差为 0（或 std 数值不稳定），优势信号消失，clip-surrogate 对参数的有效梯度接近 0。Dynamic Sampling 通过丢掉这类组、凑满有方差 batch 来避免梯度饥饿。</details>
+      </li>
+      <li>
+        Clip-Higher 为何能缓解熵塌缩？对称 clip 卡在哪？
+        <details><summary>参考答案</summary>
+        抬升低概率探索 token 时 importance ratio 常 &gt;1，对称上界 1+ε 过早截断正优势更新，探索抬不起来，熵下降。ε_high&gt;ε_low 给上冲留空间，同时向下仍紧，抑制过激放大。</details>
+      </li>
+      <li>
+        Token-level Loss 与「按样本平均再平均」差在什么归纳偏置？
+        <details><summary>参考答案</summary>
+        样本级平均让长序列每个 token 权重变小，短序列相对更「大声」，长度与梯度耦合。按总 token 归一后，每个 token 贡献更均匀，长 CoT 的逐步决策不会被长度系统性地稀释。</details>
+      </li>
+      <li>
+        为何说累计消融不能解读为「Dynamic Sampling 单独 +8」？
+        <details><summary>参考答案</summary>
+        表中每一行叠在上一行之上。42→50 的 +8 以 Overlong/Clip/Token-level 已就位为前提；没有前序时，零方差过滤的对象分布与梯度景观不同，不能把 +8 当成该技的独立 ATE。</details>
+      </li>
+      <li>
+        DAPO 与 GSPO、PPO 如何摆在同一工具箱里？
+        <details><summary>参考答案</summary>
+        PPO：通用 clip +（常有）GAE/V。GRPO：组相对无 critic。DAPO：在 GRPO 长 CoT 场景补齐 clip 非对称、采样过滤、token 归一、overlong 塑形。GSPO：序列级 IS，尤其 MoE。选型上可组合：用 DAPO 稳 outcome RL，用 GSPO 稳 MoE 路由下的 IS；有逐步价值时再引入 GAE。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Yu et al. · DAPO：
+        <a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">arXiv:2503.14476</a></li>
+      <li>交叉阅读：
+        <a href="https://blog.diffio.ai/grpo-dapo/" target="_blank" rel="noopener">blog.diffio.ai/grpo-dapo</a>（数字以论文为准）</li>
+      <li>站内交叉：
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
