@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 0,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -186,6 +186,27 @@
       "source": "frontline",
       "topic": "Mercor × SkyRL：397B 知识工作 Agent RL 全配方（六步法 / TITO / prompt_mean +3.9 / 跨 harness 泛化）",
       "file": "posts/daily-2026-09-03-mercor-skyrl.html"
+    },
+    {
+      "date": "2026-09-04",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "PGPO：经验状态势 / anchor-state 势差 Aϕ + success-adaptive w(x)；失败侧信用（arXiv:2609.02236）",
+      "file": "posts/daily-2026-09-04-pgpo.html"
+    },
+    {
+      "date": "2026-09-04",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "OpenHands V1 SDK：Optional Isolation / 唯一 conversation state / Workspace 工厂 Local·Docker·Remote",
+      "file": "posts/daily-2026-09-04-harness-openhands-v1.html"
+    },
+    {
+      "date": "2026-09-04",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "DAPO：Clip-Higher / Dynamic Sampling / Token-level Loss / Overlong（GRPO 长 CoT 四细节）",
+      "file": "posts/daily-2026-09-04-algo-dapo.html"
     }
   ]
 }
