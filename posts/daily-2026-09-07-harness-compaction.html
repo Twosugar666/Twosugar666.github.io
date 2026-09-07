@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Context Compaction：长会话 Agent Harness 如何在爆窗前主动压缩（bound / prune / checkpoint） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Context Compaction：长会话 Agent Harness 如何在爆窗前主动压缩（bound / prune / checkpoint）</h1>
+    <p class="post-meta">2026-09-07 · 收藏夹：Harness / Agent · 学习笔记<br />
+      主来源：合成自业界 harness 实践——OpenHands
+      <a href="https://docs.openhands.dev/sdk/arch/condenser" target="_blank" rel="noopener">Condenser</a>
+      /
+      <a href="https://docs.openhands.dev/sdk/guides/context-condenser" target="_blank" rel="noopener">Context Condenser Guide</a>；
+      Vercel eve 默认 harness 的 compaction 思路；AI SDK
+      <code>pruneMessages</code> / bounded tool output / ToolLoopAgent 文档模式；
+      AgentForge 一类 LoopDetector + compact 组合。文中机制描述优先于产品数字，具体取值以各仓库文档为准。
+      交叉：
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长会话 coding / ops Agent 的真实瓶颈，往往不是「模型上下文窗口不够大」，而是
+      <strong>tool loop 把窗口填爆</strong>：每一轮 tool call + observation 永久追加；
+      <code>bash</code> / <code>read_file</code> 一次 dump 数万 token；失败重试把同一条错误日志贴进历史；
+      中间结果早已过期，却仍占据 prompt 预算。这是 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>
+      层的上下文治理问题——不是 long-context 预训练、也不是单纯加长 KV cache。
+    </p>
+    <p>
+      业界答案收敛到同一套工程光谱：入口处 <strong>bound</strong> 工具观测尺寸；中段
+      <strong>prune</strong> 旧 tool output；逼近上限时做一次 <strong>active compaction</strong>
+      （用模型把旧 turn 摘要成 checkpoint）。OpenHands 的 Condenser、Vercel eve 默认 harness 的 compaction、
+      AI SDK 的 <code>pruneMessages</code> / bounded tool output、AgentForge 式 LoopDetector + compact，
+      都在这条光谱上落点不同，但合同一致：<strong>推理可见上下文可变短，原始轨迹不可丢</strong>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Context Compaction = harness 在爆窗前主动改写「给 LLM 看的 messages」——
+      bound 控入口、prune 丢旧观测、checkpoint 摘要旧进度——同时另存 raw trajectory，并在 compact 后重置 tool-local state，
+      避免「摘要掉了证据却还假装已 read」。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 为何 tool loop 必然爆窗</h3>
+    <pre><code># 典型长会话增长（概念）
+messages = [system, user]
+while not done:
+    out = llm(messages)                 # assistant + tool_calls
+    messages.append(out)
+    for call in out.tool_calls:
+        obs = tool.execute(call)        # bash / read / grep / browser …
+        messages.append(tool_result(obs))  # 永不删除 → 单调膨胀
+
+# 三类放大器
+# 1. 每次成功/失败的 observation 都留着（含重复失败）
+# 2. 单次工具返回无上限：cat 大文件、pytest -vv、curl HTML
+# 3. 模型卡在同一错误：相同 tool args 连打 N 次，历史成倍复制
+</code></pre>
+    <p>
+      对照 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> 的极简环：即便控制流干净，
+      「轨迹 = messages」一旦会话变长，messages 本身也会变成不可用的超长 prompt。
+      Compaction 不是可选优化，而是生产 harness 与评测 harness 对齐时必须显式写进合同的横切能力——
+      见 <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> 把 Condenser 列为 SDK 层组件。
+    </p>
+
+    <h3>② 三杠杆：bound / prune / checkpoint</h3>
+    <table>
+      <thead>
+        <tr><th>杠杆</th><th>作用点</th><th>典型手段</th><th>代价</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>(a) Bound</strong></td>
+          <td>工具返回 ingest 瞬间</td>
+          <td>截断 stdout/stderr；head+tail；按行/字节上限；结构化字段白名单</td>
+          <td>可能切掉关键行；需在 observation 标明 truncated</td>
+        </tr>
+        <tr>
+          <td><strong>(b) Prune</strong></td>
+          <td>历史 messages 投影</td>
+          <td>丢掉旧 tool output，保留近期 turn / 用户目标 / 最终 assistant</td>
+          <td>不可逆丢失细节；模型可能「遗忘」已读文件内容</td>
+        </tr>
+        <tr>
+          <td><strong>(c) Checkpoint</strong></td>
+          <td>阈值触发的主动压缩</td>
+          <td>另一次 LLM 调用：摘要已完成进度 vs 剩余工作 + 约束 → 写入 condensation 事件</td>
+          <td>多一次调用成本；摘要可能 hallucinate；与 raw 轨迹分叉</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 三杠杆流水线（概念，对齐业界默认 harness）
+def ingest_observation(raw: bytes) -> str:
+    text = decode(raw)
+    if len(text) > MAX_OBS:                 # (a) bound at ingest
+        return head_tail(text, MAX_OBS) + "\n…[truncated]…"
+    return text
+
+def project_for_llm(history: list[Event]) -> list[Message]:
+    msgs = render(history)
+    msgs = prune_old_tool_outputs(msgs, keep_last_k=K)   # (b) prune
+    if token_count(msgs) > THRESHOLD:
+        ckpt = llm_summarize(older_turns(msgs))          # (c) checkpoint
+        # keep: system + user goal + ckpt + recent tail
+        msgs = stitch(system, goal, ckpt, recent_tail(msgs))
+    return msgs
+</code></pre>
+    <p>
+      OpenHands <strong>LLMSummarizingCondenser</strong> 走的是 (c) 为主、带 rolling 阈值：
+      事件数超 <code>max_size</code> 时，保留头部 <code>keep_first</code>（系统 / 初始用户）与尾部近期事件，
+      中间段交给 LLM 生成 summary，并写入 <code>Condensation</code> 事件；下一 step 的
+      <code>View</code> 用 summary 替换被 forget 的事件。AI SDK 的 <code>pruneMessages</code>
+      更偏 (b)：在 tool loop 里机械丢掉旧 tool 结果，配合 bounded tool output 做 (a)。
+      Vercel eve 默认 harness 的 compaction 则是把「何时 prune / 何时 summarize」做成产品默认策略——
+      机制上仍落在同一三角形。
+    </p>
+
+    <h3>③ Compact 之后必须重置 tool-local state</h3>
+    <p>
+      压缩改的是「LLM 可见历史」，不是工作区磁盘。危险在于：模型曾依赖某次
+      <code>read_file</code> 的 observation 作为 write 前证据；摘要后那条 observation 消失，
+      若 harness 仍允许「基于记忆直接 write」，就会出现 <strong>read-before-write 证据被摘要掉</strong>
+      的静默违规。Todo / plan 列表若只活在旧 assistant 消息里，compact 后也会蒸发。
+    </p>
+    <pre><code># compact 后的 harness 责任（概念检查清单）
+on_after_compact(ckpt):
+    # 1. 重新注入仍有效的结构化状态
+    re_inject(todo_list)              # 或从外部 store 读回
+    re_inject(open_constraints)       # 用户硬约束、禁止路径等
+
+    # 2. 作废「已在旧 observation 里证明过」的隐式假设
+    invalidate(read_before_write_cache)
+    require_fresh_read_before_edit()  # 写文件前必须再 read（或标 dirty）
+
+    # 3. 工具侧本地缓存与 LLM 视图对齐
+    clear(tool_result_dedup_keys)     # 避免 prune 后仍以为「刚才已返回」
+    mark_session(compaction_generation += 1)
+</code></pre>
+    <p>
+      这条纪律与 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>「运行时接管工具与环境」一致：
+      compact 是运行时事件，不是模型私有记忆刷新。OpenHands 把 Condensation 写进 event log，
+      正是为了让后续 View 投影可审计，而不是静默改 messages 数组。
+    </p>
+
+    <h3>④ LoopDetector：相同 tool call 连打 → 强制停 / 要最终答案</h3>
+    <table>
+      <thead>
+        <tr><th>信号</th><th>判定</th><th>Harness 动作</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Identical tool call × N</td>
+          <td>name + args 规范化后哈希相同，连续或窗口内 ≥ N</td>
+          <td>注入系统提示「停止重复，给出最终答案 / 换策略」；或硬停环</td>
+        </tr>
+        <tr>
+          <td>Identical failure obs</td>
+          <td>同错误摘要反复出现</td>
+          <td>升权到用户 / 切换工具；避免再 append 完整 traceback</td>
+        </tr>
+        <tr>
+          <td>Token / step budget</td>
+          <td>逼近会话上限</td>
+          <td>先 compact；仍不足则 force final answer</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># LoopDetector（概念，对齐 AgentForge 一类实现）
+def normalize(call) -> str:
+    return hash(call.name + canonical_json(call.args))
+
+recent = deque(maxlen=WINDOW)
+recent.append(normalize(call))
+if recent.count(normalize(call)) >= N:
+    # 强制退出空转：不再执行同参工具
+    return ForceStop(reason="identical_tool_loop", ask_final=True)
+</code></pre>
+    <p>
+      LoopDetector 与 compaction 互补：前者阻止「用重复观测灌爆窗口」，后者在已经变长时回收预算。
+      只做 compact 不做检测，模型可以一边空转一边逼迫 harness 不断摘要——摘要质量会随噪声轮次崩塌。
+    </p>
+
+    <h3>⑤ 与 RL / TITO 的冲突：可见 messages ≠ 采样 raw tokens</h3>
+    <p>
+      Compaction 主动改写下一轮条件上下文：prune 丢掉的 tool token、checkpoint 新写入的 summary token，
+      都不是采样当时那条 contiguous 序列。若 trainer 只拿「当前给 LLM 的 messages」去 re-tokenize 当轨迹，
+      logprob / ratio / mask 会对齐到另一条世界线。这正是
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a> 与 OpenHands Condenser 文档共同强调的警告：
+      <strong>压缩服务推理窗口，不充当训练标签真相</strong>。
+    </p>
+    <table>
+      <thead>
+        <tr><th>层</th><th>存什么</th><th>谁消费</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>LLM view（可压缩）</td>
+          <td>bound / prune / checkpoint 后的 messages</td>
+          <td>在线推理、产品 UX、调试「模型当时看见什么」</td>
+        </tr>
+        <tr>
+          <td>Event / transcript log</td>
+          <td>完整 action–observation + Condensation 元数据</td>
+          <td>审计、回放 UI、失败分析</td>
+        </tr>
+        <tr>
+          <td>Raw trajectory（TITO）</td>
+          <td>引擎 token IDs / logp / loss_mask，compact 前分段保留</td>
+          <td>RL trainer、<a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> proxy、<a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a></td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 错误：用压缩后 messages 重建训练样本
+train_ids = tokenize(chat_template(compacted_messages))  # ≠ rollout IDs
+
+# 正确：双轨
+# - session.raw_segments[] 在每次 generate 时追加引擎 IDs（TITO）
+# - session.llm_view 可被 Condenser / prune 改写
+# - Condensation 事件只标记「view 分叉点」，不覆盖 raw_segments
+</code></pre>
+    <p>
+      实践含义：开启 Condenser 的部署 harness 若要进 RL，必须与
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a> /
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a> proxy 同设计；
+      否则要么训练时关掉有损 compact（分布漂移），要么接受分段 sample + 明确 mask，
+      绝不能用摘要文本冒充 raw tokens。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先 bound，再 prune，最后才 checkpoint。</strong> 入口截断成本最低、行为最可预测；动辄上 LLM 摘要会引入幻觉与额外延迟。</li>
+      <li><strong>observation 必须标记 truncated / pruned。</strong> 让模型知道「没看见全文」，避免把截断当完整证据写进结论。</li>
+      <li><strong>compact 后重注入 todo 与硬约束，并作废 read-before-write 缓存。</strong> 结构化状态进外部 store 或 conversation state，不要只活在即将被摘要的自然语言里。</li>
+      <li><strong>LoopDetector 与 token budget 一起配。</strong> 相同 tool call 达 N 次强制停；预算触顶先 compact，再 force final answer。</li>
+      <li><strong>双轨落盘：llm_view vs raw trajectory。</strong> 对齐 <a href="daily-2026-08-31-harness-tito.html">TITO</a>；Condensation 只记录 view 分叉，不覆盖引擎 IDs。</li>
+      <li><strong>训练/评测写明 compaction 策略版本。</strong> 对照 <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> / <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>：部署开 Condenser、训练却 NoOp，就是 silent train–serve gap。</li>
+      <li><strong>优先 proxy 接入 RL，而不是为了「好存轨迹」关掉生产 compact。</strong> <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> / Lego-RL 路径：保留原生 harness 压缩行为，在 LLM 边界捕获 raw 信号。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「换一个 1M context 模型」不能替代 harness 层的 bound / prune？
+        <details><summary>参考答案</summary>
+        窗口变大只推迟爆窗，不改变 tool loop 单调追加与重复失败的成本结构；延迟、费用与注意力噪声仍随历史线性恶化。Bound 在入口消灭无效 token，prune/checkpoint 保持「当前决策相关」的信噪比——这是运行时治理，不是模型规格竞赛。</details>
+      </li>
+      <li>
+        Bound 与 Prune 都能变短上下文，失败模式有何不同？何时必须上 Checkpoint？
+        <details><summary>参考答案</summary>
+        Bound 丢的是单次观测内部细节，时间线仍在；Prune 丢掉整段旧 tool output，模型可能忘记已探索路径。当尾部 recent turns 仍超预算、或需要跨很长历史保留「已完成 vs 剩余」语义时，才值得付一次 LLM 摘要做成 checkpoint；否则优先机械 prune。</details>
+      </li>
+      <li>
+        Compact 后若不重置 read-before-write 证据，会出现什么具体事故？
+        <details><summary>参考答案</summary>
+        模型以为旧 read 的 observation 仍在上下文中，基于摘要里模糊记忆直接 edit/write，造成未读先写、覆盖未审查文件或依赖已过期文件内容。Harness 应在 compaction_generation 递增后强制 fresh read，或把「已读路径集合」存外部 state 并在摘要后校验。</details>
+      </li>
+      <li>
+        LoopDetector 只看「相同 tool 名」够不够？为什么要规范化 args？
+        <details><summary>参考答案</summary>
+        不够。同名工具换一个无关参数（如多余的 verbose 旗标、路径写成等价相对/绝对形式）就会绕过检测。应对 name + canonical_json(args) 做哈希；并对「同错误观测反复出现」做第二类检测，避免换参空转。</details>
+      </li>
+      <li>
+        开启 Condenser 的 harness 做 RL 时，为何必须与 TITO / raw trajectory 双轨？只存压缩后 transcript 会坏在哪？
+        <details><summary>参考答案</summary>
+        Condenser/prune 改写了采样后的可见 messages，re-tokenize 得到的 ID 序列不再是引擎当时条件于其上的 token。用压缩 transcript 训练会算错 logprob/ratio/mask，破坏 on-policy 假设。TITO 要求另存 raw IDs/logp；Condensation 只标记 view 分叉。参见站内 TITO 与 OpenHands Condenser 警告。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>OpenHands · Condenser 架构：
+        <a href="https://docs.openhands.dev/sdk/arch/condenser" target="_blank" rel="noopener">docs.openhands.dev/sdk/arch/condenser</a></li>
+      <li>OpenHands · Context Condenser Guide：
+        <a href="https://docs.openhands.dev/sdk/guides/context-condenser" target="_blank" rel="noopener">docs.openhands.dev/sdk/guides/context-condenser</a></li>
+      <li>AI SDK · pruneMessages / ToolLoopAgent（文档模式，bounded tool output）：以当前 AI SDK 官方文档为准</li>
+      <li>Vercel eve · default harness compaction：产品默认策略概念，机制对齐 bound/prune/checkpoint</li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
