@@ -1,1 +1,265 @@
-PLACEHOLDER_TEST
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜TIGPO：跨更新持久任务转移图 + Exploration–Revisit 做图信用（Temporal Instance-Graph） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜TIGPO：跨更新持久任务转移图 + Exploration–Revisit 做图信用（Temporal Instance-Graph）</h1>
+    <p class="post-meta">2026-09-07 · 收藏夹：RL / Agent · 一线追踪<br />
+      主来源：Gan · <em>TIGPO: Temporal Instance-Graph Policy Optimization for Long-Horizon LLM Agents</em>，
+      <a href="https://arxiv.org/abs/2609.03383" target="_blank" rel="noopener">arXiv:2609.03383</a>（submitted 2026-09-03）。
+      作者单位：Nanjing University。文中 ALFWorld / WebShop 分数、消融与开销均标注为<strong>论文自报</strong>；未复现第三方评测。
+      交叉：
+      <a href="daily-2026-09-04-pgpo.html">PGPO</a>、
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 LLM Agent（ALFWorld / WebShop）奖励稀疏、信用难分。价值无关的组相对路线从
+      <a href="grpo-notes.html">GRPO</a> 的轨迹组相对，走到 GiGPO 的 episode + anchor-state，再到
+      <strong>GraphGPO</strong>：把同 batch rollout 聚成状态转移图，用到成功终端的最短路距离做 step-level 图信用。
+      粒度细了，但图仍是 <strong>batch-local</strong>：每个 policy update 只在当前 rollout 上建图，更新结束后丢弃。
+      早期策略可能找到好前缀却未到目标；后期策略从重叠状态走出成功后缀——若分属不同 update，batch-local 图接不上，信用无法沿「跨版本路径」回传。
+      小 rollout group 下图更稀疏，相对优势也对单条成败极度敏感。
+    </p>
+    <p>
+      直接把历史轨迹 replay 进当前 loss？旧 action / log-prob 会引入分布错配。
+      <strong>TIGPO</strong>（Temporal Instance-Graph Policy Optimization）的回答：按稳定任务身份维护<strong>持久转移图</strong>；历史边只作结构参考，绝不进 policy loss。
+      再用固定预算上的 <strong>Exploration–Revisit</strong> 主动回到旧任务，并对 Revisit 组做跨时间 episode 相对。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：TIGPO = 每任务持久转移图 Ḡ = H∪G → 图距离信用 A^TG + Exploration/Revisit 调度（Revisit 用 Norm(z^R; [Z^E; Z^R])）→ clipped PG 只优化当前策略 rollout；作者自报 Qwen2.5-1.5B、250 updates、64 traj/update 上 ALFWorld All 91.28±1.04、WebShop Score 88.65±2.30 / Succ 77.54±2.41。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 问题：GraphGPO 的图在 update 边界被切断</h3>
+    <pre><code># GraphGPO（同 update、同任务）：
+#   当前 K 条 rollout → 建图 G_x → Q^G = C * γ^d(s_{t+1}, g)
+#   同 source 边归一化 → A^G；再与 A^ep 加权
+#   update 结束 → G_x 丢弃
+
+# 跨 update 碎片无法接通：
+#   update k-1：找到有用 prefix，未达 g
+#   update k  ：从重叠状态走出成功 suffix
+#   batch-local 图看不到「prefix ∪ suffix」的短路径 → 信用偏稀、方差大
+
+# 朴素 replay 历史 τ：旧 π 的 action/logπ 进当前 loss → off-policy 错配
+# TIGPO 原则：历史只改「怎么打分」，梯度只落在当前策略新采样
+</code></pre>
+    <p>
+      这与站内 <a href="daily-2026-09-04-pgpo.html">PGPO</a>、<a href="daily-2026-09-01-ahead.html">AHEAD</a> 同属「多轮稀疏信用」问题族：
+      PGPO 用同 batch 经验势差修失败侧；AHEAD 用环境反馈做 step-aware 再权重；
+      TIGPO 把图信用的时间窗从「单 update」拉到「同任务全训练史」，且严格保持 on-policy 优化。
+    </p>
+
+    <h3>② 持久时序图：Ḡ = H^(k-1) ∪ G^(k)</h3>
+    <pre><code># 任务身份 κ(x)：同一目标 + 同一初始配置才共享图记忆
+# H^(k-1)_x：update k 之前该任务累积的转移图
+# G^(k)_x  ：本 update 当前策略新采样的转移图
+
+G_bar_x^(k) = H^(k-1)_x ∪ G^(k)_x     # 时序实例图
+
+# 在 G_bar 上重算到成功终端 g 的最短路距离
+q^TG_{i,t} = C * γ^{ d_{G_bar}(s_{i,t+1}, g_x) }
+# 后继态距离：动作后果直接体现；离成功越近 → q 越大
+
+# 仅在「当前策略产生的、同 source」转移上归一化 → A^TG
+# update 后：把本轮新有效边并入 H^(k)_x
+# 关键：历史边改连通性 → 改 A^TG；历史 token/action/logπ 不进 loss
+</code></pre>
+    <p>
+      关键句：历史边可以让「早期前缀 + 晚期后缀」在图上连成更短路径，从而给当前动作更密的 step 信用；
+      但 clipped PG 的期望只取自本 update 的 <code>B^(k)</code>。
+    </p>
+
+    <h3>③ Exploration–Revisit：固定预算 B 的槽位拆分</h3>
+    <pre><code># 每 update 仍恰好 B 个任务组、每组 K 条当前策略 rollout，总预算 N = B*K
+B_E^(k) + B_R^(k) = B
+
+# Exploration：按原任务分布采样；该任务在延迟 Δ 个 update 后可 Revisit
+# Revisit    ：用当前策略重跑「已探索且过了 Δ」的同一任务
+# 合格任务不够 → 多余 Revisit 槽回填为 Exploration（不增预算）
+
+# 论文默认匹配（自报）：
+#   GraphGPO：8 groups × 8 traj  = 64
+#   TIGPO   ：16 groups × 4 traj = 64（8 Exploration + 8 Revisit）
+#   Δ = 10；λ_step = λ_ep = 1
+#   距离折扣 γ：ALFWorld 0.10 / WebShop 0.20
+</code></pre>
+    <p>
+      关键：持久图解决「有没有结构可复用」；Revisit 解决「当前策略会不会再碰到这些结构」。
+      论文 Figure 2 方向：仅 Persistent Graph 时 task-memory / exact-state hit 明显低于带 Revisit 的完整 TIGPO——结构存了，若不主动回流，当前 rollout 撞不上。
+    </p>
+
+    <h3>④ 跨时间 episode 优势 + 联合目标</h3>
+    <pre><code># Exploration 组：组内相对（与 GRPO/GraphGPO 同族）
+A^ep = Norm(R; Z_x)
+
+# Revisit 组：把「当时 Exploration 的 detached 分数」拼进参考集
+A^CT = Norm( z^R ; [Z^E ; Z^R] )
+# Z^E 只作统计参考，不反传；只对当前 Revisit 轨迹求梯度
+
+# 联合优势
+A^TIGPO = λ_step * A^TG
+        + λ_ep   * ( A^ep     if Exploration
+                   | A^CT     if Revisit )
+
+# clipped PG（示意）：ρ = π_θ / π_old；期望仅 over 当前 update 的 (i,t)
+L = - E[ min( ρ A^TIGPO , clip(ρ, 1-ε, 1+ε) A^TIGPO ) ]
+</code></pre>
+    <p>
+      为何 Revisit 不能只用组内 Norm：TIGPO 把固定 64 条拆成更多组、每组更小（4 vs 8），
+      batch-local 相对更容易被单条成败主导；拼上同任务历史分数，参考集变大，同时直接刻画「同任务上策略是否进步」。
+      消融也写明：Persistent + Explore–Revisit 但无 A^CT 时 All 掉到 89.58——调度 alone 不够。
+    </p>
+
+    <h3>⑤ 主结果 Table 1（论文自报，Qwen2.5-1.5B-Instruct，250 updates，64 traj/update）</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>方法</th>
+          <th>ALF All</th>
+          <th>WebShop Score</th>
+          <th>WebShop Succ.</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>GRPO</td><td>77.86±1.33</td><td>84.73±0.49</td><td>71.35±2.05</td></tr>
+        <tr><td>GiGPO</td><td>91.02±0.32</td><td>87.94±0.43</td><td>73.83±2.30</td></tr>
+        <tr><td>GraphGPO</td><td>89.32±1.83</td><td>87.34±1.09</td><td>76.37±0.32</td></tr>
+        <tr><td><strong>TIGPO</strong></td><td><strong>91.28±1.04</strong></td><td><strong>88.65±2.30</strong></td><td><strong>77.54±2.41</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：相对 GraphGPO，ALF All +1.96；相对 GiGPO +0.26。WebShop 上 Score / Succ 均为论文表中 RL 行最强。
+      子任务并非全赢：例如 Cool 上 GiGPO 92.94±2.66 略高于 TIGPO 92.39±1.31；Heat 上 GraphGPO 100.0 更高。
+      <strong>不支持「每个子任务碾压」</strong>——卖点是 aggregate 与 WebShop 双指标，以及同预算下的跨更新结构复用。
+    </p>
+    <p>
+      ALFWorld 子任务（论文自报，节选）：TIGPO 在 Pick 98.01±0.9、Look 89.63±3.15、Pick2 83.43±3.90 取该表最优；
+      相对 GraphGPO，Look +3.34、Pick2 +9.30。
+    </p>
+
+    <h3>⑥ 消融 Table 2：三件套互补（ALFWorld All，论文自报）</h3>
+    <table>
+      <thead>
+        <tr><th>变体</th><th>ALF All</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Current-update graph（≈ GraphGPO 式单 update 图）</td><td>89.32±1.83</td></tr>
+        <tr><td>Persistent Graph（跨更新存图，无 Revisit / 无 A^CT）</td><td>90.69±0.49</td></tr>
+        <tr><td>Persistent + Exploration–Revisit（仍用组内 Norm）</td><td>89.58±0.45</td></tr>
+        <tr><td><strong>Full TIGPO（+ cross-temporal A^CT）</strong></td><td><strong>91.28±1.04</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      三点工程结论：① 仅持久化图：89.32 → 90.69，结构有用；② 加 Revisit 却不加 A^CT：掉到 89.58——组变更小后 batch-local 相对变脆，调度 alone 不够；③ 拼上跨时间参考后回到 91.28，相对 current-update +1.96。
+      完整 TIGPO = 持久图 + 主动回流 + 跨时间相对，三者缺一都会在 aggregate 上留坑。
+    </p>
+
+    <h3>⑦ 开销 Table 3 与信用栈对照</h3>
+    <pre><code># ALFWorld，同模型/硬件/64 traj/update；median (IQR)，warmup 后 updates 11–250
+# GraphGPO  step 258.32s | core LLM 60.42s | GPU 84.36 GB
+# TIGPO     step 247.08s | core LLM 59.56s | GPU 84.31 GB
+# 相对变化  −4.35% / −1.43% / −0.06%
+# 论文解读：IQR 重叠 → 视为可比，不宣称加速；关键是「无可见端到端/显存开销」
+</code></pre>
+    <p>
+      连回站内栈：
+      <a href="grpo-notes.html">GRPO</a> / <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 管组相对与序列级 IS；
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a> 管有 V 时的偏差–方差；
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 管动态采样与截断式优化细节；
+      <a href="daily-2026-09-04-pgpo.html">PGPO</a> 管同 batch 失败侧势差；
+      TIGPO 管<strong>跨 update 的图结构记忆 + 同任务跨时间相对</strong>——与 PGPO 正交可叠：一个补失败侧势，一个补时间维图连通。
+    </p>
+
+    <h3>⑧ 局限（论文与读法）</h3>
+    <ul>
+      <li><strong>任务身份 κ(x)</strong>：依赖「同目标 + 同初始配置」；开放分布 / 配置噪声大时图记忆可能错配或空撞。</li>
+      <li><strong>状态合并合同</strong>：图边质量取决于状态等价定义；模板文本环境友好，口语化 / 视觉状态更脆（与 PGPO 的 exact-match anchor 同族风险）。</li>
+      <li><strong>组更小的副作用</strong>：为腾出 Revisit 槽，每组 K 变小；若关掉 A^CT，消融已显示 aggregate 回退。</li>
+      <li><strong>评测面</strong>：主表为 1.5B × ALFWorld/WebShop；更大模型与更广环境属论文 future work。</li>
+      <li><strong>历史图膨胀</strong>：长训需压缩 / 检索策略；论文未给生产级 graph GC 方案。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先确认是否真是「跨 update 碎片」问题。</strong> 若同任务几乎不重复出现，持久图命中率会低——先看 task-memory hit，再决定上 TIGPO。</li>
+      <li><strong>三件套一起开。</strong> 消融写得很清楚：只存图不够；只 Revisit 不够；A^CT 是小 K 下的稳定器。</li>
+      <li><strong>预算记账要显式。</strong> 保持 N=BK 不变：Revisit 替换 Exploration，而不是追加；否则和 GraphGPO 不可比。</li>
+      <li><strong>Δ、B_E/B_R、K 写进实验卡。</strong> 论文默认 Δ=10、8+8、K=4；换环境先扫 hit rate 与组内方差，再拧。</li>
+      <li><strong>历史只进图与 detached 分数。</strong> 实现上隔离：H 无 logπ；Z^E 标 detach；loss 索引只能指向本 update rollout。</li>
+      <li><strong>与站内信用栈对照选型。</strong> 失败侧同分 → 看 PGPO；需要跨时间结构 → 看 TIGPO；有 critic → 再拧 GAE；序列 IS / MoE → GSPO；采样动态性 → DAPO。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么 GraphGPO 式「每 update 建图再丢弃」会切断有用信用？
+        <details><summary>参考答案</summary>
+        长程解常以碎片形式出现：早期 update 可能只发现有用前缀，后期 update 才从重叠状态走到成功。batch-local 图无法把跨版本的边并成到目标的短路径，step 信用只能在当次稀疏图上估，小 K 时更脆。TIGPO 用 H∪G 把这些碎片接上，但仍只对当前边算 A^TG 并回传。</details>
+      </li>
+      <li>
+        历史转移为何「只作结构参考、绝不进 policy loss」？
+        <details><summary>参考答案</summary>
+        历史轨迹来自旧策略，直接 replay 会把陈旧 action/logπ 送进当前梯度，造成 off-policy 错配。TIGPO 让历史边只改变图连通与距离 → 改变当前转移的 A^TG；旧分数只进 detached 参考集。接收梯度的轨迹全部由当前策略新采样，从而保留 on-policy clipped PG。</details>
+      </li>
+      <li>
+        Exploration–Revisit 在固定预算下如何既回流又不加成本？
+        <details><summary>参考答案</summary>
+        B 个任务组拆成 B_E + B_R = B：Revisit 槽替换而非追加 Exploration。每组仍采样 K 条当前策略轨迹，总 N=BK 与 GraphGPO 对齐。Δ 控制回流时机；合格任务不足则回填 Exploration。这样在不增加 per-update rollout 的前提下，提高 task-memory / exact-state hit。</details>
+      </li>
+      <li>
+        为何消融里「Persistent + Explore–Revisit」反而低于仅 Persistent？A^CT 补了什么？
+        <details><summary>参考答案</summary>
+        为腾出 Revisit，TIGPO 用更多组、更小 K（如 16×4 vs 8×8）。组内 Norm 参考更少，相对优势更易被单条成败主导，All 从 90.69 掉到 89.58。A^CT = Norm(z^R; [Z^E; Z^R]) 把同任务历史 Exploration 分数并入参考，放大参考集并刻画跨阶段改进；完整式回到 91.28。</details>
+      </li>
+      <li>
+        TIGPO 与 PGPO、AHEAD、GAE、GSPO 各卡在信用栈哪一层？
+        <details><summary>参考答案</summary>
+        TIGPO：跨 update 的任务级图记忆 + 同任务跨时间 episode 相对，改的是图信用的时间窗与参考集。PGPO：同 batch 经验势差，修失败侧步级信用。AHEAD：环境反馈/纠错的 step-aware 再权重。GAE：有（可学）V 时拧偏差–方差。GSPO：序列级 IS / 稳定性。可叠加：图结构用 TIGPO，失败侧再叠 PGPO；有 critic 拧 GAE；大模型序列优化看 GSPO/DAPO。关键是 κ(x)/状态合并合同与 harness 观测对齐。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Gan · TIGPO：
+        <a href="https://arxiv.org/abs/2609.03383" target="_blank" rel="noopener">arXiv:2609.03383</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-09-04-pgpo.html">PGPO</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
