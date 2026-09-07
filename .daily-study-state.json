@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 1,
+  "next": 2,
   "daily_streams": [
     "frontline",
     "harness",
@@ -207,6 +207,27 @@
       "source": "algo",
       "topic": "DAPO：Clip-Higher / Dynamic Sampling / Token-level Loss / Overlong（GRPO 长 CoT 四细节）",
       "file": "posts/daily-2026-09-04-algo-dapo.html"
+    },
+    {
+      "date": "2026-09-07",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "TIGPO：跨更新持久任务转移图 + Exploration–Revisit（arXiv:2609.03383）",
+      "file": "posts/daily-2026-09-07-tigpo.html"
+    },
+    {
+      "date": "2026-09-07",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Context Compaction：bound / prune / checkpoint 与 TITO 边界",
+      "file": "posts/daily-2026-09-07-harness-compaction.html"
+    },
+    {
+      "date": "2026-09-07",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "Importance Sampling：ratio / clip / truncate 与 LLM RL 栈",
+      "file": "posts/daily-2026-09-07-algo-importance-sampling.html"
     }
   ]
 }
