@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Importance Sampling：从 off-policy 修正到 LLM RL 的 ratio / clip / truncate · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Importance Sampling：从 off-policy 修正到 LLM RL 的 ratio / clip / truncate</h1>
+    <p class="post-meta">2026-09-07 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典课：Importance Sampling（IS）作为 on-policy 策略梯度到 off-policy / 陈旧策略修正的桥梁。
+      交叉：
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="daily-2026-08-26-granite-4-2.html">Granite / TIS</a>、
+      <a href="daily-2026-09-07-tigpo.html">TIGPO</a>。
+      公式一律用 <code>pre</code>，不用 LaTeX。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> 的骨架是 on-policy：用当前策略 π_θ 采样，再乘 ∇log π 更新。
+      一旦同一批轨迹被多次优化、或 rollout 来自异步旧权重、或 logprob 来自推理代理——采样分布 q 就不再等于目标分布 p，期望会偏。
+      <strong>Importance Sampling（重要性采样）</strong> 用权重 w = p/q 把「在 q 上采到的样本」改写成「对 p 的无偏估计」——这正是 off-policy 修正、PPO ratio、以及 LLM RL 里 stale-policy / proxy logging 校正的共同母题。
+    </p>
+    <p>
+      本课不刷蒙特卡洛面试题，只把 IS 钉成后训练工具：ratio 从哪来、为何会炸方差、clip 与 truncate 各自管什么、序列级 vs token 级怎么选——并串起
+      REINFORCE → off-policy IS → PPO clip → GRPO → GSPO → TIS / 异步，以及「结构复用 ≠ 轨迹回放」的 TIGPO 式设计选择。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：IS 用 ρ = π_θ / π_old（或 p/q）把旧样本接到新策略的期望上；无偏的代价是方差；PPO clip、GSPO 序列 IS、TIS truncate、ESS 诊断都是在管这件事——LLM agent RL 里几乎每天都要面对。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 估计问题：用 q 的样本估 E_p[f]，权重 w = p/q</h3>
+    <pre><code># 目标：估 μ = E_{x ~ p}[ f(x) ]
+# 但只能从 q 采样（q 易采、p 难采，或数据已按 q 采好）
+
+# 恒等式（p,q 同支撑且 q(x)>0 当 p(x)>0）
+E_p[f] = E_q[ (p(x)/q(x)) · f(x) ]
+
+# 权重
+w(x) = p(x) / q(x)
+
+# 蒙特卡洛
+μ_hat = (1/N) Σ_i  w(x_i) · f(x_i) ,   x_i ~ q
+
+# Kahn &amp; Marshall / Rubinstein 传统：稀有事件、仿真加速
+# RL 里：p = 当前策略诱导分布，q = 行为策略 / 旧策略 / 代理日志分布
+</code></pre>
+    <p>
+      关键是整课的代数起点：把分布差「折进权重」。权重对了，期望对；权重错了或权重爆炸，估计就废。
+      Precup / Sutton 一系的 off-policy TD、加权回报，都是同一恒等式在时序差分上的展开。
+    </p>
+
+    <h3>② 策略梯度形态：ρ = π_θ / π_old；clip 与 truncate</h3>
+    <pre><code># on-policy PG（示意）
+∇J ≈ E_{a ~ π_θ}[ ∇log π_θ(a|s) · A ]
+
+# 数据来自 π_old（多 epoch 复用 / 异步 rollout）时：
+#   E_{π_θ}[g] = E_{π_old}[ ρ · g ] ,   ρ = π_θ(a|s) / π_old(a|s)
+
+# 常用 surrogate（PPO 前身）
+L(θ) = E_{π_old}[ ρ_θ · A_hat ]
+# ρ_θ = π_θ / π_old
+
+# PPO clipped surrogate（Schulman et al.）
+L_CLIP = E[ min( ρ·A , clip(ρ, 1-ε, 1+ε)·A ) ]
+# 悲观下界：阻止 ρ 远离 1 时过大更新
+
+# Truncated IS（TIS）：硬截断权重上界
+ρ_TIS = min( ρ , C )     # 或丢弃 ρ &gt; C 的样本
+# clip：改目标形状；truncate：改权重分布 —— 都偏一点、换方差
+</code></pre>
+    <p>
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 的 clip 不是「装饰」，而是把 trust region 写进目标：同一批 π_old 轨迹上做多步 SGD 时，ρ 会漂移，无修正的 vanilla PG 可以毁灭性更新。
+      TIS（站内 <a href="daily-2026-08-26-granite-4-2.html">Granite 一线追踪</a> 亦谈及异步场景）更直接：大权重掐死或丢弃，换有偏、换稳。选型看容忍偏差 vs 容忍爆炸。
+    </p>
+
+    <h3>③ 序列级 vs token 级 IS：GSPO 与 DAPO 的不同层</h3>
+    <table>
+      <thead><tr><th>粒度</th><th>ratio 定义</th><th>典型用法</th><th>风险 / 收益</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Token 级</strong></td>
+          <td>ρ_t = π_θ(y_t|…)/π_old(y_t|…)</td>
+          <td>经典 PPO/GRPO 实现；DAPO 谈 token-level <em>loss 归一</em></td>
+          <td>与序列 outcome A 单位易错配；局部噪声大</td>
+        </tr>
+        <tr>
+          <td><strong>序列级</strong></td>
+          <td>s = (π_θ(y|x)/π_old(y|x))^(1/|y|)</td>
+          <td><a href="daily-2026-08-31-algo-gspo.html">GSPO</a>：整段 clip</td>
+          <td>与 outcome / 组相对 A 同构；MoE 更稳</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># Token 级（示意）
+for t in response:
+  ρ_t = exp(logπ_θ(y_t|…) - logπ_old(y_t|…))
+  loss += min(ρ_t * A, clip(ρ_t) * A)
+
+# 序列级 length-normalized（GSPO 精神）
+s = exp( mean_t [ logπ_θ(y_t|…) - logπ_old(y_t|…) ] )
+loss += min(s * A, clip(s) * A)
+
+# 注意：DAPO 的「Token-level Loss」主要是
+#   按 batch 总 token 数归一 surrogate 之和
+# 与「IS 在哪一级算 ρ」是不同轴——可同时存在
+</code></pre>
+    <p>
+      读论文时先问两句：① ratio 在 token 还是 sequence？② loss 按样本平均还是按 token 平均？
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 钉的是归一粒度与长 CoT 稳定；GSPO 钉的是 IS 粒度与 MoE。混谈「token-level」而不拆这两轴，会把两个问题拧成一团。
+    </p>
+
+    <h3>④ 为何 LLM agent RL 天天碰到 IS：异步、代理日志、别盲目回放</h3>
+    <pre><code># 典型陈旧源
+# 1) 多 epoch：同一批 rollout 上 θ 已走远，ρ 漂移
+# 2) 异步 actor：采样权重 ≠ 当前 learner 权重（stale policy）
+# 3) 训推分离：推理引擎 logprob ≠ 训练引擎重算 logprob（proxy logging）
+# 4) 工具 / 环境旁路：掩码与真实联合概率不一致
+
+# 错误直觉：「旧轨迹很多，直接塞进 loss 当 off-policy 数据」
+# 正确默认：要么算清 ρ / 截断 / clip，要么不要把历史轨迹当可交换样本
+
+# TIGPO 式设计选择（概念，见同日一线追踪）：
+#   可复用「历史图结构 / 拓扑先验」
+#   但损失里不对旧轨迹做盲目 replay
+#   → 结构复用 ≠ 轨迹回放
+#   图骨架提供归纳偏置；梯度仍应对准当前策略可负责的采样合同
+</code></pre>
+    <p>
+      Agent 轨迹长、工具调用多、异步队列常见——「看起来能复用」的东西最多：缓存 completion、缓存工具图、缓存裁判分。
+      能复用的是<strong>结构与标注合同</strong>；不能默认复用的是<strong>未修正的 (s,a,logπ) 进策略梯度</strong>。
+      TIGPO 把「图结构复用」与「损失内轨迹回放」拆开，正是 IS 纪律在系统设计上的投影：缺 ρ、缺 truncate，回放就是有偏噪声放大器。
+    </p>
+
+    <h3>⑤ 方差爆炸：ρ 大时怎么办；ESS 诊断</h3>
+    <pre><code># 权重方差随 ||p/q|| 变坏
+# 极端：少数样本 w 极大 → 估计被少数点绑架（effective N → 1）
+
+# Effective Sample Size（常用诊断，示意）
+ESS ≈ (Σ_i w_i)^2 / Σ_i w_i^2
+# ESS &lt;&lt; N  → 权重塌缩；该 batch 的 IS 估计不可信
+
+# 工程菜单（由轻到重）
+# 1) 缩短 reuse：少 epoch / 更勤采样
+# 2) PPO clip：限制 surrogate 对大 ρ 的敏感
+# 3) TIS / 权重截断：min(ρ,C) 或丢弃 ρ&gt;C
+# 4) 序列级 IS + length-norm：压联合比数值范围（GSPO）
+# 5) 拒绝陈旧：异步队列设 max-age；过期轨迹不计 loss
+# 6) 重算 logprob：训推合同不一致时，先对齐再谈 IS
+
+# 有偏换方差是常态：clip / truncate 引入偏差；
+# 目标是「可控偏差 + 可用方差」，不是纸面无偏
+</code></pre>
+    <table>
+      <thead><tr><th>症状</th><th>可能原因</th><th>优先动作</th></tr></thead>
+      <tbody>
+        <tr><td>梯度范数偶发尖刺</td><td>个别 ρ 极大</td><td>看 ρ 分位数；试 clip / TIS</td></tr>
+        <tr><td>ESS 持续偏低</td><td>π_θ 相对 π_old 漂移过大</td><td>减 reuse、加采样、收紧异步 age</td></tr>
+        <tr><td>clip fraction ≈ 1</td><td>几乎全程触界</td><td>ε / 学习率 / 数据新鲜度不匹配</td></tr>
+        <tr><td>训推 logprob 系统偏差</td><td>proxy 合同坏</td><td>先重算或校准，再谈 ratio</td></tr>
+      </tbody>
+    </table>
+    <p>
+      ESS 不是超参，是仪表盘。没有 ESS / ρ 直方图 / clip fraction，调 ε 多半在盲人摸象。
+      与 <a href="daily-2026-09-02-algo-gae.html">GAE</a> 对照：GAE 管的是 advantage 时间轴上的偏差–方差；IS 管的是<strong>分布轴</strong>上的偏差–方差——两条轴都要看。
+    </p>
+
+    <h3>⑥ 关系链：从 REINFORCE 到异步 TIS</h3>
+    <pre><code>REINFORCE          on-policy score-function；无 ρ
+    ↓
+off-policy IS      引入 ρ = π_θ/π_b；无偏、高方差
+    ↓
+PPO clip           把 ρ 的偏离写进悲观 surrogate
+    ↓
+GRPO               组相对 A（无 critic）；ρ 仍常 token 级
+    ↓
+GSPO               序列级 length-norm IS + 整段 clip
+    ↓
+TIS / async        截断或丢弃过大权重；对抗 stale rollout
+    +
+TIGPO 纪律         结构可复用；旧轨迹不盲目进 loss
+</code></pre>
+    <p>
+      新名字出现时，沿这条链定位：改的是 A（GRPO）、改的是 ρ 粒度（GSPO）、改的是 ρ 截断（TIS）、还是改「哪些数据根本不进期望」（拒绝回放 / age 门控）。
+      多数「后训练新算法」是这几块积木的重组，而不是另起一套无关数学。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先写清 p 与 q。</strong> 当前策略、行为策略、推理代理、异步快照——四者任一不等，就要显式 IS 或显式拒绝。</li>
+      <li><strong>日志默认带 ESS、ρ 分位、clip fraction。</strong> 比只看 reward 曲线更能提前报爆炸。</li>
+      <li><strong>粒度对齐。</strong> Outcome / 组相对 A → 优先序列级 s；逐步 PRM → token 级 ρ 更同构。参见 GSPO / DAPO 两轴拆分。</li>
+      <li><strong>异步设 max-age。</strong> 过期轨迹进 buffer 可以，进 loss 前必须过新鲜度与 ρ 门控。</li>
+      <li><strong>结构复用与轨迹回放解耦。</strong> 图、工具图式、裁判 rubric 可缓存；未修正旧 (y, logπ) 默认不进 PG。</li>
+      <li><strong>clip 与 truncate 分开消融。</strong> 一个改目标形状，一个改权重支撑；同时开时要记清各自 C / ε。</li>
+      <li><strong>串读站内。</strong> REINFORCE 骨架 → PPO clip → GRPO 组相对 → GSPO 序列 IS → DAPO 训练细节 → 本文把 IS 母题钉死。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说「E_p[f] = E_q[(p/q) f]」在支撑条件破坏时会静默失败？
+        <details><summary>参考答案</summary>
+        若存在 x 使 p(x)&gt;0 而 q(x)=0，该点永远采不到，权重公式无定义或无法覆盖，估计对 p 的质量永久偏。RL 里表现为：行为策略几乎从不选的动作，目标策略却开始依赖——IS 无法从零支撑里「变出」样本，只能靠探索或改采样。</details>
+      </li>
+      <li>
+        PPO 的 clip 与 TIS 的 truncate 都在限制大 ρ，差别在哪？
+        <details><summary>参考答案</summary>
+        Clip 作用在 surrogate：用 min(ρA, clip(ρ)A) 构造悲观目标，优化路径被改写。Truncate 直接改权重 ρ←min(ρ,C) 或丢弃样本，改变的是蒙特卡洛测度。二者都引入偏差、压方差；实现与超参语义不同，不可当成同一个旋钮的两个名字。</details>
+      </li>
+      <li>
+        为何 GSPO 强调序列级 IS，而 DAPO 强调 token-level loss，二者并不矛盾？
+        <details><summary>参考答案</summary>
+        一轴是 importance ratio 的定义粒度（token ρ_t vs 序列 s）；另一轴是损失归一（按样本平均 vs 按总 token 平均）。GSPO 对齐「序列 A × 序列 s」；DAPO 避免长答稀释每 token 梯度。可以同时：序列级 s + token 总数归一——前提是实现里两轴都显式配置。</details>
+      </li>
+      <li>
+        「结构复用 ≠ 轨迹回放」如何用 IS 语言解释 TIGPO 式选择？
+        <details><summary>参考答案</summary>
+        历史图结构不进入 E_q[ρ · ∇logπ · A] 的样本项，只作为归纳偏置或约束生成空间，故不要求旧轨迹的 π_old 与当前 π_θ 对齐。若把旧轨迹直接塞进带 ∇logπ 的损失却不算/不截断 ρ，就是在错误的 q 上估 p 的梯度。TIGPO 保留结构、拒绝盲目 replay，等于拒绝未修正的 off-policy 项。</details>
+      </li>
+      <li>
+        ESS 很低但 reward 仍在涨时，为什么仍要报警？
+        <details><summary>参考答案</summary>
+        Reward 上涨可能来自少数超大权重样本或过时分布上的过拟合；ESS 低表示有效样本量坍缩，估计方差巨大，下一阶段易崩溃或不可复现。应先修新鲜度 / clip / truncate / 采样，而不是把「还在涨」当成 IS 健康的证据。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Kahn &amp; Marshall · Methods of Reducing Sample Size in Monte Carlo Computations（经典 IS 思想）</li>
+      <li>Rubinstein · Simulation and the Monte Carlo Method（重要性采样传统教材脉络）</li>
+      <li>Precup, Sutton et al. · Eligibility Traces for Off-Policy Policy Evaluation（off-policy IS / 加权）</li>
+      <li>Schulman et al. · PPO：
+        <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347</a></li>
+      <li>DeepSeekMath · GRPO（组相对，无 critic）</li>
+      <li>Zheng et al. · GSPO：
+        <a href="https://arxiv.org/abs/2507.18071" target="_blank" rel="noopener">arXiv:2507.18071</a></li>
+      <li>Yu et al. · DAPO：
+        <a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">arXiv:2503.14476</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a> ·
+        <a href="daily-2026-08-26-granite-4-2.html">Granite / TIS</a> ·
+        <a href="daily-2026-09-07-tigpo.html">TIGPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
