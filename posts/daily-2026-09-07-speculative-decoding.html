@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜推测解码：「先猜后验」为什么能快 3 倍还严格无损 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜推测解码（Speculative Decoding）：「先猜后验」为什么能快 3 倍还严格无损</h1>
+    <p class="post-meta">2026-09-07 · 收藏夹：Infra · 领域轮更（infra）<br />
+      主要依据：Leviathan et al. <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">arXiv:2211.17192</a>、
+      Chen et al. <a href="https://arxiv.org/abs/2302.01318" target="_blank" rel="noopener">arXiv:2302.01318</a>（两篇 2022/2023 原始论文）、
+      EAGLE 系列（<a href="https://arxiv.org/abs/2401.15077" target="_blank" rel="noopener">arXiv:2401.15077</a>）、Medusa（<a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener">arXiv:2401.10774</a>）；
+      加速比汇总数字参考 <a href="https://www.morphllm.com/speculative-decoding" target="_blank" rel="noopener">Morph 的整理</a></p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-01-kv-cache.html">KV cache 笔记</a>留下了一个结论：decode 阶段是 <strong>memory-bandwidth-bound</strong>——
+      每步都要把全部权重 + KV cache 从 HBM 读一遍，却只产出 <strong>一个</strong> token。算术强度极低，GPU 的算力在 decode 时大面积闲置。
+    </p>
+    <p>
+      推测解码（speculative decoding）就是对「一次前向只出一个 token」这个浪费的直接攻击：
+      <strong>既然读一遍权重的成本已经付了，能不能用这一遍前向同时「验证」多个 token？</strong>
+      答案是 draft-then-verify——小模型先猜 γ 个 token，大模型一次并行前向全部核验，接受前缀、拒绝即回退。
+      近期它重新变热：GLM-5.2 把 MTP 层的接受长度提升 20%（<a href="daily-2026-08-28-glm-5-3.html">GLM-5.3 笔记</a>提过），
+      开源社区用 DFlash2 类推测解码把 Qwen3.8-27B 在单卡上推到 250+ tok/s，vLLM/SGLang 都把推测解码做成了一行配置。
+      本篇把机制、无损性证明的直觉、加速比公式和草稿模型的四条路线讲透。
+    </p>
+
+    <h2>核心概念</h2>
+
+    <h3>1. 机制：先猜后验，一轮最多产 γ+1 个 token</h3>
+    <pre><code>每轮循环：
+  ① 草稿：小模型（或 n-gram / 草稿头）自回归猜 γ 个 token：x̃_1..x̃_γ   # 便宜
+  ② 验证：目标大模型对 γ 个草稿做一次并行前向，拿到每个位置的 p_target(·)  # 与生成 1 个 token 同价
+  ③ 裁决：逐个位置接受/拒绝（见下），拒绝发生在位置 i → 接受 x̃_1..x̃_{i-1}，
+     并在位置 i 从「修正分布」采样一个 bonus token，本轮结束
+  一轮产出：1 ～ γ+1 个 token，分布与大模型逐个生成严格一致</code></pre>
+    <p>
+      关键点在②：decode 的成本是「读权重 + 读 KV」，验证 γ 个 token 与生成 1 个 token 读的量几乎相同——
+      只要还没进入 compute-bound 区间，验证就是近乎免费的。这就是为什么加速来自「带宽闲置」而非「算力节省」。
+    </p>
+
+    <h3>2. 无损性：修正拒绝采样保持目标分布</h3>
+    <p>
+      对位置 i 的草稿 token x̃（来自草稿分布 q），接受规则：
+      以概率 <code>min(1, p_target(x̃)/q(x̃))</code> 接受；若拒绝，从修正分布
+      <code>normalize(max(0, p_target − q))</code> 重采样一个 token（bonus token）。
+      可以证明：这样产出的序列分布<strong>与目标模型逐个自回归生成的分布完全相同</strong>——推测解码是严格无损的加速，不是近似。
+      贪心解码（temperature=0）下规则退化为「草稿 == 大模型 argmax 就接受」，实现最简单且接受率最高；温度越高，两分布差异越大，接受率越低。
+    </p>
+
+    <h2>技术要点</h2>
+
+    <h3>1. 加速比公式：接受率 α 与成本比 c 的账</h3>
+    <pre><code>设草稿长 γ、单 token 草稿耗时 T_d、验证耗时 T_v、目标模型逐 token 耗时 T_ar、接受率 r：
+  平均接受长度  L_a = (1 − r^(γ+1)) / (1 − r)
+  加速比        speedup = (L_a × T_ar) / (γ·T_d + T_v) ≈ L_a / (γ·c + 1)，其中 c = T_d / T_ar
+
+算例（Morph 整理口径）：r = 0.8、γ = 5、草稿近乎免费（c≈0）→ L_a ≈ 3.69，加速约 3.7×</code></pre>
+    <table>
+      <thead><tr><th>来源</th><th>设置</th><th>报告加速比</th></tr></thead>
+      <tbody>
+        <tr><td>Leviathan et al.（2022/23）</td><td>T5-XXL + 小草稿</td><td>2～3×（输出完全一致）</td></tr>
+        <tr><td>Chen et al.（2023）</td><td>Chinchilla 70B</td><td>2～2.5×</td></tr>
+        <tr><td>EAGLE</td><td>LLaMA2-Chat 70B</td><td>2.7～3.5×</td></tr>
+        <tr><td>EAGLE-2</td><td>动态草稿树</td><td>3.05～4.26×</td></tr>
+        <tr><td>EAGLE-3</td><td>training-time test 等多改进</td><td>最高约 6.5×（官方口径）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      两个工程推论：① <strong>接受率 r 是杠杆最大的变量</strong>——r 从 0.7 到 0.8，γ=5 时 L_a 从 2.9 涨到 3.7；
+      ② 草稿成本 c 必须远小于 1，否则 γ·c 项直接吃掉收益——「草稿要够蠢够快」是硬约束。
+    </p>
+
+    <h3>2. 草稿从哪来：四条路线</h3>
+    <table>
+      <thead><tr><th>路线</th><th>代表</th><th>优点</th><th>代价/痛点</th></tr></thead>
+      <tbody>
+        <tr><td><strong>独立小模型</strong></td><td>原始论文；DistillSpec（蒸馏对齐）</td><td>即插即用，不动目标模型</td><td>分布对齐难；多存一份模型；接受率上限低</td></tr>
+        <tr><td><strong>检索 / n-gram</strong></td><td>PLD、Lookahead、REST；Morph 生产实例（k=64 n-gram）</td><td>零训练、零额外参数；代码/编辑场景重复度高时奇准</td><td>只适用于高重复分布（代码、文档编辑）；开放生成弱</td></tr>
+        <tr><td><strong>目标模型挂草稿头</strong></td><td>Medusa（多个头各预测一个未来位置）</td><td>不要独立模型；一次前向出整棵候选</td><td>头要额外训练；Vicuna-7B 上约 11% 显存开销；各头独立预测、位置间无依赖</td></tr>
+        <tr><td><strong>特征级自回归草稿</strong></td><td>EAGLE 系列（目标模型倒数第二层 hidden state + 单层 Transformer 草稿器）</td><td>接受率最高的一档（草稿与目标分布对齐最紧）</td><td>训练-推理不一致：训练用真值特征/真值 token，推理用自己的特征/自己的草稿（exposure bias），位置越深接受率衰减越快</td></tr>
+        <tr><td><strong>训练时内嵌 MTP</strong></td><td>DeepSeek-V3 的 MTP 模块；GLM-5.2 改进 MTP 层使接受长度 +20%</td><td>草稿与目标天然同分布（同一模型同一训练）；推理零外挂</td><td>只能在预训练/后训练阶段加入，存量模型用不了</td></tr>
+      </tbody>
+    </table>
+    <p>
+      另一个正交维度是<strong>验证结构</strong>：链式草稿一次只验一条路径，<strong>树形草稿（tree attention）</strong>一次并行验证整棵候选树，
+      相同草稿预算下期望接受长度更高——EAGLE-2 的 4× 级别加速主要靠动态树。
+    </p>
+
+    <h3>3. 什么时候推测解码不赚</h3>
+    <ul>
+      <li><strong>大 batch / 长上下文下，验证不再免费</strong>：batch 已经很大时，一次前向的 FLOPs 本来就被打满（进入 compute-bound 区间），多验 γ 个 token 是真金白银的算力——加速比显著缩水，在线服务高并发时可能不值得开；</li>
+      <li><strong>高温度采样</strong>：两分布差异大 → 接受率降；greedy/低温场景最赚；</li>
+      <li><strong>草稿与目标分布漂移</strong>：领域外输入（比如给通用草稿喂医疗文本）接受率塌方；EAGLE 系的 exposure bias 在超长草稿时同样衰减。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先在离线/低并发场景开</strong>：vLLM 的 <code>--speculative-config</code>、SGLang 的 <code>--speculative-algorithm</code> 都是一行开关；离线批量（评测、数据合成、agent 轨迹生成）几乎稳赚，在线高并发要先测。</li>
+      <li><strong>监控指标选「平均接受长度」而非加速比</strong>：加速比受负载混淆，接受长度 τ 直接反映草稿质量；r 掉了先查输入分布是否漂移，再调 γ。</li>
+      <li><strong>γ 从小往大调</strong>：γ 越大期望接受越长，但 γ·c 项线性吃收益；从 3～5 起步，按实测 L_a 曲线找拐点。树形验证下这个旋钮换成树宽/树深。</li>
+      <li><strong>代码/编辑类负载优先考虑 n-gram 路线</strong>：零训练成本、对现有系统侵入最小（prompt lookup）；这正是 Morph 等 coding 产品生产环境的选择。</li>
+      <li><strong>训练新模型时把 MTP 写进架构清单</strong>：GLM-5.2/DeepSeek-V4 的经验是训练期内嵌 MTP 头收益稳定且推理零成本；与 <a href="daily-2026-09-01-kv-cache.html">KV cache 笔记</a>的「每 token KV 字节数」一样，「是否自带草稿头」已是模型选型的一阶指标。</li>
+      <li><strong>RL 训练管线的 rollout 侧</strong>：推测解码加速 rollout 直接缓解 <a href="daily-2026-09-03-mercor-skyrl.html">Mercor 配方</a>里的「系统天花板」（KV 容量 ÷ 轨迹长）；注意投机采样与训练引擎 logprob 的一致性检查（参考该文的 train-inference mismatch 检查）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「验证 γ 个草稿 token」与「生成 1 个 token」成本几乎相同？这个近似在什么条件下失效？
+        <details><summary>参考答案</summary>
+        decode 单步的成本由 HBM 读取量主导：全部权重 + 该请求的 KV cache。验证 γ 个 token 只需把 γ 个位置的 K/V 追加进 cache、做一次并行前向——权重和已有 KV 仍只读一遍，增加的只是 γ 个位置的注意力/FFN 计算，而这部分在 memory-bound 区间本来就被带宽闲置掩盖。失效条件：当 batch 足够大或序列足够长，算术强度越过屋顶线拐点进入 compute-bound 区间，γ 个位置的 FLOPs 变成真实成本；此时验证不再免费，加速比向 1 回归。这也是推测解码在高并发在线服务上收益骤降、在离线小 batch 上接近理论值的原因。</details>
+      </li>
+      <li>
+        推测解码号称「严格无损」。写出位置 i 的接受/拒绝规则，并解释为什么输出分布与目标模型逐 token 生成完全一致。
+        <details><summary>参考答案</summary>
+        对来自草稿分布 q 的 token x̃：以概率 min(1, p(x̃)/q(x̃)) 接受（p 为目标分布）；拒绝则从修正分布 p′ = normalize(max(0, p − q)) 采样。直觉证明：联合看待「提议 + 裁决」后，任意 token x 被产出的总概率为 q(x)·min(1, p(x)/q(x)) + [拒绝概率]·p′(x)。当 q(x) ≤ p(x)：第一项 = q(x)，修正项补足 p(x) − q(x)，合计 p(x)；当 q(x) > p(x)：第一项 = p(x)，修正项为 0，合计 p(x)。两种情形都精确等于目标分布——这是经典拒绝采样「包络-修边」结构在自回归上的逐位置版本，且第一个拒绝位置后本轮终止，保证不重写已接受前缀。所以无损性不依赖草稿质量：草稿差只是慢，不会错。</details>
+      </li>
+      <li>
+        加速比公式 speedup ≈ L_a / (γ·c + 1) 中，L_a = (1−r^(γ+1))/(1−r)。在 r=0.6、γ=4、c=0.05 下估算加速比；并说明 r 与 c 哪个对结果更敏感。
+        <details><summary>参考答案</summary>
+        L_a = (1 − 0.6⁵)/(1 − 0.6) = (1 − 0.0778)/0.4 ≈ 2.31；分母 = 4×0.05 + 1 = 1.2；speedup ≈ 1.92×。敏感性：r 进入 L_a 的分子是几何级数，r 的小幅提升（0.6→0.7 时 L_a 从 2.31 涨到约 2.86）带来超线性收益，且不收 γ·c 的税；c 在分母与 γ 相乘，只有 γ·c 与 1 可比拟时才显著（c=0.05、γ=4 才 0.2）。所以在 c 很小时优化接受率 r 是最优先的（换更对齐的草稿、缩短 γ、低温解码）；当草稿变重（c→0.3+），γ 和 c 的联合优化才变成主要矛盾。</details>
+      </li>
+      <li>
+        EAGLE 用目标模型的 hidden state 做特征级草稿，相比 Medusa 的「多头各自预测」解决了什么？又引入了哪个新的训练难题？
+        <details><summary>参考答案</summary>
+        Medusa 的每个头独立预测未来第 k 个位置，位置之间没有条件依赖（第 3 个头不知道第 2 个头猜了什么），且只用最终 hidden state——信息瓶颈明显。EAGLE 把草稿器做成一个自回归小模型：输入是目标模型倒数第二层特征 + 已猜的草稿 token 序列，逐位置有依赖地生成草稿，特征信息更全、位置间一致，接受率因此显著更高。引入的新难题是训练-推理不一致（exposure bias 的变体）：训练时草稿器看到的是真值特征 + 真值前缀 token，推理时看到的却是自己上一步生成的特征和自己的草稿 token——特征与 token 双重漂移，位置越深衰减越狠（pos-acc 曲线断崖）。HASS（用草稿步骤特征训练）等工作就是在补这个缝，但单草稿器跨所有位置的泛化仍是瓶颈，催生了「位置专精草稿」一类后续工作。</details>
+      </li>
+      <li>
+        训练时内嵌 MTP 头（DeepSeek-V3 / GLM-5.2 路线）与推理时外挂草稿模型，各自的核心优势是什么？为什么说 MTP 路线与 RL 后训练存在耦合红利？
+        <details><summary>参考答案</summary>
+        外挂路线的优势是<strong>存量可用</strong>：任何已发布模型都能配草稿，且草稿可独立迭代（蒸馏、领域适配），不动目标模型的权重与部署。MTP 路线的优势是<strong>天然对齐</strong>：草稿头与主模型共享主干、在同一训练分布上联合优化，草稿分布与目标分布的错位最小，接受率上限高，且推理时无任何外部组件。耦合红利在于：RL 后训练会显著改变模型的输出分布（想想 GRPO 前后同一 prompt 的回答差异）——外挂草稿若在 SFT 时代训练，RL 后接受率会漂移衰减，需要随策略版本重训；而 MTP 头随主干一起被后训练更新（GLM-5.2 改进 MTP 层使接受长度 +20% 就是后训练期的成果），草稿始终跟随当前策略。这也是 verl-SpeCo 这类「RL 训练与推理共用草稿」工作出现的动机：在 rollout 循环里草稿与策略同源演化，加速收益不被分布漂移侵蚀。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>原始论文：Leviathan et al. <em>Fast Inference from Transformers via Speculative Decoding</em> <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">arXiv:2211.17192</a> · Chen et al. <em>Accelerating LLM Decoding with Speculative Sampling</em> <a href="https://arxiv.org/abs/2302.01318" target="_blank" rel="noopener">arXiv:2302.01318</a></li>
+      <li>草稿路线代表：Medusa <a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener">arXiv:2401.10774</a> · EAGLE <a href="https://arxiv.org/abs/2401.15077" target="_blank" rel="noopener">arXiv:2401.15077</a> · 位置专精分析 Poss <a href="https://arxiv.org/abs/2506.03566" target="_blank" rel="noopener">arXiv:2506.03566</a></li>
+      <li>汇总与生产口径：<a href="https://www.morphllm.com/speculative-decoding" target="_blank" rel="noopener">Morph: Speculative Decoding 汇总（含各方法加速比与公式）</a></li>
+      <li>相关笔记：<a href="daily-2026-09-01-kv-cache.html">KV cache 的一生（decode 为什么 memory-bound）</a> · <a href="daily-2026-08-28-glm-5-3.html">GLM-5.2/5.3 的 MTP 与混合注意力</a> · <a href="daily-2026-09-03-mercor-skyrl.html">Mercor 配方（rollout 侧系统天花板）</a> · <a href="special-2026-08-27-new-models-arch.html">特别篇：2026 新模型架构全景</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
