@@ -235,6 +235,27 @@
       "source": "rotation",
       "topic": "推测解码（Speculative Decoding）：draft-then-verify / 无损修正拒绝采样 / 加速比公式 / Medusa-EAGLE-MTP 草稿路线",
       "file": "posts/daily-2026-09-07-speculative-decoding.html"
+    },
+    {
+      "date": "2026-09-08",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "AInfer-PD：通信安全 in-place Prefill–Decode 复用（collective 序 / DeepEP 相位隔离 / 分布式 MoE rollout）",
+      "file": "posts/daily-2026-09-08-ainfer-pd.html"
+    },
+    {
+      "date": "2026-09-08",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "Harness-RL：Action–Args 解耦 + CAPO + 黑盒 Interface Call Record / session 前缀树",
+      "file": "posts/daily-2026-09-08-harness-harness-rl.html"
+    },
+    {
+      "date": "2026-09-08",
+      "domain": "algo",
+      "source": "algo",
+      "topic": "Adam / AdamW：一阶矩 / 二阶矩 / bias correction；解耦权重衰减（L2≠decay）",
+      "file": "posts/daily-2026-09-08-algo-adam.html"
     }
   ]
 }
