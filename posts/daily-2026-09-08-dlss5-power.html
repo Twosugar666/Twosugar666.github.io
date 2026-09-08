@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>显卡动态｜DLSS 5 上线首周：神经渲染的功耗账单、熔端子事件与 RTX 50 涨价复盘 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>显卡动态｜DLSS 5 上线首周：神经渲染的功耗账单、12V-2×6 又熔了一只，以及 RTX 50 系 8 月涨价复盘</h1>
+    <p class="post-meta">2026-09-08 · 收藏夹：显卡 · 领域轮更（gpu）<br />
+      信息来源与口径：<a href="https://videocardz.com/newz/first-user-reports-rtx-5090-with-melted-connector-after-testing-dlss-5" target="_blank" rel="noopener">VideoCardz（熔端子首报，2026-09-06）</a>、
+      <a href="https://www.techpowerup.com/352412/dlss-5-testing-ends-in-a-melted-rtx-5090-connector-power-shoots-past-600-w" target="_blank" rel="noopener">TechPowerUp（2026-09-06）</a>、
+      <a href="https://www.tomshardware.com/pc-components/gpus/enthusiast-says-dlss-5-pushed-rtx-5090-past-600w-and-melted-the-16-pin-connector-nvidias-neural-rendering-tech-adds-up-to-50-percent-more-power-draw-in-testing" target="_blank" rel="noopener">Tom's Hardware（2026-09-07）</a>、
+      <a href="https://www.ithome.com/0/998/778.htm" target="_blank" rel="noopener">IT之家转引外媒实测（2026-09-05）</a>、
+      价格表：<a href="https://www.tomshardware.com/pc-components/gpus/geforce-rtx-50-series-gpu-prices-spike-as-much-as-39-percent-as-blackwell-price-hikes-hit-the-us-rtx-5070-gets-a-36-percent-hike-rtx-5060-up-27-percent-at-the-median-of-newegg-listings" target="_blank" rel="noopener">Tom's Hardware Newegg 价格追踪（2026-08-10）</a>。
+      价格数据为 8 月统计（本主题「价格与供货」的月度复盘）；熔端子与 DLSS 5 功耗为过去 72 小时内的进行中事件，NVIDIA 尚未回应</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      DLSS 5 在今年 3 月 GTC 发布、9 月初随《NBA 2K27》正式上线（目前唯一官方支持的游戏）。
+      它与前代 DLSS 的本质区别是引入<strong>实时神经渲染（Neural Rendering）</strong>：不只是超分 + 帧生成，
+      而是用生成式模型为画面「补细节」（光照、材质、皮肤质感），主要算力负载落在 <strong>Tensor Core</strong> 上。
+      上线第一周，两条新闻把「AI 图形」与「硬件现实」撞在了一起：
+    </p>
+    <ul>
+      <li><strong>功耗账单浮现</strong>：多方实测 DLSS 5 显著推高显卡功耗，且越高端的卡增幅越大；</li>
+      <li><strong>首个熔端子报告</strong>（9 月 6 日）：一张 MSI RTX 5090 Gaming Trio OC 在 DLSS 5 测试中 12V-2×6 接口塑料熔化——正是 8 月 31 日<a href="daily-2026-08-31-pc-atx31.html">《ATX 3.1 / 12V-2×6》笔记</a>讨论过的失效模式，现在有了真实案例。</li>
+    </ul>
+    <p>本期把三件事放在一起读：DLSS 5 的功耗账单、熔端子事件该怎么解读、以及 8 月 RTX 50 系价格追踪数据（「价格与供货」的例行复盘）。</p>
+
+    <h2>核心内容</h2>
+
+    <h3>1. DLSS 5 的功耗账单：越强，涨得越多</h3>
+    <table>
+      <thead><tr><th>显卡 / 场景</th><th>开启 DLSS 5 前</th><th>开启后</th><th>变化</th><th>来源口径</th></tr></thead>
+      <tbody>
+        <tr><td>RTX 5090 / 4K</td><td>—</td><td>—</td><td><strong>+34%</strong></td><td>外媒实测（IT之家转引）</td></tr>
+        <tr><td>RTX 5070 Ti / WQHD</td><td>224 W</td><td>286 W</td><td>+62 W（约 +28%）</td><td>同上</td></tr>
+        <tr><td>RTX 5060 / 5060 Ti</td><td>—</td><td>—</td><td>增幅较小</td><td>同上</td></tr>
+        <tr><td>RTX 5090（MSI Gaming Trio OC，NBA 2K27）</td><td>约 450 W</td><td>持续 600 W+，GPU-Z 记录板载峰值 613.5 W</td><td>约 +36%，超该卡 575 W 额定</td><td>VideoCardz 读者 erek 实测</td></tr>
+        <tr><td>另一例：RTX 5090 / Hitman 3 注入 DLSS 5</td><td>435 W</td><td>520 W</td><td>+85 W</td><td>VideoCardz 转引论坛报告</td></tr>
+      </tbody>
+    </table>
+    <p>
+      机制上的解释（IT之家转引的分析口径）：DLSS 5 的负载主要压在 <strong>Tensor Core</strong> 而非传统 FP32 管线，
+      且神经渲染 + 超分 + 帧生成叠加的计算复杂度远高于前代；GPU 档位越高、Tensor Core 规模越大，被激活的功耗增量越明显。
+      Tom's Hardware 的测试口径是「<strong>up to 50% more power draw</strong>」。
+    </p>
+
+    <h3>2. 熔端子事件：事实、边界与正确读法</h3>
+    <p><strong>事实链</strong>（VideoCardz 首报，TechPowerUp/Tom's 跟进）：</p>
+    <ul>
+      <li>用户 erek 在 MSI RTX 5090 Gaming Trio OC（官方额定 575 W）上测试 NBA 2K27 的 DLSS 5 神经渲染；</li>
+      <li>功耗从约 450 W 升到<strong>持续 600 W 以上</strong>——注意是持续平台而非瞬时尖峰，GPU-Z 截图显示最大板载功率（Board Power Draw）613.5 W；</li>
+      <li>随后显卡停止工作，闻到烧焦味；接口塑料熔化、与插座粘连，难以拔出。</li>
+    </ul>
+    <p><strong>读这条新闻的三个保留</strong>（TechPowerUp 与 VideoCardz 均强调）：</p>
+    <ol>
+      <li><strong>GPU-Z 的 board power 是整板功耗，含 PCIe 插槽供电（最高 75 W）</strong>，不等于 12V-2×6 端子单独承载 613 W；</li>
+      <li>12VHPWR / 12V-2×6 熔端在<strong>其他负载下也有大量先例</strong>，单一案例不能证明 DLSS 5 是独立原因——但「把卡长时间钉在额定功耗之上」的负载特征，确实落在该接口失效模式的风险区；</li>
+      <li>NVIDIA 未就该事件及 DLSS 5 功耗问题发表评论。</li>
+    </ol>
+    <p>
+      与 <a href="daily-2026-08-31-pc-atx31.html">ATX 3.1 / PCIe 5.1 笔记</a>对接：那篇讲 12V-2×6 相对 12VHPWR 的触点改进与 600 W 级显卡对电源/线材的要求；
+      本周事件的增量信息是——<strong>持续 600 W+ 平台功率比瞬时尖峰更接近端子的热失效边界</strong>（接触电阻发热是 I²R 的时间积分），
+      「插紧、用原生线、避免侧弯」之外，还要警惕 DLSS 5 这类能把功耗曲线整体抬升的软件特性。
+    </p>
+
+    <h3>3. RTX 50 系 8 月价格复盘：MSRP 已成名义价格</h3>
+    <p>Tom's Hardware / TechPowerUp 的 Newegg 在售listing中位数追踪（2026 年 6 月 → 8 月）：</p>
+    <table>
+      <thead><tr><th>型号</th><th>MSRP</th><th>6 月中位价</th><th>8 月中位价</th><th>两月涨幅</th><th>相对 MSRP</th></tr></thead>
+      <tbody>
+        <tr><td>RTX 5050</td><td>$249</td><td>$299.99</td><td>$314.99</td><td>+5%</td><td>+26%</td></tr>
+        <tr><td>RTX 5060</td><td>$299</td><td>$369.99</td><td>$469.99</td><td><strong>+27%</strong></td><td>+57%</td></tr>
+        <tr><td>RTX 5060 Ti 8GB</td><td>$379</td><td>$469.99</td><td>$529.99</td><td>+13%</td><td>+40%</td></tr>
+        <tr><td>RTX 5060 Ti 16GB</td><td>$429</td><td>$569.99</td><td>$804.99</td><td><strong>+39%</strong>（全线最大）</td><td>+88%</td></tr>
+        <tr><td>RTX 5070</td><td>$549</td><td>$659.99</td><td>$899.99</td><td><strong>+36%</strong></td><td>+64%</td></tr>
+        <tr><td>RTX 5070 Ti</td><td>$749</td><td>$1099.99</td><td>$1099.99</td><td>持平（此前已涨完）</td><td>+47%</td></tr>
+        <tr><td>RTX 5080</td><td>$999</td><td>$1461.99</td><td>$1499.99</td><td>+3%</td><td>+50%</td></tr>
+        <tr><td>RTX 5090</td><td>$1999</td><td>$4299.99</td><td>$4699.99</td><td>+9%（基数已畸高）</td><td><strong>+135%</strong></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>原因链</strong>：AI 数据中心需求 → 全球内存（GDDR6/GDDR7 与 HBM 共用三大厂产能）涨价 → 显存成本经 AIB 厂商转嫁；行业估计内存已占整机 BOM 的 40%～50%（BornCity 汇总口径）；台积电先进制程晶圆涨价叠加。韩国 Danawa 数据显示 RTX 5090 当地 1~8 月累计涨 40.9%，并预警 9 月起可能再涨最多 30%；</li>
+      <li><strong>市场行为恶化</strong>：有用户在 NVIDIA 官方商城以 $4,429 下单 ASUS ROG Astral RTX 5090（已 2.3× MSRP），ASUS 仍取消订单并以 $4,982 重新上架；GIGABYTE 涨价最高 40% 导致日本零售商砍单预购；Amazon 第三方 listing 8 月底已达 $5,099～5,249；</li>
+      <li><strong>NVIDIA 官方至今沉默</strong>，仅在 QuakeCon 2026 做过限量的 MSRP Founders Edition 直销；</li>
+      <li>另一条相关信号：Intel 宣布 150 亿美元普通股发行计划，资金投向点名先进封装与外部晶圆——上游成本压力是全行业的。</li>
+    </ul>
+
+    <h2>选购建议</h2>
+    <ul>
+      <li><strong>“等降价”当前没有依据</strong>：内存侧（AI 服务器挤占产能）与晶圆侧的压力都指向 2026 年内难缓解，Danawa 还在预警再涨 30%。要么现在买，要么明确改买前代。</li>
+      <li><strong>扭曲最小的档位</strong>：RTX 5070 Ti 与 5080 本月价格持平——不是便宜，而是通胀在 6 月前已计入；相对「现在上车」的边际代价最低。RTX 5060 Ti 16GB（+88% MSRP）与 5070（+64%）是当前扭曲最严重的甜蜜点型号，尽量避开或转看 AMD 同档位。</li>
+      <li><strong>前代/二手是真实选项</strong>：RTX 40 / 30 系在 1080p~1440p 仍有战斗力，且不付「GDDR7 短缺溢价」；二手重点查显存温度历史与挖矿痕迹。</li>
+      <li><strong>买 5090 级显卡的电源与接线清单</strong>（结合本次熔端事件与 <a href="daily-2026-08-31-pc-atx31.html">ATX 3.1 笔记</a>）：ATX 3.1 电源、原生 12V-2×6 线（不用转接）、插到底听到咔哒、接头处 35mm 内不弯折；开 DLSS 5 这类神经渲染特性时，用 GPU-Z 观察「持续板载功率」而非峰值——持续 600 W 平台比尖峰危险。</li>
+      <li><strong>关注 DLSS 5 的功耗声明</strong>：装机电源余量建议按「TGP + 神经渲染增幅（高端卡约 +30~35%）」重新核算，5070 Ti 实测 +62 W、5090 +150 W 以上，原来的 850 W「够用」结论可能需要上修。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么 DLSS 5 的功耗增幅随显卡档位放大（5060 增幅小、5090 +34%）？这对「TDP 标注还能不能代表真实功耗上限」意味着什么？
+        <details><summary>参考答案</summary>
+        神经渲染负载主要在 Tensor Core 上：档位越高，Tensor Core 的规模与频率预算越大，可被 AI 负载激活的功耗空间越大；低端卡的 Tensor Core 规模小、且本就受功耗墙限制，增幅自然小。这意味着「TDP/TGP」这个以传统光栅负载标定的数值，对含重 Tensor 负载的新工作负载系统性偏低——5090 额定 575 W（AIB 口径）被实测推到 613.5 W 板载功率就是例证。对消费者的含义：电源与散热选型不能再按标称 TGP 打 1.2 倍余量，而要按「最重 AI 负载」实测口径重新核算；对厂商的含义：TDP 的定义需要纳入神经渲染类负载，否则标称与实际之间的缺口会成为新的投诉与失效来源。</details>
+      </li>
+      <li>
+        GPU-Z 记录「Board Power Draw 613.5 W」，为什么不能据此断言「12V-2×6 端子过了 613 W」？这个区分对事故归因为什么重要？
+        <details><summary>参考答案</summary>
+        板载功率 = 12V-2×6 端子输入 + PCIe 插槽供电（规范内最高 75 W）之和。613.5 W 板载功率中，端子实际承担的可能是 540~600 W 之间的任何值，取决于板卡的供电分配设计。归因上的重要性：12V-2×6 的失效阈值与「单端子电流」直接相关，若插槽分担了可观功率，端子侧的裕度结论完全不同；把整板功率当作端子功率会把「软件特性推高功耗」与「端子设计缺陷」两条因果线错误合并。VideoCardz 与 TechPowerUp 在报道中主动做了这个切分，是硬件新闻里难得的严谨；读者看任何「烧端子」新闻都应先问：报的是板载功率还是端子电流。</details>
+      </li>
+      <li>
+        为什么说「持续 600 W 平台」比「瞬时 800 W 尖峰」对 12V-2×6 端子更危险？用失效的物理机制解释。
+        <details><summary>参考答案</summary>
+        端子失效链条是：接触不良/微氧化 → 接触电阻上升 → 焦耳热 P = I²R 在触点累积 → 塑料软化 → 接触进一步恶化 → 热失控熔化。关键在时间积分：瞬时尖峰（几百毫秒）产生的总热量被端子与线材的热容吸收，温度来不及爬到塑料软化点；持续平台则让触点温度单调爬升至稳态——而 12V-2×6 在 600 W 满载时本就逼近设计边界，持续超载使最弱触点先进入正反馈。DLSS 5 这类负载的危险性恰在于把功耗曲线从「脉冲型」变成「高位平台型」：它不改变峰值，改变的是占空比。这与电源的 OCP/OPP 保护逻辑也是错位的——保护针对过流尖峰，对「额定内持续高位」几乎不设防。</details>
+      </li>
+      <li>
+        拆解 8 月涨价的传导链：为什么显存成本上涨对 RTX 5090（+135% MSRP）的扭曲远大于 RTX 5050（+26%）？除了 BOM 占比，还有什么机制？
+        <details><summary>参考答案</summary>
+        直接机制是 BOM：5090 配 32GB GDDR7，5050 配 8GB，显存涨价绝对额按容量放大；行业估计内存已占整机 BOM 40~50%，容量越高被涨价的份额越大。但 BOM 解释不了「扭曲比例」远超容量比例的部分，二级机制有三：① 稀缺预期下的渠道加价具有棘轮效应——高端卡买家价格敏感度低，AIB 与零售商优先在高端压货抬价（ASUS 取消已成交订单重新定价就是极端样本）；② 替代性差异：5050 有前代/AMD 替代品压着价格上限，5090 在「32GB 大显存 + 本地 AI 推理」上没有替代品，AI 玩家与游戏玩家双向竞价；③ MSRP 锚定失真：NVIDIA 不调官方 MSRP，媒体表中的「相对 MSRP」分母是名义值，实际出厂价（AIB 拿货价）早已上调，账面扭曲被进一步放大。读这类价格表时，「环比涨幅」比「相对 MSRP」更接近真实边际变化。</details>
+      </li>
+      <li>
+        假设你今天必须装一台主力机（预算 $1,500 显卡档），用文中数据论证你的选择，并给出电源与接线的配套要求。
+        <details><summary>参考答案</summary>
+        一个自洽的论证路径：候选落在 RTX 5070（$900，+64% MSRP）、5070 Ti（$1,100，本月持平）与 5080（$1,500，+50%）之间。5070 是本月扭曲最严重的中端（+36% 单月），排除；5070 Ti 与 5080 的通胀已在前期计入、本月边际零涨幅，且 5070 Ti 留 $400 预算给电源与其他件——按「边际代价最小」原则选 5070 Ti。配套：① 电源按 TGP + 神经渲染增幅核算（5070 Ti 实测 224→286 W），选 750 W ATX 3.1 金牌以上；② 原生 12V-2×6 线、插到底、35mm 内不弯折；③ 若用 DLSS 5 类特性，首小时用 GPU-Z 记录持续板载功率而非峰值，确认平台功率在额定内。若接受 AMD，同价位 RX 9070 系不受 GDDR7 短缺溢价主导，是同等预算下帧率更高的替代——代价是 DLSS 5 生态缺席。这个答案不唯一，评分点在「用了环比而非 MSRP 锚定」和「把 DLSS 5 功耗纳入电源核算」。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>熔端子事件：<a href="https://videocardz.com/newz/first-user-reports-rtx-5090-with-melted-connector-after-testing-dlss-5" target="_blank" rel="noopener">VideoCardz 首报（2026-09-06）</a> · <a href="https://www.techpowerup.com/352412/dlss-5-testing-ends-in-a-melted-rtx-5090-connector-power-shoots-past-600-w" target="_blank" rel="noopener">TechPowerUp</a> · <a href="https://www.tomshardware.com/pc-components/gpus/enthusiast-says-dlss-5-pushed-rtx-5090-past-600w-and-melted-the-16-pin-connector-nvidias-neural-rendering-tech-adds-up-to-50-percent-more-power-draw-in-testing" target="_blank" rel="noopener">Tom's Hardware（2026-09-07）</a></li>
+      <li>DLSS 5 功耗实测：<a href="https://www.ithome.com/0/998/778.htm" target="_blank" rel="noopener">IT之家转引外媒（2026-09-05）</a> · TechPowerUp《NVIDIA DLSS 5 Technical Preview》评测（2026-09-01，站内评测栏目）</li>
+      <li>价格追踪：<a href="https://www.tomshardware.com/pc-components/gpus/geforce-rtx-50-series-gpu-prices-spike-as-much-as-39-percent-as-blackwell-price-hikes-hit-the-us-rtx-5070-gets-a-36-percent-hike-rtx-5060-up-27-percent-at-the-median-of-newegg-listings" target="_blank" rel="noopener">Tom's Hardware（Newegg 中位价，2026-08-10）</a> · <a href="https://www.techpowerup.com/351508/nvidia-rtx-50-series-median-prices-jump-up-to-41-in-august-with-msrp-now-a-distant-dream" target="_blank" rel="noopener">TechPowerUp（2026-08-11）</a></li>
+      <li>相关笔记：<a href="daily-2026-08-31-pc-atx31.html">12V-2×6 之后：ATX 3.1 / PCIe 5.1 配件如何决定 600W 级 GPU 能不能活</a> · <a href="daily-2026-08-31-gpu-rubin.html">NVIDIA Rubin：数据中心侧的供需背景</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
