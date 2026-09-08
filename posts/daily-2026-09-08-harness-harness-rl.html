@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Harness-RL：中央 Agent 多 Agent Harness 的 Action–Args 解耦与 CAPO · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Harness-RL：中央 Agent 多 Agent Harness 的 Action–Args 解耦与 CAPO</h1>
+    <p class="post-meta">2026-09-08 · 收藏夹：Harness / Agent / RL · 学习笔记<br />
+      论文：Jiang et al. · <em>Harness-RL: Black-Box Reinforcement Learning with Action–Args Decoupling for Central-Agent Multi-Agent Harnesses</em> ·
+      arXiv <a href="https://arxiv.org/abs/2608.29641" target="_blank" rel="noopener">2608.29641</a>（2026-08-30）·
+      代码 <a href="https://github.com/jiangxinke/Harness-RL" target="_blank" rel="noopener">github.com/jiangxinke/Harness-RL</a>。
+      F1 为<strong>论文自报</strong>。交叉：
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a>、
+      <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>、
+      <a href="grpo-notes.html">GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程任务越来越多走<strong>多 Agent harness</strong>：一个中央 Agent 调度子 Agent、工具与环境，而不是单模型扁平 tool-call。
+      训练中央策略时，两件事会同时为难「把整段对话压成一条 token 序列再乘一个序列级 advantage」的默认做法：
+    </p>
+    <ul>
+      <li><strong>Action vs Args 异构</strong>：动作标签是低基数决策（调谁 / 调哪类接口），args 是高维条件序列（参数、子查询、上下文改写）。共用一个序列级信号，梯度容易在「选动作」与「填参数」之间互相打架。</li>
+      <li><strong>会话不是扁序列</strong>：动态调度带来分支、并行调用、上下文重写；接口调用之间有前缀依赖，压成一条平坦 token 流会丢掉 session 结构。</li>
+    </ul>
+    <p>
+      Harness-RL 的回答分两块：① <strong>黑盒轨迹构造</strong>——在接口层记 Interface Call Record，按 session 建前缀树，把 outcome / process reward 对齐到可训 token；② <strong>CAPO（Conflict-Aware Policy Optimization）</strong>——用前向激活找出与 action / args token 相关的参数分区，再把对应策略梯度路由到子空间。支持只训中央，也支持联合多 Agent。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：中央 harness 策略的瓶颈常不在「再堆一个 GRPO」，而在「动作标签与参数序列不应共享同一冲突梯度、会话图不应被压扁」；Harness-RL 用黑盒接口轨迹 + CAPO 分区更新来处理这两点。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 中央 Agent harness：谁在被优化</h3>
+    <pre><code># 典型拓扑
+Central policy ──调用──► Sub-agent / Tool / Env
+        │                    │
+        │              返回观测 / 中间结果
+        ▼
+   改写上下文、分支、并行 session
+
+# 训练对象（论文设定）
+# - central-only：只更新中央策略（评估设定下更优）
+# - joint：中央 + 部分子 Agent 一起更
+
+# 与「单 Agent 扁平 tools」差别
+# 扁平：一次生成 = 选 tool + 填 JSON args（仍是一条序列）
+# harness：多次接口调用、多 session、可并行；中央在调度图上决策
+</code></pre>
+    <p>
+      这与站内 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、<a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a> 的问题对齐：部署时 harness 的控制流，训练时也必须被看见——否则 RL 优化的是「被压扁后的影子策略」。
+    </p>
+
+    <h3>② 黑盒轨迹：Interface Call Record + session 前缀树</h3>
+    <table>
+      <thead><tr><th>构件</th><th>内容</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Interface Call Record</strong></td>
+          <td>一次接口调用的可观测记录（谁调用、何接口、args、返回、时间序）</td>
+          <td>不依赖内部思维链是否可微；黑盒对齐部署合同</td>
+        </tr>
+        <tr>
+          <td><strong>Per-session prefix tree</strong></td>
+          <td>按会话把调用组织成前缀树（分支 / 并行可表达）</td>
+          <td>避免「一条扁平 token 序列」抹掉依赖</td>
+        </tr>
+        <tr>
+          <td><strong>Reward 对齐</strong></td>
+          <td>outcome（终局）与 process（过程）奖励对齐到可训 token</td>
+          <td>信用落到真正由策略负责的生成片段</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 概念：不要把整段 chat 当成唯一轨迹对象
+# 而以「接口调用」为原子，再挂回可训 token
+
+ICR = {
+  session_id, parent_call_id,
+  action_label,   # 低基数：调哪个接口 / 子 Agent
+  args_tokens,    # 高维条件序列
+  observation,
+  ...
+}
+
+# 同一 session 内：调用形成前缀树
+# 并行 session：多棵树；中央负责调度边
+# reward：终点 F1 / 任务成功 → 回挂到树上的可训节点
+</code></pre>
+    <p>
+      「黑盒」在这里不是不可知论，而是<strong>合同边界</strong>：训练看见的单位与部署时 harness 的接口单位一致（对照 <a href="daily-2026-08-31-harness-tito.html">TITO</a>：Token-In-Token-Out 纪律；对照 <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>：不改控制流接 PG）。
+    </p>
+
+    <h3>③ CAPO：Action / Args 冲突感知的分区梯度</h3>
+    <pre><code># 朴素做法（易冲突）
+loss = sequence_level_surrogate(all_tokens, shared_advantage)
+# action 标签 token 与 args token 吃同一 A、同一大参数空间更新
+
+# CAPO 精神
+# 1) 前向激活：估计哪些参数分区更响应 action token / args token
+# 2) 构造 Action 子空间 vs Args 子空间
+# 3) 把对应 token 的 policy gradient 路由到对应子空间
+#    → 降低「选接口」与「填参数」的梯度互扰
+
+# 示意（非论文公式逐字）
+g_action = grad_from(action_tokens)  →  apply_in(Θ_action)
+g_args   = grad_from(args_tokens)    →  apply_in(Θ_args)
+# 共享干路仍可存在；关键是冲突方向被分流
+</code></pre>
+    <p>
+      直觉：action 是分类器式决策，args 是条件语言建模；二者曲率与噪声结构不同。强行共享序列级信号，常见症状是「接口选对了但参数胡写」或「参数局部过拟合却选错工具」。CAPO 用激活分区把更新拆开，而不是再堆一个更大的 clip。
+    </p>
+
+    <h3>④ 论文自报结果与消融意味</h3>
+    <table>
+      <thead><tr><th>设定</th><th>指标</th><th>数字（论文自报）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Qwen2.5-1.5B · 七项多跳 QA / agentic retrieval 均分</td>
+          <td>Average F1</td>
+          <td><strong>42.93</strong></td>
+        </tr>
+        <tr>
+          <td>Qwen2.5-3B · 同上</td>
+          <td>Average F1</td>
+          <td><strong>47.79</strong></td>
+        </tr>
+        <tr>
+          <td>消融</td>
+          <td>CAPO 贡献</td>
+          <td>论文报告 CAPO 有效</td>
+        </tr>
+        <tr>
+          <td>训练范围</td>
+          <td>central-only vs joint</td>
+          <td>评估设定下<strong>更偏向 central-only</strong></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      central-only 更优并不反直觉：子 Agent / 工具若已是较强专用模块，联合更新易引入非平稳与信用稀释；先把中央调度训稳，往往是更便宜的杠杆——与「先冻工具、训路由器」的工程常识同构。数字以作者报告为准，落地前用自己的七项或内部检索集复测。
+    </p>
+
+    <h3>⑤ 放回站内谱系</h3>
+    <pre><code>Harness 运行时（工具/上下文/环境）
+    → TITO（轨迹合同：token 边界清晰）
+    → Lightning / Lego-RL（部署 harness 进训练环 / 不改控制流接 PG）
+    → Harness-RL（中央多 Agent：黑盒 ICR + 前缀树 + CAPO 分区）
+
+还没解决的（本文不声称）：
+    - 任意开源 harness 的一键适配
+    - CAPO 分区在超大 MoE 上的稳定估法
+    - 与过程奖励 / 裁判模型的系统组合拳
+</code></pre>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画接口图再写 loss。</strong> 列出中央可调的 action 集合与 args schema；若画不出来，序列级 RL 多半在优化影子行为。</li>
+      <li><strong>日志以 ICR 为原子。</strong> session_id / parent / action / args / obs 齐全，才能建前缀树与对齐 reward；只存整段 chat transcript 不够。</li>
+      <li><strong>Action / Args 分指标。</strong> 分别盯「选对接口率」与「参数可执行率 / 子查询命中」，比只看终点 F1 更能发现冲突梯度。</li>
+      <li><strong>默认试 central-only。</strong> 子模块强时先冻住；joint 作为消融，而不是默认全家桶。</li>
+      <li><strong>CAPO 要有探针。</strong> 分区是否漂移、action 子空间是否被 args 梯度污染——需要激活/梯度统计，而不是只看 reward 曲线。</li>
+      <li><strong>与 TITO 一起守。</strong> 黑盒接口轨迹仍要 token 边界清晰；掩码、工具旁路、重写上下文时，可训 token 集合必须可复现。</li>
+      <li><strong>小模型先行。</strong> 论文主表在 1.5B/3B；先在同量级验证合同与 CAPO，再放大中央策略。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「动作标签 + args」共用一个序列级 advantage 容易产生冲突梯度？
+        <details><summary>参考答案</summary>
+        动作是低基数离散决策，args 是高维条件生成；同一 A 会同时推「改选接口」与「改写参数」。二者最优方向常不一致（例如应换工具而非微调错误工具的参数），共享更新导致互相干扰或一方主导。</details>
+      </li>
+      <li>
+        扁平 chat 序列为什么表达不好并行 session 与分支调用？
+        <details><summary>参考答案</summary>
+        线性化会强加一个总序，抹掉并行与共享前缀结构；父调用与子调用的依赖、可复用前缀、分支失败回滚在扁序列里变成位置噪声。前缀树按 session 保留这些边，reward 才能挂回正确节点。</details>
+      </li>
+      <li>
+        「黑盒」Interface Call Record 与「必须开思维链可微」有何区别？
+        <details><summary>参考答案</summary>
+        ICR 对齐的是部署时可观测的接口合同（调用与返回），不要求内部 &lt;think&gt; 参与梯度。思维链可微是另一条研究线。黑盒路线的收益是训推一致、少泄露私有推理格式；代价是过程信用更依赖 reward 设计与树对齐。</details>
+      </li>
+      <li>
+        为何评估设定下 central-only 可能优于 joint？
+        <details><summary>参考答案</summary>
+        联合更新引入多方非平稳：子策略一变，中央面对的「环境」就变。子 Agent 已较强时，中央调度的边际收益更高，且信用分配更短。Joint 适合子模块明显是瓶颈且有稳定联合奖励时再开。</details>
+      </li>
+      <li>
+        CAPO 的分区若估错（action/args 子空间严重重叠）会怎样？如何发现？
+        <details><summary>参考答案</summary>
+        路由失效，退回近似共享更新，冲突依旧；或错误隔离导致该共享的特征也被拆开，学习变慢。监测：两类 token 的梯度余弦、分区重叠率、分项指标（选接口 vs 填参）是否一项长期牺牲另一项。重叠高就回到特征/损失设计，而不是加大学习率。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Jiang et al. · Harness-RL：
+        <a href="https://arxiv.org/abs/2608.29641" target="_blank" rel="noopener">arXiv:2608.29641</a> ·
+        <a href="https://github.com/jiangxinke/Harness-RL" target="_blank" rel="noopener">GitHub</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="grpo-notes.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
