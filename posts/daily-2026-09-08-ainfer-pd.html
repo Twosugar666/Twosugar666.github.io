@@ -1,1 +1,239 @@
-PLACEHOLDER
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜AInfer-PD：分布式 MoE Rollout 的通信安全 in-place Prefill–Decode 复用 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜AInfer-PD：分布式 MoE Rollout 的通信安全 in-place Prefill–Decode 复用</h1>
+    <p class="post-meta">2026-09-08 · 收藏夹：Infra / RL · 一线追踪<br />
+      论文：Wang et al. · <em>AInfer-PD: Communication-Safe In-Place Prefill–Decode Multiplexing for Distributed MoE Rollouts</em> ·
+      arXiv <a href="https://arxiv.org/abs/2609.00993" target="_blank" rel="noopener">2609.00993</a>（2026-09-01 提交）。
+      文中加速比与消融数字均为<strong>论文自报</strong>；交叉：
+      <a href="daily-2026-09-01-kv-cache.html">KV cache / PD 分离</a>、
+      <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>、
+      <a href="daily-2026-08-31-miles-v01.html">Miles</a>、
+      <a href="daily-2026-08-26-granite-4-2.html">异步 GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      大规模 LLM RL 的墙上时间里，<strong>rollout 推理</strong>经常比梯度更新更贵。
+      Agentic RL 里每条轨迹在「模型生成 ↔ 环境交互」之间多轮切换：异步队列下，有的轨迹刚回到模型端要做新的 <strong>prefill（P）</strong>，另一些还在 <strong>decode（D）</strong>——P/D 并存不再是「开局 ingest 一次 prompt」的短暂现象，而是 rollout 的常态。
+    </p>
+    <p>
+      两条经典出路各有代价：
+    </p>
+    <ul>
+      <li><strong>P/D 分离</strong>（Splitwise / DistServe / Mooncake 一系）：P 与 D 分池，通信域干净，但要单独设备池 + KV 搬运（见站内 <a href="daily-2026-09-01-kv-cache.html">KV cache 笔记</a>）。</li>
+      <li><strong>In-place multiplexing</strong>：同机共享权重与 KV，吞吐友好，但在「注意力 TP/DP × 分布式专家（DeepEP）」的大 MoE 上，P/D 会发出交叉 collective，跨 rank 顺序不一致就会死锁或损坏协议状态。</li>
+    </ul>
+    <p>
+      AInfer-PD 赌的是第二条路能走通：给 in-place P/D 补上<strong>通信合同</strong>——统一跨 rank 的 P/D collective 序，并给 DeepEP 的 P/D 路径各自独立的协议状态——让共享设备上的并发 P/D 对 MoE rollout 安全。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Agentic RL 的异步轨迹把 P/D 共存变成常态；AInfer-PD 用「collective 排序 + DeepEP 相位隔离」让 in-place multiplexing 在分布式 MoE 上可跑，论文自报相对关复用的同引擎与 SGLang 有两位数百分比的固定负载完成时间下降。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 问题：为什么「同机 P/D」在 MoE 上会炸通信</h3>
+    <pre><code># Agentic / 异步 rollout（示意）
+traj A:  ... env ... → 回到模型 → PREFILL(新上下文)
+traj B:  仍在 DECODE(续写)
+
+# 共享加速器上：
+#   Prefill：吞吐型、突发、易占带宽 / SM
+#   Decode：延迟敏感、逐步发 collective
+
+# 大 MoE 典型并行：
+#   Attention：TP / DP（文中 ADP/ATP）
+#   Experts：DeepEP 等分布式专家路径
+
+# 失败模式（论文诊断）
+# 1) P 与 D 发出相交的 collective，跨 rank 顺序不一致 → 死锁 / 语义错乱
+# 2) DeepEP 的 P 路径与 D 路径共享可变协议状态（buffer / counter / QP）
+#    → 并发时互相踩状态
+</code></pre>
+    <p>
+      这不是「调度不优雅」的软问题，而是<strong>分布式运行时正确性</strong>：一旦 P/D 在共享通信原语上无隔离，加速数字无从谈起。
+      与 PD 分离对比：分离用物理分池换隔离；AInfer-PD 用合同换隔离，保住「一份权重 + 一份 KV」。
+    </p>
+
+    <h3>② 设计：集体序协调 + DeepEP 相位私有状态</h3>
+    <table>
+      <thead><tr><th>组件</th><th>做什么</th><th>换来什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>P/D collective 排序</strong></td>
+          <td>跨 rank 统一相交 ADP/ATP collective 的发出顺序</td>
+          <td>避免不一致序导致的死锁 / 错配</td>
+        </tr>
+        <tr>
+          <td><strong>DeepEP 相位隔离</strong></td>
+          <td>P 与 D 各有 buffer、counter、workspace、event、QP 区间</td>
+          <td>两条路径可并存，不共享可变协议状态</td>
+        </tr>
+        <tr>
+          <td><strong>In-place 调度</strong></td>
+          <td>同设备协调 P 与 D；共享模型权重与 KV</td>
+          <td>免 KV 跨池搬运；设备利用率更高</td>
+        </tr>
+        <tr>
+          <td><strong>细粒度边界</strong></td>
+          <td>相对「整 epoch 异步入队」，更细的安全边界</td>
+          <td>同引擎消融再省完成时间（论文自报）</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 概念合同（非实现伪代码）
+on_rank_r:
+  if phase == PREFILL:
+    use deep_ep_state_P   # 独立 QP / counter / workspace
+    enqueue_collectives_in_global_P_order(...)
+  elif phase == DECODE:
+    use deep_ep_state_D
+    enqueue_collectives_in_global_D_order(...)
+
+# 相交 collective：所有 rank 看到同一全序
+# 不相交路径：可并行，但不得共享可变协议状态
+</code></pre>
+    <p>
+      读法：AInfer-PD 不是再发明一套 PD 分离拓扑，而是把「同副本上的相位共存」写成可证明/可执行的通信契约。
+      这对 RL 栈的意义很直接——异步 actor 越多，P/D 交织越狠；合同越硬，越敢把生成池拉满（对照 <a href="daily-2026-08-26-granite-4-2.html">Granite 异步 GRPO</a> / <a href="daily-2026-08-31-miles-v01.html">Miles</a> 的吞吐叙事）。
+    </p>
+
+    <h3>③ 和 PD 分离、ExpertPlex 的位置</h3>
+    <table>
+      <thead><tr><th>路线</th><th>设备 / 状态</th><th>主要代价</th><th>适合什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>PD 分离（Mooncake 等）</td>
+          <td>P/D 分池；KV 传输</td>
+          <td>池规划 + 传输延迟 / 带宽</td>
+          <td>在线服务、P/D 负载差极大</td>
+        </tr>
+        <tr>
+          <td>ExpertPlex 式混合</td>
+          <td>注意力分离、专家池共享（相关工作）</td>
+          <td>拓扑更复杂</td>
+          <td>专家成为瓶颈时的折中</td>
+        </tr>
+        <tr>
+          <td><strong>AInfer-PD in-place</strong></td>
+          <td>一份模型 + KV；合同隔离通信</td>
+          <td>实现复杂度在 runtime / DeepEP</td>
+          <td>RL rollout：异步 P/D 常态、想少搬 KV</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      站内 KV 笔记把 PD 分离讲成「显存与流水账本」；本文补另一侧：<strong>当你选择不分离时，通信隔离怎么做</strong>。
+      两条路不是互斥教条——生产里常见「训练 rollout in-place、在线服务 PD 分离」。
+    </p>
+
+    <h3>④ 论文自报结果（未第三方复测）</h3>
+    <table>
+      <thead><tr><th>设定</th><th>对比</th><th>固定负载 rollout 完成时间</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>单节点 · prefill 密集 · 重复 workload</td>
+          <td>同 AInfer 引擎关 P/D 复用</td>
+          <td><strong>−7.1% ~ −22.5%</strong>（论文自报）</td>
+        </tr>
+        <tr>
+          <td>同上</td>
+          <td>相对 SGLang</td>
+          <td><strong>−24.8% ~ −32.9%</strong>（论文自报）</td>
+        </tr>
+        <tr>
+          <td>两节点</td>
+          <td>关复用 / 相对 SGLang</td>
+          <td><strong>−18.0% ~ −35.3%</strong> / <strong>−18.3% ~ −31.8%</strong>（论文自报）</td>
+        </tr>
+        <tr>
+          <td>同引擎消融</td>
+          <td>细粒度边界 vs 整 epoch 异步入队</td>
+          <td>再降 <strong>8.6% ~ 19.8%</strong>（论文自报）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      读数字时钉两件事：① 指标是<strong>固定 workload 的完成时间</strong>，不是单请求 TTFT；② 对比含「同引擎关复用」与「SGLang」，前者更干净地归因 multiplexing 合同，后者混有引擎差异。复现前先对齐 MoE 并行拓扑与 DeepEP 版本。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画自己的 P/D 共存图。</strong> 同步 batch RL 可能几乎无长期共存；异步 agentic RL 几乎一定有。没有共存，就别为 in-place 合同付复杂度税。</li>
+      <li><strong>选型清单：池规划成本 vs runtime 正确性成本。</strong> 设备够、KV 传输链路成熟 → PD 分离更省心；设备紧、KV 大、rollout 同机 → 才值得看 AInfer-PD 这类合同。</li>
+      <li><strong>DeepEP / 专家并行是硬前提。</strong> 纯 dense TP 上的 P/D 干扰与「专家路径共享协议状态」不是同一类 bug；对齐论文设定再对标数字。</li>
+      <li><strong>把 collective 序写进测试。</strong> 混沌调度（随机延迟注入）比只跑平均吞吐更能抓住死锁级回归。</li>
+      <li><strong>细粒度边界单独消融。</strong> 论文显示边界粒度本身值几个点到十几百分点；实现时别把「能异步入队」当成已经最优。</li>
+      <li><strong>与推测解码正交。</strong> <a href="daily-2026-09-07-speculative-decoding.html">Speculative decoding</a> 改的是单请求验收路径；AInfer-PD 改的是多轨迹 P/D 在分布式 MoE 上的共存。可叠加，但归因要分轴。</li>
+      <li><strong>对待自报加速。</strong> 用自己的固定 workload（同 prompt 集、同并行度、同停止条件）重跑「开/关复用」再决定是否合入主栈。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么 agentic RL 会把 P/D 共存从「偶发」变成「常态」？
+        <details><summary>参考答案</summary>
+        多轮「生成–环境」交替 + 异步多轨迹：环境返回时间不同，有的轨迹已带着更长上下文回来要 prefill，有的仍在逐步 decode。共享加速器上两相位长期并存，而不只是开局 ingest。</details>
+      </li>
+      <li>
+        PD 分离与 AInfer-PD 各自用什么换「通信隔离」？
+        <details><summary>参考答案</summary>
+        PD 分离用物理分池（独立设备与通信域）+ KV 传输换隔离。AInfer-PD 用跨 rank collective 全序 + DeepEP 相位私有状态，在共享权重/KV 的前提下换隔离。前者付池与带宽，后者付 runtime 合同复杂度。</details>
+      </li>
+      <li>
+        DeepEP「共享可变协议状态」为什么比「算力争用」更致命？
+        <details><summary>参考答案</summary>
+        算力争用主要伤延迟与吞吐；共享 counter / QP / workspace 会在并发下破坏协议语义，导致死锁、错包或静默损坏——属于正确性问题。吞吐优化建立在正确性之上。</details>
+      </li>
+      <li>
+        为什么「相对同引擎关复用」比「相对 SGLang」更适合归因 multiplexing？
+        <details><summary>参考答案</summary>
+        同引擎开关只动 P/D 复用与合同，其它内核/调度变量更可控。相对 SGLang 混入引擎实现差异，适合工程对标，不适合单独证明合同设计的因果贡献。论文两者都报，读时要分开。</details>
+      </li>
+      <li>
+        细粒度安全边界为什么能再降完成时间？
+        <details><summary>参考答案</summary>
+        整 epoch 异步入队会把过大的临界区或过粗的同步点留给调度，P/D 可重叠的窗口变小。更细的边界让安全合同覆盖更小片段，合法并发区间变大，固定负载下墙钟下降——前提是边界本身仍保证 collective 序与状态隔离。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Wang et al. · AInfer-PD：
+        <a href="https://arxiv.org/abs/2609.00993" target="_blank" rel="noopener">arXiv:2609.00993</a> ·
+        <a href="https://arxiv.org/pdf/2609.00993" target="_blank" rel="noopener">PDF</a></li>
+      <li>相关系统脉络：Splitwise / DistServe / Mooncake（PD 分离）；DeepEP（分布式专家通信）</li>
+      <li>站内交叉：
+        <a href="daily-2026-09-01-kv-cache.html">KV cache / PD 分离</a> ·
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a> ·
+        <a href="daily-2026-08-26-granite-4-2.html">Granite 异步 GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
