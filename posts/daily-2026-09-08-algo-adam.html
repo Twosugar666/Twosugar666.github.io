@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Adam / AdamW：自适应矩估计与解耦权重衰减 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Adam / AdamW：自适应矩估计与解耦权重衰减</h1>
+    <p class="post-meta">2026-09-08 · 收藏夹：算法 · 学习笔记<br />
+      经典课：Kingma &amp; Ba · Adam（ICLR 2015）；Loshchilov &amp; Hutter · AdamW / Decoupled Weight Decay（ICLR 2019）。
+      交叉：
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>。
+      公式一律用 <code>pre</code>，不用 LaTeX。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      后训练栈里，大家天天调 clip、advantage、sampling——但参数真正怎么走一步，往往默认交给 <strong>Adam / AdamW</strong>。
+      它不是 RL 专属算法，却是几乎所有 LLM 预训练与 RL 阶段的<strong>默认一阶优化器</strong>：用一阶矩（动量）与二阶矩（自适应尺度）给每个参数一份「个人学习率」，再用 bias correction 修好初期估计。
+    </p>
+    <p>
+      本课把三件事钉死：① Adam 更新在算什么；② 为何初期要 bias correction；③ 为何「Adam + L2」不等于权重衰减，以及 AdamW 如何把 decay <strong>解耦</strong>到参数步之外——这与 PPO/GRPO 的稳定训练同样基础。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Adam = 偏置校正后的动量 / 自适应二阶矩步；AdamW = 同一自适应步 + 与梯度统计解耦的权重衰减。LLM 时代默认写 AdamW，不是因为名字多一个 W，而是因为自适应算法里 L2≠decay。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① SGD → Momentum → RMSprop 式自适应：Adam 的两块积木</h3>
+    <pre><code># 目标：min_θ L(θ)；第 t 步随机梯度 g_t = ∇_θ L_t(θ_{t-1})
+
+# SGD
+θ ← θ - η · g
+
+# Momentum（一阶矩）：平滑梯度方向
+m ← β1 · m + (1-β1) · g
+θ ← θ - η · m
+
+# 自适应尺度（二阶矩，RMSprop / Adagrad 精神）：按历史能量缩放
+v ← β2 · v + (1-β2) · g²          # 元素级平方
+θ ← θ - η · g / (sqrt(v) + ε)
+
+# Adam：两块一起做（未校正版示意）
+m_t = β1 · m_{t-1} + (1-β1) · g_t
+v_t = β2 · v_{t-1} + (1-β2) · g_t ⊙ g_t
+θ_t = θ_{t-1} - η · m_t / (sqrt(v_t) + ε)
+</code></pre>
+    <p>
+      一阶矩管「方向要不要惯性」；二阶矩管「这个坐标是不是历来梯度很大、该不该把步子缩小」。
+      稀疏、噪声大、曲率异构的深度网络里，这份 per-parameter 缩放往往比固定 η 的 SGD 更省心——这也是它成为默认的原因。
+    </p>
+
+    <h3>② Bias correction：为什么 m̂、v̂ 要除以 (1-β^t)</h3>
+    <pre><code># m0 = 0, v0 = 0 初始化
+# 早期 t 很小：m_t、v_t 被向 0 拉（指数滑动平均还「没热起来」）
+
+# Kingma &amp; Ba：无偏校正
+m̂_t = m_t / (1 - β1^t)
+v̂_t = v_t / (1 - β2^t)
+
+# Adam 正式一步
+θ_t = θ_{t-1} - η · m̂_t / (sqrt(v̂_t) + ε)
+
+# 常用默认（原论文）
+β1 = 0.9 ,  β2 = 0.999 ,  ε = 1e-8
+# LLM 预训练常见变体：β2=0.95、更大 ε、或带 schedule 的 η
+</code></pre>
+    <table>
+      <thead><tr><th>符号</th><th>含义</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr><td><code>m_t</code></td><td>梯度的指数滑动一阶矩</td><td>带阻尼的方向</td></tr>
+        <tr><td><code>v_t</code></td><td>梯度平方的指数滑动二阶矩</td><td>该坐标的「能量」/ 尺度</td></tr>
+        <tr><td><code>m̂_t, v̂_t</code></td><td>bias-corrected 矩</td><td>抵消零初始化的早期低估</td></tr>
+        <tr><td><code>η</code></td><td>全局学习率</td><td>仍需 warmup / decay schedule</td></tr>
+        <tr><td><code>ε</code></td><td>数值稳定项</td><td>防除零；过大等于削弱自适应</td></tr>
+      </tbody>
+    </table>
+    <p>
+      没有 correction 时，前几步有效步长系统性偏小；有 correction 后，早期更像「用不足的样本估矩，但把期望拉回无偏」。
+      训练很长时 <code>β^t → 0</code>，correction → 1，影响集中在开头——所以 warmup 与 bias correction 常一起出现。
+    </p>
+
+    <h3>③ Adam + L2 ≠ Weight Decay：自适应算法里的陷阱</h3>
+    <pre><code># 人们常把「权重衰减」写成 L2 加进损失：
+L_reg = L + (λ/2) · ||θ||²
+g ← ∇L + λ · θ          # L2 进梯度
+
+# 再丢进 Adam：这份 λθ 会一起被 /sqrt(v̂) 缩放
+# → 梯度历来大的坐标，衰减被自适应项「打折」
+# → 有效正则强度随坐标历史而变，λ 与 η 纠缠
+
+# SGD 特例：L2 进梯度再乘 η，与「θ ← (1-ηλ)θ」在合适缩放下等价
+# Adam：一般不等价（Loshchilov &amp; Hutter 指出的核心点）
+</code></pre>
+    <p>
+      这就是许多实现里「weight_decay 参数其实在做 Adam+L2」却仍叫 weight decay 的历史包袱。
+      结果：调 λ 像在跟自适应分母较劲；泛化常常不如「真正的」逐坐标均匀衰减。
+    </p>
+
+    <h3>④ AdamW：把衰减解耦到自适应步之外</h3>
+    <pre><code># AdamW（概念）
+# 1) 只用损失梯度（不含 λθ）更新矩 m,v → m̂,v̂
+# 2) 自适应一步与衰减一步分开
+
+θ ← θ - η · ( m̂ / (sqrt(v̂) + ε) + λ · θ )
+# 或等价地先 θ ← θ - η·λ·θ，再减自适应项（实现细节因框架而异）
+
+# 要点
+# - 衰减系数对所有坐标一致（不经过 1/sqrt(v)）
+# - λ 与 η 更好独立调：正则强度语义清晰
+# - 矩估计不被「假梯度 λθ」污染
+</code></pre>
+    <table>
+      <thead><tr><th></th><th>Adam + L2</th><th>AdamW</th></tr></thead>
+      <tbody>
+        <tr><td>正则如何进更新</td><td>λθ 进梯度，再经自适应缩放</td><td>直接收缩参数，与自适应项并列</td></tr>
+        <tr><td>有效衰减是否均匀</td><td>否（大 v 的坐标衰减弱）</td><td>是（同乘性收缩）</td></tr>
+        <tr><td>λ 与 η</td><td>纠缠</td><td>更可分</td></tr>
+        <tr><td>LLM 默认</td><td>少作默认</td><td>预训练 / 微调常见默认</td></tr>
+      </tbody>
+    </table>
+    <p>
+      落地时看框架文档：PyTorch <code>torch.optim.AdamW</code> 才是解耦实现；有的老代码路径里 <code>Adam(..., weight_decay=)</code> 实际是 L2。名称为 W 不重要，<strong>衰减有没有绕过自适应分母</strong>才重要。
+    </p>
+
+    <h3>⑤ 接到 LLM RL / 后训练</h3>
+    <pre><code># 典型栈
+# 预训练 / SFT：AdamW + warmup + cosine / WSD schedule
+# RL（PPO/GRPO/DAPO）：同一优化器族；别忘了
+#   - 策略与 critic（若有）学习率常不同
+#   - 梯度来自 clipped surrogate / 组相对 A，不是 CE
+#   - 全局 grad clip 与 Adam 的 per-param 缩放叠加
+
+# 实务清单
+# 1) 确认真是 AdamW，而不是 Adam+L2 冒名
+# 2) RL 阶段 λ 往往小于预训练；过大 → 策略被拉回「过正则」的旧点
+# 3) ε、β2 会影响噪声梯度下的自适应强度；换精度（bf16）时一起看数值
+# 4) 优化器状态（m,v）在断点续训必须对齐；错位 ≈ 另一次冷启动矩
+</code></pre>
+    <p>
+      站内 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> / <a href="grpo-notes.html">GRPO</a> / <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 管的是<strong>目标形状</strong>；AdamW 管的是<strong>参数怎么沿该目标走</strong>。
+      目标不稳时换优化器救不了；目标稳而训练抖时，才轮到查 η、β、是否真 AdamW、状态是否接对。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>默认写 AdamW，并读一眼源码路径。</strong> 防止「配置叫 weight_decay、实现却是 L2」。</li>
+      <li><strong>η 与 λ 分开扫。</strong> 解耦的意义就是让二者可分；绑在一起扫网格是浪费。</li>
+      <li><strong>RL 阶段保守设 λ。</strong> 策略已在约束目标（clip / KL）下更新，过强 decay 像双重收缩。</li>
+      <li><strong>续训带走 m、v。</strong> 只加载 θ 会让早期再次经历矩偏差；与 bias correction 的「早期敏感」叠加。</li>
+      <li><strong>全局 grad clip 仍要。</strong> Adam 不自动防爆炸；与 <a href="daily-2026-09-07-algo-importance-sampling.html">IS</a> 尖刺同屏看。</li>
+      <li><strong>别神化 β。</strong> 先保证数据、目标、学习率 schedule；再动 β2/ε。</li>
+      <li><strong>记录优化器身份。</strong> 实验卡写清 Adam vs AdamW、λ、β、ε、是否 decoupled——否则论文表无法复现。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为何零初始化的 m、v 会在早期产生偏差？bias correction 具体校正什么？
+        <details><summary>参考答案</summary>
+        指数滑动平均从 0 起步，有限步内 E[m_t] = (1-β1^t) E[g]（常梯度假设下），因此 m_t 系统性偏小。除以 (1-β1^t) 把期望拉回 E[g]；v 同理。它校正的是「矩估计的初始化偏差」，不是数据噪声本身。</details>
+      </li>
+      <li>
+        在 Adam 里把 L2 加进 g，为何有效权重衰减会变弱在「大梯度」坐标上？
+        <details><summary>参考答案</summary>
+        λθ 作为梯度的一部分会进入 m，并在更新时被 1/sqrt(v̂) 缩放。v 大的坐标分母大，衰减项一起被缩小，于是「该大力衰减的活跃权重」反而衰减不足；λ 的语义变成随历史能量变化。</details>
+      </li>
+      <li>
+        AdamW 如何让 λ 与 η 更好独立调节？
+        <details><summary>参考答案</summary>
+        衰减直接作用在参数上（乘性收缩），不经过自适应分母；自适应项只消化损失梯度。于是 λ 主要管正则强度，η 主要管损失步长，网格搜索不必为纠缠出的对角线组合买单。</details>
+      </li>
+      <li>
+        为何说「SGD 上 L2≈weight decay，Adam 上一般不成立」？
+        <details><summary>参考答案</summary>
+        SGD 更新是 θ←θ-η(g+λθ)，可重排成先乘性衰减再减 ηg（在相应定义下）。Adam 多了按 v 的逐维缩放，L2 项与损失项被同一套自适应系数扭曲，代数等价被破坏。</details>
+      </li>
+      <li>
+        RL 微调时只恢复权重、丢弃 Adam 状态，可能看到什么现象？
+        <details><summary>参考答案</summary>
+        矩从 0 重热，早期有效步长与续训前不一致，曲线可能先抖一下或需要重新 warmup；与「权重已收敛、以为无缝接着训」的预期不符。长跑 RL 应把优化器 state 纳入 checkpoint 合同。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Kingma &amp; Ba · Adam: A Method for Stochastic Optimization：
+        <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">arXiv:1412.6980</a></li>
+      <li>Loshchilov &amp; Hutter · Decoupled Weight Decay Regularization（AdamW）：
+        <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">arXiv:1711.05101</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
