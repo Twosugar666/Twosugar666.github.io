@@ -1,1 +1,283 @@
-PLACEHOLDER_WILL_REPLACE
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Attention：Scaled Dot-Product 如何从 QKV 算出上下文（softmax / 温度 / 因果掩码） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Attention：Scaled Dot-Product 如何从 QKV 算出上下文（softmax / 温度 / 因果掩码）</h1>
+    <p class="post-meta">2026-09-09 · 收藏夹：算法 · 学习笔记<br />
+      经典课：Vaswani et al. · <em>Attention Is All You Need</em>（NeurIPS 2017），
+      <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a>。
+      交叉：
+      <a href="daily-2026-09-01-kv-cache.html">KV Cache</a>、
+      <a href="daily-2026-09-07-speculative-decoding.html">Speculative Decoding</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Harness Compaction</a>、
+      <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a>。
+      公式一律用 <code>pre</code>，不用 LaTeX。Attention 是 backbone，非 RL 专属；与
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a> /
+      <a href="grpo-notes.html">GRPO</a>
+      仅作轻量对照。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      现代 LLM、Agent 运行时、后训练采样，骨子里都在反复做同一件事：给定当前 token（或 query）该「看」序列里哪些位置、看多少。
+      Vaswani et al. 2017 把这件事写成可并行、可微的 <strong>scaled dot-product attention</strong>，再用 multi-head 拆成多组子空间——此后 Transformer 成为默认骨架，RNN 逐步退场。
+    </p>
+    <p>
+      本课钉死六件事：① attention 是 soft lookup；② <code>QK^T / sqrt(d_k)</code> 为何要除；③ 温度与因果 / padding 掩码；④ multi-head 的投影—拼接—输出投影；⑤ 与 KV cache、投机解码、长程上下文 compaction、Gumbel-Softmax 的站内串读；⑥ 训练 vs 推理的 attention 形态与 flash-attn 的 IO 直觉（不编造基准数字）。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Scaled Dot-Product Attention = 用 query 对 key 做缩放点积相似度，softmax 成权重后对 value 加权求和；multi-head 只是把这件事在 h 个子空间里并行再拼回。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 为何需要 Attention：soft lookup</h3>
+    <p>
+      把一段长度为 <code>n</code> 的序列想成一张可寻址的表。每个位置持有一份「内容」；当前要生成 / 表示的位置发出一份 <strong>query</strong>（问：我该找谁？），表上每一行有一份 <strong>key</strong>（答：我是谁 / 我像什么）与一份 <strong>value</strong>（真正取出的内容）。
+    </p>
+    <pre><code># Soft lookup 直觉（单 query）
+#   score_i  = similarity(query, key_i)
+#   α_i      = softmax(score)_i          # 软权重，∑ α = 1
+#   context  = Σ_i α_i · value_i         # 加权求和，不是硬取 top-1
+
+# 对比硬检索：argmax → 只拿一个 value，不可微、不可并行混合多源
+# Attention：处处可微，一次前向混合整表；「注意力」= 权重分布本身
+</code></pre>
+    <p>
+      Self-attention 里 Q、K、V 都来自同一序列的线性投影；cross-attention 里 Q 来自一侧、K/V 来自另一侧（如 encoder–decoder）。
+      LLM decoder 主路径是 causal self-attention：每个位置只能看自己与过去。
+    </p>
+
+    <h3>② Scaled Dot-Product：公式与 /sqrt(d_k)</h3>
+    <pre><code># 矩阵形式（论文原式）
+# Q ∈ R^{n×d_k},  K ∈ R^{m×d_k},  V ∈ R^{m×d_v}
+# 常见自注意力：n = m = 序列长；d_k = d_v = 头维度
+
+Attention(Q, K, V) = softmax( Q K^T / sqrt(d_k) ) V
+
+# 逐步：
+#   1) S = Q K^T              # S_ij = &lt;q_i, k_j&gt;，形状 n×m
+#   2) S ← S / sqrt(d_k)      # 缩放
+#   3) A = softmax(S, dim=-1) # 每行对 key 维归一
+#   4) O = A V                # 输出 n×d_v
+</code></pre>
+    <table>
+      <thead><tr><th>符号</th><th>含义</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr><td><code>Q</code></td><td>Query 矩阵</td><td>「我在找什么」</td></tr>
+        <tr><td><code>K</code></td><td>Key 矩阵</td><td>「各位置如何被匹配」</td></tr>
+        <tr><td><code>V</code></td><td>Value 矩阵</td><td>「匹配后取出的内容」</td></tr>
+        <tr><td><code>d_k</code></td><td>key/query 维度</td><td>点积方差随维度涨，故要缩放</td></tr>
+        <tr><td><code>A</code></td><td>注意力权重</td><td>每行一个分布，可视化时常画它</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 为何除以 sqrt(d_k)？（论文与常见分析）
+# 假设 q,k 各维独立、均值 0、方差 1，则
+#   &lt;q,k&gt; = Σ_{t=1}^{d_k} q_t k_t
+#   Var(&lt;q,k&gt;) ≈ d_k
+# → 点积量级 ~ sqrt(d_k)，d_k 大时 |S_ij| 很大
+
+# Softmax 在大绝对值上会「饱和」：
+#   权重几乎 one-hot，其它位置梯度 ≈ 0
+#   反向传播时 softmax 雅可比变扁 → 早期训练难学
+# /sqrt(d_k) 把点积方差拉回 O(1)，logits 落在 softmax 敏感区
+</code></pre>
+    <p>
+      缩放不是魔法常数游戏：本质是<strong>控制进入 softmax 的 logits 尺度</strong>。后面谈「温度」时会看到，<code>1/sqrt(d_k)</code> 本身就是一种固定温度设定。
+    </p>
+
+    <h3>③ 温度 / 尺度直觉；因果掩码与 padding</h3>
+    <pre><code># 温度 τ：把 logits 再除一次（或乘 1/τ）
+A = softmax( S / τ )          # τ↓ → 更尖（近 hard）；τ↑ → 更平（近均匀）
+
+# 与缩放的关系（示意）
+#   论文默认：τ_eff = sqrt(d_k)（写在分母）
+#   推理采样温度（对 vocab logits）是另一路旋钮——别和 attention 温度混为一谈
+#   但数学同构：都是在调 softmax 的尖锐度
+
+# 因果掩码（decoder / GPT 式自回归）
+#   位置 i 不得看 j &gt; i（未来）
+#   实现：对禁止位置的 logits 置 -inf（或大正负数），再 softmax
+#   → 对应 α_ij = 0，且不泄漏未来信息
+
+# Padding 掩码
+#   batch 内短序列 pad 到同长：pad 位不应对任何 query 贡献
+#   同样：pad key 位 logits → -inf
+</code></pre>
+    <table>
+      <thead><tr><th>掩码类型</th><th>禁止什么</th><th>典型场景</th></tr></thead>
+      <tbody>
+        <tr><td>Causal（下三角）</td><td>看未来 token</td><td>自回归 LM 训练 / 解码</td></tr>
+        <tr><td>Padding</td><td>看 pad 位</td><td>变长 batch</td></tr>
+        <tr><td>前缀 / 双向窗口</td><td>按任务定制可见集</td><td>prefix-LM、局部 attention</td></tr>
+        <tr><td>跨文档 / 工具段</td><td>不该串的上下文块</td><td>Agent 多段 prompt（工程层）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      掩码改变的是<strong>允许的支撑集</strong>；温度改变的是<strong>分布的尖锐度</strong>。二者正交：同一因果结构下，仍可用更尖 / 更平的 attention（若实现暴露该旋钮）；多数标准 Transformer 训练把尺度钉死在 <code>1/sqrt(d_k)</code>，只靠学出来的 Q/K 幅度间接调尖度。
+    </p>
+
+    <h3>④ Multi-Head：投影 → 并行头 → 拼接 → 输出投影</h3>
+    <pre><code># 单头：一组 W^Q, W^K, W^V
+# 多头：h 组，每头维度 d_k = d_model / h（常见设定）
+
+MultiHead(Q, K, V) = Concat(head_1, …, head_h) W^O
+
+head_i = Attention(
+  Q W_i^Q,
+  K W_i^K,
+  V W_i^V
+)
+
+# 形状直觉（自注意力，序列长 n）
+#   输入 X ∈ R^{n×d_model}
+#   每头：n×d_k → Attention → n×d_v
+#   Concat → n×(h·d_v)  （常令 d_v = d_k，且 h·d_k = d_model）
+#   W^O   → n×d_model
+</code></pre>
+    <p>
+      多头的动机：不同头可以学不同关系——邻接句法、指代、稀位置模式、局部 n-gram 等——再在 <code>W^O</code> 里混合。
+      计算上，把 <code>d_model</code> 切开并行，总 FLOPs 与「单头用满 d_model」同阶，但表达能力更丰富：这是论文相对「单头大维度」的核心设计选择之一。
+    </p>
+    <pre><code># 伪代码骨架（教学用，非生产 kernel）
+def attention(Q, K, V, mask=None):
+    S = Q @ K.T / sqrt(d_k)
+    if mask is not None:
+        S = S.masked_fill(~mask, -inf)
+    A = softmax(S, dim=-1)
+    return A @ V
+
+def multi_head(X, Wq, Wk, Wv, Wo, h):
+    # 投影并拆成 h 头 → 每头跑 attention → concat → Wo
+    ...
+</code></pre>
+
+    <h3>⑤ 串到现代 LLM / Agent：KV cache、投机解码、长上下文、Gumbel</h3>
+    <p>
+      Attention 公式在训练时「一次看全序列」（带 mask）；推理时逐步生成，若每步重算全部 K/V，会重复做历史位置的投影。
+      <a href="daily-2026-09-01-kv-cache.html">KV Cache</a> 把已生成位置的 K、V 存下，新步只算新 query（及新 key/value 追加）——这是自回归服务的一等公民，也是显存随上下文线性涨的根因。
+    </p>
+    <p>
+      <a href="daily-2026-09-07-speculative-decoding.html">Speculative Decoding</a> 不改 attention 定义，但改「哪些位置的 query 被一起验证」：草稿模型提议多 token，目标模型一次前向打分；正确前缀仍依赖同一套 causal attention + KV。
+      理解 QKV，才能看清投机路径里「并行验证」吃的是哪一段 cache。
+    </p>
+    <p>
+      Agent 长地平线里，上下文会堆工具轨迹、检索片段、反思——注意力窗口与 KV 显存都是硬约束。
+      <a href="daily-2026-09-07-harness-compaction.html">Harness Compaction</a> 一类做法在 harness 层压缩 / 摘要 / 裁剪历史，本质是<strong>改写入 attention 的 token 集合</strong>，不是改 softmax 公式；但若不懂「一切上下文都要进 QK 匹配」，很难设计该删什么。
+    </p>
+    <p>
+      <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a> 也用 softmax + 温度，但目标不同：它是给<strong>离散采样</strong>一条可微松弛，噪声来自 Gumbel；attention 的 softmax 是对 key 维的 soft lookup，通常无 Gumbel 噪声。
+      一条路服务「可反传的离散选择」，一条路服务「可并行的内容寻址」——同名算子，不同问题。
+    </p>
+    <table>
+      <thead><tr><th>主题</th><th>与 Attention 的接点</th><th>站内文</th></tr></thead>
+      <tbody>
+        <tr><td>KV Cache</td><td>推理时复用历史 K/V，避免重复投影</td><td><a href="daily-2026-09-01-kv-cache.html">daily-2026-09-01-kv-cache</a></td></tr>
+        <tr><td>Speculative Decoding</td><td>多 token 草案 + 目标模型因果注意力验证</td><td><a href="daily-2026-09-07-speculative-decoding.html">daily-2026-09-07-speculative-decoding</a></td></tr>
+        <tr><td>Compaction</td><td>减少进入注意力的 token / 段</td><td><a href="daily-2026-09-07-harness-compaction.html">daily-2026-09-07-harness-compaction</a></td></tr>
+        <tr><td>Gumbel-Softmax</td><td>同是 softmax+温度，服务离散重参数化</td><td><a href="daily-2026-09-01-algo-gumbel-softmax.html">daily-2026-09-01-algo-gumbel-softmax</a></td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑥ 实践：Flash-Attention 精神；训练 vs 推理形态</h3>
+    <pre><code># 朴素实现的痛点（概念层）
+#   显式物化 n×n 的 S 与 A → HBM 读写爆炸（IO-bound）
+#   长上下文时，瓶颈常在搬数据，不在「算了多少 FLOPs」
+
+# Flash-Attention 精神（Dao et al. 等；此处只谈思想，不报跑分）
+#   分块（tiling）在 SRAM 里算 softmax 的分子分母
+#   不写满整个注意力矩阵到 HBM
+#   用在线 softmax / 重计算等技巧保住数值等价（实现细节随版本演进）
+# → 「算法数学不变，IO 调度变了」——读论文与内核时抓住这句
+
+# 训练 vs 推理（模式差异）
+#   训练：常整段并行，因果 mask；双向 encoder 则全可见
+#         要存激活供反传；checkpoint / flash 变体影响显存
+#   推理 prefill：提示词一次进，写满 KV cache
+#   推理 decode：逐步追加 1（或少数）query；吃 cache；算力密度不同
+#   投机 / 并行解码：一次多个 query 位，仍共享同一套 K/V 规则
+</code></pre>
+    <p>
+      工程选型时先问三句：① 序列是否因果？② 是否必须物化权重矩阵（可视化 / 稀疏模式）？③ 瓶颈在算还是在搬？
+      多数服务路径：数学上仍是 scaled dot-product，内核上尽量走 IO-aware 实现；长上下文再叠加 GQA/MQA、窗口、稀疏或层级 attention——那些是「减少有效 key 集」的变体，本课公式仍是底座。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先会手推小矩阵。</strong> n=4、d_k=2 时手算一遍 QK^T、缩放、mask、-inf、softmax、乘 V，比背公式牢。</li>
+      <li><strong>把 /sqrt(d_k) 写成「防饱和」。</strong>调试若误乘 <code>sqrt(d_k)</code> 或漏除，常表现为训练初期 logits 极端、loss 平台。</li>
+      <li><strong>掩码用 -inf 而非超大负数时注意实现。</strong> 半精度下「大正负数」可能溢出；跟框架推荐写法。</li>
+      <li><strong>读 KV cache 文时对照本课。</strong> cache 存的是投影后的 K/V，不是原始 token embedding。</li>
+      <li><strong>Agent 上下文治理是 attention 的上游。</strong> Compaction / 检索 / 摘要决定「表里有哪些行」；attention 只负责 soft lookup。</li>
+      <li><strong>别把采样温度当成 attention 温度。</strong> 前者作用在词表 logits；后者（若存在）作用在 key 维 logits。</li>
+      <li><strong>与 RL 笔记的轻量关系。</strong> PPO/GRPO 优化的是策略；策略网络内部仍是一堆 attention。懂 QKV 有助于读懂「长 CoT 为何贵」——每一层每步都在付注意力与 KV 的账。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说 Attention 是 soft lookup 而不是 hard retrieval？
+        <details><summary>参考答案</summary>
+        Hard retrieval 取 argmax 对应的单个 value，不可微且只混合一个源。Attention 用 softmax 权重对所有 value 加权求和，梯度可回传到 Q/K/V 投影；一次前向就能融合多位置信息，「软」体现在权重分布而非 0/1 选择。</details>
+      </li>
+      <li>
+        若去掉 /sqrt(d_k)，大 d_k 时训练容易出什么问题？
+        <details><summary>参考答案</summary>
+        点积方差随 d_k 增大，logits 绝对值变大，softmax 趋于 one-hot 并饱和，非最大位置梯度接近 0，早期难学。缩放把方差拉回 O(1)，让权重与梯度落在敏感区。</details>
+      </li>
+      <li>
+        因果掩码与 padding 掩码能否同时存在？如何实现？
+        <details><summary>参考答案</summary>
+        能。最终可见集是两者（及更多约束）的交集：对任意禁止的 (i,j) 在 softmax 前把 S_ij 置 -inf。因果禁未来；padding 禁 pad key；batch 里常组合成同一 mask 张量。</details>
+      </li>
+      <li>
+        Multi-head 相对「单头用满 d_model」的主要收益是什么？
+        <details><summary>参考答案</summary>
+        总计算量同阶，但多个低维头可在不同子空间捕获不同类型的依赖，再经 W^O 混合；单头大维度更易把多种模式挤在同一相似度度量里。经验上多头显著更强，这也是原论文的设计选择。</details>
+      </li>
+      <li>
+        KV cache、compaction、Gumbel-Softmax 各自对应 Attention 管线的哪一层？
+        <details><summary>参考答案</summary>
+        KV cache：推理时复用已算的 K/V，优化计算与延迟，不改数学定义。Compaction：减少进入注意力的 token/段，改的是「表有多大」。Gumbel-Softmax：借用 softmax+温度做离散变量的可微松弛，不是内容寻址的 soft lookup。三者同属「softmax 周边」，问题层级不同。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Vaswani et al. · Attention Is All You Need：
+        <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">arXiv:1706.03762</a></li>
+      <li>IO-aware 实现思想（选读）：Dao et al. · FlashAttention 系列（数学等价、重在 tiling / SRAM）</li>
+      <li>站内交叉：
+        <a href="daily-2026-09-01-kv-cache.html">KV Cache</a> ·
+        <a href="daily-2026-09-07-speculative-decoding.html">Speculative Decoding</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Harness Compaction</a> ·
+        <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="grpo-notes.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
