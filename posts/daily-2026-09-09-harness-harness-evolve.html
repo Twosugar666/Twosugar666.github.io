@@ -1,1 +1,268 @@
-PLACEHOLDER_WILL_REPLACE
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜HarnessEvolve：用参考轨迹修自演化的信用分配与双门控 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜HarnessEvolve：用参考轨迹修自演化的信用分配与双门控</h1>
+    <p class="post-meta">2026-09-09 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Jiang et al. · <em>HarnessEvolve: Learning from Reference Trajectories for Reliable Agent Self-Evolution</em> ·
+      arXiv <a href="https://arxiv.org/abs/2609.00829" target="_blank" rel="noopener">2609.00829</a>（2026-09-01，Huawei ICT AI Competence Center）。
+      准确率为<strong>论文自报</strong>。交叉：
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a>、
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>（同日一线）。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Self-evolving agents 的目标很明确：用环境反馈自动改 harness——prompts、skills、tools、execution logic——逐步少靠人写死工作流。
+      手工 workflow（CoT / ReAct / Graph 式编排）可控但脆；skill-augmented agent（Claude Code、OpenClaw 一类）能动态试错，但仍被人类给的 skill 质量卡住，错规划容易陷入重试环。
+      往「自演化」推时，现有框架又常只给<strong>稀疏终局反馈</strong>（成功 / 失败），优化方向容易糊掉。论文点出三条系统级故障模式：
+    </p>
+    <ul>
+      <li><strong>Credit assignment failure</strong>：长程轨迹只拿到终点对错；失败时无法定位是哪一步根因，后续错误往往是级联。整段反思容易误判原因，优化无方向。</li>
+      <li><strong>Shortcut learning</strong>：无保护时 agent 会硬编码答案、往 harness 里灌任务相关 in-context 样例 → data leakage 与 prompt bloat，训练准确率虚高、能力不泛化。</li>
+      <li><strong>Catastrophic forgetting</strong>：每次更新只吃当前子集轨迹，可能与已学能力冲突；无门控迭代会把旧能力一点点磨掉。</li>
+    </ul>
+    <p>
+      这不是「再写一个 reflective prompt optimizer」能单独修掉的——需要<strong>系统架构</strong>：把执行与演化解耦，用 reference trajectories 做细粒度信用，再用双门控挡住捷径与遗忘。
+      HarnessEvolve 的立场：整套 harness（不只 skill.md）都可演化；执行、评估、优化、门控分给独立 agent 模块，优化决策可审计、执行侧难以自欺。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：可靠自演化 = 参考轨迹对齐失败路径找首分歧点 + 错误聚类定系统模式 + 质量门挡泄漏/膨胀 + 性能门保批内增益且不伤近批；终局再用 held-out 选快照。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 四模块解耦：谁执行、谁诊断、谁改、谁放行</h3>
+    <pre><code># HarnessEvolve 拓扑（论文 Figure 1）
+A_exec  ──rollout──► 轨迹 τ（obs, action 序列）
+   │                    │
+   │  另：给 (q, a*) 生成参考轨迹 τ+（经 A_eval 验真）
+   ▼
+A_eval  · 判失败集 Fj；验参考是否「真走流程」而非直接吐答案
+A_opt   · τ− vs τ+ → 首分歧点；聚类 → 候选 harness 补丁
+A_gate  · Quality gate（泄漏 / bloat）+ Performance gate（批增益 / 近批不掉）
+        · 通过则写入 snapshot pool V；epoch 末在 T_val 选最优快照
+
+# 优化对象 = 整套 harness
+# prompts + skills（含参考文件与脚本）+ tools + execution logic
+# 对比基线：GEPA≈prompt · ACE≈context · SkillOpt≈skill.md 单组件
+</code></pre>
+    <p>
+      与站内 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>同构：部署时 harness 是能力边界；自演化时也应把它当一等公民，而不是只拧系统提示词。
+      对照 <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>：后者用 RL 训中央策略（ICR + CAPO）；HarnessEvolve 是<strong>冻结 LLM、改 harness 文本/逻辑</strong>的演化环——两条轴正交，可组合。
+    </p>
+
+    <h3>② 参考轨迹：把信用钉在「首分歧点」</h3>
+    <table>
+      <thead><tr><th>步骤</th><th>做什么</th><th>解决什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>生成 τ+</strong></td>
+          <td>A_exec 在给定 ground-truth 答案下尝试至多 T_att 次，产出能到达正确答的路径</td>
+          <td>提供「成功执行路径」对照，而非只看失败反思</td>
+        </tr>
+        <tr>
+          <td><strong>验真</strong></td>
+          <td>A_eval 拒绝「直接复述答案、跳过工具/流程」的捷径轨迹；只有合法推理链进缓存 C</td>
+          <td>防止参考本身成为 shortcut 污染源</td>
+        </tr>
+        <tr>
+          <td><strong>对齐失败</strong></td>
+          <td>对失败 τ− 与 τ+ 找 earliest action divergence t*；结构化错误信号 F=(timestep, cause, fix hint)</td>
+          <td>把终局失败拆成根因动作，压住级联误归责</td>
+        </tr>
+        <tr>
+          <td><strong>无参考回退</strong></td>
+          <td>T_att 用尽仍无验真 τ+ 时，仅对 τ− 做单轨迹分析</td>
+          <td>保证每条失败仍贡献信号，精度下降但不断流</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 概念合同（非公式抄写）
+# 失败轨迹：τ− = [(o1,a1), …]
+# 参考轨迹：τ+ = [(o1',a1'), …]  （给了 a* 且通过验真）
+# t* = min { t | a_t in τ− 与 τ+ 分歧 }
+# → 后续分歧默认视为级联，聚类时优先按根因 cause 分组
+
+# 错误聚类三原则
+# 1) Cause-Based：按错误原因分桶，不按粗粒度 severity 糊在一起
+# 2) Root-Cause Priority：有 τ+ 时以首分歧为根因
+# 3) Long-Tail Protection：保留单成员簇，稀有致命失败不被主流吞掉
+</code></pre>
+    <p>
+      直觉：稀疏终局 reward 的信用问题，在「可拿到答案」的训练集上，可被<strong>对照成功路径</strong>部分消解——这与纯 RL 里用过程奖励 / 裁判模型是不同工具箱。
+      代价也很清楚：依赖标注答案与「参考验真」质量；开放世界无 a* 时，这套诊断要换成别的对照（演示、专家轨迹、强教师）。
+    </p>
+
+    <h3>③ 双门控：质量门挡捷径，性能门挡遗忘</h3>
+    <table>
+      <thead><tr><th>门</th><th>检查</th><th>拒绝后果</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Quality gate</strong></td>
+          <td>Data leakage：候选补丁内容与失败训练实例相似度是否超 η_leak；Prompt bloat：注入 in-context 样例数是否超 η_blo</td>
+          <td>退回 A_opt 修订（至多 T_rev）；仍不过则丢弃</td>
+        </tr>
+        <tr>
+          <td><strong>Performance gate</strong></td>
+          <td>当前 batch 准确率提升（步长裕度 δ）；近 R 个历史 batch 退化不超过 ε</td>
+          <td>不入 snapshot pool；连续拒绝达 P_batch 则提前结束本 epoch</td>
+        </tr>
+        <tr>
+          <td><strong>Epoch-end</strong></td>
+          <td>池 V 中快照在 held-out T_val 上选最优；验证无提升达 P_ep 则停</td>
+          <td>最终 A* 不差于池内最佳验证快照</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 论文实现侧默认（Appendix / Setup，便于复现对照）
+T_att=5, b=40, R=2, δ=0.0, ε=0.025
+η_leak=0.8, η_blo=5, T_rev=3
+P_batch=10, P_ep=5, E=20
+
+# 批驱动环
+每个 epoch：打乱 T_train → mini-batch
+  for Bj: exec → eval → opt → gate → (accept → V, A_current 立刻切换)
+epoch 末：A_current ← argmax_{A in V} Acc(A, T_val)
+停：达 E 或验证平台期
+</code></pre>
+    <p>
+      Quality gate 直接打 shortcut learning；Performance gate + snapshot pool 打 catastrophic forgetting。
+      演化曲线上大量候选被双门拒绝（论文 Figure 2）——这是特性不是 bug：自演化若「来者不拒」，准确率曲线会好看一阵子，能力面却塌。
+      与 <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> 的「合同边界」同味：能改什么、不能靠什么涨分，必须写进流水线，而不是靠事后人工抽查。
+    </p>
+
+    <h3>④ 论文自报结果与消融意味</h3>
+    <p>五套基准：开域 SearchQA / OfficeQA / SpreadsheetBench；企业侧 CloudCoreNetwork-QA、Wireless-QA（云核心网 / 无线，多 skill QA 与 text-to-SQL）。模型：Qwen3.6-27B（域内后训）、DeepSeek-V4-Flash（无微调）。框架：企业侧 LAMAgent；开源侧 OpenClaw（优化 skills、AGENTS.md、SOUL.md、tools）。基线：Base、GEPA、ACE、SkillOpt。数字均为<strong>论文自报 Accuracy (%)</strong>。</p>
+    <table>
+      <thead><tr><th>设定</th><th>Base → HarnessEvolve</th><th>最强基线 → 差距（论文叙述）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>CloudCoreNetwork-QA · Qwen3.6-27B</td>
+          <td>43.4 → <strong>86.9</strong></td>
+          <td>GEPA 65.3；超最强基线 <strong>+21.6 pp</strong></td>
+        </tr>
+        <tr>
+          <td>Wireless-QA · DeepSeek-V4-Flash</td>
+          <td>85.9 → <strong>92.8</strong></td>
+          <td>ACE 90.1；+2.7 pp</td>
+        </tr>
+        <tr>
+          <td>SearchQA / OfficeQA / SpreadsheetBench</td>
+          <td>86.5→92.9 / 62.8→70.9 / 44.3→76.4</td>
+          <td>全面高于 GEPA / ACE / SkillOpt（论文 Table 2）</td>
+        </tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>消融（CloudCore · Qwen）</th><th>Accuracy %（论文 Table 4）</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>Full HarnessEvolve</td><td><strong>86.9</strong></td><td>完整参考 + 聚类 + 质量门</td></tr>
+        <tr><td>M1 w/o reference trajectory</td><td>57.8</td><td>信用诊断塌掉，掉点最大</td></tr>
+        <tr><td>M2 w/o error clustering</td><td>68.6</td><td>实例级补丁碎片化 / 互斥</td></tr>
+        <tr><td>M3 w/o quality gate</td><td>80.1</td><td>捷径与膨胀仍能渗进 harness</td></tr>
+      </tbody>
+    </table>
+    <p>
+      跨框架迁移（Table 3）：在 OpenClaw 上演化的 skills，不重训直接挂到 Hermes / OpenCode / LAMAgent / DeepSeek Harness，多数设定相对 Base 持平或提升——论文据此主张改的是<strong>可迁移错误模式</strong>，而非框架私有捷径。
+      落地前仍应用自己的企业集复测；尤其注意参考轨迹对 a* 的依赖与验真裁判本身的偏差。
+    </p>
+
+    <h3>⑤ 放回站内谱系</h3>
+    <pre><code>Harness 运行时（能力边界 = prompts/skills/tools/logic）
+    → Compaction / TITO（上下文与 token 合同）
+    → Lightning / Lego-RL / Harness-RL（部署 harness 进 RL 环）
+    → ARISE-RL / AHEAD（RL 侧信用与多目标另一路）
+    → HarnessEvolve（冻结 LLM，参考轨迹 + 双门控演化整套 harness）
+    → 同日一线 HarnessDev（工程交付视角，可对照读）
+
+还没解决的（本文不声称）：
+    - 无 ground-truth 的开放世界如何构造「参考」
+    - 验真 A_eval 被博弈时的对抗稳健性
+    - 与 Harness-RL / PG 联合：策略参数与 harness 文本双环稳定性
+</code></pre>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先解耦再迭代。</strong> 执行与优化同环时，执行侧会学会「骗门控」；至少把 gate / eval 做成独立角色与独立提示合同。</li>
+      <li><strong>有 a* 就建参考缓存。</strong> 训练集先验真参考轨迹；记录尝试次数、验真失败原因；无参考比例高时优先修验真与工具可达性，而不是加优化轮数。</li>
+      <li><strong>诊断对齐到首分歧。</strong> 日志里显式存 t*、cause、hint；聚类按 cause，保留长尾单簇——稀有工具幻觉往往是线上事故源。</li>
+      <li><strong>质量门写死阈值。</strong> 泄漏相似度阈值、样例条数上限、修订次数上限进配置；拒绝率进 dashboard，拒绝率≈0 反而可疑。</li>
+      <li><strong>性能门用近批回放。</strong> 只看当前 batch 会过拟合子集；R≥1–2 的近批不退化 + epoch 末 T_val 选快照，比「永远接受最新补丁」稳。</li>
+      <li><strong>优化整套 harness，不只 skill 一行描述。</strong> 企业多 skill / text-to-SQL 场景，脚本、参考文件、工具封装与提示同属搜索空间——与「只改 skill.md」的基线差一截。</li>
+      <li><strong>与 RL 路线分工。</strong> 文本 harness 可快速试错；策略权重用 <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a> / <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a> 另环。先门控演化 harness，再对冻结合同做 RL，通常更省事。</li>
+      <li><strong>迁移测要做。</strong> 在 A 框架演化、在 B 框架零样本挂载；掉点大说明学到了框架私货，回头收紧质量门与错误聚类特征。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「只对失败轨迹做整段反思」容易信用分配失败？参考轨迹如何改诊断粒度？
+        <details><summary>参考答案</summary>
+        终局失败时，后段错误常是前段决策的级联；整段反思容易把症状当根因。参考轨迹提供成功对照，定位 earliest action divergence，把信用钉在首分歧动作，再按根因聚类，避免对下游症状打补丁。</details>
+      </li>
+      <li>
+        给模型看 ground-truth 生成参考时，为何必须单独做「验真」？不验会怎样？
+        <details><summary>参考答案</summary>
+        模型可能直接复述答案、跳过工具与中间观测，得到「假成功路径」。若当参考，对齐会教 harness 学捷径，强化 shortcut learning。验真要求合法推理链（调工具、处理观测、逐步得出答案），不通过则重试或放弃该题参考。</details>
+      </li>
+      <li>
+        Quality gate 的 data leakage 与 prompt bloat 分别防什么？为何修订上限后仍要丢弃？
+        <details><summary>参考答案</summary>
+        Leakage 防把具体训练题答案/片段写进 harness；bloat 防靠堆 in-context 样例刷训练分。二者都会虚高训练准确率、伤泛化。多次修订仍不过，说明候选本质在走捷径，继续接受只会污染 snapshot pool，应丢弃并换诊断方向。</details>
+      </li>
+      <li>
+        Performance gate 为何要求「当前 batch 变好且近 R 批不掉」还不够，还要 epoch 末 held-out 选快照？
+        <details><summary>参考答案</summary>
+        批级门控是局部守恒，防短视回退；但池中多个局部可接受快照，全局验证集上仍有优劣。Epoch 末在 T_val 选最优，避免「每个 batch 都过门、整体却漂到次优」。连续拒绝耐心与验证平台期用于早停，省无效演化。</details>
+      </li>
+      <li>
+        消融里去掉参考轨迹掉点最大（86.9→57.8），对工程优先级意味着什么？与去掉质量门相比如何取舍？
+        <details><summary>参考答案</summary>
+        说明信用诊断是主杠杆：没有 τ+ 对齐，优化信号噪声大，后续聚类与门控都在修错方向。质量门主要防捷径渗入，去掉后仍有 80.1，说明「还能涨」但不可靠。工程上应优先保证参考生成与验真覆盖率，再收紧质量/性能门；两者不是二选一，而是诊断准了才谈防捷径。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Jiang et al. · HarnessEvolve：
+        <a href="https://arxiv.org/abs/2609.00829" target="_blank" rel="noopener">arXiv:2609.00829</a> ·
+        <a href="https://arxiv.org/pdf/2609.00829" target="_blank" rel="noopener">PDF</a></li>
+      <li>相关基线语境：GEPA / ACE / SkillOpt（论文对照）；站内交叉：
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
