@@ -1,1 +1,262 @@
-PLACEHOLDER_WILL_REPLACE
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜HarnessDev：把评测单位从任务输出改成可运行 harness（Creation / Evolution） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜HarnessDev：把评测单位从任务输出改成可运行 harness（Creation / Evolution）</h1>
+    <p class="post-meta">2026-09-09 · 收藏夹：Agent / Harness · 一线追踪<br />
+      论文：Wu et al. · <em>HarnessDev: Can LLMs Create and Evolve Their Own Agent Harness?</em> ·
+      arXiv <a href="https://arxiv.org/abs/2609.01437" target="_blank" rel="noopener">2609.01437</a>（submitted 2026-09-01）。
+      文中规模、域结论与跨模型结论均为<strong>论文自报</strong>；未做第三方复测。
+      交叉：
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      现有 Agent 评测大多仍把<strong>任务输出</strong>当单位：给模型一道题，看最终答案 / 补丁 / 检索报告对不对。
+      这隐含假设——「模型 + 固定 harness」是不可拆的黑盒——在 2026 年已经不够用。
+      真正决定长程能力的，往往是模型之外的执行基础设施：工具循环、上下文组装、沙箱、记忆与失败恢复。
+      站内 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a> 把这层钉成「模型之外、产品之下」；
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> / <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> 则是人类工程成熟 harness 的两条极端（完整 SDK vs 极简 subprocess）。
+    </p>
+    <p>
+      <strong>HarnessDev</strong> 把问题反过来问：若评测单位改成<strong>可运行的 agent harness</strong>本身——LLM 能否从极简种子<strong>创建（Creation）</strong>出完整执行系统，再靠下游执行反馈<strong>演化（Evolution）</strong>自己的 harness？
+      能力看 held-out 任务成功率；效率看 execution-token 成本。评测对象从「一次作答」变成「一套可复用的外部执行合同」。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：HarnessDev = 评测单位从任务输出 → 可运行 harness；Creation（种子 + 少样本 → 完整执行系统）与 Evolution（执行反馈迭代改 harness）；能力 / 效率双轴；论文自报在写作与 ML 实验上可逼近或超过部分人类参考，在代码与搜索/研究上仍明显落后，且跨模型迁移有限。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 评测单位：task output → runnable harness</h3>
+    <table>
+      <thead><tr><th>对比维</th><th>传统 Agent 评测</th><th>HarnessDev</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>评测对象</strong></td>
+          <td>单次任务输出（答案 / patch / 报告）</td>
+          <td>模型外部的可运行 harness（执行基础设施）</td>
+        </tr>
+        <tr>
+          <td><strong>成功定义</strong></td>
+          <td>该题对不对</td>
+          <td>harness 在 held-out 任务上的成功率 + 执行成本</td>
+        </tr>
+        <tr>
+          <td><strong>可复用性</strong></td>
+          <td>弱：换题常重跑整条对话</td>
+          <td>强：同一 harness 应服务同域多实例</td>
+        </tr>
+        <tr>
+          <td><strong>与模型关系</strong></td>
+          <td>模型与固定脚手架绑死</td>
+          <td>scaffolding 本身是被生成 / 演化的工件</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      这与 <a href="daily-2026-08-28-agent-lightning-v1.html">Lightning</a>「部署 harness 几乎零改动进训练环」、
+      <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>「训的是中央 harness 策略」形成互补：前两者优化<strong>已有</strong> harness 的策略或接入方式；HarnessDev 直接问<strong>harness 工件能否由 LLM 自造自改</strong>。
+    </p>
+
+    <h3>② 两阶段：Creation / Evolution</h3>
+    <pre><code># Creation（创造）
+# 输入：minimal seed + 少量开发用例（few cases）
+# 输出：完整可运行的 agent execution system（harness）
+# 约束：hidden eval tasks 对开发阶段隐瞒 → 防过拟合开发集
+
+# Evolution（演化）
+# 输入：已构造的 harness + 下游执行反馈（成功/失败、轨迹、成本信号等）
+# 过程：迭代修订 harness 自身（不是只改单题答案）
+# 目标：提升 held-out 能力；同时观察效率与稳定性
+
+# 评测双轴
+capability  = success on held-out tasks
+efficiency  = execution-token cost（跑 harness 消耗的执行侧 token）
+</code></pre>
+    <p>
+      Creation 考的是「从种子长出可用运行时」；Evolution 考的是「闭环反馈是否稳定改进工件」。
+      两者都强调 harness 是<strong>一等公民工件</strong>：可版本化、可在下游实例上复跑，而不是对话里的一次性脚手架。
+    </p>
+
+    <h3>③ Creation 实验规模（论文自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>设定（论文自报）</th></tr></thead>
+      <tbody>
+        <tr><td>Creator LLMs</td><td><strong>6</strong> 个创建侧模型</td></tr>
+        <tr><td>Domains</td><td><strong>4</strong> 个域</td></tr>
+        <tr><td>Downstream benchmarks</td><td><strong>5</strong> 套下游基准</td></tr>
+        <tr><td>Downstream instances</td><td><strong>2,207</strong> 个唯一下游实例</td></tr>
+        <tr><td>Eval 隔离</td><td>hidden eval tasks 对开发阶段隐瞒</td></tr>
+        <tr><td>对照</td><td>与成熟人类工程参考 harness 比能力与成本</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 概念流水线（非论文伪代码逐字）
+seed, few_dev_cases  →  CreatorLLM  →  Harness_v0
+Harness_v0 × held_out_tasks  →  (success_rate, exec_token_cost)
+# 开发可见：seed + few cases
+# 开发不可见：hidden eval tasks（防「为评测写死脚本」）
+</code></pre>
+
+    <h3>④ Creation 发现：域差异与成本方差</h3>
+    <table>
+      <thead><tr><th>域 / 现象</th><th>相对人类成熟参考（论文自报）</th><th>工程解读</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Code</strong></td>
+          <td>明显落后</td>
+          <td>沙箱、测试 harness、补丁循环、失败恢复对工程细节极敏感；对照 OpenHands / mini-SWE 的人类积累</td>
+        </tr>
+        <tr>
+          <td><strong>Search / Research</strong></td>
+          <td>明显落后</td>
+          <td>检索编排、引用纪律、多跳计划与工具失败处理难用少样本「长」出来</td>
+        </tr>
+        <tr>
+          <td><strong>Writing</strong></td>
+          <td>可匹配或超过所选参考</td>
+          <td>执行面相对轻：模板、修订环、质量检查器更易从种子涌现</td>
+        </tr>
+        <tr>
+          <td><strong>ML experimentation</strong></td>
+          <td>可匹配或超过所选参考</td>
+          <td>实验脚本 + 指标闭环结构规整，利于 LLM 生成可跑 pipeline</td>
+        </tr>
+        <tr>
+          <td><strong>Execution cost</strong></td>
+          <td>不同生成 harness 成本方差大</td>
+          <td>能力相近时，token 预算可差一个数量级级的工程选择（重试、上下文膨胀、工具滥用）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      结论不宜读成「LLM 已能取代 harness 工程」：在代码与搜索/研究——恰恰是 Agent 产品最难、也最贵的两块——生成 harness 仍 substantially behind 人类参考。
+      写作与 ML 实验上的相对优势，更像「结构化、可脚本化的执行面」更容易被少样本创造，而不是通用 Agent 运行时已被攻克。
+    </p>
+
+    <h3>⑤ Evolution：有增益但不稳，迁移不完整</h3>
+    <pre><code># Evolution 观察（论文自报，定性）
+# - 用下游执行反馈迭代改 harness：可见部分增益
+# - 但不稳定：迭代轨迹非单调，易震荡 / 过拟合开发反馈
+# - 向 held-out 的 transfer 仅部分成立
+#   → 「在看得见的反馈上变好」≠「隐藏评测集同步变好」
+
+# 与固定权重微调的类比
+# SFT/RL 过拟合训练题 ↔ Evolution 过拟合可见执行反馈
+# 差别：这里过拟合的对象是 harness 代码/配置，不是模型权重
+</code></pre>
+    <p>
+      对算法工程师：Evolution 不是免费的 test-time compute 圣杯。没有严格的 held-out 隔离与回归集，迭代改 harness 很容易变成「为当前失败 case 打补丁」，能力曲线好看、泛化假。
+    </p>
+
+    <h3>⑥ 固定 runtime 模型：增益强依赖执行侧模型</h3>
+    <pre><code># 实验精神（论文自报）
+# 固定 / 控制「跑 harness 的 runtime 模型」，观察 Creation/Evolution 收益
+# 发现：收益强烈依赖正在执行该 harness 的模型
+#      → cross-model transfer 有限
+#
+# 含义：
+# Harness_H 在 Model_A 上赢，不保证在 Model_B 上同幅赢
+# 「好 harness」部分是「与特定模型行为分布对齐的合同」
+# 而非与模型无关的纯工程资产
+</code></pre>
+    <p>
+      这与站内强调的训推一致、TITO 合同、Lightning「把客户端指到 proxy」同一家族问题：
+      harness 不是空气，它与模型的 tool-calling / 指令遵循分布耦合。
+      换底座却冻结脚手架，常会静默掉点——HarnessDev 用 Creation/Evolution 镜头把这件事量化成「跨模型迁移有限」。
+    </p>
+
+    <h3>⑦ 放回站内谱系</h3>
+    <pre><code>Harness 运行时（工具/上下文/环境是什么）
+    → OpenHands V1 / mini-SWE（人类成熟 harness 的两条实现）
+    → Lightning / Harness-RL（已有 harness 如何进训练与中央策略优化）
+    → HarnessDev（harness 工件本身能否由 LLM Creation + Evolution）
+
+还没被本文解决的：
+    - 代码 / 搜索域如何缩小与人类参考的缺口
+    - Evolution 的稳定目标与抗过拟合协议
+    - 跨模型可迁移的 harness 表示（合同层 vs 实现层）
+</code></pre>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>把 harness 当评测一等公民。</strong> 内部榜单除了任务成功率，增加「同一模型换脚手架」与「同一脚手架换模型」两张表；否则分不清模型赢还是脚手架赢。</li>
+      <li><strong>Creation 必留 hidden eval。</strong> 开发用例与隐藏评测隔离；否则 LLM 生成的是「过拟合脚本」，不是可迁移执行系统。</li>
+      <li><strong>双轴看齐：能力 + execution-token。</strong> 只报成功率会选出贵得不可部署的 harness；成本方差大时，设 token budget 与早停。</li>
+      <li><strong>域预期要分层。</strong> 写作 / ML 实验可先试 LLM 生成脚手架；代码与搜索/研究默认仍以人类参考（OpenHands、mini-SWE 一类）为底座，生成结果当候选而非默认。</li>
+      <li><strong>Evolution 当回归工程，不当单曲线优化。</strong> 每次改 harness 跑固定 held-out + 成本门禁；禁止只对着本轮失败 case 打补丁就合并。</li>
+      <li><strong>跨模型勿假设零成本迁移。</strong> 换 runtime 模型后重测 harness；必要时按模型族维护薄适配层（prompt/tool schema），而不是幻想一份万能脚手架。</li>
+      <li><strong>与现有训练栈对齐。</strong> 若已用 Lightning / Harness-RL，先固定人类 harness 把策略训稳，再把 HarnessDev 式生成当作「脚手架搜索」的外围实验，避免两层同时非平稳。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么把评测单位从任务输出改成可运行 harness，会改变「模型能力」的归因？
+        <details><summary>参考答案</summary>
+        任务输出混杂了模型采样与固定脚手架的贡献。以 harness 为评测对象后，可在固定 runtime 模型下比较不同脚手架，或在固定脚手架下比较模型，从而拆开「谁在贡献成功率 / 成本」。否则榜单上涨可能只是更好的人类或生成脚手架，被误读成底座变强。</details>
+      </li>
+      <li>
+        Creation 阶段隐瞒 hidden eval tasks，主要防的是哪类作弊？若不做隔离会发生什么？
+        <details><summary>参考答案</summary>
+        防的是 creator 针对评测实例写死流程、硬编码路径或过拟合可见 case 的「专用脚本」。不做隔离时，表面成功率上升，但 harness 失去同域可复用性，held-out 一换就塌——测到的是出题记忆，不是执行系统设计能力。</details>
+      </li>
+      <li>
+        为何生成 harness 在写作 / ML 实验上相对接近人类参考，在代码与搜索/研究上却明显落后？
+        <details><summary>参考答案</summary>
+        前两者执行面更规整（模板修订环、实验脚本+指标），少样本即可长出可跑闭环。代码需要沙箱、测试、补丁与失败恢复等厚工程；搜索/研究需要检索编排、引用与多跳容错。这些状态机与边界条件难从 minimal seed 稳定涌现，人类参考积累了大量隐式合同。</details>
+      </li>
+      <li>
+        Evolution「有增益但不稳、对 held-out 仅部分迁移」对迭代改脚手架的工程意味着什么？
+        <details><summary>参考答案</summary>
+        执行反馈迭代容易过拟合当前失败分布，曲线非单调。工程上必须把 Evolution 当成带回归门禁的版本管理：固定 held-out、盯成本、限制单次改动半径。没有隔离与回滚，Evolution 会变成补丁堆积，泛化假象。</details>
+      </li>
+      <li>
+        固定 runtime 模型实验显示跨模型迁移有限——部署上应如何设计 harness 资产？
+        <details><summary>参考答案</summary>
+        将 harness 拆成「模型无关合同层」（工具接口、事件、沙箱边界）与「模型相关适配层」（提示词、schema、重试策略）。资产按模型族回归；换底座触发适配层重测，而不是假设整包脚手架零成本平移。这与训推一致、代理接入（如 Lightning）同一纪律。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Wu et al. · HarnessDev：
+        <a href="https://arxiv.org/abs/2609.01437" target="_blank" rel="noopener">arXiv:2609.01437</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1 SDK</a> ·
+        <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
