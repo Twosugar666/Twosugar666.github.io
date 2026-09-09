@@ -1,1 +1,289 @@
-PLACEHOLDER_WILL_REPLACE
+{
+  "rotation": [
+    "rl",
+    "agent",
+    "infra",
+    "gpu",
+    "pc"
+  ],
+  "next": 4,
+  "daily_streams": [
+    "frontline",
+    "harness",
+    "algo"
+  ],
+  "history": [
+    {
+      "date": "2026-08-13",
+      "domain": "rl",
+      "topic": "过程奖励模型（PRM）：PRM800K / Math-Shepherd / OmegaPRM 自动过程监督",
+      "file": "posts/daily-2026-08-13-prm.html"
+    },
+    {
+      "date": "2026-08-14",
+      "domain": "agent infra",
+      "source": "frontline",
+      "topic": "DeepSeek Harness（dsh）：一切皆插件的 Agent 运行时底座",
+      "file": "posts/daily-2026-08-14-deepseek-harness.html"
+    },
+    {
+      "date": "2026-08-26",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "IBM Granite 4.2：开源推理模型家族与真实环境 Agentic RL 训练管线（异步 GRPO + TIS）",
+      "file": "posts/daily-2026-08-26-granite-4-2.html"
+    },
+    {
+      "date": "2026-08-27",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "特别篇：2026 新模型全景——十五个新旗舰的架构与训练方法拆解",
+      "file": "posts/special-2026-08-27-new-models-arch.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "agent rl harness",
+      "source": "frontline",
+      "topic": "Microsoft Agent Lightning v1.0：Harnessed Agentic RL（LLM endpoint proxy / ~3500 LOC / SWE-bench）",
+      "file": "posts/daily-2026-08-28-agent-lightning-v1.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "base infra agent",
+      "source": "base",
+      "topic": "腾讯混元 Hy4 preview：770B-A49B 开源旗舰基座（MoE / Gated DSA / iHC / MTP / 1M）",
+      "file": "posts/daily-2026-08-28-base-hy4.html"
+    },
+    {
+      "date": "2026-08-28",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "GLM-5.3 / GLM-5.3-Flash：同一基座全靠后训练，环境规模化方法论与混合注意力效率款",
+      "file": "posts/daily-2026-08-28-glm-5-3.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "Miles v0.1：生产级 LLM RL 后训练全栈（SGLang + Megatron + 全异步）",
+      "file": "posts/daily-2026-08-31-miles-v01.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "TITO：多轮 Agent Harness 里 Token-In-Token-Out 为什么决定 RL",
+      "file": "posts/daily-2026-08-31-harness-tito.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "GSPO：序列级重要性采样如何稳住 MoE 上的 RL",
+      "file": "posts/daily-2026-08-31-algo-gspo.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "gpu infra",
+      "source": "gpu",
+      "topic": "NVIDIA Rubin：Agentic 推理把数据中心改写成一台计算机（HBM4 / NVFP4 / NVLink 6 / NVL72）",
+      "file": "posts/daily-2026-08-31-gpu-rubin.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "pc gpu",
+      "source": "pc",
+      "topic": "12V-2×6 之后：ATX 3.1 / PCIe 5.1 配件如何决定 600W 级 GPU 能不能活",
+      "file": "posts/daily-2026-08-31-pc-atx31.html"
+    },
+    {
+      "date": "2026-08-31",
+      "domain": "rl agent",
+      "source": "rotation",
+      "topic": "SUPO：把总结训练进策略的 summarization-augmented MDP（Theorem 3.2 梯度分解 / rollout 组 advantage / overlong mask）",
+      "file": "posts/daily-2026-08-31-supo.html"
+    },
+    {
+      "date": "2026-09-01",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "AHEAD：step-aware 信用分配（环境反馈 + 纠错提示 / fail-only PI / RLSD-style reweight）",
+      "file": "posts/daily-2026-09-01-ahead.html"
+    },
+    {
+      "date": "2026-09-01",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "mini-SWE-agent：bash-only + 线性 messages + 无状态 subprocess 作为 RL 友好 harness 基线",
+      "file": "posts/daily-2026-09-01-harness-mini-swe.html"
+    },
+    {
+      "date": "2026-09-01",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "Gumbel-Softmax / Concrete：离散采样的可微松弛与 Straight-Through",
+      "file": "posts/daily-2026-09-01-algo-gumbel-softmax.html"
+    },
+    {
+      "date": "2026-09-01",
+      "domain": "infra",
+      "source": "rotation",
+      "topic": "KV cache 的一生：显存账本 / PagedAttention / continuous batching / prefix caching / PD 分离（Mooncake）",
+      "file": "posts/daily-2026-09-01-kv-cache.html"
+    },
+    {
+      "date": "2026-09-02",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "WMRL：World Model 替代独占执行 + Online Debiasing / Inverse-Variance Denoising（~10% 锚点）",
+      "file": "posts/daily-2026-09-02-wmrl.html"
+    },
+    {
+      "date": "2026-09-02",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "EnvHarness：Stage/Contract/Chain（Setups/Rules/Link）+ EnvRigger 黑盒写环境壳",
+      "file": "posts/daily-2026-09-02-harness-envharness.html"
+    },
+    {
+      "date": "2026-09-02",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "GAE：广义优势估计 GAE(γ,λ)=Σ(γλ)^l δ；λ 在 TD 与 MC 之间拧偏差–方差",
+      "file": "posts/daily-2026-09-02-algo-gae.html"
+    },
+    {
+      "date": "2026-09-02",
+      "domain": "agent",
+      "source": "frontline",
+      "topic": "World Labs Atlas：全模态世界模型（spatial context / 自回归扩散 Transformer / 稀疏视角 3D 重建 / Real-to-Sim）",
+      "file": "posts/daily-2026-09-02-atlas.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "ARISE-RL：rubric 共演化 + RG-SED（tool-grounded / difficulty-shaped / Δr>τ 门控蒸馏）",
+      "file": "posts/daily-2026-09-03-arise-rl.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "Lego-RL：原生 coding harness 接 PG（in-process proxy / Harbor / GSPO / R3 routing）",
+      "file": "posts/daily-2026-09-03-harness-lego-rl.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "REINFORCE：似然比 ∇J=E[Σ∇logπ·G_t]；baseline→advantage；连到 PPO/GRPO/GSPO/GAE",
+      "file": "posts/daily-2026-09-03-algo-reinforce.html"
+    },
+    {
+      "date": "2026-09-03",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "Mercor × SkyRL：397B 知识工作 Agent RL 全配方（六步法 / TITO / prompt_mean +3.9 / 跨 harness 泛化）",
+      "file": "posts/daily-2026-09-03-mercor-skyrl.html"
+    },
+    {
+      "date": "2026-09-04",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "PGPO：经验状态势 / anchor-state 势差 Aϕ + success-adaptive w(x)；失败侧信用（arXiv:2609.02236）",
+      "file": "posts/daily-2026-09-04-pgpo.html"
+    },
+    {
+      "date": "2026-09-04",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "OpenHands V1 SDK：Optional Isolation / 唯一 conversation state / Workspace 工厂 Local·Docker·Remote",
+      "file": "posts/daily-2026-09-04-harness-openhands-v1.html"
+    },
+    {
+      "date": "2026-09-04",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "DAPO：Clip-Higher / Dynamic Sampling / Token-level Loss / Overlong（GRPO 长 CoT 四细节）",
+      "file": "posts/daily-2026-09-04-algo-dapo.html"
+    },
+    {
+      "date": "2026-09-07",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "TIGPO：跨更新持久任务转移图 + Exploration–Revisit（arXiv:2609.03383）",
+      "file": "posts/daily-2026-09-07-tigpo.html"
+    },
+    {
+      "date": "2026-09-07",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Context Compaction：bound / prune / checkpoint 与 TITO 边界",
+      "file": "posts/daily-2026-09-07-harness-compaction.html"
+    },
+    {
+      "date": "2026-09-07",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "Importance Sampling：ratio / clip / truncate 与 LLM RL 栈",
+      "file": "posts/daily-2026-09-07-algo-importance-sampling.html"
+    },
+    {
+      "date": "2026-09-07",
+      "domain": "infra",
+      "source": "rotation",
+      "topic": "推测解码（Speculative Decoding）：draft-then-verify / 无损修正拒绝采样 / 加速比公式 / Medusa-EAGLE-MTP 草稿路线",
+      "file": "posts/daily-2026-09-07-speculative-decoding.html"
+    },
+    {
+      "date": "2026-09-08",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "AInfer-PD：通信安全 in-place Prefill–Decode 复用（collective 序 / DeepEP 相位隔离 / 分布式 MoE rollout）",
+      "file": "posts/daily-2026-09-08-ainfer-pd.html"
+    },
+    {
+      "date": "2026-09-08",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "Harness-RL：Action–Args 解耦 + CAPO + 黑盒 Interface Call Record / session 前缀树",
+      "file": "posts/daily-2026-09-08-harness-harness-rl.html"
+    },
+    {
+      "date": "2026-09-08",
+      "domain": "algo",
+      "source": "algo",
+      "topic": "Adam / AdamW：一阶矩 / 二阶矩 / bias correction；解耦权重衰减（L2≠decay）",
+      "file": "posts/daily-2026-09-08-algo-adam.html"
+    },
+    {
+      "date": "2026-09-08",
+      "domain": "gpu",
+      "source": "rotation",
+      "topic": "DLSS 5 上线首周：神经渲染功耗账单 / RTX 5090 熔端子事件 / RTX 50 系 8 月涨价复盘（Newegg 中位价）",
+      "file": "posts/daily-2026-09-08-dlss5-power.html"
+    },
+    {
+      "date": "2026-09-09",
+      "domain": "agent harness",
+      "source": "frontline",
+      "topic": "HarnessDev：评测单位从任务输出改为可运行 harness（Creation / Evolution / 2207 instances）",
+      "file": "posts/daily-2026-09-09-harnessdev.html"
+    },
+    {
+      "date": "2026-09-09",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "HarnessEvolve：参考轨迹信用分配 + quality/performance 双门控自演化",
+      "file": "posts/daily-2026-09-09-harness-harness-evolve.html"
+    },
+    {
+      "date": "2026-09-09",
+      "domain": "algo",
+      "source": "algo",
+      "topic": "Attention：Scaled Dot-Product / softmax(QK^T/√d_k)V / multi-head / 因果掩码",
+      "file": "posts/daily-2026-09-09-algo-attention.html"
+    }
+  ]
+}
