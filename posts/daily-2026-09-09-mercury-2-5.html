@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Mercury 2.5：扩散语言模型进生产——并行去噪把 1000+ tok/s 搬上普通 GPU · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Mercury 2.5：扩散语言模型进生产——并行去噪把 1000+ tok/s 搬上普通 GPU</h1>
+    <p class="post-meta">2026-09-09 · 收藏夹：Agent / Infra · 一线追踪<br />
+      发布方：Inception（Inception Labs，Palo Alto），发布时间 <strong>2026-09-08</strong> · 信息来源：
+      <a href="https://www.inceptionlabs.ai/blog/introducing-mercury-2-5" target="_blank" rel="noopener">Inception 官方博客：Introducing Mercury 2.5</a>；
+      背景资料：<a href="https://www.inceptionlabs.ai/blog/introducing-mercury" target="_blank" rel="noopener">Mercury 首次发布文</a>。
+      文中性能与质量数字均为 <strong>Inception 官方口径</strong>（供应商自报），第三方复测尚未出现</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      昨天的<a href="daily-2026-09-07-speculative-decoding.html">推测解码笔记</a>讲了自回归（AR）模型的结构性瓶颈：
+      token 只能一个一个蹦，decode 阶段被显存带宽锁死，业界用「先猜后验」打补丁换 2～4 倍加速。
+      昨天（9 月 8 日）Inception 发布的 <strong>Mercury 2.5</strong> 走了另一条路：<strong>不做补丁，直接换生成范式</strong>——
+      用扩散（diffusion）并行生成文本块，在普通 NVIDIA GPU 上跑出 <strong>1,107 tokens/s</strong>。
+      这不是论文 demo：Mercury 系列自 2025 年 2 月商用以来，已经在搜索、语音、编程子代理等生产负载上跑了一年多，
+      官方称用量增长超过一个数量级。本篇拆三件事：扩散语言模型（dLLM）的机制、Mercury 2.5 的规格与价格、以及它对 agent 系统设计的真实含义。
+    </p>
+    <blockquote>
+      Inception 的背书值得一句：创始团队是扩散模型图像生成的先驱，也是 DPO、FlashAttention、Decision Transformer 的共同发明人；
+      本轮发布附带了 NVIDIA 加速计算产品组的公开背书。扩散在图像/视频上是行业标准，Inception 是第一家把它做成商用语言模型的公司。
+    </blockquote>
+
+    <h2>核心概念：dLLM 与 AR 的本质差异</h2>
+    <h3>1. 并行生成：从「逐词接龙」到「先打草稿再精修」</h3>
+    <pre><code>自回归（AR）:  for t in 1..N:  x_t ~ p(·|x_&lt;t)        # N 次串行前向，一次一个 token
+扩散（dLLM）:  x^(0) = 整块噪声/mask
+               for s in 1..S:  x^(s) = denoise(x^(s-1))  # S 次迭代，每次并行改写整块
+               # S ≪ N：步数是可调旋钮——步数少则快而粗，步数多则精而慢</code></pre>
+    <ul>
+      <li><strong>生成单位从 token 变成块</strong>：输出先是一团「粗粒度草图」，经若干次去噪迭代收敛成文——token 是「一起浮现」的，不是逐个接龙的；</li>
+      <li><strong>去噪步数 = 速度/质量旋钮</strong>：这与 <a href="daily-2026-09-02-atlas.html">Atlas 笔记</a>里 rectified flow 的「步数换质量」是同一个扩散家族的性质，只是这次作用在文本上；</li>
+      <li><strong>纠错是原生的</strong>：后续迭代可以改写前面的 token——AR 模型「落子无悔」，dLLM「可以反悔」，官方把「边想边改幻觉」列为 dLLM 的演进方向；</li>
+      <li><strong>可控生成更自然</strong>：任意顺序生成、填充（infill）、schema 对齐输出，对「先生成结构再填内容」的用法友好（Mercury 2.5 已带 schema-aligned JSON）。</li>
+    </ul>
+
+    <h3>2. 与推测解码的对照：范式并行 vs 验证补丁</h3>
+    <table>
+      <thead><tr><th></th><th>AR + 推测解码</th><th>dLLM（Mercury）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>并行发生在哪</strong></td><td>验证阶段：一次前向核验 γ 个草稿 token，产出分布仍严格等于 AR</td><td>生成阶段：每个去噪步并行改写整块文本，本来就没有「逐 token 因果链」</td></tr>
+        <tr><td><strong>额外组件</strong></td><td>草稿模型 / 草稿头 / n-gram 池</td><td>无；但去噪步数本身是 hyperparameter</td></tr>
+        <tr><td><strong>与 KV cache 的关系</strong></td><td>强依赖（PagedAttention/prefix caching 全套适用）</td><td>注意力是块内双向的，没有因果 KV 复用语义——<a href="daily-2026-09-01-kv-cache.html">KV cache 笔记</a>那套管理不直接适用，工程栈要另搭</td></tr>
+        <tr><td><strong>加速来源</strong></td><td>利用 decode 的带宽闲置（memory-bound 区间）</td><td>生成路径短（S 步而非 N 步），单步计算可打满 GPU</td></tr>
+        <tr><td><strong>质量保证</strong></td><td>数学上严格无损（修正拒绝采样）</td><td>经验性对标：官方称与「成本优化前沿档」相当（见下表），非数学保证</td></tr>
+      </tbody>
+    </table>
+
+    <h2>产品要点：Mercury 2.5 规格与价格</h2>
+    <table>
+      <thead><tr><th>项目</th><th>内容（官方口径）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>定位</strong></td><td>「我们已知范围内最大的扩散语言模型」；质量对标 <strong>GPT-5.6 Luna (Low) / Gemini 3.5 Flash-Lite / Claude Haiku 4.5</strong> 这档「成本优化前沿」模型（注意：不是对标旗舰）</td></tr>
+        <tr><td><strong>质量</strong></td><td>相对 Mercury 2 智能提升 <strong>40%</strong>（官方综合口径）；训练信号来自客户反馈与生产失败案例的闭环</td></tr>
+        <tr><td><strong>速度</strong></td><td><strong>1,107 tokens/s</strong>，广泛可得的 NVIDIA GPU 上（无需定制芯片）；作为参照：2025 年首代 Mercury 发布时，速度优化型 AR 模型普遍 &lt;200 tok/s</td></tr>
+        <tr><td><strong>上下文</strong></td><td>260K tokens</td></tr>
+        <tr><td><strong>价格</strong></td><td>$0.20 / $0.75（每百万输入/输出 token）；上线期 8 折促销<strong> $0.04 / $0.15</strong></td></tr>
+        <tr><td><strong>能力</strong></td><td>可调推理（tunable reasoning）、并行工具调用、schema 对齐 JSON</td></tr>
+        <tr><td><strong>获取</strong></td><td>Inception API（新 key 送 1 亿 token）、Baseten、OpenRouter；企业版支持专属容量与合规配置</td></tr>
+        <tr><td><strong>同场发布</strong></td><td>Mercury Voice 预览（TTFT &lt;170ms 的语音专用 dLLM）、Mercury Router 预览（用 dLLM 理解请求并路由到最佳模型）</td></tr>
+      </tbody>
+    </table>
+
+    <h3>生产案例：延迟在 agent 管线里是「复利」</h3>
+    <ul>
+      <li><strong>搜索/RAG</strong>：一次搜索触发几十次模型调用（规划、改写、重排、结构化、摘要、校验），官方称多家搜索基础设施公司在生产中使用；</li>
+      <li><strong>语音（OpenCall）</strong>：电话客服场景，换用 Mercury 后 <strong>P99 从数分钟降到 1 秒，P50 从 0.4s 降到 &lt;0.2s</strong>，中位模型响应延迟约 170ms——「语音里延迟不是基础设施细节，是来电者听到的停顿」；</li>
+      <li><strong>编程子代理（Augment Code）</strong>：把 <strong>上下文压缩（compaction）</strong>切到 Mercury，延迟从约 150s 降到 27s（<strong>−82%</strong>）、成本降 90%，质量持平；MCP 工具检索摘要 <1s 返回。这个案例与 <a href="daily-2026-09-07-harness-compaction.html">Context Compaction 笔记</a>直接呼应——compaction 正是「支撑性调用」的典型。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先切「支撑性调用」，别切主推理</strong>：Augment 的模式是模板——compaction、路由、查询改写、工具摘要这类高频低风险调用先换 dLLM；主规划/主生成链路保留前沿模型。这与 <a href="daily-2026-09-03-mercor-skyrl.html">Mercor 配方</a>里「小模型承担辅助环节」的分层思想一致。</li>
+      <li><strong>用 P99 而不是 tok/s 评估</strong>：官方 1,107 tok/s 是吞吐口径；你的负载要测的是端到端 P50/P99 延迟与「一次用户交互内的总调用预算」。语音与实时交互场景尤其要实测 TTFT。</li>
+      <li><strong>注意范式差异对 harness 的假设</strong>：dLLM 没有因果 KV 语义，prefix caching、推测解码这类 AR 生态优化不适用；如果你的 harness 依赖这些（或依赖流式逐 token 输出做 UI 打字机效果），接入前要验证。</li>
+      <li><strong>质量上限要对齐预期</strong>：官方对标的是「成本优化前沿档」（Haiku 4.5 / Flash-Lite / Luna Low），不是 Opus/Fable 旗舰档；复杂多步推理、长链代码任务先用自有评测集 A/B，别凭基准表切换。</li>
+      <li><strong>价格是窗口期</strong>：$0.04/$0.15 是上线促销（80% off），常态 $0.20/$0.75；做容量规划按常态价算。</li>
+      <li><strong>值得跟踪的信号</strong>：官方称「下一代更大的模型已在训练中」——dLLM 的 scaling 曲线能否逼近旗舰质量档，是这个范式能否从「快而够用」走向「快且强」的关键证据。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        dLLM 为什么绕开了 AR 的串行瓶颈？它与推测解码的「并行」有什么本质区别？
+        <details><summary>参考答案</summary>
+        AR 的瓶颈是数学结构：p(x) = Π p(x_t | x_&lt;t)，第 t 个 token 以全部前序为条件，无法不串行。推测解码不改变这个结构，只是利用「验证 γ 个 token 与生成 1 个 token 同价（memory-bound）」的事实，把串行生成换成「串行草稿 + 并行验证」，产出分布仍严格等于逐 token AR——它是系统层补丁。dLLM 改变的是结构本身：用扩散过程对整块文本联合建模，每个去噪步并行改写所有位置，生成路径长度是 S（去噪步数）而非 N（token 数），S≪N 且可调。没有逐 token 因果链，也就不需要 KV cache 复用与草稿-验证机制。代价是放弃 AR 的精确序列分解：长程一致性与逐步条件化的推理链条要靠模型容量与训练弥补，这也是 dLLM 当前质量上限停留在「成本优化档」的深层原因。</details>
+      </li>
+      <li>
+        「去噪步数」在 dLLM 中扮演什么角色？它与 AR 系统的哪些旋钮功能类似、又本质不同？
+        <details><summary>参考答案</summary>
+        去噪步数 S 是 dLLM 的速度-质量旋钮：S 小则草图粗、延迟低，S 大则精修充分、质量高。功能上类似 AR 生态里的 reasoning effort（低/高/max）或推测解码的 γ——都是「用计算换质量」的用户侧旋钮。本质区别在于结构与确定性：reasoning effort 改变的是生成内容的「长度」（更多思考 token），γ 改变的是接受率与期望接受长度（不改变分布）；而 S 改变的是同一个扩散收敛过程的保真度——在固定输出长度下调节质量。工程含义：dLLM 允许在「输出 token 数不变」的前提下压延迟，这对有固定输出 schema 的调用（路由、改写、compaction）是独特的甜点；但也意味着质量对 S 的标定敏感，上线前需要在目标负载上扫 S 的曲线。</details>
+      </li>
+      <li>
+        为什么 dLLM 特别适合「一次请求触发几十次子调用」的 agent 管线？用 P99 的复利效应说明。
+        <details><summary>参考答案</summary>
+        串联管线的端到端延迟是各次调用延迟的累加，而尾部延迟会放大：若单次调用 P99 = 2s，一条 20 次串联调用的链路里「至少一次踩到尾部」的概率约 1 − 0.99²⁰ ≈ 18%，用户感知的 P99 被推向多次尾部叠加。子调用越多，主模型单次的「智能溢价」被延迟复利吃掉得越快。dLLM 把单次调用延迟压缩一个量级（OpenCall：P99 数分钟 → 1s），等于把整条链路的尾部风险压回可交互区间。这正是 Inception 反复强调的场景——搜索管线的几十次调用、Augment 的 compaction/路由——它们的共性是「单次调用不难、但调用次数多」。选切入点时算一笔账：把管线的调用图列出来，dLLM 先切「调用次数 × 单次延迟」乘积最大的环节。</details>
+      </li>
+      <li>
+        dLLM 没有因果 KV cache 语义。这对习惯了 AR 推理栈的工程团队意味着什么？（至少说出两点具体影响）
+        <details><summary>参考答案</summary>
+        ① <strong>系统优化工具箱整体失效</strong>：PagedAttention 的页表管理、prefix caching 的前缀复用、推测解码的草稿-验证，全部建立在「token 逐个追加、历史 K/V 不变」的因果结构上；dLLM 每步去噪都改写整块，注意力双向，这些优化不直接适用——容量规划与延迟优化要用 dLLM 自己的口径（块大小、步数、并发）重做。② <strong>流式 UX 与中断语义变化</strong>：AR 逐 token 流出，天然支持打字机 UI 与中途取消；dLLM 的输出是迭代收敛的整块，早期输出是「草图」而非「前缀」，做逐字展示或「用户打断即停」需要重新定义交互（按去噪步流式、或等收敛后一次返回）。③ 评测口径变化：tok/s 在 dLLM 上更像「块吞吐」，与 AR 的 TPOT 不可直接比——比的是端到端延迟与单位成本完成的任务数。</details>
+      </li>
+      <li>
+        Inception 说 dLLM 未来可以「边思考边纠错，把幻觉改掉」。从扩散机制解释这个能力的来源，并讨论它与 AR 推理模型「长思维链自我检查」的路线差异。
+        <details><summary>参考答案</summary>
+        来源在于扩散的非因果改写：后续去噪步可以修改任何位置的 token，包括「已经写出来」的内容——如果发现前面的论述与后面的证据矛盾，修订可以反向发生。AR 模型写出的 token 不可撤销，所谓自我检查只能靠「继续往后写」（在后续 token 里承认并纠正），原文仍在上下文里。路线差异：AR 的自纠是<strong>时间上的追加</strong>（更多 token、更长链、更高成本，且错误文本始终留在 context 中可能被后续 attend 到）；dLLM 的自纠是<strong>空间上的修订</strong>（原地改写，最终输出不含中间错误，token 账更省）。但注意这是官方描绘的方向而非已交付能力——空间修订要可靠工作，模型需要学会「何时该反悔」，这大概率要靠专门训练（可能包括 RL）；它能否在长链推理上超过 AR 的「长链 + 自洽投票」，是 dLLM 范式最值得跟踪的开放问题。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Inception 官方博客（2026-09-08）：<a href="https://www.inceptionlabs.ai/blog/introducing-mercury-2-5" target="_blank" rel="noopener">Introducing Mercury 2.5</a>；背景：<a href="https://www.inceptionlabs.ai/blog/introducing-mercury" target="_blank" rel="noopener">首代 Mercury 发布文（dLLM 机制与速度对比）</a></li>
+      <li>试用入口：Inception API（新 key 100M 免费 token）· Baseten · OpenRouter（见其官方博客）</li>
+      <li>相关笔记：<a href="daily-2026-09-07-speculative-decoding.html">推测解码（AR 范式的并行补丁）</a> · <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生（AR 推理栈的地基）</a> · <a href="daily-2026-09-07-harness-compaction.html">Context Compaction（Augment 案例对应的支撑性调用）</a> · <a href="daily-2026-09-02-atlas.html">Atlas（扩散家族的「步数换质量」旋钮）</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

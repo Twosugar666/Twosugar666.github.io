@@ -284,6 +284,13 @@
       "source": "algo",
       "topic": "Attention：Scaled Dot-Product / softmax(QK^T/√d_k)V / multi-head / 因果掩码",
       "file": "posts/daily-2026-09-09-algo-attention.html"
+    },
+    {
+      "date": "2026-09-09",
+      "domain": "agent infra",
+      "source": "frontline",
+      "topic": "Inception Mercury 2.5：扩散语言模型进生产（并行去噪 / 1107 tok/s / 260K / $0.20-$0.75）",
+      "file": "posts/daily-2026-09-09-mercury-2-5.html"
     }
   ]
 }
