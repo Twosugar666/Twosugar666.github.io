@@ -1,1 +1,188 @@
-SYNC_CHECK_SKIP
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜SRPO：把「一次环境转移消费的输出集合」当成多智能体动作（Setwise Relative Policy Optimization） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜SRPO：把「一次环境转移消费的输出集合」当成多智能体动作（Setwise Relative Policy Optimization）</h1>
+    <p class="post-meta">2026-09-10 · 收藏夹：RL / Agent · 一线追踪<br />
+      论文：Yang, Xiong, Li, Li, Cai, Feng · <em>SRPO: Setwise Relative Policy Optimization for Multi-Agent LLMs</em> ·
+      arXiv <a href="https://arxiv.org/abs/2609.08452" target="_blank" rel="noopener">2609.08452</a>（submitted 2026-09-08）。
+      文中机制与「macro-average 最强」均为<strong>论文自报</strong>；未做第三方复测。
+      交叉：
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>、
+      <a href="daily-2026-09-07-tigpo.html">TIGPO</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      多智能体 LLM（MAS）在共享环境里协作：有的分工（division of labor）——按角色 / 轮次各出一段；有的共演化（joint co-evolution）——同一状态下并行多份提案再聚合；更多时候是 mixed / dynamically routed。
+      端到端 RL 想用团队回报训整套系统，但既有相对策略优化（PPO / <a href="grpo-notes.html">GRPO</a> / <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 一线）通常仍按<strong>单条 response</strong>或<strong>单智能体 trajectory</strong>定义更新单位。
+    </p>
+    <p>
+      问题在于：一次环境转移（state transition）往往由<strong>多条输出共同造成</strong>——路由器、多个 worker、aggregator 的若干条新采样一起被环境消费。若优化器仍按「单条」clip / 赋优势，则<strong>更新单位 ≠ 系统真正执行的动作单位</strong>。换协作范式（分工 ↔ 共演化）不仅改工作流，还悄悄改了「什么叫一个 action」——同一环境决策在不同编排下拿到不同更新规则。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：SRPO 把<strong>active set</strong>（一次 transition 消费的最小新输出集合）定义为多智能体 action；成员 log-ratio 聚合成<strong>基数归一化 set ratio</strong>，赋<strong>一个</strong> relative advantage，对 set <strong>只 clip 一次</strong>——分工与共演化只是不同 cardinality。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Active set Se：对齐环境边界的动作</h3>
+    <p>
+      论文定义（Definition：Active set）：<strong>Se</strong> 是被一次状态转移消费的、新采样输出的<strong>最小集合</strong>。
+      若环境只 commit 了 aggregator 的输出，active set 可以是单元素；若路由器 + 多个 worker + aggregator 的输出同被消费，它们同属一个 Se。
+      同一 Se 内的成员从同一 pre-action state 采样，并共同造成该次转移——这才是 MAS 在环境侧的「一步」。
+    </p>
+    <table>
+      <thead><tr><th>协作形态</th><th>Active set 形态</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Division of labor</strong></td>
+          <td>常 Ke = |Se| = 1（单角色输出驱动转移）</td>
+          <td>退化为普通序列级相对更新</td>
+        </tr>
+        <tr>
+          <td><strong>Joint co-evolution</strong></td>
+          <td>Ke &gt; 1（多提案同被消费）</td>
+          <td>一次环境决策对应多成员联合动作</td>
+        </tr>
+        <tr>
+          <td><strong>Fixed / mixed / routed</strong></td>
+          <td>Ke 随事件变化</td>
+          <td>同一训练接口，不换「什么叫 action」</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>（中央 harness 策略 + Action–Args）角度不同：Harness-RL 问的是「谁在调度工具」；SRPO 问的是「环境吃掉了哪些输出，应作为一个 proximal unit」。两者可叠：harness 决定编排，SRPO 决定相对目标里的 action 粒度。
+    </p>
+
+    <h3>② Set ratio：成员 log-ratio → 基数归一化 → 一次 clip</h3>
+    <pre><code># 成员 j ∈ Se：masked 序列 log-ratio（示意）
+#   ℓ_{e,j} = Σ_u m_{e,j,u} · [ log π_θ(y_{e,j,u}|…) − log π_old(y_{e,j,u}|…) ]
+#   m 排除 prompt / padding / 环境 token
+
+# 基数归一化 set score（论文式）
+L_set ≈ (1 / √Ke) · Σ_{j ∈ Se} ℓ_{e,j}
+ρ_SRPO = exp(L_set)
+
+# 解释
+#   Ke = 1  → L_set = ℓ，ρ 退化为普通序列级 importance ratio（对齐 GSPO / 序列级 PPO）
+#   Ke &gt; 1 → 用 √Ke temper 联合 log-ratio 的增长，再对整个 set 做一次 clip
+#   一个 relative advantage A_e 乘到整个 set 上；不是对每个成员各 clip 一遍
+</code></pre>
+    <p>
+      为何要 √Ke？若各成员独立 clip，一次依赖多输出的转移会被拆成多个 proximal 约束，联合决策的「一步」被打碎；若直接对联合 log-ratio 不做基数 temper，大 Ke 事件的似然变化尺度膨胀，clip 行为与梯度尺度随 cardinality 漂移。论文选择：<strong>先归一化，再对事件做一次 setwise clip</strong>，让优化单位钉在环境转移上，同时允许 Ke 事件间变化。
+    </p>
+    <pre><code># 相对目标骨架（示意，对齐 PPO/GRPO 风格）
+#   L_SRPO ~ E[ min( ρ_SRPO · A_e ,  clip(ρ_SRPO, 1−ε, 1+ε) · A_e ) ]
+#   A_e：对该 active set / 事件的一个 relative advantage
+#        （组内相对、事件归约等细节见论文；rollout/reward/advantage 估计可互换）
+</code></pre>
+
+    <h3>③ 只改 policy action 定义；管线其余可不动</h3>
+    <table>
+      <thead><tr><th>组件</th><th>SRPO 是否强制改</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Policy action</strong></td><td>是</td><td>response/trajectory → active set Se</td></tr>
+        <tr><td><strong>Ratio / clip</strong></td><td>是（粒度）</td><td>成员聚合 + √Ke 归一 + set 一次 clip</td></tr>
+        <tr><td><strong>Rollout 生成</strong></td><td>否</td><td>固定 / 混合 / 动态路由均可</td></tr>
+        <tr><td><strong>Reward</strong></td><td>否</td><td>端到端团队回报等可沿用</td></tr>
+        <tr><td><strong>Advantage</strong></td><td>否（接口）</td><td>相对优势估计算子可互换；赋到 set 上</td></tr>
+        <tr><td><strong>Optimizer</strong></td><td>否</td><td>AdamW 等照旧</td></tr>
+      </tbody>
+    </table>
+    <p>
+      工程含义：已有 GRPO/GSPO 栈不必推倒——关键是<strong>事件原子化 batching</strong>：把「一次转移消费的输出」打成同一 action record，再算 L_set / ρ_SRPO。这与 <a href="daily-2026-09-07-tigpo.html">TIGPO</a> 的「图上信用」互补：TIGPO 管跨更新结构记忆；SRPO 管单次转移的动作对齐。
+    </p>
+
+    <h3>④ 实验画像（论文自报）</h3>
+    <ul>
+      <li><strong>任务</strong>：数学推理 + 多轮 search。</li>
+      <li><strong>工作流</strong>：fixed / mixed / dynamically routed——同一训练接口。</li>
+      <li><strong>规模</strong>：四个模型规模。</li>
+      <li><strong>结论措辞</strong>：论文称在所报告对比中 <strong>macro-average 最强</strong>（自报）；另有优化诊断：梯度尺度、回复长度、set cardinality、事件完整性等。</li>
+    </ul>
+    <p>
+      读结果时保持纪律：macro-average「最强」是相对论文所选基线与设定；换 harness、换奖励、换事件归约规则都可能改排名。落地前应用自己的 held-out 与成本账复测。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画「环境消费边界」。</strong> 日志里标清：哪几条新采样真正触发了 obs 变更；那就是候选 Se。编排图上的「逻辑一步」≠ 环境一步。</li>
+      <li><strong>Ke=1 当回归基线。</strong> 单智能体 / 单输出路径应数值贴近现有序列级 ratio；否则先查 mask 与聚合实现。</li>
+      <li><strong>禁止「假联合」。</strong> 把无关并行 rollout 硬塞进同一 Se 会污染 set ratio；Se 必须是被同一次 transition 消费的最小集合。</li>
+      <li><strong>Clip 次数是设计点。</strong> 成员各自 clip 再平均 ≠ SRPO；要对齐论文的「set 一次 clip」。</li>
+      <li><strong>与 GSPO/GRPO 对照读。</strong> GSPO 是序列级重要性；SRPO 在 MAS 上把「序列」升格为「可变基数集合」，归一用 √Ke。</li>
+      <li><strong>诊断盯 Ke 分布。</strong> 若训练中 Ke 暴涨或事件残缺，先修 event-atomic batching，再谈超参。</li>
+      <li><strong>别神化 acronym。</strong> 社区里另有同名 SRPO（如历史重采样两阶段、自反思等）；本文专指 Setwise Relative Policy Optimization（arXiv:2609.08452）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么说「按单条 response 更新」会在 MAS 里造成更新单位与系统动作单位错位？
+        <details><summary>参考答案</summary>
+        环境一次转移可能由多条输出共同造成。若优化器仍对每条独立算 ratio、独立 clip、独立赋优势，Proximal 约束钉在「单条」上，而真正改变状态的是集合。协作范式一变（分工变共演化），同一环境决策会被拆成不同数量的更新单元，规则不再可比。</details>
+      </li>
+      <li>
+        Active set 为何强调「最小」且「被该次 transition 消费」？
+        <details><summary>参考答案</summary>
+        「消费」保证集合与环境边界对齐，避免把未影响转移的旁路采样算进动作；「最小」避免把整段 rollout 历史塞进一个过大 set，导致基数与信用糊掉。定义钉在转移边界，才能跨 fixed/mixed/routed 共用同一 action 语义。</details>
+      </li>
+      <li>
+        L_set 除以 √Ke 而不是 Ke 或不除，主要防什么？
+        <details><summary>参考答案</summary>
+        Ke&gt;1 时成员 log-ratio 求和会使联合变化尺度随基数膨胀；不 temper 则 clip 阈值对不同 Ke 含义漂移。√Ke 是论文采用的基数归一，使 set ratio 在可变 cardinality 下更可比；Ke=1 时精确退化为序列级 ratio。具体指数选择应对照论文协方差尺度讨论与消融，工程上先实现论文式再调。</details>
+      </li>
+      <li>
+        「一个 relative advantage、对 set 只 clip 一次」相对「每成员 clip」的差异是什么？
+        <details><summary>参考答案</summary>
+        前者把 proximal 单位设为整个环境事件：联合动作共享同一优势信号与一次信任域约束。后者把联合决策拆成多个独立 proximal 步，可能出现部分成员被 clip、部分未被 clip，联合更新方向与「一步转移」不一致。</details>
+      </li>
+      <li>
+        若已有稳定的 GRPO/GSPO 单智能体栈，接入 SRPO 最小改动路径是什么？
+        <details><summary>参考答案</summary>
+        保留 rollout、reward、advantage 估计器与优化器；增加事件原子化：识别 Se、算成员 ℓ、聚合 L_set= (1/√Ke)Σℓ、ρ=exp(L_set)，用一个 A_e 做一次 setwise clip 目标。先在 Ke≡1 路径上回归到旧曲线，再打开多成员事件。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Yang et al. · SRPO：
+        <a href="https://arxiv.org/abs/2609.08452" target="_blank" rel="noopener">arXiv:2609.08452</a></li>
+      <li>站内交叉：
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a> ·
+        <a href="daily-2026-09-07-tigpo.html">TIGPO</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
