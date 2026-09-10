@@ -291,6 +291,27 @@
       "source": "frontline",
       "topic": "Inception Mercury 2.5：扩散语言模型进生产（并行去噪 / 1107 tok/s / 260K / $0.20-$0.75）",
       "file": "posts/daily-2026-09-09-mercury-2-5.html"
+    },
+    {
+      "date": "2026-09-10",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "SRPO：active set 作多智能体动作 + 基数归一化 set ratio / 一次 clip（arXiv:2609.08452）",
+      "file": "posts/daily-2026-09-10-srpo.html"
+    },
+    {
+      "date": "2026-09-10",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Ralph Loop：hook 拦截退出 + 清窗重注目标 + 外存续跑（vs compaction）",
+      "file": "posts/daily-2026-09-10-harness-ralph-loop.html"
+    },
+    {
+      "date": "2026-09-10",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "DPO：Bradley-Terry + 隐式奖励 β log(π/π_ref)；跳过 RM+PPO（≠ DAPO）",
+      "file": "posts/daily-2026-09-10-algo-dpo.html"
     }
   ]
 }

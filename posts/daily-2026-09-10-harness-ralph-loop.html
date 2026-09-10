@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Ralph Loop：用 hook 拦截退出、清窗重注目标的长程 harness 续跑 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Ralph Loop：用 hook 拦截退出、清窗重注目标的长程 harness 续跑</h1>
+    <p class="post-meta">2026-09-10 · 收藏夹：Harness / Agent · 学习笔记<br />
+      素材：Vivek Trivedy · <em>The Anatomy of an Agent Harness</em>（LangChain Blog）·
+      <a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness" target="_blank" rel="noopener">langchain.com/blog/…</a>。
+      对照站内
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      LangChain 文把公式写死：<strong>Agent = Model + Harness</strong>。Harness = 一切非模型的东西——system prompt、tools/skills/MCP、filesystem / sandbox / browser、编排（subagent、handoff、routing）、以及确定性 hooks/middleware（compaction、continuation、lint）。
+      模型贡献智力；harness 把智力变成可工作的系统。站内 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a> 同一立场：运行时接管工具、上下文与环境。
+    </p>
+    <p>
+      长程自主执行仍卡在两类病：① <strong>early stopping</strong>——模型过早声称完成并退出；② <strong>跨多窗口不连贯</strong>——工作跨过多个 context window 后，同会话硬塞历史会腐烂，清窗又丢进度。
+      Compaction（见 <a href="daily-2026-09-07-harness-compaction.html">站内笔记</a>）解决的是「同会话快爆窗时如何压缩续跑」；Ralph Loop 解决的是另一条轴：<strong>拦截退出 → 干净窗口 → 重注入原目标</strong>，进度靠<strong>外存（文件系统 / git）</strong>而不是靠塞满的对话历史。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Ralph Loop = hook 拦住「我做完了/要退出」→ 在<strong>干净 context</strong>里重注原目标 prompt → 强迫相对 completion goal 继续；上一轮产物落盘，新一轮<strong>读盘不读旧上下文</strong>。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Harness 组件清单（从模型能力缺口反推）</h3>
+    <table>
+      <thead><tr><th>模型做不到 / 不该独自做的</th><th>Harness 补丁</th></tr></thead>
+      <tbody>
+        <tr><td>跨交互持久状态</td><td>Filesystem、AGENTS.md 式记忆注入、git 账本</td></tr>
+        <tr><td>执行代码 / 装依赖</td><td>Bash + sandbox + 预装工具链</td></tr>
+        <tr><td>实时知识</td><td>Web search / MCP</td></tr>
+        <tr><td>上下文腐烂</td><td>Compaction、tool-output offload、Skills 渐进披露</td></tr>
+        <tr><td>长程早停与跨窗断裂</td><td><strong>Ralph Loop</strong> + plan 文件 + self-verification hooks</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>（bash-only、线性 messages）和 <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>（Workspace 工厂）对照：前两者给执行面与状态容器；Ralph 是<strong>续跑控制面</strong>——不换工具集，改「何时允许停、停了如何再开」。
+    </p>
+
+    <h3>② Ralph Loop 逐步</h3>
+    <pre><code># Ralph Loop（harness 模式，示意）
+goal_prompt = 原始用户目标（固定文本）
+while not done and within_budget:
+  ctx = 空 / 干净 context window          # 不继承上一轮对话 token
+  inject(goal_prompt + 如何读盘/plan 的提醒)
+  run_agent_until_model_tries_to_exit()
+  if hook_intercepts_exit_claim:
+    # 不把「声称完成」当成真完成
+    persist_artifacts_to_filesystem_and_git()
+    continue   # 下一轮清窗，读盘续做
+  else:
+    # 仅当外部完成判定（测试绿 / 验收脚本）通过才放行
+    break
+
+# 关键不变量
+#   对话历史不是跨轮真理；文件系统 / git 才是
+#   每一轮相对的是 completion goal，不是「接着昨天的聊天语气」
+</code></pre>
+    <ul>
+      <li><strong>Hook 拦截退出</strong>：模型输出「完成」或触发 stop 工具时，harness 可拒绝放行，改为开启新一轮。</li>
+      <li><strong>清窗重注</strong>：新窗口只带 goal + 必要的读盘/计划指令，避免把腐烂长历史原样续上。</li>
+      <li><strong>外存状态</strong>：代码、报告、plan 文件、测试日志落在 workspace；下一轮用 bash/读文件恢复态势。</li>
+    </ul>
+
+    <h3>③ 与 Compaction 对比</h3>
+    <table>
+      <thead><tr><th>维</th><th>Context Compaction</th><th>Ralph Loop</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>会话身份</strong></td>
+          <td>同一会话内压缩续跑</td>
+          <td>常开启新的干净窗口迭代</td>
+        </tr>
+        <tr>
+          <td><strong>历史处理</strong></td>
+          <td>摘要 / 裁剪 / checkpoint 同窗历史</td>
+          <td>丢弃对话上下文，依赖外存</td>
+        </tr>
+        <tr>
+          <td><strong>触发</strong></td>
+          <td>接近上下文上限、腐烂风险</td>
+          <td>模型声称完成 / 请求退出，或主动续跑策略</td>
+        </tr>
+        <tr>
+          <td><strong>风险</strong></td>
+          <td>摘要丢细节、TITO 边界（见 TITO 文）</td>
+          <td>无限续跑烧钱；丢盘则进度真丢</td>
+        </tr>
+        <tr>
+          <td><strong>可组合</strong></td>
+          <td>单轮内仍可 compaction</td>
+          <td>Ralph 外层迭代 + 内层 compaction</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      一句话分工：compaction = <strong>同会话减肥</strong>；Ralph = <strong>清窗 + 外存账本的迭代续跑</strong>。长程系统往往两层都要。
+    </p>
+
+    <h3>④ 配套：plan、自验证、git 账本</h3>
+    <ul>
+      <li><strong>Plan 文件</strong>：harness 提示模型把目标拆步写入 workspace 中的 plan；每轮清窗后先读 plan，减少「忘记还剩什么」。</li>
+      <li><strong>Self-verification hooks</strong>：退出前跑固定测试 / lint；失败则把错误回灌模型，不允许声称完成。这与 OpenHands / mini-SWE 的「观察—修复」环同构，只是钩在 harness 确定性层。</li>
+      <li><strong>Filesystem + git</strong>：跨会话与多 agent 的共享账本；新 agent / 新窗口靠 <code>git log</code> / 工作树快速对齐「已做到哪」。</li>
+    </ul>
+    <p>
+      对 RL 训练侧（<a href="daily-2026-08-31-harness-tito.html">TITO</a>）：Ralph 改变的是部署时轨迹长度与停止分布。若训推 harness 不一致（训练无 Ralph、线上有 Ralph），早停与上下文分布会偏移——训推合同要显式声明。
+    </p>
+
+    <h3>⑤ 实践边界：无限 Ralph 会烧钱</h3>
+    <pre><code># 必须同时具备的闸门（工程清单）
+budget.max_iterations / max_tokens / max_wallclock
+completion_predicate = 测试绿 ∧ 验收脚本 ∧ （可选）人工门
+stagnation_detect = 连续 k 轮 diff 为空 / 测试失败集不变 / plan 无进展
+on_stagnation → 降级：换策略提示 / 请求人类 / 硬停并保留现场
+</code></pre>
+    <p>
+      Ralph 把「模型想停」从控制权里拿走；若不加预算与停滞检测，系统会在失败环里清窗重试到账单爆炸。Harness 的职责不只是「让它继续」，更是「知道何时不许继续」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先定义完成谓词，再开 Ralph。</strong> 没有可机判的 done，拦截退出就变成无限循环。</li>
+      <li><strong>磁盘是真理，聊天是草稿。</strong> 关键产物与 plan 必须落盘；清窗前做一次「可恢复检查点」（至少 git commit 或工件清单）。</li>
+      <li><strong>与 compaction 分层启用。</strong> 单轮内防爆窗用 compaction；跨轮防早停用 Ralph。不要用无限塞历史代替外存。</li>
+      <li><strong>钩子要确定性。</strong> 退出拦截、测回灌、预算计数放 harness hooks，不交给模型「自觉」。</li>
+      <li><strong>对齐训推。</strong> 若线上 Ralph 显著拉长轨迹，评估与 RL 数据采集应用同一停止政策，或显式 domain randomization。</li>
+      <li><strong>观察停滞信号。</strong> 重复失败测试、空 diff、plan 步骤来回改——应触发熔断，而非再开一轮同温采样。</li>
+      <li><strong>成本看板。</strong> 按「每完成目标的 token / 迭代次数」报警；Ralph 是能力旋钮也是成本旋钮。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么「Agent = Model + Harness」比「Agent = 带工具的模型」更干净？
+        <details><summary>参考答案</summary>
+        后者仍把脚手架当成模型附属；前者强制把 prompt、工具、沙箱、编排、hooks 全部划到系统设计面。能力缺陷可以落在模型或 harness 两侧分别治理，也方便做「同模型换 harness」消融。</details>
+      </li>
+      <li>
+        Ralph 清窗后为何还能续做，而不是从头瞎做？
+        <details><summary>参考答案</summary>
+        因为进度被外置到文件系统与 git：代码、plan、测试结果仍在。新窗口重注目标后，模型通过读盘重建态势，不依赖上一窗的对话 token。没有外存，清窗就真是失忆。</details>
+      </li>
+      <li>
+        Compaction 与 Ralph 能否互相替代？
+        <details><summary>参考答案</summary>
+        不能。Compaction 保留同会话身份并压缩历史；Ralph 常丢弃对话历史、用迭代 + 外存对抗早停与跨窗断裂。替代会导致：只用 compaction 仍可能早停；只用 Ralph 单轮仍可能爆窗。宜分层组合。</details>
+      </li>
+      <li>
+        Self-verification hook 失败回灌，解决的是 early stopping 的哪一层？
+        <details><summary>参考答案</summary>
+        解决「声称完成但客观未完成」。模型主观 stop 被测试/验收否决后，错误信号回灌，迫使继续修。若无客观谓词，拦截退出只能靠启发式，易误杀或漏放。</details>
+      </li>
+      <li>
+        无限 Ralph 的主要风险与最小闸门集是什么？
+        <details><summary>参考答案</summary>
+        风险：token/费用爆炸、失败环空转、磁盘堆积无价值 diff。最小闸门：迭代/token/墙钟预算、可机判完成谓词、停滞检测（空 diff / 失败集不变）与熔断降级。缺任一闸门都不应默认开启自动续跑。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Vivek Trivedy · The Anatomy of an Agent Harness（LangChain）：
+        <a href="https://www.langchain.com/blog/the-anatomy-of-an-agent-harness" target="_blank" rel="noopener">langchain.com/blog/the-anatomy-of-an-agent-harness</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

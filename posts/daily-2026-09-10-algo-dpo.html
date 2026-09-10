@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜DPO：跳过奖励模型，直接用偏好对优化策略（Bradley-Terry / 隐式奖励） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜DPO：跳过奖励模型，直接用偏好对优化策略（Bradley-Terry / 隐式奖励）</h1>
+    <p class="post-meta">2026-09-10 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Rafailov et al. · <em>Direct Preference Optimization: Your Language Model is Secretly a Reward Model</em>
+      （NeurIPS 2023）· <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">arXiv:2305.18290</a>。
+      <strong>注意：DPO ≠ DAPO</strong>（后者见
+      <a href="daily-2026-09-04-algo-dapo.html">2026-09-04 DAPO 笔记</a>，是 GRPO 长 CoT 训练细节）。
+      交叉：
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      经典 RLHF 管线大致三段：① SFT 得到 π_SFT；② 用人类偏好对训奖励模型（RM）；③ 以 RM 为奖励，用 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 等对策略做 RL，并用参考模型 π_ref 做 KL 约束防崩。
+      痛点叠在一起：训 RM 要数据与校准；PPO 要价值函数 / 优势估计与采样稳定性；在线 rollout 贵；超参多。
+    </p>
+    <p>
+      <strong>DPO（Direct Preference Optimization）</strong> 的核心洞察：在 Bradley-Terry 偏好模型下，KL 约束 RL 的最优策略对应一个<strong>隐式奖励</strong>，可写成策略与参考策略的 log 比。于是可以<strong>跳过显式 RM + PPO 环</strong>，直接在偏好对 (y_w, y_l) 上对 π_θ 做分类式损失。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：DPO = 把「最优策略下的隐式奖励 r = β log(π_θ/π_ref) + const」代回 Bradley-Terry，得到只需偏好对的 −log σ(…) 目标；模型「秘密地」扮演奖励模型。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① RLHF 管线 vs DPO 捷径</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>PPO-RLHF</th><th>DPO</th></tr></thead>
+      <tbody>
+        <tr><td>SFT</td><td>需要</td><td>通常需要（作初始化 / π_ref 来源）</td></tr>
+        <tr><td>奖励模型 RM</td><td>显式训练</td><td><strong>跳过</strong></td></tr>
+        <tr><td>在线 RL（PPO 等）</td><td>需要采样 + 优势 + clip</td><td><strong>跳过</strong>；偏好对上闭式目标</td></tr>
+        <tr><td>参考模型 π_ref</td><td>KL 惩罚项</td><td>进入隐式奖励 / loss 中的比</td></tr>
+        <tr><td>数据形态</td><td>偏好→RM；再 rollout</td><td>直接偏好对 (x, y_w, y_l)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② Bradley-Terry：偏好概率</h3>
+    <pre><code># 人类（或裁判）偏好：在 prompt x 上 y_w ≻ y_l
+P(y_w ≻ y_l | x) = σ( r(x, y_w) − r(x, y_l) )
+
+# σ 为 logistic sigmoid
+# r(x, y) 是标量奖励（未知，经典 RLHF 用神经网络估）
+</code></pre>
+    <p>
+      BT 模型只关心奖励差，不关心绝对尺度——这为后面「加常数不影响」留下空间，也解释了为何隐式奖励可以带 + const。
+    </p>
+
+    <h3>③ 最优策略下的隐式奖励</h3>
+    <p>
+      考虑带 KL 约束的目标：最大化 E[r] − β KL(π || π_ref)。最优策略满足（推导见原论文）：
+    </p>
+    <pre><code># 最优策略形式（示意）
+π*(y|x) ∝ π_ref(y|x) · exp( r(x,y) / β )
+
+# 反解「隐式奖励」（差一个仅依赖 x 的归一化项）
+r(x, y) = β · log( π*(y|x) / π_ref(y|x) ) + β · log Z(x)
+# 常写：
+r(x, y) = β log( π_θ(y|x) / π_ref(y|x) ) + const(x)
+</code></pre>
+    <p>
+      关键：若把当前策略 π_θ 当作「最优策略族」中的成员，则<strong>策略比本身就编码了奖励</strong>。不必再维护一个独立 RM 网络——这就是副标题 “Your Language Model is Secretly a Reward Model” 的含义。
+    </p>
+
+    <h3>④ DPO loss</h3>
+    <pre><code># 把隐式 r 代入 BT，const(x) 在差分中消去：
+# P(y_w ≻ y_l | x) = σ(
+#     β log(π_θ(y_w|x)/π_ref(y_w|x))
+#   − β log(π_θ(y_l|x)/π_ref(y_l|x))
+# )
+
+# 最大似然 → DPO 损失（偏好对上）
+L_DPO = − E_{(x,y_w,y_l)} [
+  log σ(
+      β log(π_θ(y_w|x)/π_ref(y_w|x))
+    − β log(π_θ(y_l|x)/π_ref(y_l|x))
+  )
+]
+
+# 实现时：对 y_w / y_l 的 token logprob 求和（注意 mask）；π_ref 冻结
+</code></pre>
+    <table>
+      <thead><tr><th>符号</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>β</code></td><td>温度 / KL 强度：β↑ 更贴 π_ref（保守）；β↓ 更敢偏离参考、拟合偏好更猛，也更易过拟合或崩语言质量</td></tr>
+        <tr><td><code>π_ref</code></td><td>通常取 SFT 模型；提供隐式奖励的分母与正则锚点</td></tr>
+        <tr><td><code>y_w / y_l</code></td><td>同一 x 上的胜出 / 落败回复；数据质量决定上限</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 与 PPO-RLHF、GRPO / 可验证奖励栈</h3>
+    <table>
+      <thead><tr><th>对照</th><th>PPO-RLHF</th><th>DPO</th><th>GRPO / 规则奖励栈</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>监督信号</strong></td>
+          <td>RM 标量奖励</td>
+          <td>偏好对（相对）</td>
+          <td>可验证规则 / 测试 / 判题（常绝对或组内相对）</td>
+        </tr>
+        <tr>
+          <td><strong>是否在线采样</strong></td>
+          <td>是（RL 环）</td>
+          <td>经典设定离线偏好</td>
+          <td>是（组采样 rollout）</td>
+        </tr>
+        <tr>
+          <td><strong>与参考模型</strong></td>
+          <td>显式 KL 项</td>
+          <td>进 log-ratio</td>
+          <td>可选；许多 RLVR 更弱依赖偏好 RM</td>
+        </tr>
+        <tr>
+          <td><strong>典型场景</strong></td>
+          <td>对齐、有害性、风格</td>
+          <td>同左，工程更简单的离线对齐</td>
+          <td>数学 / 代码 / agent 工具成功等可自动判</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      关系要分清：DPO 解决的是<strong>偏好数据上的对齐目标重参数化</strong>；<a href="grpo-notes.html">GRPO</a> 等解决的是<strong>可验证奖励下的相对策略梯度</strong>。不是互相替代：无可靠自动奖励时偏好/DPO 更自然；有 unit test / 终局对错时 RLVR 往往更直接。
+      再强调：<a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 名字相近，但是给 GRPO 补 Clip-Higher / Dynamic Sampling 等训练细节的工作，<strong>不是</strong> Direct Preference Optimization。
+    </p>
+    <p>
+      与 <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> / PPO clip 的联系：DPO loss 里出现的是 π_θ/π_ref 的 log 比，但是<strong>偏好分类目标</strong>，不是 PPO 里对采样策略的 importance-weighted 优势更新。读公式时不要把两套 ratio 语义混为一谈。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>π_ref 冻结且与初始化一致。</strong> 常见：π_θ 从 SFT 初始化，π_ref 同权重拷贝后冻结。训练中误更新 ref 会毁掉比的含义。</li>
+      <li><strong>β 当正则旋钮扫。</strong> 过小易「偏好过拟合」与分布外胡话；过大则几乎不动，偏好学不动。</li>
+      <li><strong>偏好对质量 &gt; 损失花样。</strong> 标签噪声、y_w/y_l 过近或过无可比，都会让 σ 梯度没意义。</li>
+      <li><strong>长度偏置要警惕。</strong> 人类偏好有时偏爱长回复；可做长度归一或数据过滤，避免策略只会注水。</li>
+      <li><strong>能规则判就优先规则。</strong> 数学/代码/agent 成功条件清晰时，GRPO 类栈往往比硬标偏好更可扩展；DPO 更适合主观对齐轴。</li>
+      <li><strong>命名消毒。</strong> 文档与实验名写全 Direct Preference Optimization，避免与 DAPO / 其他 *PO 混检索。</li>
+      <li><strong>评测分轴。</strong> 对齐榜（有害、拒绝、风格）与能力榜（GSM/代码）分开看；DPO 提升前者时可能伤后者，需同时回归。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <ol>
+      <li>
+        为什么把隐式奖励代入 BT 后，只依赖 x 的 const / Z(x) 可以消掉？
+        <details><summary>参考答案</summary>
+        BT 只看 r(x,y_w)−r(x,y_l)。若 r = β log(π/π_ref) + c(x)，则差分中 c(x) 相减为零；Z(x) 同样只依赖 x。因此偏好概率只剩下两条回复的 log-ratio 之差，得到 DPO 的 σ 参数。</details>
+      </li>
+      <li>
+        β 增大时，DPO 训练通常更「保守」还是更「激进」？为什么？
+        <details><summary>参考答案</summary>
+        更保守。β 来自 KL 约束强度：越大表示越不愿意偏离 π_ref，隐式奖励尺度下同样的策略偏离对应更强的惩罚感；loss 里 β 放大 log-ratio 差，拟合偏好时也会被参考锚得更紧。过小则更敢改策略，风险是过拟合偏好与语言崩坏。</details>
+      </li>
+      <li>
+        DPO 相对 PPO-RLHF 省了什么，又可能缺什么？
+        <details><summary>参考答案</summary>
+        省了显式 RM 训练与在线 PPO 环（价值估计、采样稳定性等）。可能缺：在线探索（经典 DPO 吃离线偏好，难主动发现分布外更好回复）；奖励可解释的独立 RM；以及与环境交互式任务的直接对接——那些更常走 RLVR/PPO。</details>
+      </li>
+      <li>
+        为何说 DPO 里的 π_θ/π_ref 与 PPO 的 importance ratio 语义不同？
+        <details><summary>参考答案</summary>
+        PPO/IS 的 ratio 用于修正「数据由旧策略采样」的 off-policy 偏差，并常与 advantage、clip 组成 surrogate。DPO 的比来自最优策略↔奖励的重参数化，进入的是偏好分类的 logistic 似然，不扮演「用旧策略样本估新策略目标」的 IS 权重角色。</details>
+      </li>
+      <li>
+        什么时候该选 DPO，什么时候该选 GRPO/DAPO 一类？
+        <details><summary>参考答案</summary>
+        有可靠人类/裁判偏好、目标偏对齐主观轴 → DPO（或同类偏好目标）合适。有可自动验证的对错/测试/工具成功 → GRPO 等 RLVR 更合适；DAPO 是该栈上的训练细节增强，不是偏好法。很多系统两轴都会用：先 SFT，再偏好对齐，再对可验证任务做 RL。</details>
+      </li>
+    </ol>
+
+    <h2>参考链接</h2>
+    <ul class="link-list">
+      <li>Rafailov et al. · Direct Preference Optimization：
+        <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">arXiv:2305.18290</a></li>
+      <li>站内交叉：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO（≠ DPO）</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
