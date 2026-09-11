@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜NeoHorse-1：用 Routing Harness 把能力反馈写进下一轮后训练（Agentic RSI） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜NeoHorse-1：用 Routing Harness 把能力反馈写进下一轮后训练（Agentic RSI）</h1>
+    <p class="post-meta">2026-09-11 · 收藏夹：Agent / RL · 一线追踪<br />
+      报告：NeoHorse Team · <em>NeoHorse-1: Towards Recursive Self-Improvement via Agentic Post-Training with Routing Harness</em>
+      · <a href="https://arxiv.org/abs/2609.08183" target="_blank" rel="noopener">arXiv:2609.08183</a>
+      · HF <a href="https://hf.co/collections/TokenRhythm/neohorse-1" target="_blank" rel="noopener">TokenRhythm/neohorse-1</a>
+      · GitHub <a href="https://github.com/TokenRhythm/NeoHorse" target="_blank" rel="noopener">TokenRhythm/NeoHorse</a>。
+      交叉：
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Recursive self-improvement（RSI）常被写成口号：系统观察自身能力，把证据转成下一轮学习。
+      NeoHorse-1 的论点更落地——<strong>部署侧的 routing harness 已经在产生这种证据</strong>：
+      每次请求都会留下「预测能力需求 → 选中服务档位 → 实际交互轨迹」，而不只是最终答案。
+    </p>
+    <p>
+      站内最近几篇在谈 harness 能不能自演化（
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a> /
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>）。
+      NeoHorse-1 换了一条轴：<strong>用 routing 信号组织后训练分布</strong>，让「学会做什么」反过来塑造「下一轮学什么」。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Routing harness = 能力探针 + 数据飞轮；三阶段 routing curriculum SFT + routing-guided on-policy distillation + capability-guided allocation，闭合成 evaluation–selection–update 环。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 异构模型池 + 智能路由</h3>
+    <p>
+      系统把异构模型池接到多种 harness（报告提到含 OpenSquilla 等），对每个 user turn 记录：
+    </p>
+    <table>
+      <thead><tr><th>字段</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>预测能力需求</td><td>路由器根据当前请求、近期对话、历史路由与执行状态估计</td></tr>
+        <tr><td>服务档位 C0–C3</td><td>C0 低风险有界；C1 默认；C2 多步推理/执行；C3 最高能力/可靠性（可多 proposer + aggregator）</td></tr>
+        <tr><td>实际交互</td><td>交错 reasoning、tool call、harness 上下文与结果</td></tr>
+      </tbody>
+    </table>
+    <p>
+      重要区分：<strong>用于 curriculum 排序的是「预测需求」</strong>，不是「实际被服务的模型身份」——后者还混有用户覆盖、可用性与部署策略。
+    </p>
+
+    <h3>② 数据：轨迹 → user turn → subscene</h3>
+    <pre><code># 三级粒度（报告 §3.1）
+trajectory  : 完整 harness 执行史（请求 / 回复 / 工具 / 恢复 / 终态）
+user turn   : 一次用户请求到下一次请求（或结束）——基本训练单元
+subscene    : 共享局部目标的相邻 turn 组——语义刻画单元
+
+# 序列化约定（示意）
+# - 当前 turn 保留 interleaved thinking + tool calls
+# - 历史可见回复与工具交互保留为 context
+# - 更早 turn 的 reasoning 省略（对齐 Qwen3.5 / DeepSeek 类约定）
+# - loss mask 只盖当前 turn 的 assistant 目标 span
+</code></pre>
+    <p>
+      准入不是拍脑袋打分：先做精确/近重复去重与评测污染清洗，再做<strong>结构化校验</strong>（因果序、tool call/result 成对、终态分支），
+      然后对可用轨迹做六维语义评估：goal attainment / instruction adherence / tool use / evidence consistency / error recovery / termination
+      （PASS / WARN / FAIL / NOT_EVALUATED，缺证据不得伪装成正例）。
+    </p>
+
+    <h3>③ 三阶段 routing curriculum SFT</h3>
+    <pre><code># 软/硬排序（示意）
+tier ∈ {C0,C1,C2,C3}           # 硬序
+soft = Σ k * score_Ck           # 同档内再用分数区分
+
+# 三阶段调度：逐步引入高分样本，同时把部分低分样本留到后期
+# ——防止训练末期只剩「高需求交互」，把简单场景冲掉
+Stage1 → 低分侧重
+Stage2 → 覆盖加宽
+Stage3 → 高分侧重
+# 全程同一 masked SFT；阶段间不重置 optimizer / LR
+</code></pre>
+
+    <h3>④ Routing-guided on-policy distillation（OPD）</h3>
+    <p>
+      SFT 学的是<strong>录好的</strong> assistant 前缀；部署时学生条件在<strong>自己生成</strong>的前缀上。
+      OPD：学生 rollout，教师在学生访问过的状态上给 token 级监督；起始 context 仍按同一 routing 三阶段排程。
+      报告强调：routing 管「学什么材料」，on-policy 管「跟学生行为对齐」。
+    </p>
+
+    <h3>⑤ Capability-guided allocation</h3>
+    <p>
+      每轮在与训练去污染的分层评测集上估 deficiency profile，把下一轮训练混合物往薄弱区倾斜，同时保覆盖。
+      成功轨迹给正监督；有信息量的失败决定「哪里还要补数据」——改的是数据组成，不是另开一条失败专用 loss。
+    </p>
+
+    <h3>⑥ 数字（报告 Tables；macro-average）</h3>
+    <table>
+      <thead><tr><th>规模</th><th>后训练前</th><th>后训练后</th><th>Δ</th></tr></thead>
+      <tbody>
+        <tr><td>4B</td><td>58.94</td><td>64.87</td><td>+5.93</td></tr>
+        <tr><td>9B</td><td>65.60</td><td>69.04</td><td>+3.44</td></tr>
+      </tbody>
+    </table>
+    <p>
+      覆盖 harness-based agents / tool use / coding / instruction following 等约十个基准；
+      最大增益落在 harness 与执行密集评测。后训练 4B 显著收窄与 9B 基线的聚合差距。
+      Figure 1 还在 VitaBench / PinchBench / WorkBuddy / QwenClaw / BFCL V4 / τ²-Bench 等 agentic 项上与同档模型对照。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先把路由日志当一等公民</strong>：至少落盘 predicted tier、policy-adjusted decision、actually served、outcome；否则 curriculum 只能用「谁被打到」这种脏标签。</li>
+      <li><strong>训练单元用 user turn，不要整段 trajectory 硬截</strong>：保留当前 turn 的 reasoning–tool–observation 链；历史只留可见部分，避免把旧 CoT 当监督噪声。</li>
+      <li><strong>结构化门控先于语义裁判</strong>：orphan tool result、冲突 call id、缺失终态应确定性拒收；语义维度要可追溯到事件，缺证据标 NOT_EVALUATED。</li>
+      <li><strong>OPD 与 SFT 共用同一难度排程</strong>：否则蒸馏阶段会重新踩「全是难题」或「全是简单题」。</li>
+      <li><strong>RSI 是多迭代承诺</strong>：单次后训练涨分只是原型；真正闭环要看 deficiency profile 是否驱动下一轮混合物并回到 harness 产新轨迹。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么不能用「实际服务的模型」当难度标签？</summary>
+      <p>因为 served model 混入了用户强制路由、限流、可用性与定价策略；curriculum 需要的是请求侧能力需求估计。报告因此重估 turn 级 demand，而不是把 served tier 当标签。</p>
+    </details>
+    <details>
+      <summary>2. SFT 与 OPD 各自补哪一段 distribution gap？</summary>
+      <p>SFT 对齐录制轨迹的 teacher 行为；部署时学生走自己的前缀分布。OPD 在学生访问过的状态上用教师 logits 监督，缩小 off-policy 模仿与 on-policy 部署的缺口。</p>
+    </details>
+    <details>
+      <summary>3. 六维语义评估为何不合成单一分数？</summary>
+      <p>单一启发式会丢掉「工具用对了但终态失败」或「终态对但证据不一致」这类可操作缺口；结构化表示才能分别驱动入院、复核与 quarantine 策略。</p>
+    </details>
+    <details>
+      <summary>4. 三阶段 curriculum 为什么还要「留一些低分样本到后期」？</summary>
+      <p>若末期只剩高需求交互，模型容易过拟合复杂路径并遗忘简单场景的稳定行为；保留低分覆盖是防止能力偏置的显式设计。</p>
+    </details>
+    <details>
+      <summary>5. NeoHorse-1 的 RSI 与「改 harness 代码」的自演化差在哪？</summary>
+      <p>后者优化的是脚手架本身（见 HarnessDev / HarnessEvolve）；NeoHorse 优化的是<strong>训练分布如何被 routing 证据重写</strong>。两条路可互补：一个改执行层，一个改学习材料调度。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.08183" target="_blank" rel="noopener">arXiv:2609.08183 · NeoHorse-1</a></li>
+      <li><a href="https://hf.co/collections/TokenRhythm/neohorse-1" target="_blank" rel="noopener">Hugging Face collection</a></li>
+      <li><a href="https://github.com/TokenRhythm/NeoHorse" target="_blank" rel="noopener">GitHub · TokenRhythm/NeoHorse</a></li>
+      <li>站内：<a href="daily-2026-09-09-harnessdev.html">HarnessDev</a> · <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> · <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

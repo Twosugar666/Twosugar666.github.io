@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜TRPO：用 KL 信赖域约束策略更新（共轭梯度 / 线搜索 → PPO 的前身） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜TRPO：用 KL 信赖域约束策略更新（共轭梯度 / 线搜索 → PPO 的前身）</h1>
+    <p class="post-meta">2026-09-11 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Schulman, Levine, Moritz, Jordan, Abbeel · <em>Trust Region Policy Optimization</em>
+      （ICML 2015）· <a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">arXiv:1502.05477</a>。
+      交叉：
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      策略梯度（见 <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>）直接最大化期望回报，但步长难调：
+      太大则一次更新毁掉策略；太小则样本效率差。
+      理论上一类单调改进算法会对「新策略相对旧策略」的偏移施加强约束，但若把建议的惩罚系数直接用上，实际步长会小到几乎不动。
+    </p>
+    <p>
+      <strong>TRPO（Trust Region Policy Optimization）</strong> 的工程回答：不要靠难调的 KL 惩罚系数，而是把
+      <strong>平均 KL 约束成硬信赖域</strong>，在域内最大化 surrogate advantage；用共轭梯度 + 线搜索近似求解。
+      后来的 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 用 clip 近似同一直觉，实现更轻。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：maximize E[r(θ) Â] s.t. E[KL(π_old ‖ π_θ)] ≤ δ；CG 解 Fisher 系统得方向，再按 √(2δ / sᵀAs) 缩放并线搜索守住 KL 与 surrogate 改进。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 从惩罚到约束</h3>
+    <p>
+      理论路线常写成：改进下界 ≈ surrogate 优势 − C · KL（C 往往很大 → 步长极小）。
+      TRPO 改用硬约束，在保证「别走太远」的前提下尽量吃满更新：
+    </p>
+    <pre><code># 理想（逐状态 max-KL，难优化）
+maximize_θ  L_πold(π_θ)
+s.t.  max_s KL(π_old(·|s) ‖ π_θ(·|s)) ≤ δ
+
+# 实用：用旧策略状态分布上的平均 KL
+maximize_θ  L_πold(π_θ)
+s.t.  E_{s~ρ_πold}[ KL(π_old(·|s) ‖ π_θ(·|s)) ] ≤ δ
+</code></pre>
+
+    <h3>② Surrogate 目标（重要性采样形式）</h3>
+    <pre><code># 比率（见 Importance Sampling 笔记）
+r(θ) = π_θ(a|s) / π_old(a|s)
+
+# 一阶 surrogate（在 θ=θ_old 处与真目标同梯度）
+L(θ) = E_{s,a ~ π_old}[ r(θ) · Â(s,a) ]
+
+# Â 常用 GAE（站内 GAE 笔记）；也可用其他优势估计
+</code></pre>
+    <p>
+      只最大化 L 而不约束 KL，等价于允许任意大的分布偏移——正是「一步毁策略」的来源。
+      信赖域把优化限制在 π_old 附近的局部模型仍然可信的区域。
+    </p>
+
+    <h3>③ 二次近似与共轭梯度</h3>
+    <pre><code># 线性化目标 + 二次化 KL
+maximize_θ   g · (θ − θ_old)
+s.t.  1/2 (θ − θ_old)^T A (θ − θ_old) ≤ δ
+
+# A ≈ Fisher / KL Hessian；g = ∇ L
+# 不解显式矩阵：用 Hessian-vector product
+#   A v = ∇_θ ( ∇_θ KL · v )
+# 共轭梯度近似解 A s = g，得到搜索方向 s
+
+# 最大步长（使二次 KL ≈ δ）
+β = sqrt( 2δ / (s^T A s) )
+θ_candidate = θ_old + β s
+</code></pre>
+    <p>
+      Hessian-vector 可用自动微分两次得到，成本大约与几次反向同量级，避免显式存巨大 Fisher。
+      实践中常加 damping：A_eff v = A v + λ v，改善数值条件。
+    </p>
+
+    <h3>④ 线搜索：守住非线性现实</h3>
+    <p>
+      线性/二次近似会骗过优化器。TRPO 从 β 开始指数缩小步长，直到同时满足：
+    </p>
+    <ol>
+      <li>surrogate L 相对旧策略有改进；</li>
+      <li>实测平均 KL ≤ δ。</li>
+    </ol>
+    <p>
+      没有线搜索时，偶发大步会造成灾难性性能崩塌——这是原论文明确警告的实现细节。
+    </p>
+
+    <h3>⑤ 采样：single path vs vine（概念）</h3>
+    <table>
+      <thead><tr><th>方案</th><th>做法</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td>single path</td><td>按当前策略滚完整轨迹，估 Q / 优势</td><td>通用、实现简单</td></tr>
+        <tr><td>vine</td><td>在共享前缀状态上分支多个动作，降方差估 Q</td><td>模拟器可重置时更划算</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑥ 到 PPO / 现代 LLM RL 的桥</h3>
+    <table>
+      <thead><tr><th></th><th>TRPO</th><th>PPO-Clip</th><th>GRPO 等 LLM 栈</th></tr></thead>
+      <tbody>
+        <tr><td>信赖域实现</td><td>显式 KL 约束 + CG</td><td>比率 clip 近似</td><td>常继承 clip / KL / group baseline 变体</td></tr>
+        <tr><td>实现成本</td><td>高（二阶信息）</td><td>低（一阶 + clip）</td><td>视框架；多数生产栈偏 PPO/GRPO 风格</td></tr>
+        <tr><td>核心直觉</td><td>更新别离开旧策略太远</td><td>同</td><td>同：off-policy 比率失控会毁模型</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读 TRPO 不是为了在 LLM 上原样跑 CG，而是为了看清：
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 的 clip、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">IS ratio</a> 的截断、
+      以及各类 adaptive clipping，都在回答同一个问题——<strong>策略更新的几何步长</strong>。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先建立「比率 × 优势」心智模型</strong>：再看任何 clip/KL/trust-region 变体，都是在管 r(θ)。</li>
+      <li><strong>δ（target KL）是主旋钮</strong>：太小学不动；太大近似失效。PPO 里对应 clip ε 与偶尔附加的 KL early-stop。</li>
+      <li><strong>优势估计质量决定上限</strong>：TRPO/PPO 都吃 Â；GAE 的 λ 仍是偏差–方差旋钮。</li>
+      <li><strong>LLM 场景慎直接上经典 TRPO</strong>：词表级 Fisher–CG 贵且脆；更常见是 PPO/GRPO/GSPO 的一阶近似。把 TRPO 当理论锚点。</li>
+      <li><strong>线搜索/早停不要省</strong>：任何「理论上在信赖域内」的更新，都要用实测 KL 或 proxy 复核。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么平均 KL 约束比 max_s KL 更常用？</summary>
+      <p>max_s 约束数量巨大且难估；在 ρ_πold 上对 KL 取期望，得到可采样、可优化的标量约束，同时仍限制整体偏移。</p>
+    </details>
+    <details>
+      <summary>2. 共轭梯度解的是什么线性系？</summary>
+      <p>近似解 A s = g，其中 A 是 KL 的 Fisher/Hessian 信息矩阵，g 是 surrogate 梯度；等价于在二次 KL 球内走自然梯度方向。</p>
+    </details>
+    <details>
+      <summary>3. PPO clip 如何「模仿」TRPO 的信赖域？</summary>
+      <p>把比率 r 夹在 [1−ε, 1+ε]，从目标函数形状上抑制过大偏移，避免显式二阶约束；更便宜，但约束是启发式的，不是严格 KL 球。</p>
+    </details>
+    <details>
+      <summary>4. 若没有线搜索会怎样？</summary>
+      <p>线性/二次近似在大步时失效，可能出现 surrogate 看起来可走、真实回报崩溃的更新；线搜索用实测 KL 与 surrogate 改进做安全闸。</p>
+    </details>
+    <details>
+      <summary>5. TRPO 与 DPO 的「KL」是同一件事吗？</summary>
+      <p>不完全。TRPO 约束的是相邻策略迭代之间的 KL（优化几何）；DPO/RLHF 里常见的是相对参考策略 π_ref 的 KL（偏好/对齐正则）。一个管更新步，一个管偏离锚点。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">arXiv:1502.05477 · TRPO</a></li>
+      <li><a href="https://proceedings.mlr.press/v37/schulman15.html" target="_blank" rel="noopener">ICML 2015 proceedings</a></li>
+      <li>站内：<a href="daily-2026-08-28-algo-ppo.html">PPO</a> · <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> · <a href="daily-2026-09-02-algo-gae.html">GAE</a> · <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

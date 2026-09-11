@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 0,
   "daily_streams": [
     "frontline",
     "harness",
@@ -312,6 +312,27 @@
       "source": "algo",
       "topic": "DPO：Bradley-Terry + 隐式奖励 β log(π/π_ref)；跳过 RM+PPO（≠ DAPO）",
       "file": "posts/daily-2026-09-10-algo-dpo.html"
+    },
+    {
+      "date": "2026-09-11",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "NeoHorse-1：Routing Harness + 三阶段 curriculum SFT / OPD / capability-guided allocation（4B 58.94→64.87）",
+      "file": "posts/daily-2026-09-11-neohorse-1.html"
+    },
+    {
+      "date": "2026-09-11",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "EvoHarness-RL：BPE + {track,commit,recall,note} / cost-aware GRPO；annealing→~1 call/ep；ALFWorld 96.9%/86.6%",
+      "file": "posts/daily-2026-09-11-harness-evoharness-rl.html"
+    },
+    {
+      "date": "2026-09-11",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "TRPO：maximize surrogate s.t. mean KL≤δ；CG + line search；PPO clip 的前身",
+      "file": "posts/daily-2026-09-11-algo-trpo.html"
     }
   ]
 }
