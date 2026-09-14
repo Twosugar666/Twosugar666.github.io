@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 0,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -333,6 +333,27 @@
       "source": "algo",
       "topic": "TRPO：maximize surrogate s.t. mean KL≤δ；CG + line search；PPO clip 的前身",
       "file": "posts/daily-2026-09-11-algo-trpo.html"
+    },
+    {
+      "date": "2026-09-14",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "T1：300+ 轮真实 Shell 终端 Agent RL（TITO / R3 / 122B MoE；TB2.1 43.8→64.0）",
+      "file": "posts/daily-2026-09-14-t1.html"
+    },
+    {
+      "date": "2026-09-14",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "Harness-R1：失败轨迹 → 可执行 lifecycle patch；SFT+GRPO 只训工程师（44.3→53.6）",
+      "file": "posts/daily-2026-09-14-harness-harness-r1.html"
+    },
+    {
+      "date": "2026-09-14",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "Actor-Critic：V 作 baseline；A=Q−V / TD / GAE；接到 A2C/PPO/GRPO",
+      "file": "posts/daily-2026-09-14-algo-actor-critic.html"
     }
   ]
 }

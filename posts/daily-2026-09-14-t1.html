@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜T1：300+ 轮真实 Shell 上的终端 Agent RL（TITO / R3 / 122B MoE） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜T1：300+ 轮真实 Shell 上的终端 Agent RL（TITO / R3 / 122B MoE）</h1>
+    <p class="post-meta">2026-09-14 · 收藏夹：RL / Agent · 一线追踪<br />
+      报告：Yang, Shi, Li 等 · <em>T1: Terminal Agent Reinforcement Learning for Long-Horizon Tasks</em>
+      · <a href="https://arxiv.org/abs/2609.11042" target="_blank" rel="noopener">arXiv:2609.11042</a>（2026-09-10）。
+      交叉：
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL / R3</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-03-mercor-skyrl.html">Mercor × SkyRL</a>、
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agent 工作负载正往长程任务偏移：写代码、科学探索、运维排障。终端任务是其中最「硬」的一类——真实 shell、可验证脚本、动辄上百轮工具调用。
+      公开的 Terminal-Bench 系评测已经能把多数模型压到很低的 resolved 率；更长程的变体则进一步放大信用分配与训练–推理不一致。
+    </p>
+    <p>
+      <strong>T1</strong> 给出一条可复述的工业配方：122B total 的 MoE，在云沙箱里开真实 shell，单任务最多 <strong>300+ tool-call turns</strong>，奖励来自「跑任务自带的 verifier」。
+      论文自报：Terminal-Bench 2.1 上基座 43.8% → T1 <strong>64.0%</strong>；Long-Horizon Terminal Bench 上 <strong>27.9%</strong>，超过 GPT-5.4 与 GLM-5.1（作者自报，第三方复测尚缺）。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：激进 warm-start 稳住 actor-critic + 稠密过程奖励（通过的 verifier 个数）+ TITO 精确对齐采样 token + MoE 的 R3 路由回放；训练语料与 Terminal-Bench 2.1 完全隔离，避免刷榜。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 设定：真实 shell + 任务自带 verifier</h3>
+    <table>
+      <thead><tr><th>维度</th><th>T1 选择</th></tr></thead>
+      <tbody>
+        <tr><td>模型</td><td>Mixture-of-Experts，总参约 122B</td></tr>
+        <tr><td>环境</td><td>云沙箱里的真实 shell（非模拟命令语言）</td></tr>
+        <tr><td>交互长度</td><td>单任务可达 300+ 工具调用轮次</td></tr>
+        <tr><td>奖励</td><td>执行该任务自己的 verifier；过程侧用「已通过 verifier 绝对个数」做稠密信号</td></tr>
+        <tr><td>数据</td><td>隔离种子 + 合成任务，与 Terminal-Bench 2.1 全集不相交（OOD 训练语料）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      这与站内 <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> 终端阶段（最多 64 轮）同属「环境即真值」路线，但交互预算与 MoE 训练细节推得更远。
+    </p>
+
+    <h3>② 配方一：激进 warm-start + 稠密过程奖励</h3>
+    <p>
+      长程终端任务上，稀疏终局成功几乎训不动 actor-critic：绝大多数轨迹 reward=0，优势塌缩。
+      T1 先用激进 warm-start 把策略抬到「够得着部分 verifier」的区域，再用<strong>绝对通过个数</strong>给轨迹打稠密过程分——不是只看最终过没过，而是中间每多过一个 verifier 都算信号。
+    </p>
+    <pre><code># 示意：终局 + 过程
+R_final  = 1{all_verifiers_pass}          # 任务级
+R_process = |{v ∈ Verifiers : pass(v)}|   # 稠密、可比较
+
+# warm-start：先把 actor/critic 拉到非退化成功率区间
+# 再进入长程 RL，避免 GRPO/AC 组内全零优势
+</code></pre>
+
+    <h3>③ 配方二：TITO + 轮次边界 drift repair</h3>
+    <p>
+      多轮 harness 里，训练端若重组 messages / 重 tokenize，就会和采样时的 token 序列错位——站内 <a href="daily-2026-08-31-harness-tito.html">TITO</a> 笔记讲过这件事。
+      T1 强调：对 loss 区域使用<strong>采样时精确的 token identifiers</strong>；在 turn 边界做 drift repair，把训练–推理的 log-probability 差压下去。
+    </p>
+
+    <h3>④ 配方三：R3 — MoE 的 rollout routing replay</h3>
+    <p>
+      MoE 在推理时每个 token 走一组专家；若训练时重新路由，等于换了一条计算图。
+      T1 记录采样端每一层、每个 token 的 expert 选择，训练时<strong>回放同一路由</strong>（与 <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a> / <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 讨论的 MoE RL 稳定性同一族问题）。
+    </p>
+    <pre><code># 采样：记下每层 expert_ids[t, layer]
+# 训练：强制同一路由，再算 logprob / 梯度
+
+# 作者自报：TITO + R3 把 train–infer logprob 差
+# 从 0.021 降到 0.013；loss 区域 token drift = 0（精确对齐）
+</code></pre>
+
+    <h3>⑤ 数字（论文自报）</h3>
+    <table>
+      <thead><tr><th>评测</th><th>数字</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr><td>Terminal-Bench 2.1</td><td>基座 43.8% → T1 <strong>64.0%</strong></td><td>resolved；后训练管线增益</td></tr>
+        <tr><td>Long-Horizon Terminal Bench</td><td>T1 <strong>27.9%</strong></td><td>作者称超过 GPT-5.4、GLM-5.1</td></tr>
+        <tr><td>一致性</td><td>Δlogprob 0.021 → 0.013；zero token drift</td><td>TITO + R3</td></tr>
+      </tbody>
+    </table>
+    <p>
+      分数需按「作者自报」阅读；更硬的证据是配方本身——OOD 训练语料、TITO、R3 都是可迁移的工程检查清单，不依赖单一榜单名次。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量成功率地板</strong>：终端 RL 开训前看「至少过一个 verifier」的比例；地板太低先 warm-start / 缩任务，不要直接上 300 轮稀疏终局。</li>
+      <li><strong>过程奖励用绝对通过数，而不是只归一化最终分</strong>：绝对个数在组内仍可比，且对部分解决的轨迹给梯度；注意与终局权重的配比，避免「刷中间 verifier、不收尾」。</li>
+      <li><strong>TITO 做成不变量</strong>：loss mask 覆盖的每个 token id 必须与采样一致；turn 边界插入系统消息时显式做 drift repair。</li>
+      <li><strong>MoE 必开 routing replay</strong>：没有 R3 类机制时，MoE + RL 的 train–infer gap 往往被误诊为「学习率太大」。</li>
+      <li><strong>训练语料与榜单隔离</strong>：T1 用 OOD 合成/隔离种子；自家评测若与训练集同分布，resolved 涨分要打折解读。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「通过的 verifier 绝对个数」比「最终成功 0/1」更适合长程终端 RL？</summary>
+      <p>300+ 轮任务上终局成功极稀，组内优势易全零。绝对通过数给部分轨迹非零、可区分的信号，同时仍锚定真实可执行检查，而不是 LLM judge。</p>
+    </details>
+    <details>
+      <summary>2. TITO 与「重新 apply_chat_template 再 tokenize」差在哪？</summary>
+      <p>后者可能改变 BOS/特殊标记/空白，导致采样 logprob 与训练 logprob 对不上同一 token 串。TITO 要求训练端消费采样端的精确 token id，并在轮次边界修复漂移。</p>
+    </details>
+    <details>
+      <summary>3. MoE 不做 routing replay 时，重要性采样比率在测什么？</summary>
+      <p>若训练时专家路由与采样不一致，π_θ(a|s) 不再是同一计算图上的密度，ratio 混进了「路由噪声」，会放大方差甚至系统性偏置——R3 把路由当成必须对齐的行为策略细节。</p>
+    </details>
+    <details>
+      <summary>4. OOD 训练语料解决的是过拟合还是能力迁移？</summary>
+      <p>两者都有：与 Terminal-Bench 2.1 不相交，避免题目级记忆；若榜单仍涨，更支持「终端交互技能」迁移。反过来，同分布刷题涨分不能证明长程能力。</p>
+    </details>
+    <details>
+      <summary>5. T1 与站内 Lego-RL / Mercor×SkyRL 的共同点是什么？</summary>
+      <p>都把 harness 侧的 token 对齐（TITO）和路由/代理一致性当成一等公民，而不是只调 clip ε。长程 Agent RL 的瓶颈经常在「训练看见的轨迹 ≠ 推理执行的轨迹」。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.11042" target="_blank" rel="noopener">arXiv:2609.11042 · T1</a></li>
+      <li>站内：<a href="daily-2026-08-31-harness-tito.html">TITO</a> · <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a> · <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> · <a href="daily-2026-09-03-mercor-skyrl.html">Mercor × SkyRL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

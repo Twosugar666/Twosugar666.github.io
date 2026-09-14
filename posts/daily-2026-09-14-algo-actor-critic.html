@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Actor-Critic：用价值函数当基线，把 REINFORCE 接到 PPO · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Actor-Critic：用价值函数当基线，把 REINFORCE 接到 PPO</h1>
+    <p class="post-meta">2026-09-14 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典脉络：Williams（REINFORCE）→ Actor-Critic / A2C → Schulman 等（GAE / TRPO / PPO）。
+      交叉：
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-11-algo-trpo.html">TRPO</a>、
+      <a href="grpo-notes.html">GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> 给出无偏的策略梯度：沿 ∇log π 乘上回报 G_t。
+      问题是方差：同一动作在「整局很幸运」和「整局很倒霉」时梯度尺度差几个数量级。
+      减方差的第一步是减一个与动作无关的 baseline；若 baseline 选成状态价值 V(s)，优势 A = Q − V（或回报 − V）就出现了——这就是 <strong>Actor-Critic</strong> 的骨架。
+    </p>
+    <p>
+      现代 LLM RL 里，有人保留显式 critic（PPO），有人用组内相对 baseline 省掉它（GRPO）；但「策略（actor）+ 用来定标的价值信号（critic 或替代物）」仍是同一套账。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Actor 最大化 E[Â ∇log π]；Critic 拟合 V_φ（或 Q）；Â 常用 r + γV(s′) − V(s) 或 GAE。PPO/A2C 是工程壳，Actor-Critic 是骨架。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 从 baseline 到优势</h3>
+    <pre><code># REINFORCE（可减 baseline b(s)）
+∇J ≈ E[ Σ_t ∇log π_θ(a_t|s_t) · (G_t − b(s_t)) ]
+
+# 选 b(s) = V^π(s) 时，括号 ≈ 优势
+A^π(s,a) = Q^π(s,a) − V^π(s)
+
+# 采样版常见写法
+δ_t = r_t + γ V_φ(s_{t+1}) − V_φ(s_t)   # TD 残差
+# 单步 Actor-Critic 常用 Â_t = δ_t
+# 多步 / GAE：对 δ 做 λ 指数滑动（见 GAE 笔记）
+</code></pre>
+    <p>
+      关键性质：对固定策略，任意只依赖 s 的 baseline 不引入偏差（在适当正则条件下）；V 是方差上常很强的选择，因为它近似 E[G|s]。
+    </p>
+
+    <h3>② 两个网络、两套损失</h3>
+    <table>
+      <thead><tr><th></th><th>Actor（策略）</th><th>Critic（价值）</th></tr></thead>
+      <tbody>
+        <tr><td>输出</td><td>π_θ(a|s) 或 logits</td><td>V_φ(s)（或 Q）</td></tr>
+        <tr><td>目标</td><td>提高高优势动作的概率</td><td>拟合回报 / bootstrapped 目标</td></tr>
+        <tr><td>典型损失</td><td>−Â · log π（+ entropy）</td><td>(V_φ(s) − R̂)² 或 Huber</td></tr>
+        <tr><td>更新耦合</td><td>吃 Â，故依赖 critic 质量</td><td>吃 actor 产生的轨迹分布</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 同步一步的玩具循环（A2C 味）
+for each rollout chunk:
+  算 Â_t（TD 或 GAE）
+  L_actor  = −mean( Â_t · log π_θ(a_t|s_t) ) − β H[π]
+  L_critic = mean( (V_φ(s_t) − R̂_t)^2 )
+  联合（或交替）下降 L_actor + c_v L_critic
+</code></pre>
+
+    <h3>③ Online vs replay；离散 vs 连续</h3>
+    <ul>
+      <li><strong>Online on-policy</strong>（A2C / PPO）：轨迹来自当前 π，critic 目标与 actor 同分布；实现简单，样本利用率低于 off-policy Q 学习。</li>
+      <li><strong>带 replay 的变体</strong>（ACER 等）：要额外处理 off-policy 修正；LLM 后训练较少直接搬。</li>
+      <li><strong>动作空间</strong>：控制里常见对角高斯策略；LLM 是词表上的 categorical——梯度形式相同，尺度与熵基线不同。</li>
+    </ul>
+
+    <h3>④ 到 PPO / GRPO 的地图</h3>
+    <table>
+      <thead><tr><th>算法</th><th>Actor</th><th>「Critic / baseline」</th><th>额外稳定器</th></tr></thead>
+      <tbody>
+        <tr><td>REINFORCE + b</td><td>π</td><td>任意 b(s)，常学习 V</td><td>无</td></tr>
+        <tr><td>A2C</td><td>π</td><td>V_φ，同步多环境</td><td>entropy bonus</td></tr>
+        <tr><td>PPO</td><td>π</td><td>V_φ + GAE</td><td>ratio clip / 偶发 KL</td></tr>
+        <tr><td>GRPO</td><td>π</td><td>同 prompt 组内平均 reward</td><td>clip 等；无独立 V</td></tr>
+      </tbody>
+    </table>
+    <p>
+      GRPO 并没有废除 Actor-Critic 的直觉：它把 critic 换成<strong>组内经验 baseline</strong>，用同题多条样本估计「这个问题大概值多少分」。
+      当组内方差不足（全对或全错）时，优势塌缩——这与「critic 尚未学好」是同一类病，只是诊断指标从 value loss 变成 frac_degenerate。
+    </p>
+
+    <h3>⑤ 偏差–方差与致命耦合</h3>
+    <pre><code># Bootstrap 引入偏差，换方差
+Monte Carlo G_t     : 低偏差，高方差
+TD δ_t              : 高偏差（依赖 V_φ），低方差
+GAE(λ)              : 用 λ 在两者间拧（站内 GAE 笔记）
+
+# 致命更新：坏的 V → 坏的 Â → 策略走向错误象限
+# → 新轨迹更怪 → V 更难拟合（崩溃螺旋）
+</code></pre>
+    <p>
+      工程上常见护栏：value loss 系数、clip value 目标、对 Â 做 batch 标准化、限制策略步长（PPO clip / TRPO KL）。
+      LLM 长 CoT 上还要处理价值定义在哪——token 级、句级还是轨迹级——与 <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 的 token-level loss 讨论相连。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画优势从哪来</strong>：独立 V、组内均值、还是奖励模型差值？三种都能当「critic 角色」，超参与失败模式不同。</li>
+      <li><strong>Value 学不动时别猛加 actor lr</strong>：先查回报尺度、bootstrap 深度、是否需要 PopArt / 奖励归一化。</li>
+      <li><strong>LLM 上优先问「要不要显式 V」</strong>：轨迹短、组采样便宜 → GRPO 类相对 baseline；长程、跨 prompt 要比较 → 显式 critic 或势函数（如站内 PGPO）更有讨论空间。</li>
+      <li><strong>Entropy 当探索旋钮，不是装饰</strong>：系数过大变乱采样；过小过早塌缩。与温度采样是相关但不同的旋钮。</li>
+      <li><strong>把 Actor-Critic 当阅读框架</strong>：遇到新缩写，先找「谁出动作、谁出基线、优势怎么估、步长怎么限」四件套。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么减 V(s) 不改变策略梯度的期望方向（在理想条件下）？</summary>
+      <p>因为 E_{a~π}[∇log π(a|s) · V(s)] = V(s) ∇_θ Σ_a π(a|s) = V(s) ∇_θ 1 = 0。基线与动作无关时，期望里的额外项消失，只剩方差变化。</p>
+    </details>
+    <details>
+      <summary>2. TD 优势相对 Monte Carlo 付出了什么代价？</summary>
+      <p>用 V_φ(s′) bootstrap，价值函数误差会渗进 Â，带来偏差；换来更低方差与在线更新能力。GAE 的 λ 显式暴露这笔交易。</p>
+    </details>
+    <details>
+      <summary>3. GRPO 算 Actor-Critic 吗？</summary>
+      <p>狭义上没有学习的 V_φ；广义上仍是「actor + baseline」。Baseline 换成组内统计量，属于 critic-free 的 Actor-Critic 亲戚。</p>
+    </details>
+    <details>
+      <summary>4. 为什么 value 崩溃会拖垮策略？</summary>
+      <p>Â 的符号与尺度由 critic 定。系统性地高估/低估某些状态，会把概率质量推向错误动作，进而改变数据分布，使 critic 更难纠正——形成正反馈崩溃。</p>
+    </details>
+    <details>
+      <summary>5. PPO 的 clip 约束的是 actor 还是 critic？</summary>
+      <p>主 clip 作用在策略比率上，限制 actor 步长；许多实现另有 value clipping，那是稳定 critic 回归目标。两者都服务「别一步走太远」，但作用对象不同。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>Sutton &amp; Barto, <em>Reinforcement Learning: An Introduction</em>（Actor-Critic 章节）</li>
+      <li>Mnih et al., Asynchronous Methods for Deep RL（A3C/A2C）· <a href="https://arxiv.org/abs/1602.01783" target="_blank" rel="noopener">arXiv:1602.01783</a></li>
+      <li>站内：<a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> · <a href="daily-2026-09-02-algo-gae.html">GAE</a> · <a href="daily-2026-08-28-algo-ppo.html">PPO</a> · <a href="daily-2026-09-11-algo-trpo.html">TRPO</a> · <a href="grpo-notes.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

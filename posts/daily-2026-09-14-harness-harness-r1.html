@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Harness-R1：用在线 RL 训练「会改可执行运行时」的 harness 工程师 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Harness-R1：用在线 RL 训练「会改可执行运行时」的 harness 工程师</h1>
+    <p class="post-meta">2026-09-14 · 收藏夹：Harness / Agent / RL · 学习笔记<br />
+      Shao, Zhang, Li 等 · <em>Harness-R1: Learning to Edit Executable Runtime Harnesses from Agent Failure Trajectories</em>
+      · <a href="https://arxiv.org/abs/2608.02276" target="_blank" rel="noopener">arXiv:2608.02276</a>
+      · 代码 <a href="https://github.com/DeepExperience/Harness-R1" target="_blank" rel="noopener">DeepExperience/Harness-R1</a>
+      · 模型 <a href="https://huggingface.co/ShaoShuai0605/Harness-R1" target="_blank" rel="noopener">HF</a>。
+      交叉：
+      <a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness-RL</a>、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="grpo-notes.html">GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      部署中的 Agent 不断产出轨迹，但行为往往停在「权重固定」：要么再训模型，要么手改 / 提示大模型去改 harness。
+      站内最近几篇（<a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>、<a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、<a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness-RL</a>）分别在谈「评测可运行 harness」「自演化信用」「学 harness 使用策略」。
+    </p>
+    <p>
+      <strong>Harness-R1</strong> 换了一个学习目标：不训目标 Agent，而是后训练一个独立的 <strong>harness engineer</strong>——读失败轨迹批次，生成可验证的可执行 patch，用「同一批任务重跑后的回报差」做 outcome reward，在线 GRPO 只更新工程师。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：失败包 → 生命周期四处 hook 的可执行 overlay → 冻结目标同批重跑得 ΔR → SFT 冷启动 + GRPO；改的是编辑策略，不是任务答案。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 问题形式：batch-conditioned、同批重跑</h3>
+    <pre><code># 冻结目标 Agent A（模型 + 基座运行时）
+# 批次 B = {x_i}，先跑基线得 R_i^0 与失败包 s_B
+
+工程师 H_θ(s_B) → 可执行 overlay P
+安装 P 后，同一批 B 全部重跑（含原本成功的题）→ R_i^P
+
+Δ_B(P) = mean_i (R_i^P − R_i^0)
+r(B,P) = Δ_B(P)  if P 合法且评估完整 else 0
+</code></pre>
+    <p>
+      同批前后对照控制了任务组成，但是<strong>转导式</strong>目标：优化的是这批任务上的增益，跨批持久 patch 记忆不在本文设定里。
+      非法 / no-op / 未完成评估一律奖励 0——逼工程师产出能装上、能跑完的真实干预。
+    </p>
+
+    <h3>② 可编辑表面：四个生命周期 hook</h3>
+    <table>
+      <thead><tr><th>Hook</th><th>时机</th><th>典型效果</th></tr></thead>
+      <tbody>
+        <tr><td><code>on_init</code></td><td>首轮决策前</td><td>注入可复用技能 / 工具提示</td></tr>
+        <tr><td><code>make_pre_hint</code></td><td>每次决策前</td><td>按状态加消息，不直接执行动作</td></tr>
+        <tr><td><code>on_before_action</code></td><td>动作出模型后、进环境前</td><td>拦截重问 / 改写 / 强制动作（视环境）</td></tr>
+        <tr><td><code>on_post_step</code></td><td>环境反馈后</td><td>注入恢复提示；部分环境可调度下一步</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Patch 只碰冻结策略的输入输出，不改权重。安装前校验；无效 patch 等价无干预。
+      消融（论文 Figure 4b）显示：去掉 pre-action 或 post-feedback 掉分最大（约 −3.9 / −3.3 pp），且主导位置随环境变——WebShop 偏动作门控，ALFWorld 偏反馈后恢复。
+    </p>
+
+    <h3>③ 训练：SFT 冷启动 → outcome-grounded GRPO</h3>
+    <pre><code># 冷启动：强教师（论文用 GPT-5.5）对失败包提 patch
+# 校验 + 同批重跑后保留「可执行、完整、非回归」样本 ≈1K
+
+# 在线 GRPO：每个失败包采 K=8 候选
+# 各自独立安装并重跑冻结目标 → 组内 (r−μ)/σ 作优势
+# 序列级优势广播到响应 token；带 TIS 截断权重（上限 2）
+# 无 format bonus、无显式 KL loss；只更新工程师 θ
+</code></pre>
+    <p>
+      关键点：奖励不可微，且只有「改完再跑」才观测得到——所以必须把工程师从固定 proposer 升级成可学习策略。
+      对比：多数 harness 搜索管线（Meta-Harness / AutoHarness / AEGIS 等）用结果筛选候选，但<strong>不更新 proposer 参数</strong>；HarnessX 的 cross-harness GRPO 训的是任务模型。
+    </p>
+
+    <h3>④ 数字（论文 Table 1；等权平均）</h3>
+    <table>
+      <thead><tr><th>设定</th><th>Avg. success</th><th>Δ</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3.5-9B 默认 harness</td><td>44.3%</td><td>—</td></tr>
+        <tr><td>Supervised-only engineer</td><td>46.4%</td><td>+2.1</td></tr>
+        <tr><td><strong>Harness-R1</strong></td><td><strong>53.6%</strong></td><td><strong>+9.3</strong></td></tr>
+        <tr><td>Agent SFT</td><td>59.2%</td><td>—</td></tr>
+        <tr><td>Agent SFT + Harness-R1</td><td><strong>64.2%</strong></td><td><strong>+5.0</strong>（相对 SFT）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      环境：WebShop / ALFWorld / DBBench。相对最强固定前沿工程师（GLM-5.2，48.8%）仍高一截；Self-Refine 等固定套路甚至掉分。
+      泛化：同一编辑策略迁移到 20 个未见目标模型，平均 +7.06 pp；稀疏失败证据（每基准 10 条）推到 1270 held-out 任务约 +8.9±1.5 pp（三种子）。
+    </p>
+
+    <h3>⑤ 与 EvoHarness-RL / HarnessEvolve 的分工</h3>
+    <table>
+      <thead><tr><th></th><th>学什么</th><th>目标是否冻结</th></tr></thead>
+      <tbody>
+        <tr><td>EvoHarness-RL</td><td>如何读/写外部 BPE 状态（harness 使用策略）</td><td>训任务策略</td></tr>
+        <tr><td>HarnessEvolve</td><td>脚手架自演化 + 双门控</td><td>改 harness 工件</td></tr>
+        <tr><td><strong>Harness-R1</strong></td><td>从失败生成可执行 lifecycle patch 的<strong>编辑策略</strong></td><td>目标冻结；只训工程师</td></tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先把 hook 契约写死</strong>：init / pre-hint / pre-action / post-step 的返回类型与「能否改写动作」按环境分档（DBBench 论文里禁止改 SQL / 强制 commit）。</li>
+      <li><strong>奖励必须 outcome-grounded</strong>：只看 patch 文本是否「看起来合理」会学到有害干预；同批重跑 ΔR（含负值）才是监督。</li>
+      <li><strong>非法与未完成一律 0</strong>：与「小负分」不同，0 避免鼓励半吊子 patch，但也要靠校验覆盖率保证组内仍有可区分信号。</li>
+      <li><strong>SFT 过滤要严</strong>：教师候选需可执行、跑完、非回归；否则 GRPO 起点全是会编译但不提分的噪声。</li>
+      <li><strong>共演化是产品路径</strong>：先 Agent SFT 再训目标专用工程师（+5.0）说明 harness 编辑不会在「模型变强后」自动失效——两条改进轴应交替迭代。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么同批重跑要包含原本已成功的任务？</summary>
+      <p>只优化失败子集容易引入回归：patch 可能用过宽规则伤害原已成功轨迹。全批 ΔR 把回归直接写进奖励。</p>
+    </details>
+    <details>
+      <summary>2. 固定 Self-Refine 为何可能掉分？</summary>
+      <p>统一手写规则忽略具体失败模式与是否真有收益；论文匹配基线显示 Self-Refine 在三环境平均掉分。失败条件生成 + 重跑验证才是自适应编辑。</p>
+    </details>
+    <details>
+      <summary>3. Harness-R1 的「转导式」目标有什么局限？</summary>
+      <p>奖励绑定挖掘失败的那批任务，不显式优化 held-out 或推理成本。论文讨论可把 held-out 表现与效率项并入奖励。</p>
+    </details>
+    <details>
+      <summary>4. 为何 9B 工程师能打过更大的前沿「提示式编辑器」？</summary>
+      <p>前沿模型优化的是「补丁看起来对」；Harness-R1 优化的是「重跑后任务是否真涨」。尺度换不来 outcome 闭环。</p>
+    </details>
+    <details>
+      <summary>5. pre-action 与 post-feedback 哪个更重要？</summary>
+      <p>没有普适答案：WebShop 上动作门控关键，ALFWorld 上反馈后恢复关键。多 hook 协同，消融数字不可简单相加当成全局重要性排序。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2608.02276" target="_blank" rel="noopener">arXiv:2608.02276 · Harness-R1</a></li>
+      <li><a href="https://github.com/DeepExperience/Harness-R1" target="_blank" rel="noopener">GitHub · DeepExperience/Harness-R1</a></li>
+      <li><a href="https://huggingface.co/ShaoShuai0605/Harness-R1" target="_blank" rel="noopener">Hugging Face · Harness-R1</a></li>
+      <li>站内：<a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness-RL</a> · <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> · <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
