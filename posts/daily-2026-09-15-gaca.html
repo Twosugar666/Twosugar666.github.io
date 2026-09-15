@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜GACA：用 NLL 关键度自适应混合步级与轨迹级优势（Granularity-Adaptive Credit Assignment） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜GACA：用 NLL 关键度自适应混合步级与轨迹级优势（Granularity-Adaptive Credit Assignment）</h1>
+    <p class="post-meta">2026-09-15 · 收藏夹：Agent / RL · 一线追踪<br />
+      论文：Liang, Liu, Luo 等 · <em>Granularity-Adaptive Credit Assignment for Long-Horizon LLM Agent Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/2609.12424" target="_blank" rel="noopener">arXiv:2609.12424</a>（2026-09-11）。
+      交叉：
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="daily-2026-09-07-tigpo.html">TIGPO</a>、
+      <a href="daily-2026-09-04-pgpo.html">PGPO</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 LLM Agent RL 大多走 critic-free：终局成功/失败变成一条轨迹标量，再拿去更新整条轨迹上的每一步。
+      <a href="grpo-notes.html">GRPO</a> 把组内相对回报广播到该轨迹的所有 step——信用粗，但实现稳、不养价值网络。
+      问题是：长轨迹里真正「改命运」的往往是少数关键步；其余步要么例行推进，要么噪声大。一律广播同一标量，等于把信号摊薄、把噪声抬高。
+    </p>
+    <p>
+      GiGPO 一类工作试图找回 step 级信号：把共享同一 anchor state 的 timestep 分组，估出更细的步级优势，再与 episode 级估计混合。
+      但混合权重是<strong>全局固定</strong>的——不管当前步有多「关键」，都用同一 λ 掺两种粒度。GACA（Granularity-Adaptive Credit Assignment）的主张是：混合权重应该跟着<strong>每一步的关键度</strong>走。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：用 rollout 里已经记下的逐步 NLL（负对数似然）当 criticality 代理；NLL 高于均值的步加大 step-level 优势权重，低于均值的步更信任 episode-level——并给出混合的精确风险分解与局部动作价值变差的条件界。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 三层粒度：GRPO → GiGPO → GACA</h3>
+    <table>
+      <thead><tr><th>方法</th><th>优势从哪来</th><th>如何混合粒度</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>GRPO</strong></td>
+          <td>组内轨迹标量 → 广播到每一步</td>
+          <td>无步级；全轨迹同一 A</td>
+        </tr>
+        <tr>
+          <td><strong>GiGPO</strong></td>
+          <td>共享 anchor state 的 timestep 分组 → 步级估计 + 轨迹级估计</td>
+          <td>固定权重 λ 混合两级</td>
+        </tr>
+        <tr>
+          <td><strong>GACA</strong></td>
+          <td>同族步级 / 轨迹级估计</td>
+          <td><strong>逐步</strong>权重 w_t，随该步 NLL 相对均值增大而更偏步级</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-01-ahead.html">AHEAD</a>（环境反馈 + 纠错提示做 step-aware 重权）、
+      <a href="daily-2026-09-04-pgpo.html">PGPO</a>（经验势差给失败轨迹里好动作正名）、
+      <a href="daily-2026-09-07-tigpo.html">TIGPO</a>（跨更新任务转移图）同属「别把长程信用当成一条常数」这条线；GACA 的独特抓手是<strong>已有 logprob 派生的 NLL</strong>，不另训 critic。
+    </p>
+
+    <h3>② Criticality 代理：逐步 NLL</h3>
+    <pre><code># 采样时每步已有 token logprob（TITO / 训练对齐都需要）
+# 步级 NLL 示意：对该步生成片段求和 / 平均
+nll_t = − Σ_{k in step t} log π_θ(token_k | context)
+
+# 相对 batch / 组内均值做中心化（示意）
+c_t = nll_t − mean(nll)     # 高于均值 → 更「意外 / 关键」
+
+# 混合权重：c_t 大 → 更信步级优势 A_step
+#           c_t 小 → 更信轨迹级优势 A_traj
+w_t = σ( α · c_t )          # 或单调映射；α 控制调制强度
+A_t = w_t · A_step_t + (1 − w_t) · A_traj
+</code></pre>
+    <p>
+      直觉：策略对某步输出「很意外」（高 NLL）时，该步更可能是决策分叉点，值得用更细的步级信用；低 NLL 步更像例行推进，用轨迹级信号更稳、方差更低。
+      关键工程点：NLL 是 rollout 记账的副产品，不引入新网络，也不改变采样分布——只改优势的合成方式。
+    </p>
+
+    <h3>③ 风险分解与理论挂钩（论文主张）</h3>
+    <table>
+      <thead><tr><th>主张</th><th>含义（读论文口径）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>混合优势的精确风险分解</td>
+          <td>把固定权重混合与自适应混合的估计风险拆成可对照的项，说明「何时调制有益」</td>
+        </tr>
+        <tr>
+          <td>小调制 + 正方向对齐</td>
+          <td>当步级估计与真优势方向大体同向时，对固定混合做小幅度、与 NLL 对齐的扰动可改进风险</td>
+        </tr>
+        <tr>
+          <td>局部动作价值变差的条件界</td>
+          <td>用期望 NLL 约束局部 action-value 波动，给「高 NLL ↔ 更需要细粒度」一个形式化挂钩</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      这与 <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> 里「baseline / 优势估计质量决定方差」是同一账本：GACA 不学 V_φ，但用 NLL 调制两种已有估计器的凸组合，试图在偏差–方差之间按步切换。
+    </p>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>环境</td><td>ALFWorld、WebShop（长程 agent 经典基准）</td></tr>
+        <tr><td>尺度</td><td>1.5B 与 7B</td></tr>
+        <tr><td>对照</td><td>GRPO、GiGPO（固定混合）</td></tr>
+        <tr><td>结论</td><td>任务成功率相对 GRPO / GiGPO 提升（作者自报；具体百分点以论文表格为准，此处不编造）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：先核对「固定混合 vs NLL 自适应」消融是否成立，再看跨规模是否同向；数字一律标作者自报，第三方复测前不当作排行榜事实。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先确认 logprob 记账完整</strong>：GACA 吃的是逐步 NLL；若 harness 重组 messages 导致 token 错位，criticality 代理会系统性偏。先做 TITO 级对齐，再谈调制。</li>
+      <li><strong>调制幅度从小扫</strong>：论文强调「小调制」在正方向对齐时有益；α 过大等于几乎只用步级，可能把 GiGPO 的方差问题放大回来。</li>
+      <li><strong>NLL 归一化要对齐比较集</strong>：相对组内均值还是全局 EMA，会影响「高于均值」的定义；跨任务混合 batch 时优先按任务/组归一。</li>
+      <li><strong>与 AHEAD / PGPO 叠加时分工</strong>：AHEAD 偏环境反馈与纠错提示重权；PGPO 偏失败轨迹势差；GACA 偏粒度混合。同时开多个重权时，先做 2×2 消融，避免归因混乱。</li>
+      <li><strong>监控步级权重直方图</strong>：若 w_t 塌成常数，等于退回 GiGPO；若极端双峰，检查 NLL 尺度与 α。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 GRPO 把轨迹标量广播到每一步会在长程任务上吃亏？</summary>
+      <p>终局信号稀疏且延迟；多数中间步对结果贡献不等。同一 A 会给噪声步过大梯度、给关键步过小相对权重，方差高、信用糊。</p>
+    </details>
+    <details>
+      <summary>2. GiGPO 的固定混合权重缺了什么？</summary>
+      <p>它承认需要步级与轨迹级两种估计，但假设最优混合比全局恒定。不同步的关键度不同，固定 λ 无法在「要细」与「要稳」之间按步切换。</p>
+    </details>
+    <details>
+      <summary>3. 用 NLL 当 criticality 代理有什么假设与风险？</summary>
+      <p>假设：高意外度步更常是决策分叉。风险：tokenizer / 模板噪声、工具回显长度、或策略尚未学好时的「假意外」会污染 w_t。需要相对归一与幅度限制。</p>
+    </details>
+    <details>
+      <summary>4. GACA 与学一个 critic 估 V(s) 的本质差别？</summary>
+      <p>Critic 额外拟合状态价值，可提供与策略网络解耦的 baseline，但要维护价值网络与偏差–方差。GACA 不引入新网络，只重组已有 step/traj 优势与 rollout NLL，工程面更轻，表达能力也更受限。</p>
+    </details>
+    <details>
+      <summary>5. 若步级估计与真优势方向经常反号，小调制还成立吗？</summary>
+      <p>论文条件强调正方向对齐。若 A_step 系统性地指错方向，增大其权重会恶化风险——此时应先修步级估计器（分组、anchor、样本数），而不是加大 α。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.12424" target="_blank" rel="noopener">arXiv:2609.12424 · GACA</a></li>
+      <li>站内：
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-09-07-tigpo.html">TIGPO</a> ·
+        <a href="daily-2026-09-04-pgpo.html">PGPO</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 1,
+  "next": 2,
   "daily_streams": [
     "frontline",
     "harness",
@@ -354,6 +354,27 @@
       "source": "algo",
       "topic": "Actor-Critic：V 作 baseline；A=Q−V / TD / GAE；接到 A2C/PPO/GRPO",
       "file": "posts/daily-2026-09-14-algo-actor-critic.html"
+    },
+    {
+      "date": "2026-09-15",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "GACA：NLL 关键度自适应混合步级/轨迹级优势（vs GRPO/GiGPO；ALFWorld/WebShop 1.5B·7B）",
+      "file": "posts/daily-2026-09-15-gaca.html"
+    },
+    {
+      "date": "2026-09-15",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "Elastic Horizon：成功轨迹长度 P90 闭环跟踪有效交互前沿（最多省 ~25% 逐步 token）",
+      "file": "posts/daily-2026-09-15-harness-elastic-horizon.html"
+    },
+    {
+      "date": "2026-09-15",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "KTO：前景理论效用 + 二元好/坏；无需偏好对（vs DPO；1B–30B）",
+      "file": "posts/daily-2026-09-15-algo-kto.html"
     }
   ]
 }

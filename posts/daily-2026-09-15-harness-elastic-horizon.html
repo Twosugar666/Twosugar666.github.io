@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Elastic Horizon：用成功轨迹长度的 P90 关掉交互预算开环 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Elastic Horizon：用成功轨迹长度的 P90 关掉交互预算开环</h1>
+    <p class="post-meta">2026-09-15 · 收藏夹：Harness / Agent / RL · 学习笔记<br />
+      论文：<em>Elastic Horizon: Discovering the Effective Interaction Frontier in Agentic Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/2609.07247" target="_blank" rel="noopener">arXiv:2609.07247</a>（EMNLP 2026）。
+      交叉：
+      <a href="daily-2026-09-14-t1.html">T1（300+ turns）</a>、
+      <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agent RL 里，「单局最多允许多少次环境交互」是一等超参。拉长 max horizon 往往抬高长程任务上限——策略有更多步去试错、纠错、收尾。
+      课程式地<strong>逐步放大</strong> horizon，通常又好过一上来就钉死一个很大的固定上限：早期短局更易给非零奖励，后期再放开探索深度。
+    </p>
+    <p>
+      但现有进度表多半是<strong>开环</strong>：单调递增直到人手设的 max，中间没有「该停了」的信号。结果要么永远欠容量（frontier 还在涨、预算已到顶），要么过容量（边际成功率饱和，token 与墙钟却近似线性涨）。
+      Elastic Horizon 提出 <strong>effective interaction frontier</strong>：存在一条动态边界，越过之后额外交互的收益递减，而成本近似线性；训练侧应用闭环控制器去跟踪这条 frontier。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：用「成功轨迹长度」的第 90 百分位当 frontier 估计，闭环调节交互预算——从欠容量与过容量初始化都能稳住在饱和带内；作者自报在 AppWorld / BFCL 上 7B·14B 成功率最佳，并最多省约 25% 逐步轨迹 token。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 开环 curriculum vs 闭环 frontier</h3>
+    <table>
+      <thead><tr><th></th><th>开环放大 horizon</th><th>Elastic Horizon</th></tr></thead>
+      <tbody>
+        <tr><td>调度</td><td>单调 ↑ 直到手设 H_max</td><td>跟踪成功长度分布的统计量</td></tr>
+        <tr><td>停止信号</td><td>无（或人手改表）</td><td>饱和带：再加步收益递减</td></tr>
+        <tr><td>欠容量初始化</td><td>可能长期卡在过短预算</td><td>随成功轨迹变长而抬升</td></tr>
+        <tr><td>过容量初始化</td><td>浪费 token，难自动收回</td><td>向 P90  frontier 收缩</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-14-t1.html">T1</a> 的「300+ 轮硬预算」、
+      <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> 的「拦截退出续跑」、
+      <a href="daily-2026-09-07-harness-compaction.html">Compaction</a> 的「爆窗前压缩」对照：前两者管的是<strong>跑得够不够久 / 如何续</strong>，compaction 管<strong>上下文装不装得下</strong>；Elastic Horizon 管的是<strong>训练时给多少交互配额才经济</strong>。
+    </p>
+
+    <h3>② Effective interaction frontier 假说</h3>
+    <pre><code># 固定 horizon 扫描（示意）
+for H in {H1 &lt; H2 &lt; … &lt; Hk}:
+  train / eval → success(H), tokens(H)
+
+# 典型形态（论文观察）：
+#   success(H) 先升，再进入饱和平台
+#   tokens(H)  ≈ 线性涨（每步交互都计费）
+
+# frontier ≈ 平台左侧边缘：再增大 H，Δsuccess ≈ 0，Δcost &gt; 0
+</code></pre>
+    <p>
+      假说要点：frontier 不是全局常数，而随策略能力、任务难度分布漂移。开环表无法知道「今天」的边界在哪；需要从在线成功轨迹里读出有效长度。
+    </p>
+
+    <h3>③ 控制器：成功轨迹长度的 P90</h3>
+    <pre><code># 每个训练窗口收集成功 episode 的交互长度 L_i
+# （失败局可另议：常不进 frontier 估计，避免失败拖尾污染）
+
+H_target ← Percentile_90( { L_i : success } )
+
+# 闭环：把当前允许的 max_interactions 缓动到 H_target
+# （带上下夹紧、EMA，避免单 batch 尖峰）
+H ← clip( EMA(H_target), H_min, H_max_abs )
+</code></pre>
+    <table>
+      <thead><tr><th>设计选择</th><th>理由（读论文口径）</th></tr></thead>
+      <tbody>
+        <tr><td>只用<strong>成功</strong>轨迹</td><td>frontier 定义为「有效完成任务所需交互」；失败长拖尾会虚高预算</td></tr>
+        <tr><td><strong>P90</strong> 而非均值 / max</td><td>覆盖多数成功所需深度，又抑制极端长尾；比 max 稳、比均值更偏「够用」</td></tr>
+        <tr><td>闭环 + 缓动</td><td>从欠/过容量两端都能进入饱和带，而不是锁死开环斜率</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>环境</td><td>AppWorld、BFCL</td></tr>
+        <tr><td>模型</td><td>7B 与 14B</td></tr>
+        <tr><td>固定 horizon 扫描</td><td>可见成功率饱和平台；过长预算边际收益差</td></tr>
+        <tr><td>Elastic Horizon</td><td>从欠容量与过容量初始化均可稳定到饱和带附近</td></tr>
+        <tr><td>成功率</td><td>作者自报在对照中最佳（跨 7B / 14B）</td></tr>
+        <tr><td>成本</td><td>作者自报最多节省约 <strong>25%</strong> 逐步轨迹 token</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与 <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> 一类 SDK 的关系：horizon 是 harness / trainer 共享的配额旋钮；Elastic 把它从「yaml 里写死的整数」升级成「由成功分布驱动的控制器」。推理部署仍可另设硬上限做安全熔断。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画固定-H 扫描曲线</strong>：至少看 success vs H、tokens vs H。若没有平台，frontier 假说在该任务上可能不成立，闭环会来回抖。</li>
+      <li><strong>P90 统计窗口要够</strong>：成功样本过少时百分位噪声大；可与 EMA、最小成功计数门控一起用。</li>
+      <li><strong>失败长轨迹别直接灌进 P90</strong>：失败拖尾会把预算撑爆；若需要探索，用单独的探索预算或偶发上限，而不是污染 frontier 估计。</li>
+      <li><strong>与 compaction / 续跑解耦</strong>：交互步数配额 ≠ 上下文 token 配额。Ralph 续跑、compaction 解决的是窗与会话生命周期；Elastic 解决训练期逐步计费。</li>
+      <li><strong>部署硬顶仍保留</strong>：训练跟踪 frontier 不等于推理无限跑。安全与成本侧保留绝对 max，并监控「触顶率」。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么开环「一直加到 H_max」会系统性浪费？</summary>
+      <p>若成功率已进入饱和平台，额外交互几乎不抬 success，但每步仍产生轨迹 token 与环境调用。开环不知道平台在哪，只能按人手表走到顶。</p>
+    </details>
+    <details>
+      <summary>2. 为何用成功长度的 P90，而不是成功长度的最大值？</summary>
+      <p>Max 对个别病理长成功（或标注噪声）极敏感，会把全局预算拉到过容量。P90 覆盖大多数成功所需深度，尾部更稳。</p>
+    </details>
+    <details>
+      <summary>3. 欠容量初始化时，控制器如何「学会变长」？</summary>
+      <p>随着策略变强，成功轨迹的长度分布右移，P90 上升，H_target 跟随抬升——闭环用数据证明「需要更深」，而不是按日历加步。</p>
+    </details>
+    <details>
+      <summary>4. Elastic Horizon 能替代 TITO / 路由回放吗？</summary>
+      <p>不能。它只调度交互配额；token 对齐、MoE 路由一致性仍是另一类 train–infer gap。配额对了但 logprob 错位，RL 照样不稳。</p>
+    </details>
+    <details>
+      <summary>5. 若任务分布双峰（短任务 + 极长任务混训），P90 可能出什么问题？</summary>
+      <p>单一全局 P90 会被长任务主导，短任务过配额。应按任务类型 / 难度桶分别估 frontier，或对 horizon 做条件化。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.07247" target="_blank" rel="noopener">arXiv:2609.07247 · Elastic Horizon</a></li>
+      <li>站内：
+        <a href="daily-2026-09-14-t1.html">T1</a> ·
+        <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Compaction</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

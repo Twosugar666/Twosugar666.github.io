@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜KTO：用二元好/坏信号做前景理论对齐（无需偏好对） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜KTO：用二元好/坏信号做前景理论对齐（无需偏好对）</h1>
+    <p class="post-meta">2026-09-15 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Ethayarajh 等 · <em>KTO: Model Alignment as Prospect Theoretic Optimization</em>
+      · <a href="https://arxiv.org/abs/2402.01306" target="_blank" rel="noopener">arXiv:2402.01306</a> · ICML 2024。
+      交叉：
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      对齐数据最贵的形态之一是<strong>偏好对</strong>：同一 prompt 上标 y_w ≻ y_l。
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a> 把 Bradley-Terry + KL 约束 RL 重参数化成偏好对上的 −log σ(…) 目标，省掉显式 RM + PPO 环，但仍然<strong>吃成对数据</strong>。
+    </p>
+    <p>
+      现实里更常见、也更便宜的是二元标签：这条 (x, y) 合意 / 不合意——点赞、点踩、安全审核通过/拒绝、人工抽检好/坏。不必为每个 x 生成并比较两条回复。
+      <strong>KTO（Kahneman-Tversky Optimization）</strong> 把对齐写成前景理论里的效用最大化：不最大化偏好似然，而最大化生成相对参考点的价值；损失族被作者归为 HALOs（human-aware losses）——并指出 DPO 一类目标里已隐式编码了类似前景理论的偏置。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：KTO 用 Kahneman-Tversky 价值函数，对带二元 desirable / undesirable 标签的 (x,y) 做不对称 sigmoid 损失；只需好/坏，不需偏好对；β 控偏离参考策略的尺度，desirable_weight / undesirable_weight 校正类别失衡与损失厌恶不对称。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① HALOs 与「为何不必成对」</h3>
+    <table>
+      <thead><tr><th></th><th>DPO 族</th><th>KTO</th></tr></thead>
+      <tbody>
+        <tr><td>数据</td><td>(x, y_w, y_l) 偏好对</td><td>(x, y, label∈{好,坏})</td></tr>
+        <tr><td>目标语义</td><td>偏好 log-likelihood（BT）</td><td>生成效用（前景理论价值）</td></tr>
+        <tr><td>参考点</td><td>隐式进 π_θ/π_ref 比</td><td>显式 KL 参考点 + 不对称价值</td></tr>
+        <tr><td>成本</td><td>成对标注 / 配对构造</td><td>二元反馈；更易规模化</td></tr>
+      </tbody>
+    </table>
+    <p>
+      作者将人类感知偏差（损失厌恶、参考依赖等）写进损失设计，并观察：许多成功的人类感知损失（HALOs）与前景理论结构同族；DPO 等偏好法在重参数化后也浮现类似偏置——KTO 则直接从效用侧下手。
+    </p>
+
+    <h3>② Kahneman-Tversky 价值：相对参考点</h3>
+    <pre><code># 前景理论直觉（示意）：
+# 人评价的是相对参考点的「得/失」，且损失侧更陡（损失厌恶）
+
+# LLM 对齐里常用的「隐式奖励」片段（与 DPO 同族写法）：
+r_θ(x,y) = β · log( π_θ(y|x) / π_ref(y|x) )
+
+# KTO：不把两条 y 做差进 BT，而是对单条 y 的 r_θ
+# 相对一个参考基准（与 KL / 期望相关）做不对称价值
+# 合意样本：鼓励 r 高于参考 → 提高效用
+# 不合意样本：惩罚 r 高于参考（或等价地压低坏回复的相对奖励）
+</code></pre>
+    <p>
+      与 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> / <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> / <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> 的对比：后者在奖励（或优势）上做策略梯度；KTO 是离线对齐目标，不滚动环境，也不估计 V。它更接近 DPO 的「闭式偏好/反馈损失」家族，只是反馈从成对变成二元。
+    </p>
+
+    <h3>③ 损失形态：不对称 sigmoid + 类别权重</h3>
+    <pre><code># 示意（实现细节以原论文 / 官方代码为准）
+# z = r_θ(x,y) − 参考基准（与 π_ref、KL 估计相关）
+
+# 合意 (desirable)：
+L+ ∝ 1 − σ( β · z )          # 推高相对参考的价值
+
+# 不合意 (undesirable)：
+L− ∝ σ( β · z )              # 压低坏回复的相对价值
+# （等价写法常体现损失厌恶：坏侧权重/斜率与好侧不对称）
+
+L_KTO = λ_d · E_{好}[L+] + λ_u · E_{坏}[L−]
+
+# β：偏离 π_ref 的温度 / 强度
+# λ_d = desirable_weight，λ_u = undesirable_weight
+# → 校正好/坏比例失衡，并编码损失厌恶不对称
+</code></pre>
+    <table>
+      <thead><tr><th>旋钮</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>β</code></td><td>越大越贴参考策略（保守）；越小越敢按二元反馈挪分布</td></tr>
+        <tr><td><code>desirable_weight</code></td><td>上调时更强调「学好样本」；数据里好样本稀缺时可加大</td></tr>
+        <tr><td><code>undesirable_weight</code></td><td>上调时更强调「远离坏样本」；安全/拒答场景常更敏感</td></tr>
+        <tr><td><code>π_ref</code></td><td>冻结参考；与 DPO 一样，更新 ref 会毁掉比的语义</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ 和 DPO / PPO 放一张图里</h3>
+    <table>
+      <thead><tr><th></th><th>PPO-RLHF</th><th>DPO</th><th>KTO</th></tr></thead>
+      <tbody>
+        <tr><td>在线采样</td><td>要</td><td>经典设定不要</td><td>不要</td></tr>
+        <tr><td>显式 RM</td><td>要</td><td>不要</td><td>不要</td></tr>
+        <tr><td>数据</td><td>偏好→RM；再 RL</td><td>偏好对</td><td>二元好/坏</td></tr>
+        <tr><td>核心对象</td><td>E[r]−β KL</td><td>BT 偏好似然</td><td>KT 效用 / HALO</td></tr>
+        <tr><td>典型场景</td><td>有奖励模型的在线对齐</td><td>有成对偏好</td><td>有点赞点踩 / 审核标签</td></tr>
+      </tbody>
+    </table>
+    <p>
+      论文口径：在约 1B–30B 尺度上，KTO 匹配或超过偏好类方法（作者自报）。读实验时分清：二元数据量往往更大——比较的是「同预算标注」还是「同条数样本」，结论会不同。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>有成对就 DPO，有二元就 KTO</strong>：不要为了用 DPO 硬把点赞点踩拼成伪对；噪声配对会直接毒 BT 似然。</li>
+      <li><strong>先看类别比例再设 λ_d / λ_u</strong>：好/坏严重失衡时，默认等权会让梯度被多数类吞掉；权重是一等超参，不是装饰。</li>
+      <li><strong>β 与 DPO 同逻辑扫</strong>：过小易过拟合反馈、伤语言质量；过大则几乎不动。对齐轴与能力轴分开回归。</li>
+      <li><strong>坏样本质量很关键</strong>：随机噪声「坏」不如真实有害/跑题/拒答失败； undesireable 侧决定你在推开什么。</li>
+      <li><strong>与 RLVR 栈分工</strong>：数学/代码/agent 可验证成功优先规则奖励 + GRPO；主观对齐、安全、风格优先偏好/二元 HALO。可串联，勿混成一个 loss 解释一切。</li>
+      <li><strong>π_ref 冻结</strong>：从 SFT 拷贝后冻结；中途换 ref 等于改参考点，前景理论里的「得/失」会漂移。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说 DPO 隐式带有前景理论味，而 KTO 是显式？</summary>
+      <p>DPO 从 KL 约束最优策略反解隐式奖励再代入 BT，人类偏好数据本身含参考依赖与损失厌恶，损失曲面会体现类似偏置。KTO 直接把 KT 价值函数写进目标，并对单条生成相对参考点打分，不经成对 BT。</p>
+    </details>
+    <details>
+      <summary>2. 只有好样本、几乎没有坏样本时，KTO 还能用吗？</summary>
+      <p>理论上可把权重倾斜到 desirable，但缺少「推开」方向时，模型可能只会提高好样本似然、对有害模式约束弱。实践上应补至少一定量的真实 undesireable，或与安全分类器 / 规则过滤联用。</p>
+    </details>
+    <details>
+      <summary>3. KTO 的 β 与 PPO 的 KL 系数是同一个旋钮吗？</summary>
+      <p>角色类似——都约束相对 π_ref 的偏离——但嵌入的目标不同：PPO 在在线 RL 目标里显式减 KL；KTO 在离线效用损失里通过 log-ratio 尺度体现。调参直觉可迁移，实现与曲线不可照搬。</p>
+    </details>
+    <details>
+      <summary>4. 把两条 unary 标签拼成伪偏好对喂 DPO，错在哪？</summary>
+      <p>BT 假设同一 x 上两条回复可比较。跨 prompt 或随机配对会破坏「同一上下文下的相对偏好」，梯度指向无定义的比较。KTO 的设计初衷之一就是避免这种伪造。</p>
+    </details>
+    <details>
+      <summary>5. 何时仍应优先 PPO / Actor-Critic，而不是 KTO？</summary>
+      <p>需要在线探索、环境交互、或奖励随状态密集变化时（agent 工具成功、多步终局），策略梯度 / AC 更直接。KTO 擅长消化离线二元人类反馈，不是环境 RL 的替代品。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>Ethayarajh et al. · KTO：
+        <a href="https://arxiv.org/abs/2402.01306" target="_blank" rel="noopener">arXiv:2402.01306</a>（ICML 2024）</li>
+      <li>站内：
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
