@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜HarnessBandit：用可学性×可迁移性 bandit 调度多 Harness 的 Agent RL · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜HarnessBandit：用可学性×可迁移性 bandit 调度多 Harness 的 Agent RL</h1>
+    <p class="post-meta">2026-09-16 · 收藏夹：Agent / RL / Infra · 一线追踪<br />
+      论文：Wei, Tu 等 · <em>HarnessBandit: Joint Learnability-Transferability Scheduling for Multi-Harness Agentic Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/2609.13739" target="_blank" rel="noopener">arXiv:2609.13739</a>（2026-09-12；HIT + Alibaba Cloud）。
+      交叉：
+      <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>、
+      <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>、
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>、
+      <a href="grpo-notes.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      同一基座挂上不同 harness——system prompt、tool schema、control loop、trajectory format 任一处不同——表现就会参差。
+      部署侧「多接口并存」已是常态；训练侧若只盯单一 harness，学到的策略容易过拟合该接口的提示词与轨迹形状。
+      自然想法是：共享策略、多 harness 一起训。但这立刻变成<strong>调度问题</strong>：每一步优化该吃哪个 harness 的 batch——既要当前信号可学，又要更新对其余 harness 有益。
+    </p>
+    <p>
+      朴素 mixed-batch（一步混多个 harness）会把异构轨迹格式与优势尺度搅在同一更新里；轮流固定表又对「此刻谁更有信息量」视而不见。
+      HarnessBandit 把「选 harness」做成在线 bandit：每步只选一个 harness 跑 GRPO，再用可学性与可迁移性两个诊断量更新调度。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：每步选一个 harness 做 GRPO；用 batch 平均 |advantage| 估 learnability，用当前 harness 的低维梯度 sketch 与其余 harness EMA 的 cosine 估 transferability；pooled sliding-window min-max 归一后融合，再加 visit-dependent bonus 与 exploration floor。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 多 Harness 共享策略：调度比混合更先</h3>
+    <table>
+      <thead><tr><th>设定</th><th>每步吃什么</th><th>风险</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>单 harness</td>
+          <td>固定接口上的轨迹</td>
+          <td>换 prompt / schema / loop 即掉点</td>
+        </tr>
+        <tr>
+          <td>mixed-batch</td>
+          <td>同一步混多个 harness</td>
+          <td>异构格式与优势尺度互相干扰</td>
+        </tr>
+        <tr>
+          <td><strong>HarnessBandit</strong></td>
+          <td>每步<strong>一个</strong> harness + 在线调度</td>
+          <td>需估计「可学」与「可迁」；欠探索会饿死某些臂</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>（Action–Args / CAPO）、
+      <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>（原生 coding harness 接 PG）、
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>（评测单位改成可运行 harness）同属「harness 是一等公民」：HarnessBandit 进一步问——<strong>多接口共享策略时，训练步该怎么排班</strong>。
+    </p>
+
+    <h3>② 两信号：Learnability × Transferability</h3>
+    <pre><code># 每步：bandit 选出 harness h，在 h 上采样并做 GRPO 更新
+
+# ① Learnability：本 batch 平均绝对优势
+#    |A| 大 → 组内相对回报分化明显，当前更新更「有梯度」
+L_h ← mean( |A_i| ) over batch on harness h
+
+# ② Transferability：低维梯度 sketch 的跨 harness 对齐
+g_h ← sketch( ∇_θ L_GRPO on h )     # 低维投影 / 随机投影一类 sketch
+for h' ≠ h:
+  EMA_h' ← (1−α)·EMA_h' + α·g_{h'}   # 其余臂的梯度方向记忆
+T_h ← cosine( g_h , aggregate(EMA_{h'≠h}) )
+
+# 融合前：对 L 与 T 做 pooled sliding-window min-max 归一
+# → 两路量纲不同、随训练漂移，需同一窗口内可比
+L̃, T̃ ← pooled_minmax(L, T; window)
+score_h ← fuse(L̃_h, T̃_h)             # 联合可学×可迁
+</code></pre>
+    <table>
+      <thead><tr><th>信号</th><th>定义（论文口径）</th><th>在调度里扮演什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Learnability</strong></td>
+          <td>batch 平均 |advantage|</td>
+          <td>偏好「此刻还有相对回报分化」的 harness</td>
+        </tr>
+        <tr>
+          <td><strong>Transferability</strong></td>
+          <td>当前梯度 sketch 与其余 harness EMA 的 cosine</td>
+          <td>偏好「更新方向与其它臂对齐」的 harness</td>
+        </tr>
+        <tr>
+          <td>归一</td>
+          <td>pooled sliding-window min-max</td>
+          <td>两路信号可同尺度融合，且随时间漂移可再标定</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      诊断结论（作者自报）：两信号可<strong>分离演化</strong>——不是同一量的两个别名。只盯可学性可能选到「对本 harness 很吵、对其余臂方向差」的更新；只盯可迁移性可能长期忽略仍有信息量的难臂。
+    </p>
+
+    <h3>③ Bandit 采样：visit bonus + exploration floor</h3>
+    <pre><code># 示意：在归一融合分上加访问相关探索项
+bonus_h ∝ f(visit_count_h)     # visit-dependent：少访的臂加分
+p_h ∝ score_h + bonus_h
+p_h ← max(p_h, ε_floor)        # explicit exploration floor
+h* ∼ Categorical(normalize(p))
+
+# 下一优化步只在 h* 上 rollout + GRPO
+</code></pre>
+    <p>
+      Visit-dependent bonus 防止「早期偶然高分」锁死某一 harness；exploration floor 保证最冷的臂仍有正概率被抽到——对多 harness 鲁棒性目标尤其关键：从未见过的接口在评测里会出现。
+      底层更新仍是 <a href="grpo-notes.html">GRPO</a>（组内相对优势、无 critic）；与 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 的序列级 IS 正交——Bandit 管的是<strong>选哪条数据源</strong>，不是改 surrogate 形态。
+    </p>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>模型</td><td>Qwen3.5-2B</td></tr>
+        <tr><td>训练</td><td>ClawGym · 6 个 harness</td></tr>
+        <tr><td>评测 1</td><td>PinchBench：held-out tasks，in-distribution OpenClaw</td></tr>
+        <tr><td>评测 2</td><td>ClawEval：held-out tasks <strong>与</strong> held-out harness</td></tr>
+        <tr><td>对照</td><td>mixed-batch multi-harness 等</td></tr>
+        <tr><td>结论</td><td>两基准上优于 mixed-batch（作者自报；具体百分点以论文表为准，此处不编造）</td></tr>
+        <tr><td>诊断</td><td>learnability 与 transferability 提供可分离、随训练演化的信号（作者自报）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：先看 ClawEval（任务+harness 双 held-out）是否仍优于混合 batch——这才是「跨接口鲁棒」主张的硬核；PinchBench 更多验证同族 OpenClaw 上的任务泛化。数字一律标作者自报。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先统一 logprob / TITO 记账，再谈调度</strong>：不同 harness 的 trajectory format 若导致 token 错位，|A| 与梯度 sketch 都会系统性偏，bandit 会学到错误偏好。</li>
+      <li><strong>两信号都要监控曲线</strong>：分别画 L̃、T̃ 与选中频率；若某一路塌成常数，融合等于单目标，消融意义也没了。</li>
+      <li><strong>sketch 维度与 EMA α 是一等超参</strong>：过高维 sketch 贵且噪；过低维可能把「方向对齐」糊掉。α 过大则 EMA 跟当前步抖，过小则迁移记忆过时。</li>
+      <li><strong>exploration floor 别关</strong>：多 harness 评测含 held-out 接口时，训练期饿死某臂会直接反映到 ClawEval 类指标。</li>
+      <li><strong>与 mixed-batch 做同算力对照</strong>：比较应固定总环境步 / 总优化步；「每步单 harness」在墙钟上可能更串行，需报告公平预算。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么多 harness 共享策略时，「每步混一批」不一定优于「每步只选一个」？</summary>
+      <p>异构 prompt / schema / loop / 轨迹格式会把不同尺度的优势与梯度方向塞进同一次更新，可能互相抵消或放大某一接口的噪声。单臂更新后再用可迁性约束方向，归因更清晰，也便于 bandit 做在线排班。</p>
+    </details>
+    <details>
+      <summary>2. Learnability 用 mean |A| 而不是 mean A，意图是什么？</summary>
+      <p>组内相对优势可正可负；绝对均值刻画的是「本 batch 分化强度 / 信号幅度」，而不是净正回报。全零或接近常数的 A 会让 |A| 塌掉，正好提示该臂当前可学性低。</p>
+    </details>
+    <details>
+      <summary>3. Transferability 为什么要跟「其余 harness 的 EMA」比，而不是跟全局平均梯度比？</summary>
+      <p>目标是「更新对其它臂有益」。与其余臂各自记忆的方向对齐，比与含自身在内的全局平均比，更直接度量跨接口正迁移；EMA 则平滑单步 sketch 噪声。</p>
+    </details>
+    <details>
+      <summary>4. 若某 harness 长期高 |A| 但梯度与其它臂反号，调度应如何表现？</summary>
+      <p>理想融合会压低其 score（可学高、可迁低）。若仍被频繁选中，检查归一窗口、融合权重与 exploration 是否过强；否则共享策略可能被该臂拉向其它接口的对立方向。</p>
+    </details>
+    <details>
+      <summary>5. HarnessBandit 能否替代把 harness 本身做成可学习策略（如 EvoHarness / Harness-R1）？</summary>
+      <p>不能。它调度的是「在已有固定 harness 集合上训共享策略」；不改写 prompt / loop / 工具协议。接口演化与接口间排班是两层问题，可串联但不可互相替代。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.13739" target="_blank" rel="noopener">arXiv:2609.13739 · HarnessBandit</a></li>
+      <li>站内：
+        <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a> ·
+        <a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a> ·
+        <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a> ·
+        <a href="grpo-notes.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

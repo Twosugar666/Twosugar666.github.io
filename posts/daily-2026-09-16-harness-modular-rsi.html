@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜ModularRSI：把 harness 自演化拆成五模块 + 对比轨迹（benchmark-disjoint） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜ModularRSI：把 harness 自演化拆成五模块 + 对比轨迹（benchmark-disjoint）</h1>
+    <p class="post-meta">2026-09-16 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Wu, Ren, Li 等 · <em>ModularRSI: Modular and Generalizable Recursive Harness Self-Improvement</em>
+      · <a href="https://arxiv.org/abs/2609.14857" target="_blank" rel="noopener">arXiv:2609.14857</a>（2026-09-14）。
+      交叉：
+      <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a>、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>、
+      <a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness-RL</a>、
+      <a href="daily-2026-09-11-neohorse-1.html">NeoHorse-1</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Recursive Self-Improvement（RSI）正在从「改模型权重」延伸到「改 agent harness」：长程 coding / 终端任务里，执行机制——循环、工具、观察、上下文、完成判定——本身可被经验改写。
+      站内已见 <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a>（失败轨迹 → 可执行 lifecycle patch）、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>（参考轨迹 + 双门控）、
+      <a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness-RL</a>（可学 belief/progress 策略）等路线。
+    </p>
+    <p>
+      ModularRSI 指出可泛化 harness RSI 仍卡在三难：
+      （1）在评测集或其子集上演化，难分「可复用改进」与「benchmark 特化」；
+      （2）单轨迹更新把系统性 harness 缺陷与实例级推理细节搅在一起，改动难迁移；
+      （3）单体 harness 难定位 recurring deficiency，整包优化又纠缠无关机制，归因与验证困难。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：ModularRSI = benchmark-disjoint 演化集 + 同任务成功/失败对比轨迹 + 五模块独立演化再 integration；用跨任务聚合的 recurring deficiency 驱动可迁移的 harness 自改进。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 三难与三药</h3>
+    <table>
+      <thead><tr><th>难点</th><th>ModularRSI 对策</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>评测集上演化 → 特化 vs 泛化难分</td>
+          <td><strong>benchmark-disjoint</strong>：2000 条外部可执行演化任务，与下游评测不相交</td>
+        </tr>
+        <tr>
+          <td>单轨迹更新混入实例细节</td>
+          <td><strong>contrastive</strong>：同任务成功 vs 失败轨迹对比，跨任务聚合 recurring deficiency</td>
+        </tr>
+        <tr>
+          <td>单体 harness 难定位、整包纠缠</td>
+          <td><strong>modular</strong>：五功能模块独立改，再 integration 合冲突</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与 <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>「评测单位 = 可运行 harness」、
+      <a href="daily-2026-09-11-neohorse-1.html">NeoHorse-1</a>「Routing Harness + curriculum」对照：ModularRSI 强调的是<strong>演化数据与评测解耦</strong>，以及把失败归因钉在可命名的模块边界上。
+    </p>
+
+    <h3>② Contrastive：同任务成败 → 跨任务 recurring deficiency</h3>
+    <pre><code># 对同一 task：
+traj+ ← successful execution under current harness
+traj− ← failed execution under current harness
+
+# 对比：剥离「这道题的特有解法细节」，突出 harness 行为差
+# 例如：工具调用协议、观察截断、上下文丢弃、过早/过晚宣布完成 …
+
+# 跨任务聚合：
+deficiency ← Aggregate( contrast(traj+, traj−) over many tasks )
+# → recurring behavioral deficiencies（反复出现的机制缺陷）
+</code></pre>
+    <p>
+      单条失败轨迹很容易诱使「针对该 bug 补丁」；对比成功轨迹后，补丁更可能指向协议层 / 循环层的系统性缺口。跨任务聚合再滤掉偶发噪声，得到可复用的 deficiency 清单。
+    </p>
+
+    <h3>③ 五模块：独立演化 + integration</h3>
+    <table>
+      <thead><tr><th>模块</th><th>职责边界（论文口径）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Agent Loop</strong></td><td>主循环 / 回合结构 / 何时继续或分支</td></tr>
+        <tr><td><strong>Tool Use</strong></td><td>工具选择、参数、调用协议与错误恢复</td></tr>
+        <tr><td><strong>Observation Management</strong></td><td>环境回执如何截取、结构化、注入下一步</td></tr>
+        <tr><td><strong>Context Management</strong></td><td>历史压缩、保留、重排——上下文装得下什么</td></tr>
+        <tr><td><strong>Task Completion Detection</strong></td><td>何时判定任务完成 / 失败 / 需继续</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 每模块：受限修改范围（restricted modification scope）
+for module in {Loop, Tool, Obs, Ctx, Done}:
+  module' ← Evolve(module | deficiency_scoped_to_module)
+
+# Integration：合并五路演化结果，解决冲突
+harness* ← Integrate(module'_1 … module'_5)
+# 冲突例：Loop 要求更长探索，Done 却过早终止 → 需显式调和
+</code></pre>
+    <p>
+      受限范围避免「改 Tool Use 时顺手重写整段 Loop」；integration 阶段承认模块间耦合真实存在，但不把归因重新糊回单体黑盒。
+    </p>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>演化集</td><td>2000 外部可执行任务；与下游评测 <strong>disjoint</strong></td></tr>
+        <tr><td>评测</td><td>TB2.0、SWE-Bench Verified</td></tr>
+        <tr><td>泛化</td><td>未见域内（in-domain）与跨域（cross-domain）任务均有一致提升（作者自报）</td></tr>
+        <tr><td>迁移</td><td>演化后的 harness 可跨不同 foundation model 迁移（作者自报）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：benchmark-disjoint 是主张的前提——若演化集泄漏评测子集，提升不能自动解释为可泛化 RSI。跨基座迁移说明改的是执行机制而非某一模型的提示词过拟合；具体百分点以论文表为准，此处不编造。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画模块边界再开演化</strong>：没有清晰的 Loop / Tool / Obs / Ctx / Done 接口，就谈不上「独立修改范围」；边界模糊时 integration 会变成第二次整包改写。</li>
+      <li><strong>坚持同任务成败对</strong>：只有失败轨迹的 patch 极易记实例解法；尽量构造或复用同 task 的成功对照。</li>
+      <li><strong>演化集与评测严格隔离</strong>：文档化来源与去重；定期做 n-gram / 实例 ID 碰撞检查，否则「泛化」叙事站不住。</li>
+      <li><strong>integration 要可回归</strong>：合并后跑固定冒烟集；记录冲突决议（哪一模块优先），避免静默回退。</li>
+      <li><strong>与 Harness-R1 / Evolve 叠用时分工</strong>：R1 偏在线 RL 训「会改运行时」的工程师；Evolve 偏参考轨迹门控；ModularRSI 偏模块化 + 对比 + 评测隔离。先对齐「改谁、用什么数据」，再谈串联。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么在 SWE-Bench 子集上演化 harness，会让「提升」难以解释？</summary>
+      <p>改进可能只是拟合该基准的仓库分布、测试风格或提示模板，而非可迁移的执行机制。benchmark-disjoint 把演化经验与评测实例拆开，才能把增益更干净地归因到泛化。</p>
+    </details>
+    <details>
+      <summary>2. 同任务成功/失败对比，比「只看失败」多提供了什么？</summary>
+      <p>成功轨迹给出「在相同任务目标下可行的 harness 行为」；差分更可能暴露协议/循环层缺陷，而不是某次错误的具体补丁内容或解题步骤。</p>
+    </details>
+    <details>
+      <summary>3. 五模块里，Context Management 与 Observation Management 为何拆开？</summary>
+      <p>Observation 管「环境刚返回的东西如何进入决策」；Context 管「历史窗口的保留与压缩」。混在一起时，截断 bug 与记忆策略 bug 难以分别验证和回滚。</p>
+    </details>
+    <details>
+      <summary>4. Integration 阶段若总是让某一模块「赢」，意味着什么？</summary>
+      <p>可能是模块边界设计不当（职责重叠），或 deficiency 归因偏向该模块。应回头检查对比证据是否跨任务稳定，而不是在 integration 里用启发式永久压制其它模块。</p>
+    </details>
+    <details>
+      <summary>5. 跨基座迁移成功，说明 ModularRSI 改的是什么层级？</summary>
+      <p>更偏向 harness 执行机制（循环、工具、观察、上下文、完成判定），而非某一 foundation model 的权重或专属提示词套路；否则换基座后机制应失效。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.14857" target="_blank" rel="noopener">arXiv:2609.14857 · ModularRSI</a></li>
+      <li>站内：
+        <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a> ·
+        <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> ·
+        <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a> ·
+        <a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness-RL</a> ·
+        <a href="daily-2026-09-11-neohorse-1.html">NeoHorse-1</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 2,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -375,6 +375,27 @@
       "source": "algo",
       "topic": "KTO：前景理论效用 + 二元好/坏；无需偏好对（vs DPO；1B–30B）",
       "file": "posts/daily-2026-09-15-algo-kto.html"
+    },
+    {
+      "date": "2026-09-16",
+      "domain": "agent rl infra",
+      "source": "frontline",
+      "topic": "HarnessBandit：可学性×可迁移性 bandit 调度多 Harness（GRPO；ClawGym→PinchBench/ClawEval）",
+      "file": "posts/daily-2026-09-16-harnessbandit.html"
+    },
+    {
+      "date": "2026-09-16",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "ModularRSI：五模块 + 对比轨迹 + benchmark-disjoint（TB2.0 / SWE-Bench Verified）",
+      "file": "posts/daily-2026-09-16-harness-modular-rsi.html"
+    },
+    {
+      "date": "2026-09-16",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "GRPO：组内相对奖励省掉 Critic（DeepSeekMath → R1；vs PPO/DAPO/GSPO）",
+      "file": "posts/daily-2026-09-16-algo-grpo.html"
     }
   ]
 }

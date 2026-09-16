@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜GRPO：用组内相对奖励省掉 Critic（DeepSeekMath → R1） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜GRPO：用组内相对奖励省掉 Critic（DeepSeekMath → R1）</h1>
+    <p class="post-meta">2026-09-16 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Shao 等 · <em>DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</em>
+      · <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300</a>；
+      R1 用法：Guo 等 · <a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">arXiv:2501.12948</a>。
+      交叉：
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-09-11-algo-trpo.html">TRPO</a>、
+      <a href="grpo-notes.html">GRPO 实践笔记</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 在 LLM 对齐里长期是默认起点：clipped surrogate + 价值网络（critic）估 advantage，再加对 reference 的 KL。
+      Critic 要额外一套与策略同量级的参数，还要对付价值估计偏差、长 CoT 上的 bootstrap 噪声——算力与调参成本都不低。
+    </p>
+    <p>
+      DeepSeekMath 提出的 <strong>GRPO（Group Relative Policy Optimization）</strong> 走另一条路：对同一 prompt 采样一组 completions，用<strong>组内相对奖励</strong>直接当 advantage，不再训 value model。
+      后续 DeepSeek-R1 把同一套 critic-free、组内相对的思路推到大规模推理 RL，使 GRPO 成为开源后训练栈里最常见的默认算法之一。
+      站内已有 <a href="grpo-notes.html">实践向笔记</a>；本篇补「正式课」：公式骨架、与 PPO/TRPO/REINFORCE 的位置、以及 DAPO/GSPO 如何在其上打补丁。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：同一 prompt 采一组输出，用组内均值/方差标准化奖励得 advantage，塞进 PPO 式 clipped surrogate，并对 ref 加 KL——无 critic，用组内相对性代替价值基线。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 从 PPO 到「组内相对」</h3>
+    <table>
+      <thead><tr><th></th><th>PPO</th><th>GRPO</th></tr></thead>
+      <tbody>
+        <tr><td>Advantage</td><td>常靠 GAE + V_φ（critic）</td><td>同 prompt 组内 reward 标准化</td></tr>
+        <tr><td>额外网络</td><td>要 value model</td><td>不要</td></tr>
+        <tr><td>Surrogate</td><td>clipped importance ratio</td><td>同族 clipped surrogate</td></tr>
+        <tr><td>KL</td><td>对 π_ref（常见）</td><td>对 π_ref（常见）</td></tr>
+        <tr><td>采样形态</td><td>可单条 / 多条</td><td><strong>每 prompt 一组</strong> completions 是一等公民</td></tr>
+      </tbody>
+    </table>
+    <p>
+      谱系上：<a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> 给似然比骨架 →
+      <a href="daily-2026-09-11-algo-trpo.html">TRPO</a> 用 KL 信赖域 →
+      PPO 用 clip 近似 →
+      GRPO 保留 clip，但把 baseline/advantage 换成「组内相对奖励」。
+      与 <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> 对照：AC 显式学 V；GRPO 用同组样本的经验均值当基线，是一种<strong>无参数、prompt-条件</strong>的 baseline。
+    </p>
+
+    <h3>② Advantage：组内均值 / 方差标准化</h3>
+    <pre><code># 对固定 prompt x，采样一组 completions {y_1 … y_G}
+# 每条有标量奖励 r_i（规则 / RM / 可验证成功 …）
+
+mean_r = (1/G) Σ_i r_i
+std_r  = sqrt( (1/G) Σ_i (r_i − mean_r)^2 ) + ε
+
+A_i = (r_i − mean_r) / std_r     # 组内相对优势
+
+# 典型：把 A_i 广播到 y_i 的每个 token（或按实现做 token 掩码）
+# 再进 clipped surrogate（示意）
+ratio_t = π_θ(token_t | …) / π_old(token_t | …)
+L_clip  = − min( ratio_t · A_i ,
+                 clip(ratio_t, 1−ε, 1+ε) · A_i )
+
+# 常再加：
+L = L_clip + β · KL( π_θ(·|x) ∥ π_ref(·|x) )
+</code></pre>
+    <p>
+      直觉：不需要知道「绝对回报该是多少」；只需知道<strong>在同一题上，这条比同组其它条更好还是更差</strong>。
+      标准化后 A 近似零均值、单位方差，梯度尺度跨 prompt 更可比——这也是「Group Relative」一名的来源。
+    </p>
+
+    <h3>③ 和 DAPO / GSPO 的接口</h3>
+    <table>
+      <thead><tr><th>变体</th><th>相对 GRPO 改了什么</th><th>站内笔记</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>DAPO</strong></td>
+          <td>Clip-Higher、Dynamic Sampling、Token-level Loss、Overlong 惩罚等训练细节</td>
+          <td><a href="daily-2026-09-04-algo-dapo.html">DAPO</a></td>
+        </tr>
+        <tr>
+          <td><strong>GSPO</strong></td>
+          <td>重要性采样提到<strong>序列级</strong>，稳住 MoE 等设定</td>
+          <td><a href="daily-2026-08-31-algo-gspo.html">GSPO</a></td>
+        </tr>
+        <tr>
+          <td>IS 工具箱</td>
+          <td>ratio / clip / truncate 的一般理论</td>
+          <td><a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      读现代栈时建议分层：GRPO 定「无 critic + 组内相对」；DAPO 修长 CoT 训练病理；GSPO 改 IS 粒度。不要把三者当成互斥品牌，而是同一主干上的不同旋钮层。
+    </p>
+
+    <h3>④ 实践坑：组大小、全零/全一、length bias</h3>
+    <table>
+      <thead><tr><th>现象</th><th>机制</th><th>常见处理</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>组内奖励全相同（全对 / 全错）</td>
+          <td>std→0，A≈0，该组无梯度</td>
+          <td>Dynamic Sampling（DAPO）、过滤零方差组、增大 G / 调温度</td>
+        </tr>
+        <tr>
+          <td>G 过小</td>
+          <td>均值/方差估计噪，相对排序不稳</td>
+          <td>数学/代码常用较大组；与算力折中</td>
+        </tr>
+        <tr>
+          <td>Length bias</td>
+          <td>奖励与长度相关时，标准化仍可能偏爱冗长或极短</td>
+          <td>长度惩罚、overlong mask、按 token 归一奖励</td>
+        </tr>
+        <tr>
+          <td>广播到每 token</td>
+          <td>终局标量信用糊在长链上</td>
+          <td>接受为基线；或接步级方法（AHEAD/GACA 等）</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>可验证奖励优先</strong>：数学/代码/agent 终局成功最适合 GRPO；主观偏好更常走 RM+PPO 或 DPO/KTO。</li>
+      <li><strong>把「零方差组比率」做成一等监控</strong>：长期接近 1 说明难度或采样温度失配，算法再对也推不动。</li>
+      <li><strong>π_old 与采样策略对齐</strong>：off-policy 过大时 clip 救不动；异步 rollout 要管好版本与 <a href="daily-2026-09-07-algo-importance-sampling.html">IS</a>。</li>
+      <li><strong>KL 系数与 clip 范围分开扫</strong>：KL 管「离 ref 多远」，clip 管「单步更新多猛」；混成一个旋钮会归因混乱。</li>
+      <li><strong>先读通本页再读实践笔记</strong>：公式与坑在这里；多智能体/工程配方见 <a href="grpo-notes.html">grpo-notes</a>。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. GRPO 的组内均值 baselining，与 Actor-Critic 的 V(s) 有何同构与差异？</summary>
+      <p>同构：都在减一个「期望回报」估计以降方差。差异：V_φ 是学出来的状态函数，可泛化到未见 prompt；组内均值只依赖当前组样本，无参数、但方差受 G 限制，且不能外推到组外状态。</p>
+    </details>
+    <details>
+      <summary>2. 为什么全对或全错的组会让 GRPO「没学到东西」？</summary>
+      <p>相对优势需要组内分化。奖励常数 ⇒ 标准化后 A≈0 ⇒ clipped surrogate 梯度消失。这是相对方法的结构性代价，不是实现 bug。</p>
+    </details>
+    <details>
+      <summary>3. GRPO 还需要 importance sampling ratio 吗？</summary>
+      <p>需要——只要用 π_old 采样、π_θ 更新，就有 off-policy 修正；clip 正是对 ratio 的保守处理。组内相对只替换了 advantage 来源，不取消 IS。</p>
+    </details>
+    <details>
+      <summary>4. 把 GRPO 的 A_i 广播到每个 token，与「过程奖励 / 步级优势」差在哪？</summary>
+      <p>广播假定终局相对好坏均匀归因到所有 token，长链上信用糊。过程奖励或步级方法试图区分关键步，但要额外标注或估计器；GRPO 用简单换可扩展性。</p>
+    </details>
+    <details>
+      <summary>5. 何时应回到带 critic 的 PPO，而不是死磕 GRPO？</summary>
+      <p>当难以对同一 prompt 采够大组、奖励极度稀疏且需跨状态泛化的 baseline、或已有可靠 value 模型可复用时，PPO/AC 可能更稳。组采样便宜、可验证奖励清晰时，GRPO 通常更香。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>Shao et al. · DeepSeekMath（GRPO）：
+        <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300</a></li>
+      <li>Guo et al. · DeepSeek-R1：
+        <a href="https://arxiv.org/abs/2501.12948" target="_blank" rel="noopener">arXiv:2501.12948</a></li>
+      <li>站内：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">IS</a> ·
+        <a href="daily-2026-09-11-algo-trpo.html">TRPO</a> ·
+        <a href="grpo-notes.html">GRPO 实践笔记</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
