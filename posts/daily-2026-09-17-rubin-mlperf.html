@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Vera Rubin NVL72 首登 MLPerf Inference v6.1：相对 GB300 最高 3.7× 吞吐 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜Vera Rubin NVL72 首登 MLPerf Inference v6.1：相对 GB300 最高 3.7× 吞吐</h1>
+    <p class="post-meta">2026-09-17 · 收藏夹：显卡 / Infra · 一线追踪<br />
+      来源：NVIDIA 自报 / MLCommons · Zhihan Jiang ·
+      <a href="https://blogs.nvidia.com/blog/vera-rubin-nvl72-mlperf-inference/" target="_blank" rel="noopener">Vera Rubin NVL72 Delivers Leading Performance in MLPerf Inference v6.1 Debut</a>
+      （2026-09-16）。条目示例：6.1-0106、6.1-0074 等（Closed Division；以 MLCommons 官网为准）。
+      交叉：
+      <a href="daily-2026-08-31-gpu-rubin.html">NVIDIA Rubin 平台</a>、
+      <a href="daily-2026-09-01-kv-cache.html">KV cache</a>、
+      <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>、
+      <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      推理经济学通常被拧成三根旋钮：单系统吞吐（单位时间吐多少 token）、跨机架扩展效率（加 GPU 是否近似线性涨吞吐）、以及软件迭代速度（同一代硬件能否持续吃到软件红利）。
+      MLPerf Inference v6.1 把这三件事同时摊开；NVIDIA 首次提交 <strong>Vera Rubin NVL72</strong> preview，并继续用 GB300 NVL72 讲「四机架怎么扩」与「v6.0→v6.1 纯软件抬了多少」。
+    </p>
+    <p>
+      站内 <a href="daily-2026-08-31-gpu-rubin.html">Rubin 平台篇</a>已拆过 HBM4 / NVFP4 / NVLink 6 / NVL72 的硬件叙事；本篇只跟 <strong>MLPerf 自报数字与全栈手法</strong>：相对 GB300 的倍数、扩机架效率、软件增益，以及 AgentX preview 口径——后者<strong>不是</strong>已核验的 MLPerf 主榜数字，读时需单独标注。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Vera Rubin NVL72 preview 在 Qwen3-VL 上相对 GB300 NVL72 最高约 3.7× 吞吐（offline/server/interactive；vLLM + Dynamo）；DeepSeek-R1 最高约 2.5×（TensorRT-LLM）；GB300 四机架 offline 扩到约 99% scaling efficiency；同代软件 v6.1 vs v6.0 在 Qwen3-VL 上最高约 1.6×——全栈靠 NVFP4、PD 分离与大规模 expert parallelism。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 数字一览（NVIDIA 自报 / MLCommons）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>口径</th><th>数字（勿外推百分点）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Qwen3-VL</td>
+          <td>Vera Rubin NVL72 vs GB300 NVL72</td>
+          <td>最高约 <strong>3.7×</strong> 吞吐；offline / server / interactive；vLLM + NVIDIA Dynamo</td>
+        </tr>
+        <tr>
+          <td>DeepSeek-R1</td>
+          <td>同上对比</td>
+          <td>最高约 <strong>2.5×</strong>；TensorRT-LLM</td>
+        </tr>
+        <tr>
+          <td>GB300 扩机架</td>
+          <td>单机架 72 GPU → 四机架 288 GPU</td>
+          <td>offline 约 <strong>99%</strong> scaling efficiency（吞吐近似随硬件线性）</td>
+        </tr>
+        <tr>
+          <td>软件代际</td>
+          <td>v6.1 vs v6.0，GB300 @ Qwen3-VL</td>
+          <td>最高约 <strong>1.6×</strong>（更低 KV 精度、kernel fusion、disaggregated serving 等）</td>
+        </tr>
+        <tr>
+          <td>AgentX preview</td>
+          <td>SemiAnalysis AgentX；作者口径</td>
+          <td>Vera Rubin 相对 GB300 约 <strong>30×</strong>——<strong>preview / 非已核验 MLPerf 主榜</strong></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      读法：3.7× / 2.5× / 1.6× / 99% 来自 NVIDIA 对 Closed Division 提交的叙述，并点名条目如 6.1-0106、6.1-0074（扩机架对照另涉 6.1-0073 等）；最终以 <a href="https://www.mlcommons.org" target="_blank" rel="noopener">MLCommons</a> 官网检索为准。AgentX 的 30× 明确标为 preview testing，勿与主榜倍数混读。
+    </p>
+
+    <h3>② 全栈手法：NVFP4 · PD 分离 · Expert Parallelism · NVL72</h3>
+    <pre><code># NVIDIA 自报的 codesign 要点（示意，非实现伪代码）
+
+# ① 精度：NVFP4 压 weights / attention / KV cache 足迹
+#    → 同显存装更多并发；与站内 KV cache 账本同构
+#    参见：daily-2026-09-01-kv-cache.html
+
+# ② Disaggregated serving：Prefill 与 Decode 分治
+#    Prefill 偏算力密集；Decode 偏带宽 / KV 密集
+#    分离后可按阶段异构扩容（与 AInfer-PD 同属 PD 族问题）
+#    参见：daily-2026-09-08-ainfer-pd.html
+
+# ③ 大规模 expert parallelism（MoE）
+#    DeepSeek-R1 / Qwen3-VL 等 MoE 层靠专家并行摊负载
+#    NVL72 域内 NVLink 6 + NVLink Switch 提供低延迟高包率互联
+
+# ④ 软件栈分工（提交口径）
+#    Qwen3-VL  ：vLLM + NVIDIA Dynamo
+#    DeepSeek-R1：TensorRT-LLM
+</code></pre>
+    <table>
+      <thead><tr><th>杠杆</th><th>解决什么瓶颈</th><th>与站内交叉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>NVFP4</strong></td>
+          <td>权重与 KV 显存；提高并发与吞吐</td>
+          <td><a href="daily-2026-08-31-gpu-rubin.html">Rubin</a>、<a href="daily-2026-09-01-kv-cache.html">KV cache</a></td>
+        </tr>
+        <tr>
+          <td><strong>Disaggregated serving</strong></td>
+          <td>Prefill/Decode 资源画像不同，合绑易浪费</td>
+          <td><a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a></td>
+        </tr>
+        <tr>
+          <td><strong>Expert parallelism</strong></td>
+          <td>MoE 专家间通信与负载</td>
+          <td>依赖 NVL72 域内高带宽互联</td>
+        </tr>
+        <tr>
+          <td><strong>NVLink 6 / NVL72</strong></td>
+          <td>机架内 scale-up：包率 ↑、延迟 ↓（相对以太网叙事）</td>
+          <td><a href="daily-2026-08-31-gpu-rubin.html">Rubin 平台</a></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      软件侧 v6.1 相对 v6.0 的约 1.6×，NVIDIA 归因为更低 KV cache 精度、额外 kernel fusion、更好 kernel，以及 vLLM + Dynamo 上的 disaggregated serving——说明「同代硬件」仍可被软件持续抬高；投稿截止后还有未经验证的 post-submission 增益（GPT-OSS-120B、DLRMv3 等），本篇不采信为正式榜单。
+    </p>
+
+    <h3>③ 扩机架：99% scaling efficiency 意味着什么</h3>
+    <p>
+      单机架 72 GPU 扩到四机架 288 GPU，offline 吞吐几乎按 GPU 数线性走（约 99%），说明 scale-up（机架内 NVLink）与 scale-out（机架间网络 + 请求编排）没有在通信或调度上吃掉大部分增量。
+      反例直觉：若 GPU 数接近翻倍而吞吐只涨个位数百分比，单位 token 成本会被基础设施吞噬——扩展效率因此是「买更多卡」之前的硬指标。
+    </p>
+
+    <h3>④ AgentX 30×：如何标注</h3>
+    <table>
+      <thead><tr><th>对象</th><th>是否 MLPerf Closed 主榜</th><th>读法</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Qwen3-VL 3.7× / DeepSeek-R1 2.5×</td>
+          <td>是（NVIDIA 叙述 + 条目号）</td>
+          <td>可与 GB300 同场景对比引用；仍标 NVIDIA 自报</td>
+        </tr>
+        <tr>
+          <td>GB300 99% / 软件 1.6×</td>
+          <td>是（同上）</td>
+          <td>扩机架与软件代际，勿与 Rubin 硬件倍数混乘</td>
+        </tr>
+        <tr>
+          <td>AgentX ~30×</td>
+          <td><strong>否</strong>（preview / 作者口径）</td>
+          <td>反映 agentic 多步负载兴趣；待 MLPerf Endpoints 等标准化后再核验</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>引用倍数时写清场景与栈</strong>：offline/server/interactive、模型名、vLLM+Dynamo 或 TensorRT-LLM；「最高约」不可省略。</li>
+      <li><strong>硬件倍数与软件倍数分开记账</strong>：3.7× 是 Rubin vs GB300；1.6× 是同 GB300 的 v6.1 vs v6.0；禁止口头连乘当「总加速」。</li>
+      <li><strong>PD 分离与 KV 精度是一等工程旋钮</strong>：上新机架前，先确认 prefill/decode 池化与 KV 量化策略是否已吃满——否则测到的是软件欠账而非硬件天花板。</li>
+      <li><strong>扩机架先报 scaling efficiency</strong>：只报绝对吞吐、不报相对单机架效率，无法判断通信是否成为主因。</li>
+      <li><strong>AgentX / Endpoints 单独跟踪</strong>：agentic 负载与传统吞吐榜不是同一度量；产品叙事与采购表应分栏。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么同一 Vera Rubin NVL72，在 Qwen3-VL 与 DeepSeek-R1 上相对 GB300 的倍数不同（约 3.7× vs 2.5×）？</summary>
+      <p>模型结构（含 MoE / 多模态路径）、软件栈（vLLM+Dynamo vs TensorRT-LLM）与场景（offline/server/interactive）都会改变瓶颈是算力、带宽还是调度。倍数差本身说明「平台领先」不能压成单一标量。</p>
+    </details>
+    <details>
+      <summary>2. Disaggregated serving 为什么特别契合 NVL72 这类机架域？</summary>
+      <p>Prefill 与 Decode 的资源画像不同；机架内高带宽低延迟互联让跨节点拆分阶段的 KV/激活搬运更可承受。以太网式 scale-out 若延迟与包率不足，PD 分离的收益会被通信吃掉。</p>
+    </details>
+    <details>
+      <summary>3. 把 v6.1 相对 v6.0 的 1.6× 与 Rubin 的 3.7× 乘在一起，错在哪？</summary>
+      <p>1.6× 是同代 GB300 上的软件代际；3.7× 是 Rubin vs GB300 的跨代硬件+栈对比。基线与分子不同，连乘没有物理含义，还会双重计算软件贡献。</p>
+    </details>
+    <details>
+      <summary>4. 99% scaling efficiency 仍可能掩盖什么问题？</summary>
+      <p>Offline 场景对延迟不敏感，扩机架时排队与跨机架编排的代价可能被吞吐指标「抹平」。Server/interactive 或严格 SLA 下，同样的硬件扩展效率可能显著低于 99%。</p>
+    </details>
+    <details>
+      <summary>5. AgentX 报 30× 时，采购或评测文档应如何措辞？</summary>
+      <p>标明 preview、非 MLPerf Closed 核验、基准名称与对比系统；并指向即将标准化的 Endpoints 类负载。不可与 Qwen3-VL 3.7× 并列成「官方 MLPerf 倍数」。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>NVIDIA Blog · Zhihan Jiang（2026-09-16）：
+        <a href="https://blogs.nvidia.com/blog/vera-rubin-nvl72-mlperf-inference/" target="_blank" rel="noopener">Vera Rubin NVL72 · MLPerf Inference v6.1</a></li>
+      <li>MLCommons · <a href="https://www.mlcommons.org" target="_blank" rel="noopener">mlcommons.org</a>（检索条目 6.1-0106、6.1-0074 等）</li>
+      <li>站内：
+        <a href="daily-2026-08-31-gpu-rubin.html">Rubin 平台</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache</a> ·
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Ecdysis：用跨任务失败聚合 + FDCR 把 harness 演化从「修单点失败」拉回系统缺陷 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Ecdysis：用跨任务失败聚合 + FDCR 把 harness 演化从「修单点失败」拉回系统缺陷</h1>
+    <p class="post-meta">2026-09-17 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：<em>Ecdysis: Efficient and Effective Training of Runtime Harnesses for LLM Agents</em>
+      · <a href="https://arxiv.org/abs/2609.11677" target="_blank" rel="noopener">arXiv:2609.11677</a>（2026-09-10）。
+      交叉：
+      <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a>、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、
+      <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>、
+      <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      迭代搜索式 harness 演化常见套路是：跑一批任务 → 看失败 → 改 harness 代码 → 再跑。
+      贵，而且容易过拟合<strong>单任务、单模型</strong>上的失败表象：提示词补丁、特判分支、为某一基座「迁就」的恢复逻辑，都会让 harness 越改越像该模型的外挂，而不是可迁移的执行机制。
+    </p>
+    <p>
+      失败本身也是混杂信号：有的是 model-specific（推理步错、工具参数幻觉），有的是 harness 系统性缺陷（循环过早退出、观察截断、上下文丢弃、完成判定不准）。
+      直接对着个案修，等于用 harness 去补偿模型——站内 <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> 用对比轨迹 + 模块边界抗特化；Ecdysis 则强调<strong>跨实例聚合复发失败</strong>，再用多角色 FDCR 产出「改什么」的规格，最后才交给 coding agent 动代码。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Ecdysis = batch-level 跨实例失败聚合，找出 recurring failure modes → Failure-Driven Collaborative Refinement（Analyst / Critic / Engineer / Moderator）迭代出 harness modification specification → coding agent 按规格改 harness；偏向修 systematic deficiencies，而非 model-specific accommodation。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 痛点：修个案 ≠ 修系统</h3>
+    <table>
+      <thead><tr><th>失败来源</th><th>若直接对着修</th><th>Ecdysis 偏好</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Model-specific（某基座特有推理/工具失误）</td>
+          <td>harness 长出「迁就该模型」的补丁</td>
+          <td>尽量不把这类失败写成 harness 硬编码</td>
+        </tr>
+        <tr>
+          <td>Harness 系统缺陷（协议 / 循环 / 上下文 / 完成判定）</td>
+          <td>可能被淹没在个案噪声里</td>
+          <td>跨实例聚合后优先进 modification spec</td>
+        </tr>
+        <tr>
+          <td>单任务偶发</td>
+          <td>过拟合该题的解法痕迹</td>
+          <td>聚合时被滤掉或降权</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与 <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a>（失败轨迹 → 可执行 lifecycle patch）、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>（参考轨迹 + 双门控）对照：Ecdysis 把「诊断与规格」从「立刻改代码」里拆出来，用多角色协作降低「看见一个失败就开补丁」的冲动。
+    </p>
+
+    <h3>② Batch-level cross-instance failure aggregation</h3>
+    <pre><code># 一批任务 / 多实例 rollout 后：
+failures ← { (task_i, traj_i, error_sig_i) … }
+
+# 跨实例聚合：找 recurring failure modes
+# ——不是「第 17 题错了」，而是「多次出现同一类机制缺口」
+modes ← AggregateAcrossInstances(failures)
+# 例：观察截断导致丢关键报错；完成判定过早；工具错误无重试协议 …
+
+# 输出：复发模式清单（带支撑实例集合）
+# → 进入 FDCR，而不是直接 git apply 个案补丁
+</code></pre>
+    <p>
+      聚合的价值是把信用从「这道题」挪到「这类失败」：支撑实例越多，越像 systematic harness deficiency；支撑越少、且高度绑定某一模型输出风格，越像该迁就模型而非改 harness。
+    </p>
+
+    <h3>③ FDCR：Analyst / Critic / Engineer / Moderator</h3>
+    <table>
+      <thead><tr><th>角色</th><th>职责（论文口径）</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Analyst</strong></td><td>基于聚合模式做诊断：机制缺口在哪一层</td></tr>
+        <tr><td><strong>Critic</strong></td><td>挑战「是否 model-specific / 是否过拟合个案」</td></tr>
+        <tr><td><strong>Engineer</strong></td><td>把认可的诊断收敛成 harness modification specification</td></tr>
+        <tr><td><strong>Moderator</strong></td><td>协调分歧、控制迭代轮次、守住「修系统不迁就模型」的偏好</td></tr>
+      </tbody>
+    </table>
+    <pre><code># Failure-Driven Collaborative Refinement（示意）
+modes ← AggregateAcrossInstances(batch_failures)
+
+spec ← ∅
+for round in 1 … R:
+  diagnosis ← Analyst(modes, current_harness)
+  critique  ← Critic(diagnosis, modes)   # 拦 model-specific 迁就
+  draft     ← Engineer(diagnosis, critique)
+  spec      ← Moderator(spec, draft, critique)
+  # 未收敛则带着争议点进入下一轮
+
+# 规格就绪后，再交给 coding agent 改 harness 源码
+harness' ← CodingAgent(harness, spec)
+</code></pre>
+    <p>
+      关键点在于 <strong>specification 先于 patch</strong>：多角色把「该不该改、改哪一类接口」辩清楚，再让 coding agent 执行——降低一次性大补丁把模型迁就写进运行时的概率。
+      与 <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a>「评测单位 = 可运行 harness」、
+      <a href="daily-2026-08-28-harness-runtime.html">运行时笔记</a>同属：harness 是可演化的一等工件，但演化过程本身也需要协议。
+    </p>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容（摘要口径；勿外推）</th></tr></thead>
+      <tbody>
+        <tr><td>训练加速</td><td>相对既有 harness evolution 最高约 <strong>1.84×</strong>（作者自报）</td></tr>
+        <tr><td>推理准确率</td><td>提升约 <strong>18.56%</strong>（作者自报）</td></tr>
+        <tr><td>泛化</td><td>更好跨 LLM 泛化（作者自报）</td></tr>
+        <tr><td>成本</td><td>降低推理 token（摘要口径；作者自报）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：1.84× / 18.56% 一律标作者自报；「跨 LLM 泛化」与「少迁就单模型」的主张一致——若补丁只是某一基座的提示词外挂，换模型应失效。具体设定与表项以论文为准，此处不编造额外百分点。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先聚合再开修</strong>：单条失败进 FDCR 前，要求至少跨若干实例复现同一 error signature；否则默认当个案噪声。</li>
+      <li><strong>Critic 要显式问「换模型是否仍失败」</strong>：若只在某一基座上复现，优先怀疑 model-specific，而不是立刻改 harness。</li>
+      <li><strong>modification spec 可回归</strong>：规格里写清预期行为与禁止事项（例如禁止为某模型特判）；coding agent 产出后跑固定冒烟集。</li>
+      <li><strong>与 ModularRSI / Harness-R1 分工</strong>：ModularRSI 偏模块边界 + 对比轨迹 + 评测隔离；R1 偏在线 RL 训工程师；Ecdysis 偏失败聚合 + 多角色规格。串联时先对齐「谁产出 deficiency / 谁产出 patch」。</li>
+      <li><strong>监控「补丁是否降低跨模型方差」</strong>：演化后若只抬高训练所用 LLM、其它基座掉点，说明系统缺陷叙事可能已被迁就逻辑污染。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「看见失败就改 harness」容易变成迁就模型？</summary>
+      <p>单次失败混合了模型推理错误与运行时机制缺口。没有跨实例证据时，最省事的补丁往往是给该模型的输出风格加特判，从而把模型缺陷外化成 harness 硬编码。</p>
+    </details>
+    <details>
+      <summary>2. Batch-level aggregation 与 ModularRSI 的 contrastive 轨迹有何同构？</summary>
+      <p>同构：都在从多次执行里抽取 recurring deficiency，而不是记一道题的解法。差异：ModularRSI 强调同任务成败对比与模块边界；Ecdysis 强调跨实例模式聚合 + FDCR 规格，再交给 coding agent。</p>
+    </details>
+    <details>
+      <summary>3. FDCR 里 Critic 若总是输给 Engineer，会发生什么？</summary>
+      <p>规格会重新退化成「快速补丁清单」，多角色形同虚设。应检查 Moderator 的否决权与「跨模型复现」门槛是否写进协议，而不是只靠提示词礼貌提醒。</p>
+    </details>
+    <details>
+      <summary>4. 为何要先产出 modification specification，再让 coding agent 改代码？</summary>
+      <p>规格层可以辩论「改不改 / 改哪类接口 / 禁止迁就」；代码层一旦直接开改，讨论容易被 diff 细节绑架，系统性偏好更难坚持。</p>
+    </details>
+    <details>
+      <summary>5. 作者自报的跨 LLM 泛化，应用哪类消融来核验？</summary>
+      <p>固定演化得到的 harness，在未见基座上复测同一任务集；并与「针对单模型特判」的基线对照。若换模型增益消失，说明补丁仍可能是 model-specific accommodation。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.11677" target="_blank" rel="noopener">arXiv:2609.11677 · Ecdysis</a></li>
+      <li>站内：
+        <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a> ·
+        <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> ·
+        <a href="daily-2026-09-09-harnessdev.html">HarnessDev</a> ·
+        <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

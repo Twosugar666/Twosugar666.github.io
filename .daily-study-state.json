@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 3,
+  "next": 4,
   "daily_streams": [
     "frontline",
     "harness",
@@ -396,6 +396,27 @@
       "source": "algo",
       "topic": "GRPO：组内相对奖励省掉 Critic（DeepSeekMath → R1；vs PPO/DAPO/GSPO）",
       "file": "posts/daily-2026-09-16-algo-grpo.html"
+    },
+    {
+      "date": "2026-09-17",
+      "domain": "gpu infra",
+      "source": "frontline",
+      "topic": "Vera Rubin NVL72 首登 MLPerf Inference v6.1：相对 GB300 最高约 3.7× 吞吐（Qwen3-VL）/ DeepSeek-R1 约 2.5×；GB300 99% scaling；软件约 1.6×；AgentX preview ~30×",
+      "file": "posts/daily-2026-09-17-rubin-mlperf.html"
+    },
+    {
+      "date": "2026-09-17",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Ecdysis：跨任务失败聚合 + FDCR（Analyst/Critic/Engineer/Moderator）修 systematic harness deficiencies（arXiv:2609.11677）",
+      "file": "posts/daily-2026-09-17-harness-ecdysis.html"
+    },
+    {
+      "date": "2026-09-17",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "KL 散度：相对熵约束策略更新（TRPO 硬约束 / PPO clip / DPO β logπ/π_ref / GRPO KL 项）",
+      "file": "posts/daily-2026-09-17-algo-kl.html"
     }
   ]
 }

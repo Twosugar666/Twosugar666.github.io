@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜KL 散度：相对熵如何约束策略更新（TRPO / PPO / DPO / GRPO） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜KL 散度：相对熵如何约束策略更新（TRPO / PPO / DPO / GRPO）</h1>
+    <p class="post-meta">2026-09-17 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典工具：Kullback–Leibler divergence（相对熵）作为策略更新的信赖域 / 惩罚 / 隐式约束。
+      交叉：
+      <a href="daily-2026-09-11-algo-trpo.html">TRPO</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-09-15-algo-kto.html">KTO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      策略梯度族方法的核心焦虑之一是：更新步太大时，新策略 π_θ 相对采样策略 π_old（或参考策略 π_ref）跑太远，重要性采样比值爆炸、回报估计失效，训练崩溃。
+      <strong>KL 散度</strong>（相对熵）提供一把「测两个分布有多不像」的尺子，被 TRPO 写成硬约束、被 PPO 用 clip 近似、在 DPO / GRPO 里又以 β 加权的 KL 项或隐式奖励出现。
+    </p>
+    <p>
+      本篇不重复各算法全文，只把 KL 这条线串起来：定义与不对称性、前向/反向、惩罚 vs 硬约束，以及接到站内已写的 TRPO / PPO / DPO / GRPO；并列出 token 级 vs 序列级、估计偏置、β 与 clip 分开扫等实践坑。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：KL(P∥Q)=Σ P log(P/Q) 度量「用 Q 编码来自 P 的样本」多付的额外比特；策略优化里它约束「新策略别离旧/参考太远」——TRPO 硬约束 mean KL≤δ，PPO 用 clip 近似信赖域，DPO/GRPO 用 β·KL 或隐式奖励里的 β log(π/π_ref) 把偏离标成代价。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 定义、不对称、前向与反向</h3>
+    <pre><code># 离散分布（策略对动作 / token 的概率）
+KL(P ∥ Q) = Σ_x  P(x) · log( P(x) / Q(x) )
+
+# 性质（务必记住）
+# · KL ≥ 0；KL=0 iff P=Q（几乎处处）
+# · 一般 KL(P∥Q) ≠ KL(Q∥P)  → 不对称，不是距离度量
+# · 不是对称，也就没有「三角不等式」意义上的度量几何
+
+# 习惯称呼（相对谁是「真」分布）：
+# 前向 KL：KL(P∥Q) —— P 为参照（期望在 P 下）
+# 反向 KL：KL(Q∥P) —— 期望改在 Q 下
+#
+# 模式覆盖直觉（连续/高维上常被这样口口相传）：
+# · 前向 KL(P∥Q) 偏「覆盖 P 的支撑」（mass-covering）
+# · 反向 KL(Q∥P) 偏「捡 P 的一个模式」（mode-seeking）
+# 具体到 LLM 策略，还要看采样分布与估计器，勿教条套用。
+</code></pre>
+    <p>
+      在 on-policy RL 叙述里，常见的是对状态（或 prompt）条件化的
+      E_{s∼ρ}[ KL(π_θ(·|s) ∥ π_old(·|s)) ]，
+      即「新策略相对旧策略」的平均 KL——TRPO 约束的正是这类 mean KL。
+    </p>
+
+    <h3>② 惩罚项 vs 硬约束</h3>
+    <table>
+      <thead><tr><th>形式</th><th>写法（示意）</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>硬约束</strong></td>
+          <td>maximize surrogate &nbsp; s.t. &nbsp; mean KL(π_θ∥π_old) ≤ δ</td>
+          <td>信赖域：步长由 δ 显式封顶（TRPO）</td>
+        </tr>
+        <tr>
+          <td><strong>惩罚 / 正则</strong></td>
+          <td>maximize &nbsp; surrogate − β · KL(π_θ∥π_ref)</td>
+          <td>偏离参考要付钱；β 越大越保守</td>
+        </tr>
+        <tr>
+          <td><strong>隐式约束</strong></td>
+          <td>最优策略 ∝ π_ref · exp(R/β) 一类形式</td>
+          <td>KL 正则目标的闭式；DPO 由此导出</td>
+        </tr>
+        <tr>
+          <td><strong>Clip 近似</strong></td>
+          <td>限制 importance ratio ∈ [1−ε, 1+ε]</td>
+          <td>不显式算 KL，但限制单步概率比变化（PPO）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      硬约束要解约束优化（TRPO：共轭梯度 + 线搜索）；惩罚更易实现但 β 与学习率耦合；clip 最工程友好，却<strong>不是</strong>严格的 KL 球——极端概率质量上仍可能累积大 KL。详见
+      <a href="daily-2026-09-11-algo-trpo.html">TRPO</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>。
+    </p>
+
+    <h3>③ 接到 TRPO / PPO / DPO / GRPO</h3>
+    <pre><code># TRPO：显式信赖域
+#   max_θ  L_surrogate(θ)
+#   s.t.   E_s [ KL(π_θ(·|s) ∥ π_old(·|s)) ] ≤ δ
+
+# PPO：clip ≈ 「别让 ratio 跑太远」
+#   ratio = π_θ(a|s) / π_old(a|s)
+#   L = − min( ratio·A , clip(ratio, 1−ε, 1+ε)·A )
+#   （可选）再加 β·KL(π_θ∥π_ref) 惩罚
+
+# DPO：KL 正则 RLHF 的闭式 → 隐式奖励
+#   r̂(x,y) = β · log( π_θ(y|x) / π_ref(y|x) )
+#   偏好损失里 β 同时扮演「温度 / KL 强度」
+#   参见：daily-2026-09-10-algo-dpo.html
+
+# GRPO：组内相对优势 + 常对 π_ref 加 KL
+#   L ≈ L_clip(A_group) + β · KL(π_θ(·|x) ∥ π_ref(·|x))
+#   参见：daily-2026-09-16-algo-grpo.html
+</code></pre>
+    <table>
+      <thead><tr><th>算法</th><th>KL 扮演什么</th><th>相对谁</th></tr></thead>
+      <tbody>
+        <tr><td><strong>TRPO</strong></td><td>硬约束 mean KL≤δ</td><td>π_old（采样策略）</td></tr>
+        <tr><td><strong>PPO</strong></td><td>clip 近似信赖域；可选 KL 惩罚</td><td>π_old / 常另对 π_ref</td></tr>
+        <tr><td><strong>DPO</strong></td><td>隐式奖励里的 β log(π/π_ref)；源自 KL 正则目标</td><td>π_ref</td></tr>
+        <tr><td><strong>GRPO</strong></td><td>clipped surrogate + 常见 β·KL 项</td><td>π_ref（亦依赖 π_old 做 IS）</td></tr>
+        <tr><td><strong>KTO</strong> 等</td><td>同样常挂在 π_ref 的 KL / 隐式奖励族</td><td>π_ref</td></tr>
+      </tbody>
+    </table>
+    <p>
+      谱系提醒：IS ratio 管的是「用旧策略采的数据估新策略」（见
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>）；
+      KL 管的是「分布整体偏了多远」。PPO 的 clip 同时安抚两者的工程症状，但概念上勿混为一谈。
+    </p>
+
+    <h3>④ 实践坑：粒度、估计、超参</h3>
+    <table>
+      <thead><tr><th>坑</th><th>机制</th><th>常见处理</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Token 级 vs 序列级 KL</td>
+          <td>逐 token 平均 KL ≠ 序列联合分布的 KL；MoE/长 CoT 上差更大</td>
+          <td>与 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 的序列级 IS 对照；统一报表粒度</td>
+        </tr>
+        <tr>
+          <td>KL 估计有偏 / 高方差</td>
+          <td>用样本 logπ 差估 KL，批太小或温度不一时噪声大</td>
+          <td>增大 batch、对 prompt 分层、监控滑动均值而非单步尖峰</td>
+        </tr>
+        <tr>
+          <td>β 与 clip 混成一个旋钮</td>
+          <td>β 管「离 ref 多远」，clip 管「单步 ratio 多猛」</td>
+          <td><strong>分开扫</strong>；归因时分别画 KL 曲线与 clip 触发率</td>
+        </tr>
+        <tr>
+          <td>π_ref 过旧或过强</td>
+          <td>β·KL 把策略钉在过时参考上，或几乎无约束</td>
+          <td>定期刷新 ref、退火 β；与奖励尺度联合标定</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先分清相对谁</strong>：对 π_old 的 KL 是信赖域 / on-policy 步长；对 π_ref 的 KL 是对齐锚点。日志里分两列，勿只写一个「KL」。</li>
+      <li><strong>β 与 clip 分开扫</strong>：先固定 clip 扫 β（或反过来），避免「既不动又过拟合」时归因混乱。</li>
+      <li><strong>统一 KL 报表粒度</strong>：写明 token-average 还是 sequence-level；换实现时禁止直接比绝对数值。</li>
+      <li><strong>把 KL 曲线与奖励曲线一起看</strong>：奖励涨而 KL 爆炸，多半是约束失灵；KL 极低而奖励不动，可能是 β 过大或 ref 过强。</li>
+      <li><strong>读 DPO/GRPO 时回到本页</strong>：看见 β log(π/π_ref) 就想到「这是 KL 正则最优策略的影子」，而不是另一个无关超参。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说 KL 不是对称距离？举一个 P≠Q 使 KL(P∥Q) 与 KL(Q∥P) 差很多的直觉情形。</summary>
+      <p>若 P 把质量放在 Q 近乎为零的点上，log(P/Q) 极大，KL(P∥Q) 巨大；反过来若 Q 更「尖」、P 更「平」，两个方向的数值可以差几个数量级。因此优化时必须写清 KL(π_θ∥π_old) 还是反过来。</p>
+    </details>
+    <details>
+      <summary>2. PPO 的 clip 能否保证 mean KL≤δ？</summary>
+      <p>不能严格保证。Clip 限制单步 importance ratio 的局部变化，是对信赖域的启发式近似；在长序列或概率质量重新分配时，累积 KL 仍可能超过任何预设 δ。</p>
+    </details>
+    <details>
+      <summary>3. DPO 里的 β 变大，对隐式奖励 r̂=β log(π/π_ref) 意味着什么？</summary>
+      <p>同样的 log-ratio 会被放大，等价于更强调「相对 ref 的偏离」在偏好损失中的尺度；从 KL 正则视角，β 也对应正则强度的温度角色。实践中 β 过大常使策略不敢离 ref，过小则易偏离锚点。</p>
+    </details>
+    <details>
+      <summary>4. GRPO 已有组内相对优势，为何还常常加对 π_ref 的 KL？</summary>
+      <p>组内相对解决的是 advantage 基线；KL 解决的是「整条策略别漂离参考分布」。两者正交：没有 KL 时，组内相对仍可能系统性推向高奖励但低先验的奇异输出。</p>
+    </details>
+    <details>
+      <summary>5. Token 级平均 KL 很小，是否意味着序列分布也接近？</summary>
+      <p>不一定。逐 token 条件 KL 平均可能掩盖序列级联合上的系统性偏移（尤其长度变化、MoE 路由漂移时）。需要与序列级度量或下游行为指标交叉验证。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>站内算法线：
+        <a href="daily-2026-09-11-algo-trpo.html">TRPO</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-15-algo-kto.html">KTO</a></li>
+      <li>背景阅读：Kullback &amp; Leibler（1951）相对熵；Schulman et al. TRPO；Rafailov et al. DPO；Shao et al. DeepSeekMath / GRPO</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
