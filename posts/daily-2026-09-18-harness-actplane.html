@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜ActPlane：用 eBPF 在 OS 层做可编程策略执行（语义反馈 + IFC） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜ActPlane：用 eBPF 在 OS 层做可编程策略执行（语义反馈 + IFC）</h1>
+    <p class="post-meta">2026-09-18 · 收藏夹：Harness / Agent / Infra · 学习笔记<br />
+      论文：Zheng 等 · <em>ActPlane: Programmable OS-Level Policy Enforcement for Agent Harnesses</em>
+      · <a href="https://arxiv.org/abs/2606.25189" target="_blank" rel="noopener">arXiv:2606.25189v2</a>。
+      交叉：
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a>、
+      <a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      生产里的 Agent 策略常常是自然语言意图：「commit 前先跑测试」「敏感数据不得外泄」。
+      意图落在 harness / 提示词层很容易写；真正要拦的是<strong>系统动作</strong>——哪个测试被跑、哪条写路径、哪次网络出站。中间隔着语义鸿沟：策略是 underspecified NL，执行必须落在 concrete system actions。
+    </p>
+    <p>
+      现有两路都不够：
+      <strong>tool-call guardrail</strong> 只能看见走工具层的调用，绕过工具的间接路径（shell 嵌套、脚本副作用、子进程）会漏；
+      <strong>OS sandbox</strong> 管的是资源配额与权限边界，不理解「动作语义」，失败时常返回 opaque error，Agent 难以据此修正。
+      ActPlane 的主张：策略上下文最靠近任务的是 agent；覆盖全部执行路径的执行点必须下沉到 OS。用内核 eBPF 做策略执行，并回传 semantic feedback + isolation。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Agent 声明策略 → ActPlane 在 OS 内核用 eBPF 执行 + 语义反馈 + 隔离；IFC DSL 支持跨事件策略（顺序 / 数据流）；作者自报开销约 1.9%–8.4%，并能覆盖 tool-call 看不见的间接路径。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 语义鸿沟：意图 vs 系统动作</h3>
+    <table>
+      <thead><tr><th>层</th><th>看见什么</th><th>典型缺口</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Tool-call guardrail</strong></td>
+          <td>LLM 发出的工具名 / 参数</td>
+          <td>绕过工具接口的系统动作；间接路径不可见</td>
+        </tr>
+        <tr>
+          <td><strong>OS sandbox</strong></td>
+          <td>资源、权限、隔离边界</td>
+          <td>不管「动作是否符合策略语义」；错误 opaque</td>
+        </tr>
+        <tr>
+          <td><strong>ActPlane</strong></td>
+          <td>内核可见的系统动作 + 策略标签</td>
+          <td>要解决：策略声明、跨事件 IFC、可理解反馈</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-08-28-harness-runtime.html">Harness 运行时</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>（可选沙箱 / Workspace）对照：沙箱回答「能不能碰资源」；ActPlane 回答「这个动作序列是否违反声明策略」，并把违反原因写成 Agent 可读反馈。
+    </p>
+
+    <h3>② 架构：声明在 Agent，执行在内核</h3>
+    <pre><code># 关键路径（示意）
+policy ← Agent.declare(NL_intent → IFC rules)   # 靠近任务的策略上下文
+hooks  ← Load_eBPF(policy)                      # 内核为唯一 detector
+
+on syscall / LSM hook:
+  if Violate(policy, event, labels):
+    feedback ← FormatSemantic(rule, effect, target, reason, next_step)
+    Deliver(feedback)   # 文件 / hook / MCP 等通道
+    Enforce(isolation_or_deny)
+  else:
+    Allow(event)
+</code></pre>
+    <p>
+      关键 insight（论文口径）：policy context 住在最靠近任务的 agent 侧；enforcement 必须在 OS，才能覆盖全部执行路径。二者拆开：Agent 负责「要什么」，内核负责「拦什么 / 怎么说清楚」。
+    </p>
+
+    <h3>③ IFC DSL：跨事件策略</h3>
+    <table>
+      <thead><tr><th>能力</th><th>例子（直觉）</th><th>为何需要跨事件</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>事件顺序</strong></td>
+          <td>test before commit</td>
+          <td>单次 syscall 看不出「是否已测」</td>
+        </tr>
+        <tr>
+          <td><strong>数据流 / 污点</strong></td>
+          <td>敏感文件内容不得外泄到网络</td>
+          <td>标签需沿进程谱系、文件、网络传播</td>
+        </tr>
+        <tr>
+          <td><strong>标签传播</strong></td>
+          <td>子进程继承 / 写后标签跟随</td>
+          <td>间接路径正是 tool-call 漏检处</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># IFC（Information-Flow Control）DSL 角色（示意）
+# · 为进程 / 文件 / 网络操作打 label
+# · 规则可引用「先前事件是否发生」「数据是否带某污点」
+# · 因此能表达 ordering 与 data-flow，而不只是单点 allow/deny
+
+# 与「只拦 git_commit 工具」对比：
+# 若 Agent 用 bash 直接 git commit，tool guardrail 可能看不见；
+# 内核 hook 仍能看到对应系统动作，并检查「测试完成」标签是否已置位。
+</code></pre>
+    <p>
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> 用 bash-only + 无状态 subprocess 换 RL 友好；正因为动作最终都落在 OS，OS 层策略反而成了「薄 harness」场景里更稳的安全网——不依赖工具清单是否齐全。
+    </p>
+
+    <h3>④ Semantic feedback 与开销（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>反馈内容</strong></td>
+          <td>规则、effect、target、reason、next step；可选污点溯源（实现侧常见字段）</td>
+        </tr>
+        <tr>
+          <td><strong>相对 opaque errno</strong></td>
+          <td>Agent 可据此修正计划，而不是盲目重试</td>
+        </tr>
+        <tr>
+          <td><strong>评测面</strong></td>
+          <td>经验研究中的策略、coding-task benchmarks、safety benchmarks（论文设定）</td>
+        </tr>
+        <tr>
+          <td><strong>开销</strong></td>
+          <td>约 <strong>1.9%–8.4%</strong>（作者自报）</td>
+        </tr>
+        <tr>
+          <td><strong>合规</strong></td>
+          <td>提升策略合规，含 tool-call 不可见的间接路径（作者自报）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与 <a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a> 同属「harness / 运行时机制可演化」叙事，但抓手不同：Ecdysis 修 harness 代码的系统缺陷；ActPlane 把策略执行面下沉到内核，减少「只在工具层假装安全」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>策略从 NL 落到 IFC 规则时写可测断言</strong>：每条规则对应「触发事件 + 前置标签 + 期望反馈字段」；否则无法回归。</li>
+      <li><strong>不要只拦工具名</strong>：审计间接路径（bash、子进程、脚本）；把「tool 层通过、内核层拒绝」当成一等测试用例。</li>
+      <li><strong>反馈必须进 Agent 可观测通道</strong>：文件、hook、MCP 任一均可，但要进 messages / 观察流；否则等于 sandbox opaque error。</li>
+      <li><strong>与沙箱叠加而非替代</strong>：sandbox 管资源与爆炸半径；ActPlane 管动作语义。生产上两者互补。</li>
+      <li><strong>开销按策略复杂度分开报</strong>：1.9%–8.4% 是作者自报区间；换高频 syscall 工作负载时先复测，勿直接当 SLA。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 tool-call guardrail 盖不住「先测后提交」这类策略？</summary>
+      <p>策略依赖跨事件状态（是否已跑测试），且 commit 可能不走注册工具。只看单次 tool call 既缺历史，也缺间接路径。</p>
+    </details>
+    <details>
+      <summary>2. OS sandbox 返回 permission denied，对 Agent 有什么坏处？</summary>
+      <p>错误 opaque：不知道触犯哪条策略意图、下一步该改什么。语义反馈把 rule / reason / next_step 写清楚，才便于修正。</p>
+    </details>
+    <details>
+      <summary>3. 为何说「策略上下文在 Agent、执行在 OS」是关键拆分？</summary>
+      <p>Agent 最懂当前任务该遵守什么；只有 OS 能看见全部执行路径。两边耦合在工具层，会同时丢掉任务语义与覆盖面。</p>
+    </details>
+    <details>
+      <summary>4. IFC 标签传播解决的是哪类漏洞？</summary>
+      <p>数据经中间文件/子进程再外泄、或动作顺序被拆到多个进程时的漏检——正是单点 allow/deny 与 tool 列表最容易漏的地方。</p>
+    </details>
+    <details>
+      <summary>5. 薄 bash harness（如 mini-SWE）是否反而更需要 OS 层策略？</summary>
+      <p>是。工具面越薄，越多动作直接落在系统调用上；若只靠 LLM 自觉或工具包装，安全与合规缺口更大，内核策略成为更自然的执行面。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2606.25189" target="_blank" rel="noopener">arXiv:2606.25189 · ActPlane</a></li>
+      <li><a href="https://github.com/eunomia-bpf/ActPlane" target="_blank" rel="noopener">GitHub · eunomia-bpf/ActPlane</a></li>
+      <li>站内：
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

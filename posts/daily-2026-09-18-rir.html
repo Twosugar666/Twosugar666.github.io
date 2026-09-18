@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜RIR：回滚环境状态、保留反思记忆——长程 Agent 的 Rollback-Induced Reflection · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜RIR：回滚环境状态、保留反思记忆——长程 Agent 的 Rollback-Induced Reflection</h1>
+    <p class="post-meta">2026-09-18 · 收藏夹：Agent / RL · 一线追踪<br />
+      论文：Yu, Yao, Li, Wang, Wu · <em>Rollback the World, Keep the Reflection: Rollback-Induced Reflection for Long-Horizon LLM Agents</em>
+      · <a href="https://arxiv.org/abs/2609.18304" target="_blank" rel="noopener">arXiv:2609.18304</a>（2026-09-16）。
+      交叉：
+      <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-14-t1.html">T1</a>、
+      <a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程多步 Agent 里，单步错误不只污染对话上下文：它会改写环境状态与后续 observation，让后续决策在错误世界里继续滚雪球。
+      现有恢复手段常落在两个极端——要么只改上下文（反思、重写计划、压缩窗口），环境已脏的事实仍在；要么把环境回滚到更早检查点，却把失败轨迹里可复用的经验一并丢掉，容易在同一坑里再摔一次。
+    </p>
+    <p>
+      站内 <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> 与 <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> 主要管<strong>上下文窗</strong>：bound/prune/checkpoint、hook 拦退出后清窗重注目标。
+      RIR（Rollback-Induced Reflection）把问题改写成 <strong>rollback-boundary control</strong>：何时介入、回退到哪、哪些信息在恢复后仍存活——在恢复先验环境状态的同时，携带从废弃轨迹蒸馏出的 reflection memory。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：可靠恢复 = 回滚边界控制（何时 / 回退到哪 / 什么信息存活）；RIR 恢复选定先验状态，同时把废弃轨迹蒸馏成结构化 reflection memory 指导后续决策；并用统一算子刻画 rollback depth × retained memory。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 两类失败恢复，各缺一半</h3>
+    <table>
+      <thead><tr><th>路线</th><th>改什么</th><th>常见代价</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>只修上下文</strong></td>
+          <td>提示、摘要、反思、清窗重注目标</td>
+          <td>环境状态 / 文件系统 / 外部副作用仍脏；后续 observation 继续误导</td>
+        </tr>
+        <tr>
+          <td><strong>只回滚环境</strong></td>
+          <td>恢复检查点 / snapshot</td>
+          <td>失败轨迹上的里程碑、可复用知识、失败分析被丢弃 → 重复试错</td>
+        </tr>
+        <tr>
+          <td><strong>RIR</strong></td>
+          <td>状态回滚 + reflection memory 存活</td>
+          <td>要解决「回退多深」与「保留什么」的联合决策</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与 Compaction / Ralph 的分工写清：后者主要管上下文预算与续跑协议；RIR 管<strong>环境状态回滚 + 知识保留</strong>。长程终端场景（见 <a href="daily-2026-09-14-t1.html">T1</a>）里两者常需叠用：窗可以清，世界状态与「别再踩的坑」不能一起清。
+    </p>
+
+    <h3>② Rollback-boundary control：何时 / 何处 / 何物</h3>
+    <pre><code># 可靠恢复被写成边界控制问题（论文口径）
+# 1) when  —— 何时认定当前轨迹已不可救 / 值得介入
+# 2) where —— 回退到哪一个先验状态（rollback depth）
+# 3) what  —— 哪些信息在恢复后仍存活（retained memory）
+
+# RIR 核心动作（示意）
+s'   ← Restore(s_checkpoint)           # 环境回到选定先验
+mem' ← DistillReflection(traj_abandoned)  # 从废弃轨迹抽可复用知识
+π    ← Continue(s', mem' ⊕ context)    # 带着 reflection 再决策
+</code></pre>
+    <p>
+      reflection memory 侧强调结构化保留：里程碑（milestones）、可复用知识、失败分析——目标是「消掉失败条件」与「避免重复过去错误」同时成立，而不是二选一。
+    </p>
+
+    <h3>③ 统一算子：rollback depth × retained memory</h3>
+    <table>
+      <thead><tr><th>轴</th><th>含义</th><th>工程直觉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Rollback depth</strong></td>
+          <td>回退多远：浅回滚 vs 深回滚</td>
+          <td>太浅 → 失败条件未消；太深 → 丢进度、成本高</td>
+        </tr>
+        <tr>
+          <td><strong>Retained memory</strong></td>
+          <td>废弃轨迹里保留多少 / 何种结构</td>
+          <td>全丢 → 重复失败；全留 → 脏上下文 / 错误归因污染</td>
+        </tr>
+        <tr>
+          <td><strong>统一算子</strong></td>
+          <td>把「状态恢复 × 知识保留」写成同一 recovery 视图</td>
+          <td>便于对照「只回滚」「只反思」等特例</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 统一算子视角（示意，非论文公式抄写）
+# Recover(s_t, traj, d, M) =
+#   ( Restore(s_{t-d}) ,  Keep(M(traj_{t-d:t})) )
+#
+# 特例：
+# · d=0, M=全上下文修补  → 只修上下文、不修环境
+# · d&gt;0, M=∅             → 纯回滚、经验清零
+# · d&gt;0, M=structured reflection → RIR 主张的工作点
+</code></pre>
+    <p>
+      与 <a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a> 对照：Horizon 管交互预算开环（P90 成功长度）；RIR 管失败后的<strong>世界状态与经验边界</strong>。预算耗尽前的策略，和踩坑后的恢复策略，是两条正交旋钮。
+    </p>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>设定</td><td>三套长程 benchmark；多个 LLM backbone</td></tr>
+        <tr><td>结论</td><td>RIR <strong>consistently improves</strong> 任务表现（作者自报）</td></tr>
+        <tr><td>机制证据</td><td>structured reflection memory 保留有用经验；selective rollback 支持高效恢复（摘要口径）</td></tr>
+        <tr><td>读法</td><td>不编造具体分数；百分点与表项以论文为准</td></tr>
+      </tbody>
+    </table>
+    <p>
+      核验重点应放在消融：去掉 reflection、固定深度回滚、只修上下文——是否同向掉点；跨 backbone 是否仍「consistent」，而不是单模型偶然。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先分清「窗」与「世界」</strong>：Compaction / Ralph 清的是上下文；若环境（工作区、容器、外部 API）已脏，必须另有 checkpoint / snapshot，否则反思只是在错误世界上自言自语。</li>
+      <li><strong>检查点要可回退、可命名</strong>：记录 (step, env_hash, summary_handle)；介入策略才能选 depth，而不是只能「整局重开」。</li>
+      <li><strong>reflection 要结构化，忌整段粘贴失败轨迹</strong>：优先 milestones / 可复用事实 / 失败原因模板；否则等于把脏上下文又灌回去。</li>
+      <li><strong>depth 与 memory 分开扫</strong>：先固定 memory schema 扫回退深度，再扫保留字段；归因时分别看「失败条件是否消失」与「是否重复同一错误」。</li>
+      <li><strong>与长程 RL harness 叠用时写清职责</strong>：T1 类真实 Shell、Elastic Horizon 类预算控制，解决的是采样与成本；RIR 解决的是失败后的状态–经验联合恢复。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「只改上下文」往往消不掉长程失败条件？</summary>
+      <p>错误动作已改变环境与后续 observation；上下文里的反思无法撤销文件系统/外部副作用。策略仍在错误世界上采样，失败条件会继续被观测到。</p>
+    </details>
+    <details>
+      <summary>2. 纯环境回滚为什么容易重复踩坑？</summary>
+      <p>回滚抹掉了失败轨迹里的经验信号。若没有保留失败分析与可复用知识，策略可能再次选择同一条高风险路径。</p>
+    </details>
+    <details>
+      <summary>3. Compaction / Ralph 与 RIR 的职责边界如何一句话区分？</summary>
+      <p>前两者主要管上下文窗与续跑协议；RIR 管环境状态回滚深度，以及恢复后哪些 reflection memory 存活。</p>
+    </details>
+    <details>
+      <summary>4. rollback depth 过深或过浅各有什么症状？</summary>
+      <p>过浅：失败条件仍在，observation 继续误导。过深：丢掉大量有效进度，恢复成本接近重开，且可能抹掉本可保留的正确中间产物。</p>
+    </details>
+    <details>
+      <summary>5. 若把整段废弃轨迹原文塞进上下文，算不算好的 retained memory？</summary>
+      <p>通常不算。原文携带错误状态描述与噪声，易再次污染决策。RIR 强调蒸馏后的结构化 reflection（里程碑、可复用知识、失败分析），而不是原文回放。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.18304" target="_blank" rel="noopener">arXiv:2609.18304 · RIR</a></li>
+      <li>站内：
+        <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-14-t1.html">T1</a> ·
+        <a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

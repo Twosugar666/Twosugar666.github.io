@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Softmax / Temperature / Entropy：策略分布如何被「温度」拧软，又如何被熵正则稳住 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Softmax / Temperature / Entropy：策略分布如何被「温度」拧软，又如何被熵正则稳住</h1>
+    <p class="post-meta">2026-09-18 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典工具：softmax 策略、温度 τ、策略熵 H(π)、熵 bonus / entropy coef。
+      交叉：
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL 散度</a>、
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a>、
+      <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      离散动作（或 LLM token）上的策略几乎总是 π(a|s) = softmax(z / τ)：logits 经温度缩放再归一化成分布。
+      τ 拧大，分布变「软」，探索面变宽；τ → 0，质量塌到 argmax，变成近乎确定性策略。
+      训练侧另有一条旋钮：在目标里加熵 bonus（或 entropy coef），直接奖励「别太尖」——与采样温度相关但<strong>不是同一个旋钮</strong>。
+    </p>
+    <p>
+      本篇把三条线串起来：softmax / τ 如何塑形；∇logπ = φ − E_π[φ] 为何对策略梯度友好；熵正则如何出现在 PPO / GRPO；以及采样温度 vs 训练温度、词表熵陷阱等实践坑。
+      Attention 里的 softmax(QKᵀ/√d) 是同一归一化家族（见 <a href="daily-2026-09-09-algo-attention.html">Attention</a>），但此处焦点是<strong>策略分布</strong>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：π = softmax(z/τ) 用温度拧软探索；∇logπ 对 logits 的梯度是「特征减期望」；熵 bonus 在训练目标里显式稳住分布宽度——PPO/GRPO 的 entropy coef 管训练，采样 τ 管推理，二者勿混用同一数字叙事。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Softmax 与温度 τ</h3>
+    <pre><code># 离散策略（动作或 token）
+π(a|s) = exp(z_a / τ) / Σ_b exp(z_b / τ)
+
+# τ &gt; 1  → 分布更平，探索更强
+# τ = 1  → 常用默认
+# 0 &lt; τ &lt; 1 → 更尖，偏剥削
+# τ → 0  → 近 one-hot（argmax）
+
+# 数值稳定：先减 max(z)，再除 τ
+z' = (z − max(z)) / τ
+π  = exp(z') / Σ exp(z')
+</code></pre>
+    <table>
+      <thead><tr><th>旋钮</th><th>作用面</th><th>典型用途</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>采样温度 τ_sample</strong></td>
+          <td>推理 / rollout 时从 π 取样</td>
+          <td>解码多样性、探索</td>
+        </tr>
+        <tr>
+          <td><strong>训练温度 τ_train</strong></td>
+          <td>算 logπ / 损失时用的缩放</td>
+          <td>与标签平滑、蒸馏、部分 RL 实现相关</td>
+        </tr>
+        <tr>
+          <td><strong>Entropy coef c_ent</strong></td>
+          <td>目标里 + c_ent · H(π)</td>
+          <td>防过早塌缩；与 τ 互补</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a> 用另一路温度把离散采样变成可微松弛；本页的 τ 是策略/解码温度，不要和 Concrete 松弛温度混谈成「同一个温度故事」。
+    </p>
+
+    <h3>② ∇logπ = φ − E_π[φ]</h3>
+    <pre><code># 设 π(a) ∝ exp(φ_a)，φ 为 logits（或 z/τ）
+log π(a) = φ_a − log Σ_b exp(φ_b)
+
+# 对 φ 的梯度（示意）：
+# ∂ logπ(a) / ∂φ =  1_a  − π
+# 即：选中动作的方向推高，同时按 π 加权压低全体 —— 「特征减期望」
+
+# 策略梯度（REINFORCE 骨架）：
+# ∇_θ J ≈ E[ ∇_θ log π_θ(a|s) · G ]
+# 见 daily-2026-09-03-algo-reinforce.html
+</code></pre>
+    <p>
+      「减期望」保证：在同一状态下对所有动作按 π 平均，∇logπ 的期望为 0——这是似然比梯度能配 baseline / advantage 的几何前提之一。
+      接到 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> / <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 时，仍是对 logπ（或 ratio）加权，熵项则另算 H(π)= −Σ π logπ。
+    </p>
+
+    <h3>③ 熵 bonus：稳住分布宽度</h3>
+    <table>
+      <thead><tr><th>形式</th><th>写法（示意）</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>最大化熵</strong></td>
+          <td>maximize E[R] + c_ent · H(π(·|s))</td>
+          <td>同样回报下偏好更不确定的策略</td>
+        </tr>
+        <tr>
+          <td><strong>PPO 常见</strong></td>
+          <td>L = L_clip − c_vf · L_value + c_ent · H</td>
+          <td>entropy coef 防过早确定性塌缩</td>
+        </tr>
+        <tr>
+          <td><strong>GRPO / LLM RL</strong></td>
+          <td>clipped surrogate ± KL 项，常另加 token 级熵</td>
+          <td>与 <a href="daily-2026-09-17-algo-kl.html">KL</a> 分工：KL 锚参考分布，熵管自身尖锐度</td>
+        </tr>
+        <tr>
+          <td><strong>Soft Actor-Critic 族</strong></td>
+          <td>温度 α 乘熵（连续控常见）</td>
+          <td>α 可学；离散 LLM 栈里更常见固定 c_ent</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 熵定义（离散）
+H(π(·|s)) = − Σ_a π(a|s) log π(a|s)
+
+# 与温度的粗糙对照（固定 logits 时）：
+# τ ↑ ⇒ H ↑（更平）；τ ↓ ⇒ H ↓（更尖）
+# 但：训练时改 c_ent 改的是目标，不一定等于改采样 τ
+# 推理时只改 τ_sample，也不自动等于训练见过的熵水平
+</code></pre>
+
+    <h3>④ 采样温度 vs 训练温度；词表熵陷阱</h3>
+    <table>
+      <thead><tr><th>坑</th><th>机制</th><th>常见处理</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>采样 τ ≠ 训练分布</td>
+          <td>用 τ=1.2 采样、用 τ=1.0 的 logπ 算梯度 → 分布不一致</td>
+          <td>rollout 与 logprob 记账温度对齐；或显式 importance 修正</td>
+        </tr>
+        <tr>
+          <td>词表熵陷阱</td>
+          <td>|V| 很大时，均匀分布熵 = log|V| 巨大；token 平均熵难比跨模型</td>
+          <td>报「相对均匀的归一熵」或 top-k 质量上的熵；统一分母</td>
+        </tr>
+        <tr>
+          <td>熵与 KL 混成一个旋钮</td>
+          <td>熵管「自己尖不尖」，KL 管「离 ref 远不远」</td>
+          <td>日志分列 H 与 KL；分开扫 c_ent 与 β</td>
+        </tr>
+        <tr>
+          <td>长序列平均熵掩盖塌缩</td>
+          <td>多数 token 高熵、关键位已 argmax</td>
+          <td>按位置 / 工具调用位分层监控；看 argmax 率</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Attention 的 √d_k 缩放也是在管 softmax 尖锐度（见 <a href="daily-2026-09-09-algo-attention.html">Attention</a>）；策略温度是同一数学物件的另一工程表面。RL 日志里若只写「entropy」，务必注明是 token-average H(π)、序列级，还是解码 τ。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先对齐采样与记账温度</strong>：rollout 用的 τ 与算 ∇logπ 用的 τ 不一致时，先修这个，再谈 entropy coef。</li>
+      <li><strong>c_ent 与 β_KL 分开扫</strong>：熵塌缩时先看 H 曲线；离 ref 太远时看 KL。两者同时动只会归因混乱。</li>
+      <li><strong>词表熵不要跨模型裸比绝对值</strong>：至少除以 log|V|，或固定评测词表子集。</li>
+      <li><strong>推理温度当产品旋钮，训练温度当实验因子</strong>：改用户侧 decoding τ 不等于复现训练探索；写报告时分开。</li>
+      <li><strong>监控 argmax 率与 H 一起看</strong>：H 尚可但关键工具位已几乎确定性，仍可能探索不足。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 固定 logits，把 τ 从 1 降到 0.5，π 与 H(π) 如何变？</summary>
+      <p>分布变尖，峰值动作概率上升，熵下降。极端 τ→0 时接近 one-hot，H→0。</p>
+    </details>
+    <details>
+      <summary>2. 为什么说 ∇logπ 对 logits 是「减期望」？这对 baseline 意味着什么？</summary>
+      <p>∂logπ(a)/∂φ = 1_a − π，在 π 下对 a 取期望为 0。因此只依赖 s 的 baseline 不会改变梯度期望，只影响方差——这是 REINFORCE+baseline 成立的基础。</p>
+    </details>
+    <details>
+      <summary>3. PPO 的 entropy coef 与采样温度能否互相替代？</summary>
+      <p>不能简单替代。c_ent 改变训练目标下的最优尖锐度；采样 τ 只改变当前如何从已有 π 取样。训练未见过的温度，推理硬拧，分布与梯度记账可能系统性偏离。</p>
+    </details>
+    <details>
+      <summary>4. 熵正则与 KL(π∥π_ref) 各约束什么？</summary>
+      <p>熵约束策略自身的不确定性（尖不尖）；KL 约束相对参考分布的偏离（漂不漂）。可以同时「高熵但离 ref 很远」或「低熵但贴着 ref」。见站内 KL 文。</p>
+    </details>
+    <details>
+      <summary>5. 为什么大词表上「平均 token 熵很大」不一定代表探索健康？</summary>
+      <p>均匀分布基线是 log|V|，绝对熵被词表撑大；且平均可能掩盖少数关键位置的塌缩。需要归一化或分层（位置 / 动作类型）指标。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>站内算法线：
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> ·
+        <a href="daily-2026-09-09-algo-attention.html">Attention</a> ·
+        <a href="daily-2026-09-01-algo-gumbel-softmax.html">Gumbel-Softmax</a></li>
+      <li>背景：Williams REINFORCE；Schulman et al. PPO；Haarnoja et al. Soft Actor-Critic（熵正则经典表述）</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

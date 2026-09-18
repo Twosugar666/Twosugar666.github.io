@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 0,
   "daily_streams": [
     "frontline",
     "harness",
@@ -417,6 +417,27 @@
       "source": "algo",
       "topic": "KL 散度：相对熵约束策略更新（TRPO 硬约束 / PPO clip / DPO β logπ/π_ref / GRPO KL 项）",
       "file": "posts/daily-2026-09-17-algo-kl.html"
+    },
+    {
+      "date": "2026-09-18",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "RIR：rollback-boundary control（何时/何处/何物）；环境回滚 + structured reflection memory；统一算子 rollback depth × retained memory（arXiv:2609.18304）",
+      "file": "posts/daily-2026-09-18-rir.html"
+    },
+    {
+      "date": "2026-09-18",
+      "domain": "harness agent infra",
+      "source": "harness",
+      "topic": "ActPlane：Agent 声明策略 → 内核 eBPF 执行 + semantic feedback + IFC DSL；开销 1.9%–8.4%（arXiv:2606.25189v2）",
+      "file": "posts/daily-2026-09-18-harness-actplane.html"
+    },
+    {
+      "date": "2026-09-18",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "Softmax / Temperature / Entropy：π=softmax(z/τ)；∇logπ=φ−Eπ[φ]；熵 bonus / PPO·GRPO entropy coef；采样温度 vs 训练温度；词表熵陷阱",
+      "file": "posts/daily-2026-09-18-algo-softmax-entropy.html"
     }
   ]
 }
