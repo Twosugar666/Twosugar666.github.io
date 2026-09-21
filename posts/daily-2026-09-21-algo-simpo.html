@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜SimPO：用平均 logprob 当隐式奖励、丢掉 reference model 的偏好优化 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜SimPO：用平均 logprob 当隐式奖励、丢掉 reference model 的偏好优化</h1>
+    <p class="post-meta">2026-09-21 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Meng, Xia, Chen · <em>SimPO: Simple Preference Optimization with a Reference-Free Reward</em>
+      （NeurIPS 2024）· <a href="https://arxiv.org/abs/2405.14734" target="_blank" rel="noopener">arXiv:2405.14734</a>。
+      交叉：
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>、
+      <a href="daily-2026-09-15-algo-kto.html">KTO</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL 散度</a>、
+      <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a> 把 KL 约束 RL 的最优策略重参数化成隐式奖励
+      <code>r = β log(π_θ(y|x) / π_ref(y|x))</code>，从而跳过显式 RM + PPO。
+      代价仍在：训练时要挂一个冻结的 <strong>reference model</strong>（多占一份前向与显存），且奖励用的是序列<strong>总</strong> logprob，容易偏爱更长回复。
+    </p>
+    <p>
+      <strong>SimPO（Simple Preference Optimization）</strong> 做两处手术：① 隐式奖励改成<strong>长度归一化的平均 logprob</strong>
+      <code>r = (β/|y|) log π_θ(y|x)</code>，不再除以 π_ref；② 在 Bradley-Terry 里显式加 margin γ。
+      结果是 reference-free：少一次参考模型前向，工程更简单，并对齐指标上作者报出明显增益。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：SimPO = 用平均 log-likelihood 当奖励（无 π_ref）+ BT 目标加 margin γ；比 DPO 更贴生成度量，且省参考模型的算力与显存。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 从 DPO 奖励到 SimPO 奖励</h3>
+    <pre><code># DPO 隐式奖励（依赖 reference）
+r_DPO(x, y) = β * log( π_θ(y|x) / π_ref(y|x) )
+            = β * ( log π_θ(y|x) − log π_ref(y|x) )
+
+# SimPO 长度归一化、reference-free 奖励
+r_SimPO(x, y) = (β / |y|) * log π_θ(y|x)
+# |y| = 回复 token 数；log π_θ(y|x) = 序列总 logprob
+# 等价于：β * (平均 token logprob)
+</code></pre>
+    <table>
+      <thead><tr><th>对比</th><th>DPO</th><th>SimPO</th></tr></thead>
+      <tbody>
+        <tr><td>奖励形式</td><td>β log(π_θ/π_ref)</td><td>(β/|y|) log π_θ</td></tr>
+        <tr><td>Reference model</td><td>需要（冻结前向）</td><td><strong>不需要</strong></td></tr>
+        <tr><td>长度</td><td>总和 logprob，易偏长</td><td>平均 logprob，抑制注水</td></tr>
+        <tr><td>与生成</td><td>训练度量含 π_ref 比</td><td>更直接对齐「高平均似然」生成质量</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与 <a href="daily-2026-09-17-algo-kl.html">KL</a> 的关系：DPO 的 π_ref 项来自 KL 约束最优解；SimPO 丢掉显式 ref 后，用长度归一 + margin 承担「别无限抬高似然 / 拉开胜负」的正则角色，而不是再挂一个参考分布做 KL。
+    </p>
+
+    <h3>② Bradley-Terry + margin</h3>
+    <pre><code># 带 margin 的 BT 偏好概率
+p(y_w ≻ y_l | x) = σ( r(x, y_w) − r(x, y_l) − γ )
+
+# γ &gt; 0：要求胜出回复的奖励比落败高出至少 γ，才算「够赢」
+</code></pre>
+    <p>
+      margin 把「略胜」和「明显胜」分开：γ=0 时只要 r_w &gt; r_l 就推；γ&gt;0 时梯度更强调拉开差距。作者消融称 γ=0 次优。
+    </p>
+
+    <h3>③ SimPO loss</h3>
+    <pre><code># 把 r_SimPO 代入带 margin 的 BT，最大似然：
+L_SimPO = − E_{(x,y_w,y_l)} [
+  log σ(
+      (β / |y_w|) * log π_θ(y_w|x)
+    − (β / |y_l|) * log π_θ(y_l|x)
+    − γ
+  )
+]
+
+# 典型超参（作者口径）
+# β ∈ [2.0, 2.5]
+# γ ∈ [0.5, 1.5]
+</code></pre>
+    <table>
+      <thead><tr><th>符号</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>β</code></td><td>缩放平均 logprob；典型 2.0–2.5，比 DPO 常用 β 量级更大（因奖励定义不同，勿直接搬）</td></tr>
+        <tr><td><code>γ</code></td><td>胜负 margin；0.5–1.5；γ=0 作者报次优</td></tr>
+        <tr><td><code>|y|</code></td><td>长度归一；去掉后易长而重复（作者消融）</td></tr>
+        <tr><td><code>π_ref</code></td><td>不出现——少一次前向</td></tr>
+      </tbody>
+    </table>
+    <p>
+      实现注意：log π_θ(y|x) 对 response token 求和时做 padding mask；|y| 用有效 token 数。与 <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a> 对照：这里优化的是序列平均 logprob 差，不是显式熵 bonus；但「别用总 logprob 鼓励注水」与长度归一同向。
+    </p>
+
+    <h3>④ 与 DPO / KTO / PPO-RLHF</h3>
+    <table>
+      <thead><tr><th></th><th>DPO</th><th>SimPO</th><th>KTO</th><th>PPO-RLHF</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>数据</td><td>偏好对</td><td>偏好对</td><td>二元好/坏</td><td>RM + 在线 rollout</td>
+        </tr>
+        <tr>
+          <td>Reference</td><td>要</td><td>不要</td><td>常要（KL 项）</td><td>KL 项要</td>
+        </tr>
+        <tr>
+          <td>奖励</td><td>β log(π/π_ref)</td><td>β·avg logprob</td><td>前景理论效用</td><td>显式 RM</td>
+        </tr>
+        <tr>
+          <td>额外旋钮</td><td>β</td><td>β, γ, 长度归一</td><td>λ/风险参数等</td><td>clip、GAE、…</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      <a href="daily-2026-09-15-algo-kto.html">KTO</a> 解决「没有成对偏好、只有好/坏」；SimPO 仍要 (y_w, y_l)，但把 DPO 的 ref 与长度问题收掉。
+      需要在线探索或可验证奖励时，仍回到 <a href="daily-2026-08-28-algo-ppo.html">PPO</a> / GRPO 栈，而不是用 SimPO 硬替。
+    </p>
+
+    <h3>⑤ 实证与消融（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>作者自报</th></tr></thead>
+      <tbody>
+        <tr><td>相对 DPO</td><td>最高约 <strong>+6.4</strong> AlpacaEval2 LC；约 <strong>+7.5</strong> Arena-Hard</td></tr>
+        <tr><td>Gemma-2-9B-it-SimPO</td><td>AlpacaEval2 LC <strong>72.4%</strong>；Arena-Hard <strong>59.1%</strong></td></tr>
+        <tr><td>效率（vs vanilla DPO）</td><td>约 <strong>−20%</strong> runtime；约 <strong>−10%</strong> GPU mem（8×H100，Llama-3-Base 设定）</td></tr>
+        <tr><td>消融</td><td>去掉长度归一（w/o LN）伤害大，易长而重复；γ=0 次优</td></tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>β / γ 按 SimPO 量表扫，勿照搬 DPO 的 β。</strong> 奖励已是平均 logprob，数值尺度不同；先从 β∈[2.0,2.5]、γ∈[0.5,1.5] 网格起。</li>
+      <li><strong>长度归一默认开。</strong> 关掉等于用总 logprob 当奖励，作者报会长而重复——与对齐榜上的 verbose bias 同族。</li>
+      <li><strong>省下的 ref 前向可换 batch。</strong> 同卡可加大 micro-batch 或序列长，但先回归偏好过拟合与能力榜。</li>
+      <li><strong>仍要高质量偏好对。</strong> Reference-free 不降低对标签噪声的敏感；y_w/y_l 过近时 margin γ 会让梯度更「挑食」，需监控有效 pair 比例。</li>
+      <li><strong>与 DPO 对照实验写清度量。</strong> 比 LC / Arena-Hard 时固定解码温度与长度惩罚；否则长度归一的收益会被评测协议吃掉。</li>
+      <li><strong>有规则奖励时别硬换 SimPO。</strong> 数学/代码可验证场景优先 RLVR；SimPO 主场仍是偏好对齐轴。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 (β/|y|) log π 比 β log(π/π_ref) 更「贴近生成」？</summary>
+      <p>解码时模型按自身 π_θ 采样，并不除以 π_ref。平均 logprob 直接描述「这条回复在当前模型下有多像自己会说的话」；DPO 的比还编码了相对参考的偏离，训练信号与纯生成度量不完全同构。</p>
+    </details>
+    <details>
+      <summary>2. 去掉长度归一会发生什么？</summary>
+      <p>奖励变成与序列总 logprob 成正比，优化器倾向更长回复以累积 logprob。作者消融：w/o LN 伤害大，出现长而重复。</p>
+    </details>
+    <details>
+      <summary>3. margin γ 的作用与 γ=0 为何次优？</summary>
+      <p>γ 要求 r_w − r_l ≥ γ 才算充分满足偏好，迫使胜负在奖励空间拉开。γ=0 时微弱优势即可，区分度不足；作者报 γ=0 次优。</p>
+    </details>
+    <details>
+      <summary>4. SimPO 省掉 reference model，还如何防止策略崩坏？</summary>
+      <p>不再靠显式 KL(π||π_ref)。改为：长度归一限制「靠注水抬总 logprob」，margin 限制「只略胜也猛更新」，外加 β 缩放。仍需用 SFT 初始化与偏好数据质量托底；极端分布外仍可能崩，需能力榜回归。</p>
+    </details>
+    <details>
+      <summary>5. 什么时候选 SimPO，什么时候留在 DPO / KTO？</summary>
+      <p>有成对偏好、想省 ref 显存/时间、且受长度偏置困扰 → SimPO。需要与 SFT 参考强锚定、沿用现成 DPO 配方 → DPO。只有二元好/坏、无配对 → KTO。可验证任务 → PPO/GRPO 更合适。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2405.14734" target="_blank" rel="noopener">arXiv:2405.14734 · SimPO (NeurIPS 2024)</a></li>
+      <li>站内：
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="daily-2026-09-15-algo-kto.html">KTO</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> ·
+        <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Coding Agent Harness 组件消融：规划 / 动作空间 / 上下文管理（176 组对照） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Coding Agent Harness 组件消融：规划 / 动作空间 / 上下文管理（176 组对照）</h1>
+    <p class="post-meta">2026-09-21 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Fan et al. · <em>An Empirical Study of Harness Design for Coding Agents</em>
+      · <a href="https://arxiv.org/abs/2609.20804" target="_blank" rel="noopener">arXiv:2609.20804</a>（2026-09-17）。
+      交叉：
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-09-14-t1.html">T1</a>、
+      <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Coding Agent 的「能力」常被模型卡片抢走注意力；真正决定长会话能否跑完、成本飞到哪的，往往是 harness：规划要不要显式写、动作是预定义工具还是 bash-only、上下文爆窗时怎么裁。
+      缺的是<strong>匹配对照</strong>：换一个组件就换一套提示与循环，归因混乱。Fan 等固定执行循环，系统消融 planning / action space / context management，在 4 个模型 × SWE-Bench Verified + Terminal-Bench 2.1 上摆出 <strong>176</strong> 组匹配设定。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：固定 loop，扫规划、动作空间、上下文策略（T0–T4）与窗口预算；上下文管理主要防 overflow 失败，T4 效率最强；规划对弱模型是准确率脚手架、对强模型更像省成本；弱 bash 受益于预定义工具，强 bash 模型在 CLI 任务上 bash-only 更省。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 实验骨架：固定 loop，变三轴</h3>
+    <table>
+      <thead><tr><th>轴</th><th>扫什么</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Planning</strong></td><td>有 / 无显式规划脚手架</td><td>弱模型准度 vs 强模型成本</td></tr>
+        <tr><td><strong>Action space</strong></td><td>预定义工具 vs bash-only 等</td><td>写代码粒度随之变</td></tr>
+        <tr><td><strong>Context management</strong></td><td>T0–T4 × 4 档窗口预算</td><td>5 种策略；共 176 matched settings</td></tr>
+        <tr><td><strong>模型 / 榜</strong></td><td>4 models × SWE-Bench Verified + Terminal-Bench 2.1</td><td>执行循环固定，归因才干净</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② 上下文策略 T0–T4</h3>
+    <table>
+      <thead><tr><th>代号</th><th>机制</th><th>一句话</th></tr></thead>
+      <tbody>
+        <tr><td><strong>T0</strong></td><td>无管理；溢出即终止</td><td>基线：爆窗 = 任务失败</td></tr>
+        <tr><td><strong>T1</strong></td><td>规则 elision + placeholders</td><td>按规则删/占位，可恢复引用</td></tr>
+        <tr><td><strong>T2</strong></td><td>T1 + <code>recall_event</code></td><td>显式召回被 elide 的事件</td></tr>
+        <tr><td><strong>T3</strong></td><td>LLM summarization</td><td>模型摘要压缩历史</td></tr>
+        <tr><td><strong>T4</strong></td><td>先 stage rule elision，再 summarization</td><td>规则裁剪 → 再摘要；效率最强（作者口径）</td></tr>
+      </tbody>
+    </table>
+    <pre><code># T4 流水线（示意）
+history → rule_elision(stage-aware) → llm_summarize → continue_loop
+
+# T0
+if context_overflow: terminate_failure
+</code></pre>
+    <p>
+      与站内 <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>（bound / prune / checkpoint）同族：都是爆窗前主动管窗。
+      与 <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> 对照：Ralph 是拦退出、清窗重注目标的续跑协议；本文 T* 是<strong>窗内压缩策略消融</strong>，不替代外环续跑。
+    </p>
+
+    <h3>③ 四条主结论（作者口径）</h3>
+    <table>
+      <thead><tr><th>#</th><th>发现</th><th>工程读法</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>窗口收紧时，上下文管理的价值上升；作用主要是<strong>防止 overflow 失败</strong></td>
+          <td>大窗上「有没有 compaction」差距小；小窗上 T0 大量直接死</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td><strong>T4</strong> 效率最强；可恢复 elision（偏 T1/T2）常引入未使用的机制，<strong>不准度增益</strong></td>
+          <td>先规则裁再摘要，比「可召回占位」更划算；别为 recoverable 加复杂工具却从不 recall</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Planning：弱模型是<strong>准确率脚手架</strong>；强模型准确率几乎不动，但更像<strong>省成本</strong></td>
+          <td>强模型可少规划步骤降 token；弱模型去掉规划易掉点</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>预定义工具帮<strong>弱 bash</strong>；bash 能力强的模型在 CLI 任务上 bash-only 往往更低成本</td>
+          <td>与 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE</a>「bash-only 基线」同向；工具集要按模型能力选，不是越多越好</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>④ 轨迹视角：三轴改的是什么</h3>
+    <table>
+      <thead><tr><th>轴</th><th>对轨迹的影响</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Context</strong></td><td>延长轨迹存活：否则 overflow 早停</td></tr>
+        <tr><td><strong>Planning</strong></td><td>改变「在哪停」——何时收束、是否过早放弃 / 空转</td></tr>
+        <tr><td><strong>Action space</strong></td><td>改变写代码的粒度（一次大补丁 vs 细工具调用链）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      对接 <a href="daily-2026-09-14-t1.html">T1</a> 长程真实 Shell：终端场景下窗口与动作空间选择会直接乘在 300+ 轮预算上；本文的 matched 消融正好给「先选 T4 + 按模型选 bash/工具」提供经验先验。
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> 的 Workspace / 工具面可当作 action-space 实例；消融结论提醒：SDK 功能完备 ≠ 对每个 backbone 都该全开。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量窗口再谈策略。</strong> 大窗默认 T0 可能够用；一收窗，优先上 T4（规则 elision → summarization），而不是先上复杂 recall。</li>
+      <li><strong>Recoverable elision 要有调用证据。</strong> 若日志里几乎从无 <code>recall_event</code>，T2 相对 T1 就是死重量——与作者「unused machinery / no accuracy gain」同向。</li>
+      <li><strong>规划按模型分流。</strong> 弱模型保留显式 plan；强模型可降规划频率换成本，并单列看准确率是否真的平坦。</li>
+      <li><strong>动作空间按 bash 能力选。</strong> 弱 bash → 预定义工具降错用命令；强 bash + CLI 榜 → 试 bash-only（mini-SWE 风格）降工具描述 token。</li>
+      <li><strong>消融时固定执行 loop。</strong> 同时改提示模板、重试策略与压缩，归因会糊成「整包 harness 魔法」。</li>
+      <li><strong>轨迹日志打三标签。</strong> overflow-kill / plan-stop / edit-granularity，分别对应 context / planning / action 三轴，便于对照本文视角。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么上下文管理的收益会随窗口收紧而上升？</summary>
+      <p>紧窗下 T0 更容易 overflow 直接失败；管理策略的主要贡献是让轨迹继续跑完，而不是在宽裕窗口上额外「想得更聪明」。作者口径：价值上升，且主要防 overflow。</p>
+    </details>
+    <details>
+      <summary>2. T4 相对 T2「可恢复 elision」为何更受青睐？</summary>
+      <p>T4 先规则裁再摘要，效率最强（作者）。T1/T2 若提供 recall 却很少被用，等于增加未使用机械，准确率无增益——复杂度没有兑换成行为改变。</p>
+    </details>
+    <details>
+      <summary>3. 强模型上「规划不准、但更省」该如何产品化？</summary>
+      <p>把规划当成成本旋钮而非必开准度开关：默认精简 plan，仅在失败重试或长程分支时加规划；与弱模型「保 plan 保准度」配置分开发布。</p>
+    </details>
+    <details>
+      <summary>4. 何时优先预定义工具，何时 bash-only？</summary>
+      <p>弱 bash / 易拼错命令 → 预定义工具。模型已会稳定用 shell、且任务偏 CLI（Terminal-Bench 类）→ bash-only 常更低成本。与 mini-SWE 的 RL 友好 bash-only 基线一致。</p>
+    </details>
+    <details>
+      <summary>5. Compaction、Ralph、本文 T* 各自解决哪类失败？</summary>
+      <p>T* / Compaction：窗内如何压历史以免 overflow。Ralph：退出被拦后清窗重注目标的外环续跑。三者可叠：内环 T4 压窗，外环 Ralph 续跑，但指标要分开记。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.20804" target="_blank" rel="noopener">arXiv:2609.20804 · Harness Design Empirical Study</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-09-14-t1.html">T1</a> ·
+        <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

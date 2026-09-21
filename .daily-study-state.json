@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 0,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -438,6 +438,27 @@
       "source": "algo",
       "topic": "Softmax / Temperature / Entropy：π=softmax(z/τ)；∇logπ=φ−Eπ[φ]；熵 bonus / PPO·GRPO entropy coef；采样温度 vs 训练温度；词表熵陷阱",
       "file": "posts/daily-2026-09-18-algo-softmax-entropy.html"
+    },
+    {
+      "date": "2026-09-21",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "UnifiedPlayers：Planning/Execution/Evaluation 三角色 + 可执行 verifier 证据矩阵；轮流 GRPO 冻结另二；math≥3.5% / general≥3.9%；对抗检测 84.2%；奖励方差 2.03×（arXiv:2609.20089）",
+      "file": "posts/daily-2026-09-21-unifiedplayers.html"
+    },
+    {
+      "date": "2026-09-21",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Coding Agent Harness 消融：planning / action space / context T0–T4；4 models × SWE-Bench Verified + TB2.1；176 matched；T4 效率最强（arXiv:2609.20804）",
+      "file": "posts/daily-2026-09-21-harness-design-study.html"
+    },
+    {
+      "date": "2026-09-21",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "SimPO：r=(β/|y|)logπ；无 π_ref；BT+margin γ；β∈[2,2.5] γ∈[0.5,1.5]；vs DPO +6.4 LC / +7.5 AH；Gemma-2-9B-it 72.4%/59.1%（arXiv:2405.14734）",
+      "file": "posts/daily-2026-09-21-algo-simpo.html"
     }
   ]
 }

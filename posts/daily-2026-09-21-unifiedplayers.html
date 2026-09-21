@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜UnifiedPlayers：用可执行反馈协调 Planning / Execution / Evaluation 的 Agentic RL · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜UnifiedPlayers：用可执行反馈协调 Planning / Execution / Evaluation 的 Agentic RL</h1>
+    <p class="post-meta">2026-09-21 · 收藏夹：RL / Agent · 一线追踪<br />
+      论文：Liao, Zhao, Cao · <em>UnifiedPlayers: Enhance Tool-Integrated Reasoning in Agentic Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/2609.20089" target="_blank" rel="noopener">arXiv:2609.20089</a>（2026-09-17）。
+      交叉：
+      <a href="grpo-notes.html">GRPO 笔记</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO 日更</a>、
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a>、
+      <a href="daily-2026-08-13-prm.html">PRM</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Tool-integrated reasoning（工具增强推理）里，一条完整管线往往拆成三段：谁出题（Planning）、谁多轮调工具解题（Execution）、谁判对错（Evaluation）。
+      三段若要一起变强，会出现<strong>循环依赖</strong>：任务难度取决于执行器当前能力；执行器的学习信号取决于 verifier 是否可靠；verifier 又需要「好/坏轨迹」样本来学——任一侧静态或自洽式更新，都容易把<strong>共享误差</strong>写进闭环。
+    </p>
+    <p>
+      静态 verifier（规则 / 固定判题脚本）跟不上策略演化后的失败模式；self-consistency 一类「多采样投票」又会在共同偏见上互相确认，奖励方差不足。
+      UnifiedPlayers 把三段做成三个 player，用<strong>同一份可执行证据</strong>（sandbox 跑 verifier）生成角色特异奖励，并<strong>一次只训一个 player、冻结另两个</strong>，打断循环依赖。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：三个 player（Planning / Execution / Evaluation）共享 sandbox 可执行证据 → 角色特异奖励；用 GRPO 轮流优化其中一个、冻结另两个，避免联合适应时的循环依赖与共享误差强化。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 三个 Player 的职责</h3>
+    <table>
+      <thead><tr><th>Player</th><th>角色</th><th>产出</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Planning</strong></td>
+          <td>task-setter：生成需工具使用的任务</td>
+          <td>可训的任务分布（难度 / 工具需求随执行器能力演化）</td>
+        </tr>
+        <tr>
+          <td><strong>Execution</strong></td>
+          <td>多轮轨迹求解；调用 Python 等工具</td>
+          <td>tool-calling trajectories</td>
+        </tr>
+        <tr>
+          <td><strong>Evaluation</strong></td>
+          <td>构造<strong>可执行</strong> verifier（不是只吐自然语言对错）</td>
+          <td>能在 sandbox 里跑的判题程序 / 检查器</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      关键在 Evaluation：判题物本身可执行，才能在原轨迹与对抗扰动轨迹上得到可比的 verdict，而不是靠另一份「口头一致」。
+    </p>
+
+    <h3>② 问题：联合适应的循环依赖</h3>
+    <pre><code># 循环依赖（示意）
+Planning  --生成任务--> Execution
+Execution --需要可靠奖励--> Evaluation
+Evaluation --需要难/易与对/错样本--> Planning + Execution
+
+# 静态 verifier：跟不上新失败模式
+# Self-consistency：共享偏见互相确认 → 奖励方差偏低、误差强化
+</code></pre>
+    <p>
+      与站内 <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a> 的 rubric 共演化对照：ARISE 走「评分标准与策略共演化 + 门控蒸馏」；UnifiedPlayers 强调<strong>可执行 verifier + 对抗扰动 verdict 矩阵</strong>，并把三角色拆成可轮流冻结的 player。
+      与 <a href="daily-2026-08-13-prm.html">PRM</a> 对照：PRM 给过程步打分；这里 Evaluation 产出的是能跑的检查器，信用来自 sandbox 执行结果。
+    </p>
+
+    <h3>③ 共享可执行证据 → 角色特异奖励</h3>
+    <pre><code># 证据构造（作者口径示意）
+# 1) Evaluation 生成可执行 verifier V
+# 2) Sandbox 在「原始轨迹」与「对抗扰动轨迹」上跑 V
+# 3) 得到 verdict matrix（多轨迹 × 多检查结果）
+# 4) 从同一矩阵派生 Planning / Execution / Evaluation 各自的 reward
+
+# 训练节律
+# for round in outer_iterations:
+#   pick one player ∈ {Plan, Exec, Eval}
+#   GRPO-update(player) while freeze(other two)
+</code></pre>
+    <table>
+      <thead><tr><th>组件</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Sandbox + executable verifier</strong></td><td>把「对不对」落成可复现的程序结果，而非口头自洽</td></tr>
+        <tr><td><strong>Adversarial perturbation</strong></td><td>扰动轨迹上再跑 verifier → 测检测力 / 稳健性，拉开奖励方差</td></tr>
+        <tr><td><strong>Verdict matrix</strong></td><td>共享证据表；三个 player 的奖励从同一表切片，保证可比</td></tr>
+        <tr><td><strong>轮流 GRPO + 冻结</strong></td><td>打断「三者同时漂」的循环依赖；优化器见站内 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a></td></tr>
+      </tbody>
+    </table>
+    <p>
+      图示侧提到 Qwen3-4B 的 outer iterations——外环是「换哪个 player 上场」，内环是该 player 的 GRPO 组采样更新。
+      信用分配与多轮工具轨迹相关时，可对照 <a href="daily-2026-09-01-ahead.html">AHEAD</a> 的 step-aware 思路；UnifiedPlayers 的增量在「三角色协调 + 可执行判据」，而非单条轨迹内的步级重加权 alone。
+    </p>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>维度</th><th>作者自报</th></tr></thead>
+      <tbody>
+        <tr><td>骨干</td><td>两个模型；十二个 reasoning benchmarks</td></tr>
+        <tr><td>相对最强先验基线</td><td>数学 ≥ <strong>3.5%</strong>；通用推理 ≥ <strong>3.9%</strong></td></tr>
+        <tr><td>学到的 verifier</td><td>对抗检测准确率 <strong>84.2%</strong></td></tr>
+        <tr><td>奖励方差</td><td>相对 self-consistency（Agent0 风格）每题奖励方差约 <strong>2.03×</strong></td></tr>
+        <tr><td>外环</td><td>图示含 Qwen3-4B outer iterations</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：百分点与倍数均按作者自报引用，不外推到未给出的 backbone / 榜单项。核验时优先看「轮流冻结 vs 联合更新」「可执行 verifier vs 静态 / self-consistency」消融是否同向。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先把 Evaluation 做成可执行物。</strong> 自然语言 rubric 可以作冷启动，但闭环奖励应能进 sandbox；否则又回到口头自洽。</li>
+      <li><strong>一次只动一个 player。</strong> 联合端到端微调三角色，最容易把共享偏差写进任务分布与判据；外环轮转 + 冻结是工程默认。</li>
+      <li><strong>对抗扰动轨迹别省。</strong> 只在干净成功轨迹上训 verifier，检测力虚高；扰动后的 verdict 矩阵才拉开方差（作者报 2.03× 量级）。</li>
+      <li><strong>Planning 难度要跟 Execution 能力挂钩。</strong> 任务过易 → 奖励饱和；过难 → 全零组、GRPO 无相对信号。可用执行成功率做 curriculum 门控。</li>
+      <li><strong>与 PRM / AHEAD 叠用时写清接口。</strong> PRM 管步分；AHEAD 管步级信用；UnifiedPlayers 管「出题–执行–可执行判题」三角色调度——三者正交，勿混成一个 loss。</li>
+      <li><strong>GRPO 组大小与冻结节奏一起扫。</strong> 换 player 太勤，证据矩阵统计不稳；太慢，冻结侧过时。以 outer iteration 为单位记日志。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么静态 verifier 与 self-consistency 都会强化「共享误差」？</summary>
+      <p>静态 verifier 固定了判据，策略演化出新失败模式时仍按旧标准给奖励，偏差被固化。Self-consistency 让多样本在同一偏见上互相确认，表面一致但方差不足，错误信号被放大成「共识」。</p>
+    </details>
+    <details>
+      <summary>2. 可执行 verifier 相对自然语言裁判的关键增益是什么？</summary>
+      <p>同一段检查逻辑可在原轨迹与对抗扰动轨迹上复现执行，得到可比的 verdict matrix；口头裁判难以保证跨轨迹、跨扰动的同一判据与可审计性。</p>
+    </details>
+    <details>
+      <summary>3. 「一次只训一个 player、冻结另两个」如何打断循环依赖？</summary>
+      <p>任务分布、解题策略、判据若同时漂，梯度互相追逐且归因不清。冻结两侧后，当前 player 面对相对固定的任务/执行/判题接口，奖励语义更稳定，外环再轮转角色。</p>
+    </details>
+    <details>
+      <summary>4. 对抗扰动轨迹在 Evaluation 训练里主要贡献什么？</summary>
+      <p>迫使 verifier 区分「真对」与「看起来像对」；作者自报学到的 verifier 对抗检测 84.2%，并相对 self-consistency 拉高每题奖励方差（约 2.03×）。</p>
+    </details>
+    <details>
+      <summary>5. UnifiedPlayers 与 ARISE-RL / PRM 各管哪一层？</summary>
+      <p>ARISE-RL 侧重 rubric 共演化与门控蒸馏；PRM 给推理过程步打分；UnifiedPlayers 把 Planning/Execution/Evaluation 拆成可轮流 GRPO 的 player，并用 sandbox 可执行证据统一奖励。可叠用，但接口与冻结节奏要分开记。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.20089" target="_blank" rel="noopener">arXiv:2609.20089 · UnifiedPlayers</a></li>
+      <li>站内：
+        <a href="grpo-notes.html">GRPO 笔记</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO 日更</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-09-03-arise-rl.html">ARISE-RL</a> ·
+        <a href="daily-2026-08-13-prm.html">PRM</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
