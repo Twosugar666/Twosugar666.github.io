@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜CodeMidas：只用源码把已实现功能炼成 Coding Agent RL 环境 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜CodeMidas：只用源码把已实现功能炼成 Coding Agent RL 环境</h1>
+    <p class="post-meta">2026-09-22 · 收藏夹：Agent / RL · 一线追踪<br />
+      论文：Ye et al.（Xiaomi / PKU / HKU / RUC）· <em>CodeMidas: Scaling Agentic Coding RL Environments from Code Itself</em>
+      · <a href="https://arxiv.org/abs/2609.22068" target="_blank" rel="noopener">arXiv:2609.22068</a>（约 2026-09-21 提交）。
+      交叉：
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-14-t1.html">T1</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-21-unifiedplayers.html">UnifiedPlayers</a>、
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Coding Agent 的 RL 要同时满足两件事：任务够多样，奖励够可信。
+      现有合成管线多绑定 issue / PR / commit、仓库已有测试或文档——覆盖被「开发记录」卡住，大量只写了实现、没留下 issue 的功能进不了训练池。
+    </p>
+    <p>
+      CodeMidas 的主张更狠：<strong>任务侧唯一要用的输入是源码本身</strong>。
+      已实现功能既是行为规格的来源，也是参考解；公开接口与可观测行为定义「该做什么」，在原代码上跑出来的结果给测试期望；仓库再改编成「缺这块实现」的起点。
+      整条管线把 agentic compute 铺到任务设计、测试构造、一致性检查与 rollout 过滤上，而不是只靠人类写 issue。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：只用源码 → 行为规格 + 执行 grounding 测试 + fail/pass 一致性 + 三道 post-rollout 过滤 → 5545 个可执行 RL 任务；MiMo-V2.5 + GRPO 后五个外部榜全涨（作者自报）。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 输入边界：不要 issue / PR / commit / 既有测试 / 文档</h3>
+    <table>
+      <thead><tr><th>对比维度</th><th>典型 SWE 管线</th><th>CodeMidas</th></tr></thead>
+      <tbody>
+        <tr><td>任务种子</td><td>issue / PR / commit / 既有单测 / 文档</td><td><strong>仅源码</strong>（作者口径）</td></tr>
+        <tr><td>规格从哪来</td><td>人类描述或 commit 改写</td><td>agent 探公开入口与可观测行为</td></tr>
+        <tr><td>测试期望</td><td>仓库原测或合成故障</td><td>在<strong>原实现</strong>上执行，再审断言是否越权</td></tr>
+        <tr><td>语言覆盖</td><td>常 1–20 语</td><td>作者自报 <strong>23</strong> 语、<strong>15</strong> 域</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE</a>「bash-only 友好 harness」对照：CodeMidas 解的是<strong>任务供给</strong>，不是动作空间；与 <a href="daily-2026-09-21-unifiedplayers.html">UnifiedPlayers</a> 的「可执行 verifier」同向——奖励仍落在 sandbox 执行，而不是口头判题。
+    </p>
+
+    <h3>② 四段流水线</h3>
+    <pre><code># CodeMidas 管线（示意）
+source_code
+  → task_design + codebase_adaptation   # 删核心实现、改起点、写行为规格
+  → execution_grounded_tests            # 在参考副本上跑入口，固化断言
+  → env_prep + fail/pass consistency    # 2× 起点必败 + 4× 参考必过
+  → post_rollout_filter                 # leakage / verifier agreement / mixed outcomes
+  → RL pool (statement + container + hidden verifier)
+</code></pre>
+    <table>
+      <thead><tr><th>阶段</th><th>做什么</th><th>守门条件（作者口径）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Task design</strong></td>
+          <td>找公开入口与可观测结果；删核心实现；改周边成连贯起点；规格只管输入/行为/公开接口</td>
+          <td>优先跨文件推理；CLI / 纯函数 / 有状态 API 均可</td>
+        </tr>
+        <tr>
+          <td><strong>Execution-grounded tests</strong></td>
+          <td>把规格映射成用例；在参考代码上记录期望；审查并去掉「规格未写死」的过严断言</td>
+          <td>断言依赖私有符号且无行为替代 → 拒题</td>
+        </tr>
+        <tr>
+          <td><strong>Env + consistency</strong></td>
+          <td>装依赖、清泄漏工件、去掉目标相关原测</td>
+          <td>6 个干净容器：<strong>2 起点 fail + 4 参考 pass</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Post-rollout filter</strong></td>
+          <td>对抗 rollout 挖泄漏；审 agent 解与测试裁决一致；筛难度</td>
+          <td>泄漏可走捷径 / 假阳假阴 / 全过或全挂 → 拒</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Verifier 在求解全程对 agent 隐藏，只在打分时注入——二元执行奖励直接进 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>，不另训 RM。这与 <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a>「能 rule-based 就 rule-based」同一条工程原则。
+    </p>
+
+    <h3>③ 数据集与训练设定（作者自报）</h3>
+    <table>
+      <thead><tr><th>项</th><th>作者自报</th></tr></thead>
+      <tbody>
+        <tr><td>训练任务</td><td><strong>5,545</strong> 题，来自 <strong>3,185</strong> 仓库</td></tr>
+        <tr><td>覆盖</td><td><strong>23</strong> 语言、<strong>15</strong> 技术域；Python / TS / Go 等居前</td></tr>
+        <tr><td>参考 patch</td><td>中位 <strong>142 LOC</strong>；<strong>65.9%</strong> 触及 ≥2 文件</td></tr>
+        <tr><td>算法</td><td>MiMo-V2.5 + <strong>GRPO</strong>；二元执行奖励；batch <strong>32</strong>；每题 <strong>32</strong> rollouts</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ 外部榜与规模 / 质量消融（作者自报）</h3>
+    <table>
+      <thead><tr><th>Benchmark</th><th>初始 → RL 后</th><th>Δ</th></tr></thead>
+      <tbody>
+        <tr><td>DeepSWE</td><td>10.0% → 21.7%</td><td><strong>+11.7</strong> pp</td></tr>
+        <tr><td>ProgramBench Almost Solved</td><td>4.5 → 21.5</td><td><strong>+17</strong></td></tr>
+        <tr><td>Terminal-Bench v2.1</td><td>63.7% → 72.2%</td><td><strong>+8.5</strong> pp</td></tr>
+        <tr><td>另两项外部榜</td><td>（SWE-bench Pro / RepoZero C2Rust 等）</td><td>作者称<strong>五项全涨</strong></td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>消融</th><th>作者自报读法</th></tr></thead>
+      <tbody>
+        <tr><td>1k → 3k → 5.5k</td><td>高质量池放大，DeepSWE / Val 等逐步抬升</td></tr>
+        <tr><td>高质量 3k vs 未过滤 vanilla 8k</td><td><strong>3k 全面打赢 8k</strong>——过滤比「堆量」更划算</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 行为变化：探索 / 起草 / 自验证</h3>
+    <table>
+      <thead><tr><th>行为</th><th>Early → Late（作者自报）</th></tr></thead>
+      <tbody>
+        <tr><td>编辑前 read/search</td><td>27.2 → <strong>40.1</strong></td></tr>
+        <tr><td>Drafting ratio（写进补丁前已出现在推理里的片段占比）</td><td>0.36 → <strong>0.63</strong></td></tr>
+        <tr><td>收尾后多样自验证命令</td><td>2.03 → 2.53</td></tr>
+        <tr><td>Agent 自写检查 vs 无</td><td>同任务同 checkpoint：pass <strong>+4.2</strong> pp（95% CI 1.8–6.6）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      这些行为在外部榜上也同向出现（如 SWE-bench Pro 探索 23.1→35.5），说明信号不只是「背 CodeMidas 题型」。
+      对接 <a href="daily-2026-09-14-t1.html">T1</a> 长程终端 RL：Terminal-Bench 上的 +8.5pp 说明「从仓库功能炼题」也能迁移到 shell 工作流，而不必只训 issue repair。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>缺 issue 别等：</strong> 只要仓库有可执行入口，就能按「删实现 → 规格 → 参考执行测」开池；issue 覆盖不是硬前置。</li>
+      <li><strong>一致性检查别省：</strong> 2 fail + 4 pass 是廉价噪声筛；跳过之后再堆 8k 未过滤题，作者报不如干净 3k。</li>
+      <li><strong>Post-rollout 三刀一起开：</strong> 泄漏、裁决不一致、全过/全挂分别对应作弊捷径、坏 oracle、无相对信号——任一漏掉都会污染 GRPO 组内 advantage。</li>
+      <li><strong>奖励保持二元执行。</strong> 与 UnifiedPlayers / Granite 同向：能 sandbox 就别上口头 judge；假阳假阴用「解审」过滤，而不是再训 RM 掩盖。</li>
+      <li><strong>盯行为日志，不只盯榜。</strong> 预编辑探索次数与 drafting ratio 是训练是否在学「先读后写」的早期探针；自写检查与通过率的相关（作者 +4.2pp）可做成 online 诊断。</li>
+      <li><strong>Harness 仍要独立选。</strong> 任务池再大，动作空间与窗管仍按 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE</a> / Design Study 那套消融；CodeMidas 不替你选 bash-only 还是工具集。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「只用源码」比「从 issue/commit 抽题」更能扩语言与域？</summary>
+      <p>Issue/PR/测试/文档的覆盖远小于已实现功能；多数仓库有代码无 issue。从源码抽行为规格，任务池跟代码语种与域走，而不是跟人类记录走——作者自报 23 语 / 15 域正是这条供给链的结果。</p>
+    </details>
+    <details>
+      <summary>2. 2× 起点失败 + 4× 参考通过在筛什么？</summary>
+      <p>筛「起点已能过测」（无学习空间）、「参考仍不过」（测坏了）以及间歇性 flaky。重复容器运行压低环境噪声，保证 fail→pass 转移可复现，否则二元奖励方差会吃掉 GRPO 信号。</p>
+    </details>
+    <details>
+      <summary>3. 为什么高质量 3k 能打赢未过滤 8k？</summary>
+      <p>未过滤池含泄漏捷径、坏 verifier、全过/全挂题：要么 reward hacking，要么组内无相对 advantage。过滤提高每条轨迹的信息密度；在同等 GRPO 配置下，噪声样本会稀释有效更新。</p>
+    </details>
+    <details>
+      <summary>4. Drafting ratio 升高说明什么训练动力学？</summary>
+      <p>写进 Edit/Write 的片段更多先出现在推理里——策略从「边想边糊补丁」转向「先草稿再落地」。与更高探索一起，构成「先读仓库、再规划、再改」的行为链，而不只是最终 pass 数字。</p>
+    </details>
+    <details>
+      <summary>5. CodeMidas 与 UnifiedPlayers / T1 各解决 RL 栈的哪一层？</summary>
+      <p>CodeMidas：从源码规模化<strong>可执行任务与 verifier</strong>。UnifiedPlayers：Planning/Execution/Evaluation 三角色调度与可执行证据。T1：超长真实 Shell 交互下的终端 RL。三者可叠——任务池、角色协调、长程 harness 正交。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.22068" target="_blank" rel="noopener">arXiv:2609.22068 · CodeMidas</a></li>
+      <li>站内：
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-14-t1.html">T1</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-21-unifiedplayers.html">UnifiedPlayers</a> ·
+        <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

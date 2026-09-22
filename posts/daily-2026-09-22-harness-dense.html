@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜DENSE：把无结局标签的轨迹蒸馏成证据接地的嵌套 Shortcut 树 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜DENSE：把无结局标签的轨迹蒸馏成证据接地的嵌套 Shortcut 树</h1>
+    <p class="post-meta">2026-09-22 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Liu, Yu et al.（Fudan / Meituan Longcat）· <em>DENSE: Distilling Agent Trajectories into Evidence-Grounded Shortcut Trees for Self-Refinement</em>
+      · <a href="https://arxiv.org/abs/2609.21423" target="_blank" rel="noopener">arXiv:2609.21423</a>。
+      交叉：
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a>、
+      <a href="daily-2026-09-18-rir.html">RIR</a>、
+      <a href="daily-2026-09-21-harness-design-study.html">Harness Design Study</a>、
+      <a href="daily-2026-09-14-t1.html">T1</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      线上 Agent 不断吐出长轨迹：试错、局部修好、还有没收口的交付物。
+      离线评测可以挂隐藏 verifier 或人工标签；线上同规模监督成本扛不住。
+      问题变成：<strong>没有 post-hoc 结局标签时，轨迹里还剩什么可复用？</strong>
+    </p>
+    <p>
+      DENSE 的设定叫 <strong>post-hoc outcome blindness</strong>：反馈只能来自任务描述 + 已完成执行轨迹；
+      禁止 post-hoc reward、隐藏 verifier、参考答案、人类对错标签。
+      轨迹里执行期看见的公开测试输出仍可用——那是过程观察，不是事后判决。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：嵌套子任务树 → 压缩成 shortcut（死路 + 可行路径 + 证据）→ 跨层用恢复证据和解问题 → 完成枝摘要 / 未完成枝展开；REFIT 下四模型 strict pass 相对 run0 +7.12–15.64 pp，token −19–43.6%（作者自报）。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① REFIT：公平比「反馈有没有用」</h3>
+    <pre><code># REFIT（示意）
+run0 = A(task, feedback=None, env=e0)          # 共享源轨迹
+f_g  = g(task, tau0)                          # 各方法只看 task+tau0（outcome-blind）
+run1 = A(task, feedback=f_g, env=reset(e0))   # 环境 + 模型上下文全重置
+# 反馈是 run0→run1 的唯一信息通道
+U(g) = E[ strict_pass(run1) − strict_pass(run0) ]
+</code></pre>
+    <table>
+      <thead><tr><th>约束</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>共享 run0</td><td>各反馈方法吃同一源轨迹，避免「源质量」混淆</td></tr>
+        <tr><td>重置 env + context</td><td>历史文件/进程不在；不能「报告旧 CSV 当新交付」</td></tr>
+        <tr><td>Outcome blindness</td><td>生成反馈时看不到事后 reward / 隐藏测</td></tr>
+        <tr><td>VF 单独标 privileged</td><td>带事后 verifier 的上界参考，不与非特权方法混排冠军</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> 对照：Ralph 是拦退出、清窗重注目标的<strong>外环续跑</strong>；REFIT 测的是「从旧轨迹抽出的反馈」在<strong>全新尝试</strong>上的效用。
+      与 <a href="daily-2026-09-18-rir.html">RIR</a> 对照：RIR 回滚环境状态并保留反思记忆；DENSE 不回滚源轨迹，而是蒸馏后交给重置后的 run1。
+    </p>
+
+    <h3>② DENSE 两阶段</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>操作</th><th>产出</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>嵌套子任务树</strong></td>
+          <td>按时间队列找语义边界；叶子=(动作,观察)；自底向上挂父节点并做局部诊断</td>
+          <td>带目标作用域的层次结构</td>
+        </tr>
+        <tr>
+          <td><strong>Shortcut + 和解 + 渲染</strong></td>
+          <td>同父下连续尝试压成 shortcut；跨层用恢复证据关问题；完成枝短摘要、未完成枝展开证据</td>
+          <td>有界反馈：可复用路径 ↔ 剩余义务</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># Shortcut 保留什么（示意）
+shortcut = {
+  dead_ends:   [...],   # 已证实走不通的路
+  working_path:[...],   # 观察支持的可行做法
+  evidence:    [...],   # 源动作/观察引用
+  open_issues: [...]    # 未满足要求（未完成枝）
+}
+
+# 跨层和解：子问题被后继子任务修好 → 父层关掉；根仍保留未交付物
+# 例：summary.json 已写回校验 → 关「缺 JSON」；chart.png 仍缺 → 根保留
+</code></pre>
+    <p>
+      关键纪律：<strong>局部恢复 ≠ 父任务完成</strong>；<strong>历史上成功 ≠ 重置后当前已交付</strong>。
+      反馈必须显式绑定「证据支持了什么」和「下一轮还要做什么」。
+    </p>
+
+    <h3>③ Terminal-Bench 2.1 主结果（作者自报）</h3>
+    <p>Recipients：MiniMax-M2.7 / DeepSeek V4 Pro / GPT-5.5 / Kimi K2.6。Strict pass（非特权最佳均为 DENSE）：</p>
+    <table>
+      <thead><tr><th>Recipient</th><th>DENSE strict %</th><th>Δ vs run0</th><th>Token Δ</th></tr></thead>
+      <tbody>
+        <tr><td>MiniMax-M2.7</td><td>52.43</td><td><strong>+7.87</strong> pp</td><td><strong>−19.0%</strong></td></tr>
+        <tr><td>DeepSeek V4 Pro</td><td>67.08</td><td><strong>+15.64</strong> pp</td><td><strong>−20.0%</strong></td></tr>
+        <tr><td>GPT-5.5</td><td>75.66</td><td><strong>+7.12</strong> pp</td><td><strong>−43.6%</strong></td></tr>
+        <tr><td>Kimi K2.6</td><td>50.94</td><td><strong>+11.61</strong> pp</td><td><strong>−23.7%</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      对照：All-at-once / Step-by-step / Traj-only / Advisor 等多数低于 DENSE；
+      MiniMax 上 DENSE 甚至高于 privileged Verifier Feedback（52.43 vs 44.94）——组织好的证据可以胜过「裸轨迹 + 事后通过报告」。
+    </p>
+
+    <h3>④ GPT-5.5 消融（作者自报）</h3>
+    <table>
+      <thead><tr><th>设定</th><th>Strict %</th><th>Tokens (K)</th></tr></thead>
+      <tbody>
+        <tr><td>run0</td><td>68.54</td><td>319.1</td></tr>
+        <tr><td>w/o S&amp;R（无 shortcut+和解）</td><td>72.28</td><td>228.6</td></tr>
+        <tr><td>w/o hierarchy（单根摘要）</td><td>72.66</td><td>199.2</td></tr>
+        <tr><td><strong>Full DENSE</strong></td><td><strong>75.66</strong></td><td><strong>179.9</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      层次与 S&amp;R 都贡献准度；完整管线同时最省 run1 token。
+      对接 <a href="daily-2026-09-07-harness-compaction.html">Compaction</a> / <a href="daily-2026-09-21-harness-design-study.html">Design Study T4</a>：DENSE 是<strong>跨次尝试的经验蒸馏</strong>，不是窗内 elision；但都强调「压冗余、留可执行证据」。
+    </p>
+
+    <h3>⑤ MiniMax 案例：别把历史 CSV 当成当前交付</h3>
+    <p>
+      Verifier Feedback 把「run0 已通过」的测试报告塞进反馈后，recipient 可能<strong>零工具调用</strong>直接声称 <code>/app/summary.csv</code> 已写好——重置环境里文件并不存在。
+      DENSE 把完成范围标成 trajectory-local，并保留构造脚本的 key-action；recipient 在新环境重跑分析脚本、读回 CSV，才真正过测。
+      工程含义：privileged 结局信号若缺少「必须重建」的作用域，会强化<strong>历史成功误用</strong>。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>线上轨迹先当证据库，再谈标签。</strong> 没 verifier 也能抽 dead-end / working-path / open-issue；REFIT 式 A/B 用重置后的 strict pass 量反馈效用。</li>
+      <li><strong>反馈模板强制写作用域。</strong> 「历史上完成」≠「当前环境已有文件」；开头就写 fresh-env 重建义务（论文 recipient wrapper 同向）。</li>
+      <li><strong>完成枝摘要、未完成枝展开。</strong> 全量回放轨迹费 token 且易淹没交付步骤；与 Compaction「先规则裁再摘要」同哲学。</li>
+      <li><strong>跨层和解要证据，不要口头关掉问题。</strong> 子任务修好 JSON 才能关父层「缺 JSON」；否则 open-issue 漂移。</li>
+      <li><strong>别只贴 reward=1。</strong> MiniMax 案例显示 privileged 报告可诱导零工具「假完成」；保留构造过程往往比贴结局更稳。</li>
+      <li><strong>与 Ralph / RIR 分工。</strong> 同会话续跑 → Ralph；环境回滚+反思 → RIR；跨次重置复用旧轨迹 → DENSE。日志里分开记通道。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. Post-hoc outcome blindness 允许哪些信息、禁止哪些？</summary>
+      <p>允许：任务说明、轨迹中的动作/观察（含执行期公开测试输出）。禁止：事后 reward、隐藏 verifier 诊断、参考答案/参考轨迹、人类对错标签。目的是逼反馈方法从轨迹证据本身提炼可迁移物。</p>
+    </details>
+    <details>
+      <summary>2. 为什么环境与上下文都要重置？</summary>
+      <p>若不重置，run1 可能直接读旧文件「续命」，测的是状态残留而非反馈信息量。重置后反馈是唯一转移通道，U(g) 才归因到蒸馏质量。</p>
+    </details>
+    <details>
+      <summary>3. Shortcut 里同时留 dead-end 与 working-path 的理由？</summary>
+      <p>Working-path 给可复用做法；dead-end 避免重复无效探索。只留成功摘要会丢「别再试 pandas/错误分隔符」这类负样本，run1 容易重踩同一坑。</p>
+    </details>
+    <details>
+      <summary>4. 消融里去掉 hierarchy 或 S&amp;R 后，准度与 token 如何变化？</summary>
+      <p>作者自报 GPT-5.5：full 75.66% / 179.9K；无 S&amp;R 72.28 / 228.6；无层次 72.66 / 199.2。两者都掉点，且完整管线最省 token——层次压缩与问题和解共同提高反馈信噪比。</p>
+    </details>
+    <details>
+      <summary>5. DENSE、Ralph、Compaction、RIR 各管哪类失败？</summary>
+      <p>Compaction：窗内防 overflow。Ralph：退出后清窗续跑。RIR：回滚环境+保留反思。DENSE：无结局标签下把旧轨迹炼成重置后仍可用的嵌套证据反馈。可叠加，指标分开。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.21423" target="_blank" rel="noopener">arXiv:2609.21423 · DENSE</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> ·
+        <a href="daily-2026-09-18-rir.html">RIR</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">Harness Design Study</a> ·
+        <a href="daily-2026-09-14-t1.html">T1</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

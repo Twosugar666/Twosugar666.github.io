@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜ORPO：用 Odds Ratio 把偏好罚项并进 SFT（无 reference model） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜ORPO：用 Odds Ratio 把偏好罚项并进 SFT（无 reference model）</h1>
+    <p class="post-meta">2026-09-22 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Hong, Lee, Thorne · <em>ORPO: Monolithic Preference Optimization without Reference Model</em>
+      （EMNLP 2024）· <a href="https://arxiv.org/abs/2403.07691" target="_blank" rel="noopener">arXiv:2403.07691</a>。
+      交叉：
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>、
+      <a href="daily-2026-09-21-algo-simpo.html">SimPO</a>、
+      <a href="daily-2026-09-15-algo-kto.html">KTO</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL 散度</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      常见对齐管线是两段：先对 chosen 做 SFT，再挂冻结的 <code>π_ref</code> 跑
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a> / RLHF。
+      SFT 单独训 chosen 时，rejected 风格的似然也会跟着抬——交叉熵只抬标签 token，不罚「不该说的话」。
+      于是需要第二阶段显式拉开胜负。
+    </p>
+    <p>
+      <strong>ORPO（Odds Ratio Preference Optimization）</strong> 把弱惩罚直接并进 SFT：
+      同一阶段、同一模型，对 chosen 做 NLL，同时用 odds ratio 压低 rejected——
+      <strong>monolithic、reference-free</strong>，省掉单独对齐阶段与参考模型前向。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：L_ORPO = L_SFT(x,y_w) + λ · (−log σ(log OR(y_w,y_l)))；用 odds 比概率比更温和地区分风格，单阶段完成域适应 + 偏好。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Odds 与 Odds Ratio</h3>
+    <pre><code># 序列平均 log 似然（作者记号；实现对 response token 求和/平均需一致）
+log P_θ(y|x) = (1/m) Σ_t log P_θ(y_t | x, y_&lt;t)
+
+# Odds：生成 y 相对「不生成 y」的倍率
+odd_θ(y|x) = P_θ(y|x) / (1 − P_θ(y|x))
+
+# Odds ratio：chosen 相对 rejected 有多「更像会被生成」
+OR_θ(y_w, y_l) = odd_θ(y_w|x) / odd_θ(y_l|x)
+</code></pre>
+    <p>
+      直觉：odd=k 表示「生成该回复」比「不生成」大约 k 倍可能；OR&gt;1 表示模型更偏向 y_w。
+      相对直接用概率比 P(y_w)/P(y_l)，odds 在并进 SFT 时对比度更温和，不易把 rejected token 压到退化（作者对比 PR vs OR）。
+    </p>
+
+    <h3>② ORPO 目标</h3>
+    <pre><code># 单阶段目标
+L_ORPO = E_{(x,y_w,y_l)} [ L_SFT(x, y_w) + λ · L_OR ]
+
+# SFT：对 chosen 的因果 LM NLL（最大化 P(y_w|x)）
+# Odds-ratio 罚项：
+L_OR = − log σ( log OR_θ(y_w, y_l) )
+     = − log σ( log odd(y_w|x) − log odd(y_l|x) )
+
+# λ：偏好罚项相对 SFT 的权重（作者在 Phi-2/Llama-2/Mistral 上用约 0.1–0.25）
+</code></pre>
+    <table>
+      <thead><tr><th>符号</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>L_SFT</code></td><td>域适应 / 指令跟随：抬高 chosen</td></tr>
+        <tr><td><code>L_OR</code></td><td>拉开 odd(y_w) 与 odd(y_l)；σ 包 log OR 便于最小化</td></tr>
+        <tr><td><code>λ</code></td><td>罚项强度；过大易过拟合 chosen 风格、伤硬答案类题</td></tr>
+        <tr><td><code>π_ref</code></td><td><strong>不出现</strong>——无参考模型前向</td></tr>
+      </tbody>
+    </table>
+    <p>
+      梯度直觉（作者）：当 OR 已够大时惩罚项权重变小；对低似然一侧的梯度被 1/(1−P) 放大——chosen 还不够像时加速适应，rejected 仍高时加速打压。
+    </p>
+
+    <h3>③ 与 DPO / SimPO / KTO</h3>
+    <table>
+      <thead><tr><th></th><th>DPO</th><th>SimPO</th><th>ORPO</th><th>KTO</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>阶段</td><td>常需 SFT 后再对齐</td><td>偏好阶段（通常在 SFT 后）</td><td><strong>单阶段 SFT+偏好</strong></td>
+          <td>偏好阶段（二元好/坏）</td>
+        </tr>
+        <tr>
+          <td>Reference</td><td>要 π_ref</td><td>不要</td><td>不要</td>
+          <td>常要 KL 项</td>
+        </tr>
+        <tr>
+          <td>数据</td><td>偏好对</td><td>偏好对</td><td>偏好对</td>
+          <td>二元标签</td>
+        </tr>
+        <tr>
+          <td>核心项</td><td>β log(π/π_ref) + BT</td><td>β·avg logprob + margin γ</td><td>NLL(y_w) + λ(−log σ(log OR))</td>
+          <td>前景理论效用</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      <a href="daily-2026-09-21-algo-simpo.html">SimPO</a> 也是 reference-free，但仍是「偏好优化目标」本身，通常接在 SFT 之后；
+      ORPO 显式保留 L_SFT，把偏好做成 SFT 的附加罚项。
+      <a href="daily-2026-09-15-algo-kto.html">KTO</a> 解决无配对；ORPO 仍要 (y_w, y_l)。
+      与 <a href="daily-2026-09-17-algo-kl.html">KL</a>：DPO 的 π_ref 来自 KL 约束最优解；ORPO 用 odds 罚项代替显式 KL 锚。
+      可验证任务仍优先 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> / PPO，不要硬替。
+    </p>
+
+    <h3>④ 实证口径（作者自报）</h3>
+    <table>
+      <thead><tr><th>设定</th><th>作者自报</th></tr></thead>
+      <tbody>
+        <tr><td>Mistral-ORPO-β (7B)</td><td>AlpacaEval 2.0 最高约 <strong>12.20%</strong>；MT-Bench 约 <strong>7.32</strong></td></tr>
+        <tr><td>Mistral-ORPO-α</td><td>AlpacaEval 2.0 约 11.33%；MT-Bench 约 7.23</td></tr>
+        <tr><td>数据</td><td>UltraFeedback（及 cleaned 变体）单独微调即可竞争更大 chat 模型</td></tr>
+        <tr><td>骨干</td><td>Phi-2 / Llama-2 / Mistral 等；相对 SFT→DPO 管线更省阶段与显存</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：榜分数均为作者自报与同期公开对照；复现时固定解码与评测裁判版本。
+      工程收益除分数外，还包括：训练时少挂一份参考模型、少一轮独立对齐。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>想要一阶段 SFT+对齐、且显存紧 → 优先试 ORPO。</strong> 省 π_ref 前向；仍需成对偏好。</li>
+      <li><strong>λ 从小扫。</strong> 作者常用约 0.1–0.25；λ 过大易过度贴 chosen、伤 math/抽取等硬答案（作者 MT-Bench 消融同向）。</li>
+      <li><strong>P(y|x) 实现要统一。</strong> 公式用序列级概率（常取长度归一的似然）；与 token NLL 混用会导致 OR 尺度乱跳。</li>
+      <li><strong>仍要高质量偏好对。</strong> Monolithic 不降低标签噪声敏感度；y_w≈y_l 时 OR 信号弱，需过滤。</li>
+      <li><strong>与 SimPO/DPO 对照时写清阶段。</strong> 比的是「SFT+DPO 两段」还是「ORPO 一段」；算力与数据预算要对齐。</li>
+      <li><strong>有执行奖励别硬换 ORPO。</strong> 代码/数学可验证场景用 GRPO；ORPO 主场是偏好风格对齐。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么纯 SFT chosen 还会抬高 rejected 风格？</summary>
+      <p>交叉熵只对标签 token 施压；非标签 token（含 rejected 风格里的词）没有直接负梯度。域适应时对话/指令分布整体抬升，rejected 回复的似然常同步上升，偏好未被编码。</p>
+    </details>
+    <details>
+      <summary>2. Odds ratio 相对概率比 P_w/P_l 在「并进 SFT」时有何好处？</summary>
+      <p>作者认为 OR 对比度更温和：用 PR+log-sigmoid 时，为压低 loss 往往更极端地打压 rejected，在模型尚未适应域时易过度抑制、甚至退化。OR 在拉开偏好的同时更利于保留 SFT 域适应。</p>
+    </details>
+    <details>
+      <summary>3. ORPO 为何不需要 reference model？</summary>
+      <p>偏好信号来自同一 π_θ 上 y_w 与 y_l 的 odds 对比，再叠加对 y_w 的 NLL；不依赖「相对 SFT 参考策略的 KL 最优重参数」。代价是失去显式 KL 锚，需靠 λ、数据与早停托底。</p>
+    </details>
+    <details>
+      <summary>4. ORPO 与 SimPO 同是 reference-free，选用差异在哪？</summary>
+      <p>SimPO：偏好阶段用长度归一平均 logprob + margin，通常接在 SFT 后。ORPO：把偏好罚项写进 SFT 目标，强调单阶段。显存都省 ref；是否已有稳定 SFT checkpoint、以及想不想合并阶段，决定选型。</p>
+    </details>
+    <details>
+      <summary>5. λ 过大可能出现什么现象？</summary>
+      <p>过度拉大 chosen/rejected 间隔，模型贴训练集 chosen 文风；开放生成或被偏好裁判喜欢，但 math/reasoning/extraction 等硬答案项变差（作者 λ 消融）。应按能力榜与对齐榜联合选 λ。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2403.07691" target="_blank" rel="noopener">arXiv:2403.07691 · ORPO (EMNLP 2024)</a></li>
+      <li>代码 / 权重（作者发布）：<a href="https://github.com/xfactlab/orpo" target="_blank" rel="noopener">github.com/xfactlab/orpo</a></li>
+      <li>站内：
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="daily-2026-09-21-algo-simpo.html">SimPO</a> ·
+        <a href="daily-2026-09-15-algo-kto.html">KTO</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

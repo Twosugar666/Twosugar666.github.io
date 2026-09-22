@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 1,
+  "next": 2,
   "daily_streams": [
     "frontline",
     "harness",
@@ -459,6 +459,27 @@
       "source": "algo",
       "topic": "SimPO：r=(β/|y|)logπ；无 π_ref；BT+margin γ；β∈[2,2.5] γ∈[0.5,1.5]；vs DPO +6.4 LC / +7.5 AH；Gemma-2-9B-it 72.4%/59.1%（arXiv:2405.14734）",
       "file": "posts/daily-2026-09-21-algo-simpo.html"
+    },
+    {
+      "date": "2026-09-22",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "CodeMidas：仅源码炼 Coding Agent RL 环境；5545 任务/3185 仓/23 语；MiMo-V2.5+GRPO；DeepSWE +11.7 / ProgramBench +17 / TB2.1 +8.5；高质量 3k>vanilla 8k（arXiv:2609.22068）",
+      "file": "posts/daily-2026-09-22-codemidas.html"
+    },
+    {
+      "date": "2026-09-22",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "DENSE：无结局标签轨迹→证据接地嵌套 Shortcut 树；REFIT；TB2.1 四模型 +7.12–15.64 pp、token −19–43.6%（arXiv:2609.21423）",
+      "file": "posts/daily-2026-09-22-harness-dense.html"
+    },
+    {
+      "date": "2026-09-22",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "ORPO：L_SFT+λ(−logσ(log OR))；monolithic、无 π_ref；Mistral-ORPO-β AlpacaEval2 ~12.20% / MT-Bench ~7.32（arXiv:2403.07691）",
+      "file": "posts/daily-2026-09-22-algo-orpo.html"
     }
   ]
 }
