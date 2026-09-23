@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜ROLLART：异构解耦的多任务 Agentic RL 训练系统 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜ROLLART：异构解耦的多任务 Agentic RL 训练系统</h1>
+    <p class="post-meta">2026-09-23 · 收藏夹：Infra / RL / Agent · 一线追踪<br />
+      论文：Gao / Zhao / Wu / Xiong / Wang 等（HKUST / Alibaba / Tongyi Lab）· <em>ROLLART: Disaggregated Multi-Task Agentic RL Training at Scale</em>
+      · <a href="https://www.cse.ust.hk/~weiwa/papers/rollart-osdi26.pdf" target="_blank" rel="noopener">OSDI&#39;26 PDF</a>（港科大 Wei Wang 组公开稿）。
+      交叉：
+      <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a>、
+      <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 异步 GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agentic RL 的一步训练同时混着四类负载：compute-bound 的 prefill、bandwidth-bound 的 decode、
+      CPU 重的多轮环境交互，以及突发、无状态的 reward 打分。
+      现有系统要么把整条流水线塞进同一 GPU 集群（veRL / slime / rLLM），要么只做粗粒度拆分——
+      训练与 rollout 分开，却仍把 prefill/decode 当成一整块「生成」，环境长尾与 reward 低利用率照旧拖后腿。
+    </p>
+    <p>
+      ROLLART 的主张是：<strong>按硬件亲和性把阶段（乃至生成子阶段）绑到最合适的池子上</strong>，
+      再用轨迹级解耦与有界陈旧异步，把跨集群同步气泡压下去。
+      作者在 H800+H20 解耦集群上训 Qwen3（8B–32B），并在阿里超过 3000 GPU 的集群上，
+      为 Qoder 产品训数百 B 级 MoE，连续一周稳定跑（作者自报）。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：prefill→算力卡、decode→带宽卡、env→CPU、reward→serverless；
+      轨迹级异步 rollout + staleness-bounded 权重同步 → 相对各类 RL 系统训练时间缩短 <strong>1.31–2.05×</strong>（作者自报）。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 四条系统需求（R1–R4）</h3>
+    <table>
+      <thead><tr><th>需求</th><th>观察（作者 profiling）</th><th>ROLLART 对策</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>R1 硬件亲和映射</strong></td>
+          <td>同成本下：FrozenLake（prefill 重）上 H800 把 rollout 压到 H20 的 <strong>0.53×</strong>；
+            GEM-Math（decode 重）上 H20 把 rollout 压到 H800 的 <strong>0.49–0.79×</strong></td>
+          <td><code>hw_mapping</code>：按任务域把生成路由到 H800 / H20</td>
+        </tr>
+        <tr>
+          <td><strong>R2 轨迹级异步 rollout</strong></td>
+          <td>env.reset / env.step 长尾；批同步交互可让 rollout 多 <strong>21.3%</strong>；失败时 env.reset 可占 <strong>78%</strong></td>
+          <td>每条轨迹独立 EnvManager + LLMProxy；慢环境不挡快环境</td>
+        </tr>
+        <tr>
+          <td><strong>R3 Serverless reward</strong></td>
+          <td>专卡跑 reward LLM 平均利用率仅 <strong>7.4%</strong></td>
+          <td><code>register_serverless</code>：无状态打分卸到 Function Compute</td>
+        </tr>
+        <tr>
+          <td><strong>R4 有界陈旧异步训练</strong></td>
+          <td>跨集群权重同步（TCP/RDMA）可达数十秒；同步范式制造依赖气泡</td>
+          <td>训练与 rollout 并行；每轨迹 staleness 界 <strong>α</strong>（默认 <strong>1</strong>）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-08-31-miles-v01.html">Miles</a>（SGLang+Megatron 全异步栈）、
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 异步 GRPO</a> 对照：ROLLART 把「异步」拆到
+      <strong>生成子阶段 × 环境 × reward × 训练</strong> 四条轴，而不只是 train/rollout 两阶段重叠。
+    </p>
+
+    <h3>② 资源 / 数据 / 控制三平面</h3>
+    <pre><code># ROLLART 运行时分层（示意）
+Resource plane: ResourceManager 绑定 H800 / H20 / CPU / FaaS
+Data plane:     Cluster(ActorTrain | ActorGen | Env | Reward) + Worker 装饰器
+Control plane:  RolloutScheduler + LLMProxy + SampleBuffer
+                  └─ EnvManager_i 独立驱动轨迹 i
+                  └─ Reward 完成后进 SampleBuffer → get_batch → train_step
+</code></pre>
+    <table>
+      <thead><tr><th>装饰器 / 组件</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>@register(mode=&quot;execute_all&quot;)</code></td><td>单控制器广播：如各训练 Worker 算梯度</td></tr>
+        <tr><td><code>@hw_mapping(hw_affinity=...)</code></td><td>按 <code>tag_name</code>（任务域）路由到 H800 或 H20</td></tr>
+        <tr><td><code>@register_serverless</code></td><td>reward 方法改走 HTTP/FaaS，不占热备 GPU</td></tr>
+        <tr><td>LLMProxy</td><td>轨迹级 ADD/ABORT；步间插命令，不堵引擎</td></tr>
+        <tr><td>SampleBuffer + α</td><td>只保留版本 ≥ n−α 的轨迹；超窗 abort，缓冲 O(α·E)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ 异步权重同步六步协议</h3>
+    <pre><code># 每 iteration（示意）
+① get_batch   # 阻塞直到 SampleBuffer 凑满 batch
+② suspend     # LLMProxy 拒新请求，保留 in-flight
+③ update      # 训练侧权重 → Mooncake store → 推理侧拉取
+④ resume
+⑤ recomp+rollout  # 对 in-flight 做 KV recompute，继续生成
+⑥ train_step      # 与⑤并行：在①取到的 batch 上更新
+</code></pre>
+    <p>
+      与 <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a> 的 in-place PD 复用同属「生成侧拆分」家族；
+      ROLLART 额外支持可选 PD 解耦（prefill 节点 H800、decode 节点 H20），
+      MoE 上 2P2D 相对同置最高约 <strong>1.21×</strong> rollout 加速（作者自报）。
+      多轮 token 记账仍应对照站内 <a href="daily-2026-08-31-harness-tito.html">TITO</a>——解耦系统若不保留真实 token 序列，RL 信用会漂。
+    </p>
+
+    <h3>④ 端到端数字（作者自报）</h3>
+    <table>
+      <thead><tr><th>对比 / 消融</th><th>作者自报</th></tr></thead>
+      <tbody>
+        <tr><td>步时 vs Sync+ / One-off / AReaL</td><td>缩短 <strong>2.05× / 1.35× / 1.31×</strong>（Qwen3-32B，α=1）</td></tr>
+        <tr><td>吞吐 vs Sync</td><td><strong>2.65–4.58×</strong></td></tr>
+        <tr><td>亲和路由 vs H800-only / H20-only</td><td>步时 <strong>1.12–1.37× / 1.30–1.68×</strong></td></tr>
+        <tr><td>轨迹级 vs 批环境（σ↑）</td><td><strong>1.23→2.27×</strong></td></tr>
+        <tr><td>Serverless reward</td><td>GPU 利用率 <strong>6%→88%</strong>；rollout <strong>158s→77s</strong></td></tr>
+        <tr><td>生产部署</td><td><strong>&gt;3000</strong> GPU；数百 B MoE；一周连续；优化后 env.reset 成功率 <strong>&gt;99.99%</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      注意：评测里 ROLLART 混用 H800+H20，作者称相对「纯 128×H800 基线」约 <strong>83%</strong> 的每 GPU·小时成本——
+      读加速比时要把异构成本差算进账本。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先标任务域，再绑硬件。</strong> 生产里 turn 分布双峰（&lt;5 vs &gt;10）；域级 <code>hw_mapping</code> 够用，不必一上来做 per-request 负载均衡。</li>
+      <li><strong>α=1 作默认。</strong> α=2 早期收敛快，但 late-stage time-to-score 可能回退；陈旧界要按轨迹逐步卡，而不只在轨迹起点卡（相对 AReaL）。</li>
+      <li><strong>Reward 别占专卡。</strong> 规则/代码奖励与固定 judge LLM 都适合 serverless；把省下的 GPU 全还给 rollout。</li>
+      <li><strong>环境长尾用冗余组。</strong> GRPO group 结构下多开 EnvManager，凑满目标轨迹后 abort 慢尾——作者报最高约 <strong>1.62×</strong> rollout 加速。</li>
+      <li><strong>跨集群权重走异步拉取。</strong> Mooncake bucket 化推送 + 推理侧 on-demand pull，可把 exposed pull 压到 32B 上约 <strong>9.6s</strong>（相对 naive 157s，作者自报）。</li>
+      <li><strong>与 Miles / Granite 栈对齐接口。</strong> 解耦编排是系统层；算法侧仍可挂 GRPO + TITO 式 token 记账——别把「异步系统」当成「可以丢 token 对齐」。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「生成一律上廉价带宽卡」对 Agentic RL 不够？</summary>
+      <p>多轮、上下文不断变长的任务（SWE / FrozenLake）是 prefill 重；少轮但长 CoT 的任务（GEM-Math）才是 decode 重。静态绑定会让一类任务吃亏；ROLLART 用域级亲和路由同时吃两种加速。</p>
+    </details>
+    <details>
+      <summary>2. 轨迹级解耦相对「批环境交互」具体消除了什么气泡？</summary>
+      <p>批同步迫使快环境等最慢 env.step/reset 再进下一轮生成。轨迹级 EnvManager 各走各的时间线，生成完成即进环境，完成即打分——长尾与失败不再放大整批等待。</p>
+    </details>
+    <details>
+      <summary>3. Serverless reward 为什么能把利用率从个位数拉到近九成？</summary>
+      <p>Reward 突发、无状态、参数固定；专卡大部分时间空转。FaaS 按调用扩缩、零热备，原专卡 GPU 转给 rollout，作者报利用率 6%→88%、rollout 时间近乎减半。</p>
+    </details>
+    <details>
+      <summary>4. α 有界陈旧与「完全 one-off（上一整步权重）」差在哪？</summary>
+      <p>One-off 要求本步所有轨迹都在旧权重下跑完；ROLLART α=1 可在下一步 suspend→update→resume，并对 in-flight 做 KV recompute，及时 abort 超窗轨迹，减少「长尾跨多版本」污染梯度。</p>
+    </details>
+    <details>
+      <summary>5. ROLLART 与 Miles / AInfer-PD / TITO / Granite 各卡在哪一层？</summary>
+      <p>ROLLART：异构解耦编排与轨迹级控制面。Miles：生产级 SGLang+Megatron 异步全栈。AInfer-PD：分布式 MoE rollout 的通信安全 PD 复用。TITO：多轮 harness 的 token 进出对齐。Granite：真实环境异步 GRPO 算法配方。系统 × 通信 × 记账 × 算法可叠。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://www.cse.ust.hk/~weiwa/papers/rollart-osdi26.pdf" target="_blank" rel="noopener">ROLLART PDF（OSDI&#39;26 相关公开稿）</a></li>
+      <li>站内：
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a> ·
+        <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

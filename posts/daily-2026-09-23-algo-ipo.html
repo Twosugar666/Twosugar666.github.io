@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜IPO：用身份映射优化偏好概率，躲开 DPO 的过尖策略 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜IPO：用身份映射优化偏好概率，躲开 DPO 的过尖策略</h1>
+    <p class="post-meta">2026-09-23 · 收藏夹：算法 / RL · 学习笔记<br />
+      论文：Azar / Rowland / Piot / Guo / Calandriello / Valko / Munos（Google DeepMind）·
+      <em>A General Theoretical Paradigm to Understand Learning from Human Preferences</em>
+      · <a href="https://arxiv.org/abs/2310.12036" target="_blank" rel="noopener">arXiv:2310.12036</a>。
+      交叉：
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>、
+      <a href="daily-2026-09-21-algo-simpo.html">SimPO</a>、
+      <a href="daily-2026-09-22-algo-orpo.html">ORPO</a>、
+      <a href="daily-2026-09-15-algo-kto.html">KTO</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      RLHF 常见两道近似：把成对偏好换成点式奖励（Bradley-Terry / Elo），再假设奖励模型能泛化到策略采样的 OOD。
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a> 跳过第二道——直接从偏好数据学策略——但仍依赖第一道：用 BT 把 p*(y ≻ y′) 写成 σ(r(y)−r(y′))。
+    </p>
+    <p>
+      当偏好接近确定性（经验上 ˆp=1 很常见）时，BT 要求奖励差 → ∞，最优策略会把败方概率压到 0，
+      <strong>无论 KL 温度 τ 取多大</strong>——正则名存实亡，过拟合偏好集。
+      IPO（Identity Preference Optimisation）把 ΨPO 里的非线性映射 Ψ 取成恒等，
+      直接优化偏好概率本身，让 τ 重新管得住与 π_ref 的距离。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：ΨPO 用任意非降 Ψ 统一 RLHF/DPO；Ψ=Id → IPO，
+      回归 log 似然比差距到 τ⁻¹/2，避免「无限强偏好 → 策略过尖」。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① ΨPO：统一偏好目标</h3>
+    <pre><code># Ψ-preference optimisation（示意）
+max_π  E_{x~ρ, y~π, y&#39;~μ} [ Ψ(p*(y ≻ y′ | x)) ]  −  τ · D_KL(π || π_ref)
+</code></pre>
+    <table>
+      <thead><tr><th>选取</th><th>对应方法</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Ψ(q)=log(q/(1−q)) 且 BT 成立</td>
+          <td>RLHF / DPO 最优策略重合</td>
+          <td>logit 偏好 = Elo；确定性偏好使正则失效</td>
+        </tr>
+        <tr>
+          <td>Ψ(q)=q（恒等）</td>
+          <td><strong>IPO</strong></td>
+          <td>直接最大化总偏好 p*_ρ(π ≻ μ) − τ KL</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      闭式最优（一般 Ψ）：π*(y) ∝ π_ref(y) exp(τ⁻¹ E_{y′~μ}[Ψ(p*(y≻y′))])。
+      DPO 路径上 Ψ 无界 → 经验 ˆp∈{0,1} 时 π 可退化；IPO 的 g(y)=E[p*] 有界 ∈[0,1]，τ 始终有齿。
+    </p>
+
+    <h3>② 为什么 DPO 会「过尖」</h3>
+    <table>
+      <thead><tr><th>设定</th><th>DPO / BT 行为</th><th>IPO 行为</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>两动作，p*(y1≻y2)=1，π_ref 均匀</td>
+          <td>对任意 τ：π*(y1)=1, π*(y2)=0</td>
+          <td>π*(y1)=σ(0.5/τ)；τ→∞ 回到均匀，τ→0 才变贪心</td>
+        </tr>
+        <tr>
+          <td>有限样本 ˆp=1（真值可能 0.8）</td>
+          <td>经验最优仍可把败方置零</td>
+          <td>目标差距有界，由 τ 控制偏离 π_ref 的幅度</td>
+        </tr>
+        <tr>
+          <td>动作从未赢过 / 数据集很小</td>
+          <td>作者 toy 实验：DPO 仍可把概率打到 0</td>
+          <td>强正则时贴近 π_ref，不无端排除</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      站内 <a href="daily-2026-09-17-algo-kl.html">KL</a> 文强调：正则要「真的约束更新」。
+      DPO 在 BT+确定性偏好下，约束项被无限奖励差淹没——这是目标形式问题，不是调 τ 能单独修好的。
+    </p>
+
+    <h3>③ IPO 损失：从求根到平方回归</h3>
+    <pre><code># 最优性条件（Ψ=Id）
+h_π(y,y′) := log( π(y)π_ref(y′) / (π(y′)π_ref(y)) )
+h_π(y,y′)  =  τ⁻¹ ( p*(y≻μ) − p*(y′≻μ) )
+
+# 总体平方损失
+L(π) = E_{y,y′~μ} [ ( h_π(y,y′) − τ⁻¹(p*(y≻μ)−p*(y′≻μ)) )² ]
+
+# 采样版（用偏好指示 I，等价到常数）
+# 对称利用 (yw,yl,1) 与 (yl,yw,0) 后简化为：
+L_emp = E_{(yw,yl)~D} [ ( h_π(yw,yl) − τ⁻¹/2 )² ]
+</code></pre>
+    <table>
+      <thead><tr><th>量</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>h_π</td><td>策略相对参考的 log 似然比差</td></tr>
+        <tr><td>回归目标 τ⁻¹/2</td><td>在「赢/输」样本上，把比值差距钉在有限值</td></tr>
+        <tr><td>τ ↑</td><td>目标变小 → 更贴 π_ref</td></tr>
+        <tr><td>τ ↓</td><td>允许更大间距 → 更跟偏好走</td></tr>
+      </tbody>
+    </table>
+    <p>
+      定理层面：在 Supp(π)=Supp(μ)=Supp(π_ref) 时，L 在策略空间有<strong>唯一</strong>局部/全局最小，即解析最优 π*（作者 Theorem 2）。
+      实现上从 π=π_ref 出发做平方损失 SGD 即可——无奖励模型、无 PPO 环。
+    </p>
+
+    <h3>④ 与 DPO / SimPO / ORPO / KTO 对照</h3>
+    <table>
+      <thead><tr><th>方法</th><th>核心信号</th><th>Reference</th><th>典型风险</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="daily-2026-09-10-algo-dpo.html">DPO</a></td>
+          <td>−log σ(τ Δlogπ − τ Δlogπ_ref)</td>
+          <td>需要 π_ref</td>
+          <td>确定性偏好下过尖；隐式奖励可无界</td>
+        </tr>
+        <tr>
+          <td><strong>IPO</strong></td>
+          <td>(h_π − τ⁻¹/2)²</td>
+          <td>需要 π_ref</td>
+          <td>对 μ/π_ref 支撑假设敏感；τ 网格仍要扫</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-21-algo-simpo.html">SimPO</a></td>
+          <td>长度归一平均 logprob + margin</td>
+          <td>无 π_ref</td>
+          <td>奖励尺度与 β、γ 耦合</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-22-algo-orpo.html">ORPO</a></td>
+          <td>SFT + odds-ratio 罚项</td>
+          <td>无 π_ref（monolithic）</td>
+          <td>SFT 与偏好权重 λ 要平衡</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-15-algo-kto.html">KTO</a></td>
+          <td>前景理论效用；二元好/坏</td>
+          <td>可选</td>
+          <td>需要好/坏先验与 KL 估计</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>偏好很「干净」时优先试 IPO。</strong> 标注员高度一致、或规则合成偏好接近 0/1 时，DPO 最容易过尖；先把 τ 扫在能保持熵的区间。</li>
+      <li><strong>损失实现按对称样本。</strong> 每个 (yw,yl) 贡献赢侧与输侧，最终回归到 τ⁻¹/2；别只优化单向 logσ。</li>
+      <li><strong>盯败方概率与 KL，不只盯 win rate。</strong> Toy 设定里 DPO 的失败模式是「赢者概率→1 / 未见动作→0」；线上应监控动作覆盖与相对 π_ref 的 KL。</li>
+      <li><strong>支撑集合要对齐。</strong> 理论唯一性要求 μ 与 π_ref 同支撑；参考模型词汇/截断与采样策略不一致时，先对齐再训。</li>
+      <li><strong>与 SimPO/ORPO 分工。</strong> 缺可靠 π_ref 或想 monolithic → SimPO/ORPO；有 SFT 参考且怕过尖 → IPO；只有二元标签 → KTO。</li>
+      <li><strong>失败模式清单：</strong> τ 过小仍可跟噪；τ 过大学不动偏好；batch 过小使 ˆp 更极端——配合 label smoothing 或配对重采样，而不是只加大学习率。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. Ψ(q)=log(q/(1−q)) 在 q→1 时发生了什么？</summary>
+      <p>logit 趋向 +∞，等价于 BT 奖励差无界。最优策略公式里 exp(τ⁻¹·∞) 会压垮任意有限 τ 的 KL 项，故败方概率→0。</p>
+    </details>
+    <details>
+      <summary>2. 为什么把 Ψ 换成恒等就能让 τ「重新有效」？</summary>
+      <p>E[p*]∈[0,1]，指数权重有界；τ 放大/缩小的是有限偏好优势，而不是无穷 Elo 差。τ→∞ 时 π*→π_ref 的极限重新成立。</p>
+    </details>
+    <details>
+      <summary>3. 采样损失里的 τ⁻¹/2 从哪来？</summary>
+      <p>用 I∈{0,1} 替代未知 p*(·≻μ) 差值后，对称计入 (yw,yl) 与 (yl,yw)，平方损失期望等价（差常数）于把 h_π(yw,yl) 回归到 τ⁻¹/2。</p>
+    </details>
+    <details>
+      <summary>4. IPO 与 DPO 都要 π_ref，差别在目标几何还是优化器？</summary>
+      <p>主要在目标几何：DPO 是 logistic 似然（BT），IPO 是对有界偏好差的平方求根。优化器都可以是离线 SGD；换成 Adam 不会自动修复 DPO 的过尖。</p>
+    </details>
+    <details>
+      <summary>5. 何时仍该用 DPO / SimPO 而不是 IPO？</summary>
+      <p>偏好本身软、BT 拟合良好、且已有成熟 DPO 配方与评估时，DPO 仍可用。没有参考模型时 SimPO/ORPO 更直接。IPO 的甜点是「强偏好 + 需要可控偏离参考」的离线对齐。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2310.12036" target="_blank" rel="noopener">arXiv:2310.12036 · ΨPO / IPO</a></li>
+      <li>站内：
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="daily-2026-09-21-algo-simpo.html">SimPO</a> ·
+        <a href="daily-2026-09-22-algo-orpo.html">ORPO</a> ·
+        <a href="daily-2026-09-15-algo-kto.html">KTO</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

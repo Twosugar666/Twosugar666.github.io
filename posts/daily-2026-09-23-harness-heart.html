@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜HEART：用 Agent-native Tool Primitives 做 Harness Engineering · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜HEART：用 Agent-native Tool Primitives 做 Harness Engineering</h1>
+    <p class="post-meta">2026-09-23 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Jin / Wang / Yu / Luo / Wang（UIUC / Starc）· <em>Harness Engineering in LLM Tool Use via Agent-Native Reusable Tool Primitives</em>
+      · <a href="https://arxiv.org/abs/2609.01736" target="_blank" rel="noopener">arXiv:2609.01736</a>。
+      交叉：
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      工具增强 LLM 常见两条脆点：
+      （1）多步 / 多轮时，上一工具输出类型对不上下一工具的 API schema；
+      （2）工具目录一大，把原始 schema 塞进上下文，准确率随目录膨胀明显掉（文献报 8K→120K token 时跌幅可达 7%–85%）。
+      NESTFUL 上即便强模型 full-sequence match 也常只有约 28%——「让模型说 API 语言」这条路越走越窄。
+    </p>
+    <p>
+      HEART 反过来问：<strong>能不能让工具说模型的语言？</strong>
+      答案是 Tool Primitives（自然语言接口包住 schema 解析与执行）+ ToolFace（25519 函数按需检索）+
+      Planner / Router / Verifier 编排与重规划。默认骨干全部用 Qwen3-8B，重规划预算 <strong>B=3</strong>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：Tool Primitive 自然语言调工具 + ToolFace 按需检索 → 五段流水线；
+      多榜超 SFT 约 <strong>10%</strong>、超 GPT-5.4 / Claude-4.6 / Gemini-3.1 约 <strong>6%</strong>，成本最高降约 <strong>85%</strong>；
+      真实 50 题完成率 <strong>84%</strong> vs 商用平均约 <strong>22%</strong>；prompt injection ASR=<strong>0</strong>（作者自报）。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Tool Primitives：工具说自然语言</h3>
+    <table>
+      <thead><tr><th>对比</th><th>传统 function calling</th><th>Tool Primitive</th></tr></thead>
+      <tbody>
+        <tr><td>调用面</td><td>模型直接填 JSON / schema 参数</td><td>上游发自然语言请求 x（+ 可选上下文 c）</td></tr>
+        <tr><td>Schema</td><td>暴露在提示词里</td><td>封在 Primitive 内：解析 → 校验 → 调 f_i</td></tr>
+        <tr><td>工具间传递</td><td>手工拼字段类型</td><td>结构化 result + 自然语言 summary 作下游 c</td></tr>
+        <tr><td>失败</td><td>常静默重试或整链崩</td><td>本地 FAILURE 信号交给 Verifier，不私自改计划</td></tr>
+      </tbody>
+    </table>
+    <pre><code># Tool Primitive（示意）
+P_i(x; c) = M([s_i ; c ; x])
+  → 解释请求、按 s_i 绑定参数、调用 f_i
+  → SUCCESS{result, summary} | FAILURE{type, details}
+</code></pre>
+
+    <h3>② ToolFace：25519 函数的中心仓库</h3>
+    <table>
+      <thead><tr><th>来源</th><th>数量（作者自报）</th></tr></thead>
+      <tbody>
+        <tr><td>ToolBench 在线 API</td><td>16,464（49 类）</td></tr>
+        <tr><td>NESTFUL 数学 / 代码工具</td><td>40 + 4,348</td></tr>
+        <tr><td>τ²-Bench 零售 / 航司 / 电信</td><td>68</td></tr>
+        <tr><td>ACEBench 双语 API</td><td>4,538</td></tr>
+        <tr><td>BFCLv4 搜索 / 记忆</td><td>2 + 5</td></tr>
+        <tr><td>手工交互工具</td><td>54</td></tr>
+        <tr><td><strong>合计</strong></td><td><strong>25,519</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      推理时只对 schema 描述做语义检索，把「目录膨胀」从上下文里拆掉——
+      消融里去掉 ToolFace &amp; Primitives，ToolBench Avg Pass 从 <strong>75.1→16.1</strong>，NESTFUL Full Acc. 从 <strong>0.44→0.06</strong>（作者自报）。
+    </p>
+
+    <h3>③ 五段流水线：Planning → Routing → Tools → Execution → Verification</h3>
+    <pre><code># HEART 控制流（示意，B=3）
+C ← {q}; b ← 0
+while Planner(q,C)=insufficient: 澄清用户 → 扩充 C
+Π ← Planner.Plan(q,C)
+while b ≤ B:
+  for π_k in Π:
+    β_k ← Router(π_k, C)           # 自然语言调用 + H-Params
+    r_k ← P_k(β_k | r_{k-1})       # Tool Primitive
+    if Verifier(r_k)=fail:
+      C ← C ∪ {feedback}; Π ← replan; b++; break
+  else: return r_K
+</code></pre>
+    <table>
+      <thead><tr><th>角色</th><th>输入 → 输出</th><th>守门</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Planner</strong></td><td>q, C → sufficient? / 澄清 / 有序计划 Π</td><td>信息不够不发车</td></tr>
+        <tr><td><strong>Router</strong></td><td>π_k, C → 自然语言 x_k + retry/priority/timeout</td><td>不发明上下文里没有的值</td></tr>
+        <tr><td><strong>Tool Primitive</strong></td><td>x_k, c → 执行结果</td><td>错误局部化，不改计划</td></tr>
+        <tr><td><strong>Verifier</strong></td><td>四准则：完成 / 参数一致 / 执行有效 / 约束满足</td><td>任一条 fail → 结构化反馈回 Planner</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE</a>（bash-only 极简动作空间）、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>（Workspace 工厂）对照：
+      HEART 解的是<strong>大规模异构 API 目录下的编排与恢复</strong>，不是 shell 沙箱形态。
+      与 <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a> / <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a> 对照：
+      HEART 是 training-free harness engineering；后两者把 harness 放进 RL 环——可叠，但问题层不同。
+    </p>
+
+    <h3>④ 主结果与真实任务 / 安全（作者自报）</h3>
+    <table>
+      <thead><tr><th>场景</th><th>作者自报</th></tr></thead>
+      <tbody>
+        <tr><td>五榜相对 SFT 工具模型</td><td>平均约 <strong>+10%</strong></td></tr>
+        <tr><td>相对 GPT-5.4 / Claude-4.6-Sonnet / Gemini-3.1-Pro</td><td>平均约 <strong>+6%</strong>；token 成本最高降约 <strong>85%</strong></td></tr>
+        <tr><td>ToolBench</td><td>Pass <strong>75.1%</strong> / Win <strong>75.7%</strong>（超 Claude-4.6 DFSDT）</td></tr>
+        <tr><td>NESTFUL（3-shot）</td><td>Full Acc. <strong>0.47</strong> / Win <strong>0.79</strong></td></tr>
+        <tr><td>τ²-Bench</td><td>各域 Pass@k 最优；相对 GPT-5.4 API 成本可降约 <strong>7.4×</strong></td></tr>
+        <tr><td>50 真实端到端题</td><td>完成率 <strong>84%</strong> vs 商用 20/24/22%（约 <strong>3.8×</strong>）</td></tr>
+        <tr><td>ToolHijacker 式注入</td><td>Gradient-Free / Based ASR 均为 <strong>0.0%</strong>（schema 不进提示词）</td></tr>
+        <tr><td>重规划预算</td><td>B=0→3 增益明显；B=5 几乎饱和 → 默认 <strong>B=3</strong></td></tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先包 Primitive，再谈目录。</strong> 消融里去掉自然语言封装跌得最狠；只做 RAG 选工具、仍暴露 raw schema，攻击面与嵌套传参问题都还在。</li>
+      <li><strong>Verifier 四准则写死进协议。</strong> 完成 / 一致 / 有效 / 约束——失败要返回可行动诊断，而不是「再试一次」。</li>
+      <li><strong>B=3 够用就停。</strong> 第二轮重规划贡献最大增益；盲目加大 B 只堆 token。</li>
+      <li><strong>成本账：轻骨干 × 多角色。</strong> 默认四角色全 Qwen3-8B；token 量高但单价低，作者报相对前沿商用可大幅降 API 成本。</li>
+      <li><strong>安全默认：schema 永不进主提示。</strong> ToolFace 内执行把 ToolHijacker 攻击面拆掉；若必须暴露候选列表，需另做注入评测。</li>
+      <li><strong>与 coding harness 分工。</strong> Shell/Repo 任务继续用 mini-SWE / OpenHands；跨 SaaS API、嵌套调用、多域目录走 HEART 式 Primitive 仓库。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「工具说自然语言」能缓解嵌套 API 失败？</summary>
+      <p>嵌套失败常来自字段类型/命名不对齐。Primitive 在边界做 schema 解析与类型强制，下游只吃 summary/结构化 result，Router 不必手写跨工具 JSON 拼装。</p>
+    </details>
+    <details>
+      <summary>2. ToolFace 按需检索相对「把目录塞进上下文」解决了什么？</summary>
+      <p>大目录稀释注意力、拖准确率，还把工具元数据暴露给注入。检索只取相关 Primitive，上下文长度与攻击面同时下降。</p>
+    </details>
+    <details>
+      <summary>3. 去掉 Verifier 为什么掉点接近去掉 Planner？</summary>
+      <p>作者报 w/o Verifier 时 ToolBench Pass 75.1→47.6。无反馈重规划时，单次路由/执行错误直接交卷；Verifier 把可恢复失败转成带诊断的再计划。</p>
+    </details>
+    <details>
+      <summary>4. ASR=0 是「更强对齐」还是「攻击面消失」？</summary>
+      <p>作者口径是后者：候选工具 schema 不出现在主 LLM 提示里，ToolHijacker 依赖的「恶意工具文档进候选集」路径不成立。换威胁模型（如篡改工具返回）仍需另测。</p>
+    </details>
+    <details>
+      <summary>5. HEART 与 mini-SWE / OpenHands / Harness-RL / Agent Lightning 如何选型？</summary>
+      <p>mini-SWE / OpenHands：编码沙箱与状态/工作区。Harness-RL / Lightning：把 harness 纳入 RL 训练。HEART：大规模 API 工具的 harness engineering（规划-路由-验证 + Primitive 仓库）。按任务是「改代码」还是「调成千上万 API」选型，而非互相替代。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.01736" target="_blank" rel="noopener">arXiv:2609.01736 · HEART / Tool Primitives</a></li>
+      <li>站内：
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-09-08-harness-harness-rl.html">Harness-RL</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

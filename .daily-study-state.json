@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 2,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -480,6 +480,27 @@
       "source": "algo",
       "topic": "ORPO：L_SFT+λ(−logσ(log OR))；monolithic、无 π_ref；Mistral-ORPO-β AlpacaEval2 ~12.20% / MT-Bench ~7.32（arXiv:2403.07691）",
       "file": "posts/daily-2026-09-22-algo-orpo.html"
+    },
+    {
+      "date": "2026-09-23",
+      "domain": "infra rl agent",
+      "source": "frontline",
+      "topic": "ROLLART：异构解耦多任务 Agentic RL（prefill→算力/decode→带宽/env→CPU/reward→serverless；1.31–2.05×；3000+ GPU MoE 一周）",
+      "file": "posts/daily-2026-09-23-rollart.html"
+    },
+    {
+      "date": "2026-09-23",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "HEART：Tool Primitives + ToolFace 25519 + Planner/Router/Verifier；超 SFT~10%/商用~6%；50题84%；ASR=0（arXiv:2609.01736）",
+      "file": "posts/daily-2026-09-23-harness-heart.html"
+    },
+    {
+      "date": "2026-09-23",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "IPO：ΨPO 恒等映射；回归 h_π→τ⁻¹/2；避免 DPO 确定性偏好过尖（arXiv:2310.12036）",
+      "file": "posts/daily-2026-09-23-algo-ipo.html"
     }
   ]
 }
