@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Harness Engineering：十一套生产 Coding Agent 的源码解剖（七子系统 / 29 模式） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Harness Engineering：十一套生产 Coding Agent 的源码解剖（七子系统 / 29 模式）</h1>
+    <p class="post-meta">2026-09-24 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Barbaste / Darrigol / Vu / Wiltberger（Inclusive Brains / Wavestone AI Lab）·
+      <em>Harness Engineering: Anatomy, Architecture, and Evolution of Coding Agents — A Source-Code Study of Eleven Systems</em>
+      · <a href="https://arxiv.org/abs/2609.00006" target="_blank" rel="noopener">arXiv:2609.00006</a>。
+      交叉：
+      <a href="daily-2026-08-28-harness-runtime.html">Harness Runtime</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-09-21-harness-design-study.html">组件消融</a>、
+      <a href="daily-2026-09-23-harness-heart.html">HEART</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agent = Model + Harness。模型提供智能；harness 用 loop、工具、上下文、安全、编排与扩展面把智能接到仓库与终端。
+      2026 上半年「Harness Engineering」从口语变成学科，但缺一份<strong>钉死到生产源码</strong>的参考解剖——
+      Barbaste 等这篇 83 页研究填的就是这个空：十一套生产 coding harness + Omnigent 作为 meta-harness 对照，
+      <strong>不排名、不刷榜</strong>，只描述怎么造。
+    </p>
+    <p>
+      十一套：Claude Code、Codex CLI、Gemini CLI、Mistral Vibe、OpenHands、Aider、Mini-SWE-Agent、Hermes、Pi、OpenCode、OpenClaw；
+      对照点 Omnigent（Databricks）把多家 harness 当成可互换后端。快照钉在 2026-07；其中八套与 2026-04 版形成纵向 diff。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：约 4M LOC 里找不到 LangChain/LangGraph/AutoGen 导入，也找不到向量检索——
+      全是手写 async loop + ripgrep/tree-sitter/glob/Markdown 确定性检索；
+      论点：H1 2026 harness 已从工具翻成平台（13 观察 / 29 模式 / 18 建议 / 90 行 MVP）。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 七子系统地图</h3>
+    <table>
+      <thead><tr><th>子系统</th><th>角色</th><th>最小形态（语料）</th><th>最大形态（语料）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Agent loop</strong></td>
+          <td>推理 ↔ 动作交替；停机与恢复</td>
+          <td>Mini-SWE：线性 while + 单 bash</td>
+          <td>OpenHands：事件溯源 conversation + 并行 action batch</td>
+        </tr>
+        <tr>
+          <td><strong>LLM integration</strong></td>
+          <td>协议 / prompt / cache / thinking / 路由</td>
+          <td>Mini-SWE：一次 LiteLLM + Jinja</td>
+          <td>Hermes：多自研 transport；Codex：服务端 model catalog</td>
+        </tr>
+        <tr>
+          <td><strong>Tools / actions</strong></td>
+          <td>可执行动作面，尤以编辑为核心</td>
+          <td>Mini-SWE：仅 bash</td>
+          <td>Claude Code：数十 typed tools + deferred loading</td>
+        </tr>
+        <tr>
+          <td><strong>Memory / context</strong></td>
+          <td>窗口配给与跨会话知识</td>
+          <td>Mini-SWE：无界线性 history</td>
+          <td>Codex：agent 维护的跨会话 memory；Gemini：图蒸馏</td>
+        </tr>
+        <tr>
+          <td><strong>Safety / permissions</strong></td>
+          <td>允跑 / 询问 / 禁止；隔离执行</td>
+          <td>Mini-SWE：成本与步数上限</td>
+          <td>Codex：策略规则 + LLM 审批 + 多 OS sandbox</td>
+        </tr>
+        <tr>
+          <td><strong>Orchestration</strong></td>
+          <td>子 agent / 跨 agent 协议</td>
+          <td>Aider：刻意无（单 agent）</td>
+          <td>Claude Code：递归组合；Omnigent：跨厂商 meta 层</td>
+        </tr>
+        <tr>
+          <td><strong>Extensibility</strong></td>
+          <td>hooks / skills / plugins / MCP</td>
+          <td>Mini-SWE：Python protocol 结构类型</td>
+          <td>Pi：everything-is-extension；Codex：marketplace 插件</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      站内 <a href="daily-2026-08-28-harness-runtime.html">Harness Runtime</a> 从「运行时接管什么」切入；
+      本文把同一对象钉成可对照的七格解剖图——读源码与读消融（
+      <a href="daily-2026-09-21-harness-design-study.html">Design Study</a>）可互证。
+    </p>
+
+    <h3>② 两个「缺席」：框架与向量检索</h3>
+    <table>
+      <thead><tr><th>缺席</th><th>作者发现（自报）</th><th>实际替代</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>通用 agent 框架</td>
+          <td>~4M LOC 的 Py/TS/Rust 中无 LangChain / LangGraph / AutoGen 等导入；Gemini CLI 也不用 Google 自家框架</td>
+          <td>手写 async loop、自建 registry / middleware</td>
+        </tr>
+        <tr>
+          <td>向量 embedding 检索</td>
+          <td>无一套用 embedding 做代码检索</td>
+          <td>ripgrep、tree-sitter、glob、自动发现的 Markdown 上下文（AGENTS.md / GEMINI.md 等）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      这与站内 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE</a> 的「bash + 无状态 subprocess」基线同向：
+      生产路径优先<strong>确定性、可审计、低依赖</strong>，而不是通用编排库。
+      讽刺之处：术语「harness engineering」最早从 LangChain 圈传开，但语料 runtime 里看不到它的库。
+    </p>
+
+    <h3>③ 扩展标准：SKILL.md / MCP / ACP</h3>
+    <table>
+      <thead><tr><th>标准</th><th>采纳（作者计数）</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>SKILL.md</strong></td>
+          <td><strong>9 / 11</strong></td>
+          <td>技能包领先；含 registry、trust tier、首见 agent 自写 skill</td>
+        </tr>
+        <tr>
+          <td><strong>MCP</strong></td>
+          <td><strong>8 / 11</strong></td>
+          <td>工具/数据连接标准；与 skills 并存而非互斥</td>
+        </tr>
+        <tr>
+          <td><strong>ACP</strong></td>
+          <td><strong>6</strong> 套含 ACP</td>
+          <td>新增第三角色：<strong>harness hosting</strong>——OpenHands 可把 Claude Code / Codex / Gemini CLI 当可互换后端</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      纵向样本（八套、一季度）：收敛变成模仿——Codex 逐字采用 Claude Code 的 hook 词汇并提供 session/settings 导入器；
+      OpenHands 读取 Claude Code 插件格式；行为策略从 prompt 散文迁到配置与 feature flag。
+    </p>
+
+    <h3>④ 平台化论题与交付物</h3>
+    <pre><code># 作者论题（浓缩）
+H1 2026: harness : tool → platform
+  - 可 import 的 SDK ↔ 框架厂商开始自研 harness
+  - marketplace / switching-cost tooling / MDM 治理
+  - agent 可被当成 OpenAI-compatible endpoint
+  - meta-harness（Omnigent）编排多家，套利专有能力
+
+# 论文交付
+13 observations · 29 design patterns · 18 recommendations
+90-line MVP scaffold（直接实现其中约 10 条建议）
+</code></pre>
+    <table>
+      <thead><tr><th>站内文章</th><th>与本文关系</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a></td>
+          <td>语料中「可宿主竞品」与 Workspace 工厂的具体切片</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-23-harness-heart.html">HEART</a></td>
+          <td>工具原语 / Planner–Router–Verifier——子系统设计的另一条实证线</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-21-harness-design-study.html">组件消融</a></td>
+          <td>规划 / 动作空间 / 上下文的量化消融，补源码解剖缺的「改哪格涨分」</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画七格，再加功能。</strong> 新 harness 或改造旧脚手架时，对每个子系统写清「最小 / 目标」形态，避免只堆 tools。</li>
+      <li><strong>检索默认走确定性路径。</strong> ripgrep + AST + 约定 Markdown 上下文文件；向量索引当可选加速层，别当唯一真相源。</li>
+      <li><strong>扩展面优先 SKILL.md，MCP 作工具总线。</strong> 语料显示 skills 采纳领先；两者可叠，别二选一教条。</li>
+      <li><strong>安全从配置落地，不只从 system prompt。</strong> 纵向趋势是策略迁出散文；权限、sandbox、doom-loop 询问应有代码路径。</li>
+      <li><strong>把「能宿主其它 harness」当成平台能力。</strong> ACP hosting / Omnigent 式 meta 层说明互操作比单打独斗更值钱。</li>
+      <li><strong>90 行 MVP 可当教学地板。</strong> 作者脚手架实现约十条建议；学习路径：Mini-SWE 地板 → 加权限与扩展 → 再谈编排。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么生产 harness 普遍不用 LangChain 一类框架？</summary>
+      <p>作者观察是控制面要钉死到 loop、权限、缓存方言与厂商特性；通用库抽象层往往挡路。框架侧反应是自研 harness，两边在形态上汇合。</p>
+    </details>
+    <details>
+      <summary>2. 「无向量检索」是否等于「无检索」？</summary>
+      <p>否。语料用的是 JIT / 确定性检索：grep、tree-sitter、glob、自动发现的 AGENTS.md 等。缺的是 embedding index 作为默认路径。</p>
+    </details>
+    <details>
+      <summary>3. SKILL.md 领先 MCP 说明什么产品判断？</summary>
+      <p>技能包更接近「可分发的行为与工作流」；MCP 更接近「接外部工具/数据」。生产上两者并存，skills 更易形成 marketplace 与 trust tier。</p>
+    </details>
+    <details>
+      <summary>4. ACP 的「harness hosting」角色新在哪里？</summary>
+      <p>过去 ACP 多被看成会话/编辑器协议；现在 harness 可把其它 harness 当后端互换——互操作升到运行时宿主层。</p>
+    </details>
+    <details>
+      <summary>5. 「从工具到平台」对自建 Agent 团队意味着什么？</summary>
+      <p>要规划 SDK、插件市场、会话导入、治理与可观测，而不只是「能改文件的 CLI」。meta-harness 会出现时，专有差异应可被策略层套利或替换。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.00006" target="_blank" rel="noopener">arXiv:2609.00006 · Harness Engineering</a></li>
+      <li>站内：
+        <a href="daily-2026-08-28-harness-runtime.html">Harness Runtime</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">组件消融</a> ·
+        <a href="daily-2026-09-23-harness-heart.html">HEART</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

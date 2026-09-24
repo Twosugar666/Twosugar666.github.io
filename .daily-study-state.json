@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 3,
+  "next": 4,
   "daily_streams": [
     "frontline",
     "harness",
@@ -501,6 +501,27 @@
       "source": "algo",
       "topic": "IPO：ΨPO 恒等映射；回归 h_π→τ⁻¹/2；避免 DPO 确定性偏好过尖（arXiv:2310.12036）",
       "file": "posts/daily-2026-09-23-algo-ipo.html"
+    },
+    {
+      "date": "2026-09-24",
+      "domain": "gpu infra",
+      "source": "frontline",
+      "topic": "NVIDIA Topograph：provider→normalize→engine；Slurm topology.conf / K8s labels / Slinky ConfigMap / NFD / Graph JSON；POST /v1/generate",
+      "file": "posts/daily-2026-09-24-topograph.html"
+    },
+    {
+      "date": "2026-09-24",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Harness Engineering 源码解剖：11 systems + Omnigent；七子系统；~4M LOC 无框架/无向量检索；SKILL 9/11 MCP 8/11 ACP 6；13 obs / 29 patterns / 18 rec / 90-line MVP（arXiv:2609.00006）",
+      "file": "posts/daily-2026-09-24-harness-anatomy.html"
+    },
+    {
+      "date": "2026-09-24",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "RLOO：序列级 REINFORCE + leave-one-out 基线；无 Critic；vs PPO win-rate 77.9/43.7/64.1；vs GRPO 组均值含自身（arXiv:2402.14740）",
+      "file": "posts/daily-2026-09-24-algo-rloo.html"
     }
   ]
 }

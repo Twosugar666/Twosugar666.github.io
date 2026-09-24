@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜NVIDIA Topograph：把集群拓扑发现写进 Kubernetes / Slurm 调度 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜NVIDIA Topograph：把集群拓扑发现写进 Kubernetes / Slurm 调度</h1>
+    <p class="post-meta">2026-09-24 · 收藏夹：显卡 / Infra · 一线追踪<br />
+      项目：NVIDIA · <em>Topograph</em>
+      · <a href="https://github.com/NVIDIA/topograph" target="_blank" rel="noopener">github.com/NVIDIA/topograph</a>
+      · <a href="https://github.com/NVIDIA/topograph/blob/main/docs/overview.md" target="_blank" rel="noopener">docs/overview.md</a>。
+      交叉：
+      <a href="daily-2026-09-17-rubin-mlperf.html">Vera Rubin MLPerf</a>、
+      <a href="daily-2026-08-31-gpu-rubin.html">NVIDIA Rubin</a>、
+      <a href="daily-2026-09-23-rollart.html">ROLLART</a>、
+      <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      AI factory 里，训练与推理的性能越来越取决于<strong>通信 locality</strong>，而不只是「有没有空闲 GPU」。
+      跨 leaf / spine 的梯度同步拖长迭代；disaggregated inference 里 prefill 与 decode 若分落在不同 NVLink 域，
+      KV cache 就从高带宽域掉到 Ethernet / InfiniBand 跨跳——吞吐与尾延迟一起变差。
+      Topograph 官方 overview 明确写了这一点：placement 与 allocation 同等重要。
+    </p>
+    <p>
+      困难在于拓扑信息<strong>碎片化</strong>：CSP API、fabric 管理系统（如 NetQ）、底层 IB / 系统工具各说各话；
+      而调度器又要各自格式——Slurm 要 <code>topology.conf</code>，Kubernetes 要 node labels / NFD CR，
+      Slurm-on-K8s（Slinky）要 ConfigMap。手工维护既脆又不可复现。
+    </p>
+    <p>
+      站内 <a href="daily-2026-09-17-rubin-mlperf.html">Vera Rubin MLPerf</a> 与
+      <a href="daily-2026-08-31-gpu-rubin.html">Rubin</a> 讲的是芯片 / 机架级吞吐；
+      Topograph 落在下一层：<strong>把物理拓扑发现写进调度输入</strong>。
+      二次报道（如 Quantum Zeitgeist ~2026-09-23）也强调它在「映射集群链路 → 调度器可读形式」上的角色；
+      文中若引用 NVLink 带宽数字，一律标注为 NVIDIA 文档或二次报道口径，而非本站实测。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：provider 发现 → 归一化 → engine 发布；
+      输出 Slurm topology.conf / K8s node labels / Slinky ConfigMap / NFD CR / Graph JSON，
+      让调度器终于「看得见」NVLink 域与 leaf 亲和。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Provider × Engine 管道</h3>
+    <pre><code># Topograph 核心抽象（示意）
+request → Provider.discover() → normalize → Engine.publish()
+
+# 异步 API（官方）
+POST /v1/generate   → 校验请求，返回 request ID
+GET  /v1/topology    → 按 ID 查询状态与结果
+</code></pre>
+    <table>
+      <thead><tr><th>角色</th><th>含义</th><th>例子</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Provider</strong></td>
+          <td>云 / 本地环境下的拓扑源</td>
+          <td>aws / gcp / oci / crusoe / nebius / nscale / lambda、netq、dra、infiniband-bm、infiniband-k8s、test</td>
+        </tr>
+        <tr>
+          <td><strong>Engine</strong></td>
+          <td>调度系统侧输出格式</td>
+          <td>slurm、k8s、nfd、slinky、graph</td>
+        </tr>
+        <tr>
+          <td><strong>归一化层</strong></td>
+          <td>把异构源变成统一中间表示</td>
+          <td>屏蔽 CSP 字段差异，再喂给各 engine</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      拓扑发现异步进行：<code>/v1/generate</code> 只负责受理与校验；真正结果用 request ID 去 <code>/v1/topology</code> 拉取。
+      这让长耗时的 fabric 查询不堵在同步 HTTP 上。
+    </p>
+
+    <h3>② Engine 产出对照</h3>
+    <table>
+      <thead><tr><th>Engine</th><th>输出形态（文档口径）</th><th>调度侧用途</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>slurm</strong></td>
+          <td><code>topology.conf</code>（tree / block 等）</td>
+          <td>Slurm 拓扑感知放置、减少跨交换机通信</td>
+        </tr>
+        <tr>
+          <td><strong>k8s</strong></td>
+          <td>Node labels（如 fabric / accelerator domain）</td>
+          <td>Scheduler / TopologySpread / 亲和规则消费</td>
+        </tr>
+        <tr>
+          <td><strong>nfd</strong></td>
+          <td>Node Feature Discovery CR</td>
+          <td>把拓扑特征挂进 NFD 管线</td>
+        </tr>
+        <tr>
+          <td><strong>slinky</strong></td>
+          <td>ConfigMap（Slurm-on-K8s）</td>
+          <td>混合栈上把块拓扑交给 Slinky</td>
+        </tr>
+        <tr>
+          <td><strong>graph</strong></td>
+          <td>实例导向的拓扑 JSON</td>
+          <td>自定义编排、可视化、二次工具链</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>③ Provider 选型（官方推荐表浓缩）</h3>
+    <table>
+      <thead><tr><th>场景</th><th>推荐 Provider</th><th>注意</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>公有云集群</td>
+          <td>匹配的 CSP provider（AWS / GCP / OCI / …）</td>
+          <td>跟厂商 API 生命周期走</td>
+        </tr>
+        <tr>
+          <td>Spectrum-X / MNNVL 跨分区 locality</td>
+          <td>NetQ 或 InfiniBand (K8s)</td>
+          <td>需要看见分区之间的 fabric 邻近性时</td>
+        </tr>
+        <tr>
+          <td>Slinky + 单 NVLink 分区 + 已有 <code>nvidia.com/gpu.clique</code></td>
+          <td>DRA</td>
+          <td>窄集成：按已有 label 分 block，<strong>不</strong>发现后端交换机</td>
+        </tr>
+        <tr>
+          <td>无 NetQ 的 IB（裸金属 / Slurm）</td>
+          <td>InfiniBand (bare-metal)</td>
+          <td>DGX B200/B300 等非 MNNVL 场景的主要拓扑源之一</td>
+        </tr>
+        <tr>
+          <td>无 NetQ 的 IB（K8s）</td>
+          <td>InfiniBand (Kubernetes)</td>
+          <td>与 NetQ 路径对照选型</td>
+        </tr>
+        <tr>
+          <td>集成 / 回归</td>
+          <td>Test provider</td>
+          <td>模拟 success / pending / error</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      DRA 路径尤其值得单独记：它把节点按 <code>nvidia.com/gpu.clique</code>（可配）编成 Slurm <code>topology/block</code> 域，
+      但<strong>不</strong>发现 NVLink 分区之间的交换机邻近性。工作负载塞不进单分区时，额外分区选择<strong>没有</strong>网络邻近信息——
+      此时应切 NetQ 或 <code>infiniband-k8s</code>。非 MNNVL 的 SuperPOD 上该 label 往往不存在，IB provider 才是调度拓扑的主要来源。
+    </p>
+
+    <h3>④ 与 Rubin MLPerf / ROLLART 的分层对照</h3>
+    <table>
+      <thead><tr><th>层</th><th>站内文章</th><th>回答的问题</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>芯片 / 机架吞吐</td>
+          <td><a href="daily-2026-09-17-rubin-mlperf.html">Rubin MLPerf</a>、<a href="daily-2026-08-31-gpu-rubin.html">Rubin</a></td>
+          <td>NVL72 / NVLink 域上「能跑多快」</td>
+        </tr>
+        <tr>
+          <td>训练系统编排</td>
+          <td><a href="daily-2026-09-23-rollart.html">ROLLART</a>、<a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a></td>
+          <td>prefill/decode/env/reward 如何拆池、如何复用</td>
+        </tr>
+        <tr>
+          <td><strong>调度拓扑输入</strong></td>
+          <td><strong>本文 Topograph</strong></td>
+          <td>调度器如何知道「谁和谁在同一 leaf / NVLink 域」</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      没有拓扑输入，再强的 NVL72 也可能被跨 spine 放置浪费；没有系统层解耦，拓扑感知也只能优化「一整块生成」。
+      三层可叠，别互相替代。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先定 engine，再选 provider。</strong> 纯 Slurm、纯 K8s、Slinky 混合栈的输出格式不同；从消费端反推发现源，少做无用标签。</li>
+      <li><strong>MNNVL 跨分区别用 DRA 凑合。</strong> DRA 只吃现成 clique label；跨分区 locality 走 NetQ / IB-K8s。</li>
+      <li><strong>把 <code>/v1/generate</code> 当异步作业。</strong> 节点扩缩、pod 变化后应重新生成；用 request ID 轮询，别假设同步返回最终图。</li>
+      <li><strong>与 PD 分离 / 多池训练对齐标签。</strong> Prefill 池与 decode 池、训练与 rollout 池若要 locality，调度规则应消费 Topograph 写出的 domain / tier labels。</li>
+      <li><strong>Graph JSON 留给自定义控制面。</strong> 自研编排或可视化先吃 graph engine，再决定是否落 Slurm/K8s 原生格式。</li>
+      <li><strong>带宽数字引用要标注来源。</strong> NVLink / NVL72 峰值以 NVIDIA 文档或二次报道为准；本站不把它写成实测。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 AI factory 里「有空闲 GPU」仍可能很慢？</summary>
+      <p>空闲只保证 allocation；若作业跨 leaf/spine 或跨 NVLink 域，每次同步与 KV 搬运都走更贵路径。拓扑无关放置把通信变成隐藏瓶颈。</p>
+    </details>
+    <details>
+      <summary>2. Provider 与 Engine 拆开解决了什么运维痛点？</summary>
+      <p>同一套发现逻辑可服务 Slurm / K8s / Slinky；换云或换 fabric 工具只换 provider，换调度栈只换 engine，避免 N×M 手工脚本。</p>
+    </details>
+    <details>
+      <summary>3. DRA provider 的边界条件是什么？</summary>
+      <p>它依赖已有 Node label（默认 <code>nvidia.com/gpu.clique</code>）做 block 分组，不发现分区之间的交换机邻近性；跨分区调度需要 NetQ 或 IB-K8s。</p>
+    </details>
+    <details>
+      <summary>4. Topograph 与 Rubin MLPerf 报道分别回答什么？</summary>
+      <p>MLPerf / Rubin 文回答芯片与机架级吞吐上限；Topograph 回答调度器能否把作业放进那些高速域。一个是「能有多快」，一个是「能不能用上」。</p>
+    </details>
+    <details>
+      <summary>5. 异步 <code>/v1/generate</code> 对自动扩缩集群意味着什么？</summary>
+      <p>拓扑会随节点变化过期。应在扩缩或故障后重新提交 generate，用 request ID 取新结果并刷新 labels / topology.conf，而不是一次性静态文件。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://github.com/NVIDIA/topograph" target="_blank" rel="noopener">NVIDIA/topograph</a></li>
+      <li><a href="https://github.com/NVIDIA/topograph/blob/main/docs/overview.md" target="_blank" rel="noopener">docs/overview.md</a></li>
+      <li>站内：
+        <a href="daily-2026-09-17-rubin-mlperf.html">Vera Rubin MLPerf</a> ·
+        <a href="daily-2026-08-31-gpu-rubin.html">NVIDIA Rubin</a> ·
+        <a href="daily-2026-09-23-rollart.html">ROLLART</a> ·
+        <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

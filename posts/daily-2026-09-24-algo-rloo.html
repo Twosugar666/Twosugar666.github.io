@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜RLOO：用 Leave-One-Out 基线把 REINFORCE 做成无 Critic 的在线对齐 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜RLOO：用 Leave-One-Out 基线把 REINFORCE 做成无 Critic 的在线对齐</h1>
+    <p class="post-meta">2026-09-24 · 收藏夹：算法 / RL · 学习笔记<br />
+      论文：Ahmadian / Cremer / Gallé / Fadaee / Kreutzer / Pietquin / Üstün / Hooker（Cohere / Cohere For AI）·
+      <em>Back to Basics: Revisiting REINFORCE Style Optimization for Learning from Human Feedback in LLMs</em>
+      · <a href="https://arxiv.org/abs/2402.14740" target="_blank" rel="noopener">arXiv:2402.14740</a>（ACL 2024）。
+      交叉：
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>、
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>、
+      <a href="grpo-notes.html">GRPO 实践笔记</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      RLHF 第三阶段几乎默认挂 <a href="daily-2026-08-28-algo-ppo.html">PPO</a>：策略、参考、Critic、奖励最多四份模型同驻，
+      再叠加 clip / GAE / 归一化等旋钮。作者主张：Deep-RL 里催生 PPO 的「大方差、狂偏策略更新」在
+      <strong>预训 + SFT 暖启动</strong>的 LLM 对齐里并不典型——概率质量已挤在少数 token 上，环境更稳。
+    </p>
+    <p>
+      另一条常见建模习惯是把每个 token 当动作、前缀当状态；但偏好奖励几乎只打在<strong>完整生成</strong>上，
+      中间 token 只有 KL 项。更干净的视角是 bandit：整段 completion 是一次动作。
+      回到 <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>，再用多条在线样本构造 Leave-One-Out 基线，
+      就是 RLOO——无 Critic、无 PPO clip 也能在作者设定里赢过 PPO / DPO / RAFT。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：序列级 REINFORCE + 同 prompt 的 k 条样本互相当基线（排除自身）；
+      无 Critic、暖启动下不必依赖 PPO clip；教学上务必与 GRPO「组均值含自身」对照。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 从 PPO 目标回到序列级 REINFORCE</h3>
+    <pre><code># RLHF 常用 KL-shaped 奖励
+R(x,y) = r_φ(x,y) − β · log( π_θ(y|x) / π_ref(y|x) )
+
+# 序列级 REINFORCE（整段 y 当一个动作）
+∇J ≈ E[ (R(x,y) − b) · ∇ log π_θ(y|x) ]
+
+# 朴素基线：训练过程奖励滑动均值 b_MA
+</code></pre>
+    <table>
+      <thead><tr><th>建模</th><th>动作</th><th>奖励落点</th><th>代表</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Token MDP</td>
+          <td>每个 token</td>
+          <td>末 token 拿 r，其余多半只有 KL</td>
+          <td>PPO + <a href="daily-2026-09-02-algo-gae.html">GAE</a></td>
+        </tr>
+        <tr>
+          <td><strong>Bandit / 序列</strong></td>
+          <td>整段 generation</td>
+          <td>完整 y 一次拿 R</td>
+          <td>REINFORCE / <strong>RLOO</strong> / RAFT</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      作者拆 PPO：在 RLHF 实验里提高 GAE 的 λ（更少偏置、更多方差）更好；λ=1 退回 Vanilla PG 时奖励曲线最强；
+      clip 触发率常 &lt;5%，关掉 clip 甚至略好——说明更新接近 on-policy，PPO 的「防大步」动机变弱。
+    </p>
+
+    <h3>② RLOO：Leave-One-Out 基线</h3>
+    <pre><code># 对同一 prompt x 采 k 条 i.i.d. 样本 y_(1)..y_(k) ~ π_θ(·|x)
+
+# 第 i 条的基线 = 其余 k−1 条奖励均值（排除自身）
+b_i = (1/(k−1)) · Σ_{j≠i} R(y_(j), x)
+
+# 多样本 MC 策略梯度
+(1/k) · Σ_i  ( R(y_(i), x) − b_i ) · ∇ log π_θ(y_(i)|x)
+</code></pre>
+    <table>
+      <thead><tr><th>性质</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>无参数 Critic</td><td>基线由同批在线样本即时构成，少加载一份价值网络</td></tr>
+        <tr><td>无偏（相对均值基线家族）</td><td>Leave-one-out 是经典方差削减技巧（Kool et al., 2019）</td></tr>
+        <tr><td>用满 k 条样本</td><td>相对 RAFT「只训 top-1」信息更全</td></tr>
+        <tr><td>额外采样成本</td><td>每个 prompt 要生成 k 条；换来更稳的优势估计</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ 关键对照：RLOO vs GRPO</h3>
+    <table>
+      <thead><tr><th></th><th>RLOO</th><th>GRPO</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>基线怎么算</td>
+          <td><strong>Leave-one-out</strong>：均值排除当前样本</td>
+          <td><strong>组均值</strong>：含组内<strong>所有</strong>样本（含自身）</td>
+        </tr>
+        <tr>
+          <td>优势形态</td>
+          <td>R_i − mean_{j≠i} R_j</td>
+          <td>常再标准化：(R_i − mean_all) / std_all</td>
+        </tr>
+        <tr>
+          <td>自包含效应</td>
+          <td>自身奖励不进自己的基线 → 优势不被「自己拉平」</td>
+          <td>自身进入均值 → 高分样本优势被略微压缩</td>
+        </tr>
+        <tr>
+          <td>谱系</td>
+          <td>Cohere 2024；REINFORCE 多样本</td>
+          <td>DeepSeekMath → R1；站内 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a></td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 教学例子：k=2，奖励 {1.0, 0.0}
+# RLOO: 样本1 优势 = 1.0 − 0.0 = 1.0；样本2 = 0.0 − 1.0 = −1.0
+# GRPO: 组均值 0.5 → 优势 +0.5 / −0.5（若再 /std 则尺度变化）
+
+# k=4 时差异更细：RLOO 的 b_i 对每个 i 都不同；GRPO 共用一个组统计量
+</code></pre>
+    <p>
+      两者都属「用同 prompt 组内相对信号省 Critic」家族；实现与论文配方不同，
+      <strong>不要把 GRPO 的 group mean 直接叫成 RLOO</strong>。细节与工程笔记见
+      <a href="grpo-notes.html">GRPO 实践笔记</a>。
+    </p>
+
+    <h3>④ 作者自报结果（AlpacaFarm / GPT-4 代理 win-rate）</h3>
+    <table>
+      <thead><tr><th>方法</th><th>TL;DR</th><th>HH (Pythia)</th><th>HH (Llama)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>RLOO (k=4)</strong></td><td><strong>77.9</strong></td><td>43.7</td><td><strong>64.1</strong></td></tr>
+        <tr><td>RAFT (k=4)</td><td>73.2</td><td>42.1</td><td>63.3</td></tr>
+        <tr><td>RLOO (k=2)</td><td>74.2</td><td><strong>47.6</strong></td><td>62.2</td></tr>
+        <tr><td>RAFT (k=2)</td><td>72.1</td><td>37.7</td><td>58.4</td></tr>
+        <tr><td>REINFORCE + MA baseline</td><td>70.7</td><td>37.9</td><td>55.3</td></tr>
+        <tr><td>Vanilla PG</td><td>70.4</td><td>36.4</td><td>52.3</td></tr>
+        <tr><td>PPO</td><td>67.6</td><td>29.2</td><td>32.0</td></tr>
+        <tr><td>DPO</td><td>66.6</td><td>39.0</td><td>61.9</td></tr>
+      </tbody>
+    </table>
+    <p>
+      相对 PPO：RLOO(k=4) 在三组设定上分别高约 <strong>10.3 / 14.5 / 32.1</strong> 个百分点（作者自报）。
+      样本效率：<strong>RLOO k=2 可匹配或超过 RAFT k=4</strong>——因为 RAFT 丢掉非 top 样本，RLOO 用满梯度。
+      相对噪声与更大 β（KL）时，作者曲线显示 RLOO 比 RAFT 更稳。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>暖启动 + 在线奖励时先试序列级 PG。</strong> 已有强 SFT / RM 时，优先验证「无 Critic 的 RLOO/REINFORCE」是否够用，再决定是否上 PPO。</li>
+      <li><strong>k 从 2～4 扫。</strong> 论文主结果在 k=2/4；更大 k 换方差但烧采样——对照站内 GRPO 组大小习惯。</li>
+      <li><strong>实现时显式 leave-one-out。</strong> 用 <code>(sum − R_i)/(k−1)</code>，不要偷懒写成含自身的 mean（那就更接近 GRPO 家族）。</li>
+      <li><strong>奖励用 KL-shaped R，不只裸 r。</strong> β 过大时 RAFT 排序更脆；RLOO 仍建议监控 KL 与奖励双曲线。</li>
+      <li><strong>与离线偏好法分工。</strong> 无在线采样预算 → DPO/IPO；有 RM 且能 rollout → RLOO/GRPO；只要 top-1 监督 → RAFT（但信息利用率更低）。</li>
+      <li><strong>失败模式：</strong> RM 过优化、k=1 退化成无 LOO、把 token-level PPO 日志直接塞进序列级公式——三者都会让「看似 RLOO」训歪。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 LLM RLHF 里「整段当一个动作」说得通？</summary>
+      <p>真值奖励几乎只标注完整回复；中间 token 没有独立偏好信号。环境转移对已生成前缀也是确定性拼接，可压成 prompt→completion 的 bandit。</p>
+    </details>
+    <details>
+      <summary>2. Leave-one-out 相对「组均值含自身」差在哪一步代数？</summary>
+      <p>LOO 的 b_i 不含 R_i；组均值把 R_i 算进基线，使高分样本优势变小、低分样本负优势的幅度也变小。k 较小时数值差更明显。</p>
+    </details>
+    <details>
+      <summary>3. 作者为何说 PPO clip 在该设定里常多余？</summary>
+      <p>实验中 clip 触发率很低，关掉 clip 不伤甚至略好，说明迭代间策略比变化温和；PPO 防「大偏策略步」的前提在暖启动 RLHF 中较弱。</p>
+    </details>
+    <details>
+      <summary>4. RLOO 相对 RAFT 的样本效率优势从哪来？</summary>
+      <p>同样 k 条在线样本，RAFT 只对 top-1 做 CE；RLOO 对每条都算加权策略梯度，差样本提供负向信号，好样本提供正向信号。</p>
+    </details>
+    <details>
+      <summary>5. 何时仍该上 PPO / Actor-Critic 而不是 RLOO？</summary>
+      <p>需要逐步稠密奖励、长程信用分配、或与现有 PPO 基础设施强绑定（含 value head、GAE 工具链）时。纯序列末奖励 + 强 SFT 初始化，RLOO/GRPO 往往更省。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2402.14740" target="_blank" rel="noopener">arXiv:2402.14740 · RLOO / REINFORCE-style RLHF</a></li>
+      <li><a href="https://huggingface.co/blog/putting_rl_back_in_rlhf_with_rloo" target="_blank" rel="noopener">HF Blog · Putting RL back in RLHF with RLOO</a></li>
+      <li>站内：
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> ·
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="grpo-notes.html">GRPO 实践笔记</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
