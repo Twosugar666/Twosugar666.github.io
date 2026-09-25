@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Growing Harness：从无策略脚手架长出可复用控制代码（失败窗口 / 门控回滚） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Growing Harness：从无策略脚手架长出可复用控制代码（失败窗口 / 门控回滚）</h1>
+    <p class="post-meta">2026-09-25 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Li et al. ·
+      <em>Grow the Harness, Not the Context</em>
+      · <a href="https://arxiv.org/abs/2609.26760" target="_blank" rel="noopener">arXiv:2609.26760</a>。
+      交叉：
+      <a href="daily-2026-09-24-harness-anatomy.html">Harness Anatomy</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-21-harness-design-study.html">组件消融</a>、
+      <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a>、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      同任务族里，许多控制决策会反复出现：何时重试、如何解析工具结果、怎样切分子目标。
+      常见做法是把这些决策继续塞进 context，每一步再调一次 LLM——
+      context 变长、费用上升，小模型还容易在长轨迹上塌掉。
+    </p>
+    <p>
+      Li et al. 主张换切面：<strong>Grow the Harness, Not the Context</strong>——
+      从无预置控制器的脚手架出发，把反复出现的控制逻辑<strong>固化成可执行代码</strong>，
+      用失败窗口定位该改哪里，用 held-out 门控防止「修好训练集、弄坏泛化」。
+      下列机制与数字均为<strong>作者自报</strong>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：strategy-free scaffold（固定 M/T）+ 失败窗口 W_t + 函数级 DAG 编辑 + 修复队列 Q + held-out gate；
+      相对 Tool-Calling，作者报 LLM calls −76.0%～91.8%、online cost −74.4%～98.6%；
+      小模型上 success 跨尺度更稳。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① Strategy-free scaffold：只固定 M/T，不预置 ReAct</h3>
+    <table>
+      <thead><tr><th>组件</th><th>含义</th><th>刻意不做的事</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>M</strong></td>
+          <td>模型调用接口</td>
+          <td>不内置某一种 prompt 控制器套路</td>
+        </tr>
+        <tr>
+          <td><strong>T</strong></td>
+          <td>工具调用接口</td>
+          <td>不预置 ReAct / Plan-Act 等策略模板</td>
+        </tr>
+        <tr>
+          <td><strong>生长对象</strong></td>
+          <td>可执行控制代码（函数）</td>
+          <td>不只往 context 追加「下次注意…」</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 对照（示意）
+Context-growing agent:
+  每步 LLM(context + 历史决策散文) → action
+  控制逻辑留在 prompt 里，反复付 token
+
+Harness-growing (本文):
+  scaffold(M, T) 无策略模板
+  离线优化器改 traced 函数 → 下次同类控制走代码路径
+</code></pre>
+    <p>
+      与站内 <a href="daily-2026-09-24-harness-anatomy.html">Anatomy</a> 的「手写 loop」同向：
+      生产 harness 倾向把稳定控制面钉进代码；本文进一步给出<strong>自动生长</strong>与<strong>回滚门控</strong>的闭环。
+    </p>
+
+    <h3>② 失败窗口 W_t 与函数级执行 DAG</h3>
+    <table>
+      <thead><tr><th>符号</th><th>作者设定</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>W_t</strong></td>
+          <td>失败窗口，容量 <strong>K</strong></td>
+          <td>缓存近期失败轨迹，供离线优化定位</td>
+        </tr>
+        <tr>
+          <td><strong>执行 DAG</strong></td>
+          <td>函数级调用图</td>
+          <td>把「该改哪段控制逻辑」收成可改函数集合</td>
+        </tr>
+        <tr>
+          <td><strong>编辑预算 L</strong></td>
+          <td>单次候选的改动上限</td>
+          <td>只改 traced 函数 + 少量 helpers，限制发散</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 生长一步（作者流程浓缩）
+1) 在线跑任务；失败样本进入 W_t（容量 K）
+2) 从失败轨迹构建函数级执行 DAG → 候选可改集合
+3) 离线优化器产出完整可执行候选（预算 L）
+4) 进入修复队列 Q，等待门控验证
+</code></pre>
+    <p>
+      相对纯 <a href="daily-2026-09-07-harness-compaction.html">compaction</a>（压缩 context 仍每步调模型），
+      这里是把重复决策<strong>移出</strong> context；相对
+      <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a> / <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>
+      的「补丁 / 演化」叙事，本文强调失败窗口 + 函数级定位 + held-out 整段回滚。
+    </p>
+
+    <h3>③ 修复队列 Q + held-out gate（整段回滚）</h3>
+    <table>
+      <thead><tr><th>机制</th><th>规则（作者自报）</th><th>防什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>修复队列 <strong>Q</strong></td>
+          <td>候选按队列应用 / 验证</td>
+          <td>无序乱改导致不可复现</td>
+        </tr>
+        <tr>
+          <td>Held-out gate</td>
+          <td>验证集成功率 <strong>SR_G 不得下降</strong></td>
+          <td>过拟合近期失败窗口</td>
+        </tr>
+        <tr>
+          <td>回滚</td>
+          <td>gate 失败 → <strong>整段回滚</strong></td>
+          <td>留下「半修好」的有害控制代码</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      门控是关键设计：允许 harness 变「更会做训练集里的失败题」，但若 held-out SR_G 掉了就整段撤掉。
+      这与站内演化类工作里的 quality / performance 双门控同一哲学——
+      <strong>能改，但必须可证伪、可回滚</strong>。
+    </p>
+
+    <h3>④ 评测与消融（作者自报）</h3>
+    <table>
+      <thead><tr><th>设定</th><th>结果口径</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>基准</td>
+          <td>BrowseComp-Plus · WebArena-Verified</td>
+        </tr>
+        <tr>
+          <td>部署模型</td>
+          <td>gpt-oss-120b / 20b · Qwen3.5-4B</td>
+        </tr>
+        <tr>
+          <td>主结论</td>
+          <td>六组设定中<strong>五组</strong>最高 mean success</td>
+        </tr>
+        <tr>
+          <td>相对 Tool-Calling</td>
+          <td>LLM calls <strong>−76.0%～91.8%</strong>；online cost <strong>−74.4%～98.6%</strong></td>
+        </tr>
+        <tr>
+          <td>WebArena 跨尺度</td>
+          <td>本文 success <strong>44.7–45.3%</strong>；Tool-Calling 从 30%（120B）掉到 6.7%（4B）</td>
+        </tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>消融（BrowseComp · gpt-oss-20b · 单跑）</th><th>Success</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Full</strong></td><td><strong>36%</strong></td></tr>
+        <tr><td>w/o Function-Level</td><td>18%</td></tr>
+        <tr><td>w/o Gate</td><td>22%</td></tr>
+        <tr><td>w/o Failure-Window</td><td>28%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      消融排序（该单跑）：函数级定位 &gt; 门控 &gt; 失败窗口——
+      没有函数级 DAG，优化器不知道该改哪；没有 gate，容易留下有害补丁；没有失败窗口，则缺少可学习的失败信号。
+      与 <a href="daily-2026-09-21-harness-design-study.html">Design Study</a> 的组件消融可互读：一个改「生长机制」，一个改「规划 / 动作 / 上下文」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先找「同任务族里反复出现的控制决策」。</strong> 只有可复用的控制，才值得长进 harness；一次性特殊 case 仍可留在 context。</li>
+      <li><strong>脚手架保持 strategy-free。</strong> 固定 M/T 接口，避免一上来绑死 ReAct 模板，给生长留下空间。</li>
+      <li><strong>编辑必须可追溯到函数。</strong> 没有执行 DAG / 调用栈，就不要自动改生产 harness。</li>
+      <li><strong>held-out gate 做成硬条件。</strong> SR_G 下降即整段回滚；不要只看训练失败窗口是否变绿。</li>
+      <li><strong>用调用次数与 online cost 当一等指标。</strong> 本文相对 Tool-Calling 的主收益在「少调 LLM」；只报 success 会漏掉部署价值。</li>
+      <li><strong>小模型场景优先验证跨尺度稳定性。</strong> 作者 WebArena 上 4B 仍约 45% 量级，而 Tool-Calling 塌到 6.7%——控制代码外置对弱模型更关键。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 「长 harness」与「长 context」分别把控制逻辑放在哪？</summary>
+      <p>前者写入可执行函数，运行时少调 LLM；后者留在 prompt / 历史里，每步仍付推理与 token。重复控制决策更适合前者。</p>
+    </details>
+    <details>
+      <summary>2. 为什么需要失败窗口容量 K，而不是只看最近一次失败？</summary>
+      <p>单次失败噪声大，且可能不可复现；窗口聚合近期失败模式，才够支撑函数级定位与离线候选生成。</p>
+    </details>
+    <details>
+      <summary>3. held-out gate 失败时为什么要「整段」回滚？</summary>
+      <p>部分应用候选可能让训练集变好、验证集变差；整段回滚避免留下不可解释的半成品控制代码。</p>
+    </details>
+    <details>
+      <summary>4. 消融里 w/o Function-Level 掉到 18% 说明什么？</summary>
+      <p>没有函数级 DAG，优化器难以把失败归因到可改单元，生长退化为盲改或继续堆 context，收益大减。</p>
+    </details>
+    <details>
+      <summary>5. 与 Compaction / Harness-R1 如何分工？</summary>
+      <p>Compaction 管窗口预算；Harness-R1 / Evolve 管补丁与演化流程；本文强调无策略脚手架 + 失败窗口 + 门控回滚，把重复控制从 context 迁到代码。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.26760" target="_blank" rel="noopener">arXiv:2609.26760 · Grow the Harness, Not the Context</a></li>
+      <li>站内：
+        <a href="daily-2026-09-24-harness-anatomy.html">Harness Anatomy</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">组件消融</a> ·
+        <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a> ·
+        <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

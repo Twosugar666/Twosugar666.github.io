@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜V-trace：IMPALA 用截断重要性采样稳住 off-policy Actor-Critic · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜V-trace：IMPALA 用截断重要性采样稳住 off-policy Actor-Critic</h1>
+    <p class="post-meta">2026-09-25 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Espeholt et al. ·
+      <em>IMPALA: Scalable Distributed Deep-RL with Importance Weighted Actor-Learner Architectures</em>
+      · ICML 2018 · <a href="https://arxiv.org/abs/1802.01561" target="_blank" rel="noopener">arXiv:1802.01561</a>。
+      交叉：
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2（TIS）</a>、
+      <a href="daily-2026-09-24-algo-rloo.html">RLOO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      IMPALA 把 <strong>Actor</strong> 与 <strong>Learner</strong> 解耦：大量 actor 在各自环境里用行为策略 μ 采样，
+      中央 learner 用目标策略 π 更新。吞吐上去了，但轨迹相对 learner 一定是
+      <strong>off-policy</strong>——μ 与 π 不一致，朴素策略梯度会偏。
+    </p>
+    <p>
+      纠正手段是 <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>：逐步乘积 ρ=π/μ。
+      长轨迹上未截断的乘积方差爆炸。V-trace 的回答是：
+      <strong>截断</strong>两套 ratio——ρ̄ 管「修正到目标策略的强度」，c̄ 管「时间信用能回传多远」——
+      得到可在大规模 actor–learner 架构里稳定跑的 off-policy value target。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：v_s = V(x_s) + Σ_t γ^{t−s} (∏_{i=s}^{t−1} c_i) δ_t V，
+      其中 δ_t V = ρ_t (r_t + γ V(x_{t+1}) − V(x_t))，ρ_t=min(ρ̄, π/μ)，c_t=min(c̄, π/μ)；
+      通常 ρ̄ ≥ c̄；策略梯度用截断 ρ 加权相对 v 的 advantage。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 为什么 Actor–Learner 必须谈 IS</h3>
+    <table>
+      <thead><tr><th></th><th>On-policy AC / PPO</th><th>IMPALA Actor–Learner</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>采样策略</td>
+          <td>与更新策略同为 π（或极近）</td>
+          <td>Actor 用 μ，Learner 更新 π</td>
+        </tr>
+        <tr>
+          <td>延迟</td>
+          <td>同步或近同步 rollout</td>
+          <td>轨迹入队时 π 可能已前进数步</td>
+        </tr>
+        <tr>
+          <td>无修正后果</td>
+          <td>—</td>
+          <td>价值与策略梯度对错误分布期望，偏置累积</td>
+        </tr>
+        <tr>
+          <td>修正工具</td>
+          <td>常靠 clip / 短信任域（见 <a href="daily-2026-08-28-algo-ppo.html">PPO</a>）</td>
+          <td>轨迹级 IS + V-trace 截断</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 逐步重要性比
+ρ_t = π(a_t | x_t) / μ(a_t | x_t)
+
+# 朴素逐步乘积（长轨迹方差易爆）
+ρ_s · ρ_{s+1} · … · ρ_t
+</code></pre>
+
+    <h3>② V-trace 目标：截断 ρ 与 c</h3>
+    <pre><code># 截断后的 ratio（论文常用记号）
+ρ_t = min(ρ̄, π(a_t|x_t) / μ(a_t|x_t))
+c_t = min(c̄, π(a_t|x_t) / μ(a_t|x_t))
+# 实践上通常取 ρ̄ ≥ c̄
+
+# TD 残差（带截断 ρ）
+δ_t V = ρ_t * ( r_t + γ * V(x_{t+1}) − V(x_t) )
+
+# V-trace 目标
+v_s = V(x_s) + Σ_{t=s}^{s+n-1} γ^{t-s} * (∏_{i=s}^{t-1} c_i) * δ_t V
+# 约定：空积 ∏ = 1
+</code></pre>
+    <table>
+      <thead><tr><th>符号</th><th>角色</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>ρ_t</strong></td>
+          <td>进 δ_t V 的截断 IS</td>
+          <td>控制「这一跳」要把更新拉向 π 多狠</td>
+        </tr>
+        <tr>
+          <td><strong>c_i</strong></td>
+          <td>积在时间折扣链上的截断系数</td>
+          <td>控制更远的 δ 能回传到 s 的幅度（信用分配长度）</td>
+        </tr>
+        <tr>
+          <td><strong>ρ̄ ≥ c̄</strong></td>
+          <td>常见超参关系</td>
+          <td>允许单步修正稍强，但回传链更保守，抑方差</td>
+        </tr>
+        <tr>
+          <td><strong>v_s</strong></td>
+          <td>off-policy value target</td>
+          <td>Critic 回归目标；也可构造 advantage</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      ρ 与 c 都来自同一 ratio π/μ，但截断阈值可以不同：
+      ρ 决定<strong>目标策略修正强度</strong>，c 决定<strong>时间信用回传</strong>。
+      这与站内 <a href="daily-2026-09-02-algo-gae.html">GAE</a> 用 λ 在 TD↔MC 之间拧偏差–方差是同一类旋钮，
+      只是 GAE 通常假设 on-policy（或近 on-policy），V-trace 显式服务 off-policy 轨迹。
+    </p>
+
+    <h3>③ 策略梯度侧：截断 ρ 加权 advantage</h3>
+    <pre><code># 相对 V-trace 目标的 advantage（示意）
+A_t ≈ ρ_t * ( r_t + γ * v_{t+1} − V(x_t) )
+# 或等价地用 v_t − V(x_t) 等 IMPALA 实现变体
+
+# 策略梯度带截断 IS
+∇ ≈ E_μ [ ρ_t * ∇ log π(a_t|x_t) * A_t ]
+</code></pre>
+    <table>
+      <thead><tr><th>组件</th><th>V-trace / IMPALA</th><th>对照</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Critic</td>
+          <td>回归 v_s</td>
+          <td><a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> 的 V 头</td>
+        </tr>
+        <tr>
+          <td>Actor</td>
+          <td>截断 ρ 加权 advantage</td>
+          <td>PPO 用 clip(ratio) 限步；此处用截断 IS 纠偏</td>
+        </tr>
+        <tr>
+          <td>无 Critic 路线</td>
+          <td>—</td>
+          <td><a href="daily-2026-09-24-algo-rloo.html">RLOO</a> / GRPO：组内相对奖励，不走轨迹 V-trace</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>④ 教学对照表</h3>
+    <table>
+      <thead><tr><th></th><th>On-policy GAE</th><th>Off-policy V-trace</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>数据分布</td>
+          <td>μ ≈ π</td>
+          <td>μ 可明显落后于 π</td>
+        </tr>
+        <tr>
+          <td>核心系数</td>
+          <td>λ（GAE）</td>
+          <td>ρ̄、c̄（截断 IS）</td>
+        </tr>
+        <tr>
+          <td>目标形态</td>
+          <td>Σ (γλ)^l δ_{t+l}</td>
+          <td>Σ γ^{t−s} (∏ c) δ_t V，δ 含 ρ</td>
+        </tr>
+        <tr>
+          <td>典型场景</td>
+          <td>PPO 同步 rollout</td>
+          <td>IMPALA 异步 actor–learner</td>
+        </tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th></th><th>TIS（token ratio 截断）</th><th>V-trace（轨迹 IS 截断）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>出现位置</td>
+          <td>LLM RL 异步 / 延迟策略（站内 <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2</a>）</td>
+          <td>经典 Deep-RL IMPALA</td>
+        </tr>
+        <tr>
+          <td>ratio 粒度</td>
+          <td>常按 token：π_θ / π_old</td>
+          <td>按环境步：π(a|x)/μ(a|x)</td>
+        </tr>
+        <tr>
+          <td>截断目的</td>
+          <td>抑高方差 token 级 IS，稳 off-policy 更新</td>
+          <td>抑轨迹乘积方差，并分开「修正强度 / 回传长度」</td>
+        </tr>
+        <tr>
+          <td>血缘</td>
+          <td>同一「截断重要性采样」家族</td>
+          <td>同一家族的轨迹价值估计版本</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      读 LLM 后训练里的 TIS / 异步 IS 时，把 V-trace 当经典参照：
+      <strong>截断的是 ratio，保护的是方差，付出的是偏置</strong>——
+      ρ̄、c̄（或 token 截断阈值）都是偏置–方差旋钮，不是「越大越 on-policy 正确」。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>异步 actor–learner 先承认 off-policy。</strong> 队列越深、learner 越快，μ 与 π 差距越大，越需要 V-trace 一类修正。</li>
+      <li><strong>扫 ρ̄、c̄ 时保持 ρ̄ ≥ c̄。</strong> 先固定一对常用值，再看价值损失与策略熵是否失控。</li>
+      <li><strong>监控 IS ratio 分布。</strong> 大量 ρ≪1 或频繁顶到 ρ̄，说明行为策略过旧——优先减延迟，而不是只拧截断。</li>
+      <li><strong>与 GAE 选型：近 on-policy 用 GAE；明显 off-policy 用 V-trace。</strong> 不要把 GAE(λ) 直接当 off-policy 银弹。</li>
+      <li><strong>LLM 栈对照 TIS。</strong> token 级截断与轨迹级 V-trace 同属截断 IS；实现时分清粒度与 advantage 定义。</li>
+      <li><strong>无 Critic 方法另册。</strong> RLOO/GRPO 用组内相对信号省 V；有环境逐步奖励且异步采样时，V-trace AC 仍更贴经典控制任务。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么朴素逐步乘积 ρ 会在长轨迹上炸？</summary>
+      <p>每步 ratio 独立波动时，乘积的方差随长度 Roughly 指数恶化；极端小概率动作若 π≫μ，单项已很大，连乘更不稳定。</p>
+    </details>
+    <details>
+      <summary>2. ρ 与 c 都截断同一 ratio，为何还要两套阈值？</summary>
+      <p>ρ 进入 TD 残差，管「这一跳」对目标策略的修正；c 乘在回传链上，管更远残差能否传到当前状态。分开才能「修正稍强、回传更保守」。</p>
+    </details>
+    <details>
+      <summary>3. V-trace 相对 on-policy GAE 多付出了什么代价？</summary>
+      <p>截断引入偏置，换来方差可控的 off-policy 目标。若数据已近 on-policy，GAE 往往更简单、偏置结构更清晰。</p>
+    </details>
+    <details>
+      <summary>4. TIS 与 V-trace 最容易混淆的一点是什么？</summary>
+      <p>都叫「截断 IS」，但 TIS 多在 LLM token ratio 上截断，V-trace 在轨迹环境步上截断并拆 ρ/c。家族相同，公式与实现层不同。</p>
+    </details>
+    <details>
+      <summary>5. Actor–Learner 延迟变大时，应先调什么？</summary>
+      <p>先减队列延迟 / 提高 actor 同步频率，使 μ 贴近 π；截断阈值是止损，不是无限容忍过期数据的许可证。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1802.01561" target="_blank" rel="noopener">arXiv:1802.01561 · IMPALA / V-trace</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-08-26-granite-4-2.html">Granite 4.2（TIS）</a> ·
+        <a href="daily-2026-09-24-algo-rloo.html">RLOO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

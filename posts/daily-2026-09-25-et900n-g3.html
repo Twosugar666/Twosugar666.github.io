@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜ASUS ET900N G3：把 NVIDIA DGX Station 搬到桌边（GB300 / 748GB 一致内存） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜ASUS ET900N G3：把 NVIDIA DGX Station 搬到桌边（GB300 / 748GB 一致内存）</h1>
+    <p class="post-meta">2026-09-25 · 收藏夹：配件 / 显卡 · 一线追踪<br />
+      来源：ASUS Blog ·
+      <em>From AI Compute to AI Action: ASUS Zenni AI Hub and ExpertCenter Pro ET900N G3</em>
+      · <a href="https://www.asus.com/blog/from-ai-compute-to-ai-action-asus-zenni-ai-hub-and-expertcenter-pro-et900n-g3/" target="_blank" rel="noopener">asus.com/blog · 2026-09-23</a>。
+      交叉：
+      <a href="daily-2026-08-31-gpu-rubin.html">NVIDIA Rubin</a>、
+      <a href="daily-2026-09-17-rubin-mlperf.html">Vera Rubin MLPerf</a>、
+      <a href="daily-2026-08-31-pc-atx31.html">ATX 3.1 / PCIe 5.1</a>、
+      <a href="daily-2026-09-24-topograph.html">Topograph</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      机架级 AI factory（NVL72、多机 NVLink / InfiniBand）解决「能训多大、能推多快」；
+      另一端是笔记本 / 工作站级本地推理，受显存与互联束缚。中间缺一块：
+      <strong>deskside</strong>——数据不出楼、延迟可控、又不想上整机柜的超级工作站。
+    </p>
+    <p>
+      ASUS 2026-09-23 博客把 ExpertCenter Pro ET900N G3 定位为基于
+      <strong>NVIDIA DGX Station</strong> 架构的 deskside AI 超算，配套软件层
+      <strong>ASUS Zenni AI Hub</strong>（部署 LLM、RAG、模型路由、多 agent）。
+      下列性能与容量数字一律标注为<strong>厂商自报</strong>，非本站实测。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：GB300 Grace Blackwell Ultra Desktop Superchip + 最高约 748GB coherent CPU–GPU memory；
+      厂商自报最高约 20 petaFLOPS AI、可撑约 1 万亿参数级本地工作负载；
+      卖点是「数据不出机房 / 延迟可控 / 对云 API 依赖下降」。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 硬件栈（厂商自报）</h3>
+    <table>
+      <thead><tr><th>项</th><th>ET900N G3 口径（ASUS / NVIDIA 表述）</th><th>读法</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>形态</strong></td>
+          <td>ExpertCenter Pro · deskside AI 超算</td>
+          <td>DGX Station 架构搬到桌边，不是机柜 NVL72</td>
+        </tr>
+        <tr>
+          <td><strong>SoC</strong></td>
+          <td>NVIDIA GB300 Grace Blackwell Ultra Desktop Superchip</td>
+          <td>与站内 <a href="daily-2026-08-31-gpu-rubin.html">Rubin / Blackwell 谱系</a>同代叙事；桌面封装</td>
+        </tr>
+        <tr>
+          <td><strong>AI 性能</strong></td>
+          <td>最高约 <strong>20 petaFLOPS</strong> AI</td>
+          <td>厂商峰值口径；未给本站可复现基准</td>
+        </tr>
+        <tr>
+          <td><strong>一致内存</strong></td>
+          <td>最高约 <strong>748GB</strong> coherent CPU–GPU memory</td>
+          <td>CPU 与 GPU 共享统一地址空间量级</td>
+        </tr>
+        <tr>
+          <td><strong>模型规模</strong></td>
+          <td>支持最大约 <strong>1 万亿参数</strong>模型</td>
+          <td>厂商宣称的本地可承载上限（精度 / 稀疏未在博客展开）</td>
+        </tr>
+        <tr>
+          <td><strong>工作负载</strong></td>
+          <td>本地推理 / 微调 / 多模态 / agentic AI</td>
+          <td>强调「AI Action」：从算力到可部署工作流</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 分层位置（示意，非规格表）
+Rack / AI Factory :  NVL72 · multi-node · Topograph 调度输入
+Deskside Station  :  ET900N G3 · GB300 · ~748GB coherent · Zenni Hub
+PC / Workstation  :  消费级 GPU · ATX 3.1 / 12V-2×6 供电约束
+</code></pre>
+
+    <h3>② 一致内存（coherent CPU–GPU memory）意味着什么</h3>
+    <table>
+      <thead><tr><th>概念</th><th>传统拆分</th><th>一致内存叙事</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>地址空间</td>
+          <td>主机 DRAM ↔ 设备 HBM，显式拷贝</td>
+          <td>CPU–GPU 共享 coherent 空间，减少「搬了再算」</td>
+        </tr>
+        <tr>
+          <td>大模型瓶颈</td>
+          <td>往往卡在单卡 / 单节点显存墙</td>
+          <td>厂商用 ~748GB 统一池讲「桌边也能装下更大权重 / KV」</td>
+        </tr>
+        <tr>
+          <td>工程含义</td>
+          <td>PCIe 拷贝、分片、offload 脚本</td>
+          <td>仍要看驱动 / CUDA / 框架是否真正吃满一致性路径</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      站内 <a href="daily-2026-08-31-pc-atx31.html">ATX 3.1</a> 讲的是消费级供电与 PCIe 供电端子；
+      ET900N G3 落在另一档：整机以 DGX Station 级 deskside 交付，
+      讨论重点从「600W 级显卡会不会熔端子」转向「统一内存池能不能撑住本地万亿级叙事」。
+    </p>
+
+    <h3>③ 软件层：ASUS Zenni AI Hub</h3>
+    <table>
+      <thead><tr><th>能力（博客口径）</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td>部署 LLM</td><td>把模型装到本地 Station，而不是只调云端 API</td></tr>
+        <tr><td>RAG</td><td>企业知识库落地；数据路径可控</td></tr>
+        <tr><td>模型路由</td><td>按任务选模型 / 后端，降低「一个端点打天下」</td></tr>
+        <tr><td>多 agent 协作</td><td>对接 agentic 工作流（规划 / 工具 / 多角色）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      硬件给算力与内存；Hub 给「算完能干什么」。博客标题 <em>From AI Compute to AI Action</em>
+      就是在强调这一层：没有编排与 RAG / agent 壳，deskside 超算只是安静的机箱。
+    </p>
+
+    <h3>④ 与机架 NVL72 / 调度层对照</h3>
+    <table>
+      <thead><tr><th>层</th><th>站内文章</th><th>回答的问题</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>芯片 / 机架吞吐</td>
+          <td><a href="daily-2026-09-17-rubin-mlperf.html">Vera Rubin MLPerf</a>、<a href="daily-2026-08-31-gpu-rubin.html">Rubin</a></td>
+          <td>NVL72 上「能跑多快」；集群级 scaling</td>
+        </tr>
+        <tr>
+          <td><strong>Deskside Station</strong></td>
+          <td><strong>本文 ET900N G3</strong></td>
+          <td>数据不出楼时，桌边能装多大模型、接什么软件壳</td>
+        </tr>
+        <tr>
+          <td>调度拓扑输入</td>
+          <td><a href="daily-2026-09-24-topograph.html">Topograph</a></td>
+          <td>多机集群里谁和谁在同一 NVLink / leaf 域</td>
+        </tr>
+        <tr>
+          <td>消费级供电 / 配件</td>
+          <td><a href="daily-2026-08-31-pc-atx31.html">ATX 3.1</a></td>
+          <td>单卡工位能不能活、12V-2×6 风险</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      NVL72 与 Topograph 属于「机房里的 AI factory」；ET900N G3 属于「楼里的 deskside」。
+      隐私敏感、合规要求数据驻留、或对云 API 延迟 / 成本敏感的团队，会更关心后一档——
+      但仍要用厂商基准与自有负载复测，不能把博客峰值当 SLA。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>所有 FLOPS / 参数上限标「厂商自报」。</strong> 选型以自有模型（精度、上下文、批大小）压测为准。</li>
+      <li><strong>先定数据驻留需求，再选 deskside vs 云 vs 机柜。</strong> 合规与延迟是 Station 的主叙事；纯刷榜吞吐仍看 NVL72 类。</li>
+      <li><strong>把 Zenni Hub 当产品层，不是驱动层。</strong> 评估 LLM 部署、RAG、路由、多 agent 是否覆盖现有流水线；缺口仍要自研 harness。</li>
+      <li><strong>一致内存 ≠ 自动消除工程复杂度。</strong> 框架是否走统一地址、KV / 优化器状态如何放置，需要实测与 profiling。</li>
+      <li><strong>与机架方案分层预算。</strong> deskside 服务「楼内试点 / 敏感数据」；集群服务「大规模训练与高并发推理」——别用一台 Station 替代拓扑感知调度。</li>
+      <li><strong>配件层对照别混。</strong> 消费级 ATX / 12V-2×6 经验不能直接外推 DGX Station 级整机。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 deskside DGX Station 与 NVL72 不是替代关系？</summary>
+      <p>前者优化数据驻留、楼内延迟与单机大内存叙事；后者优化机架级吞吐与多节点 scaling。合规试点与刷集群吞吐的约束不同。</p>
+    </details>
+    <details>
+      <summary>2. 「748GB coherent memory」解决的主要痛点是什么？</summary>
+      <p>降低「权重 / KV 装不下单卡 HBM → 频繁 host–device 拷贝或粗暴 offload」的摩擦；是否吃满仍取决于软件栈。</p>
+    </details>
+    <details>
+      <summary>3. Zenni AI Hub 相对「只卖硬件」多提供了什么？</summary>
+      <p>部署、RAG、路由与多 agent 协作——把算力接到可运营工作流，对应博客从 Compute 到 Action 的主张。</p>
+    </details>
+    <details>
+      <summary>4. 读 Topograph 文之后，为何仍可能需要 ET900N 这类机器？</summary>
+      <p>Topograph 服务多机调度 locality；若工作负载根本不应出楼、或不值得上集群，deskside Station 是另一条产品线。</p>
+    </details>
+    <details>
+      <summary>5. 选型时哪些数字必须自己复测？</summary>
+      <p>目标模型的有效吞吐、首字 / 尾延迟、微调步时、多模态与 agent 工具调用开销，以及 Hub 路由策略是否匹配业务 SLA——博客峰值不能直接写进合同。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://www.asus.com/blog/from-ai-compute-to-ai-action-asus-zenni-ai-hub-and-expertcenter-pro-et900n-g3/" target="_blank" rel="noopener">ASUS Blog · Zenni AI Hub &amp; ET900N G3（2026-09-23）</a></li>
+      <li>站内：
+        <a href="daily-2026-08-31-gpu-rubin.html">NVIDIA Rubin</a> ·
+        <a href="daily-2026-09-17-rubin-mlperf.html">Vera Rubin MLPerf</a> ·
+        <a href="daily-2026-08-31-pc-atx31.html">ATX 3.1 / PCIe 5.1</a> ·
+        <a href="daily-2026-09-24-topograph.html">Topograph</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

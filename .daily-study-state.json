@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 0,
   "daily_streams": [
     "frontline",
     "harness",
@@ -522,6 +522,27 @@
       "source": "algo",
       "topic": "RLOO：序列级 REINFORCE + leave-one-out 基线；无 Critic；vs PPO win-rate 77.9/43.7/64.1；vs GRPO 组均值含自身（arXiv:2402.14740）",
       "file": "posts/daily-2026-09-24-algo-rloo.html"
+    },
+    {
+      "date": "2026-09-25",
+      "domain": "pc gpu",
+      "source": "frontline",
+      "topic": "ASUS ET900N G3：DGX Station deskside / GB300 / ~20 PFLOPS AI / 748GB coherent / Zenni AI Hub（厂商自报）",
+      "file": "posts/daily-2026-09-25-et900n-g3.html"
+    },
+    {
+      "date": "2026-09-25",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Growing Harness：strategy-free scaffold + 失败窗口 W_t + 函数级 DAG + held-out gate 整段回滚；LLM calls −76–91.8%（arXiv:2609.26760）",
+      "file": "posts/daily-2026-09-25-harness-growing.html"
+    },
+    {
+      "date": "2026-09-25",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "V-trace：IMPALA 截断 IS；v_s=V+Σγ(∏c)δV；ρ̄/c̄；vs GAE / TIS（arXiv:1802.01561）",
+      "file": "posts/daily-2026-09-25-algo-vtrace.html"
     }
   ]
 }
