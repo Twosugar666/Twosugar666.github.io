@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜TD(λ) 与 Eligibility Traces：在 TD(0) 与蒙特卡洛之间拧偏差–方差 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜TD(λ) 与 Eligibility Traces：在 TD(0) 与蒙特卡洛之间拧偏差–方差</h1>
+    <p class="post-meta">2026-09-28 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Sutton &amp; Barto ·
+      <em>Reinforcement Learning: An Introduction</em>（eligibility traces / TD(λ) 章节）。
+      交叉：
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>、
+      <a href="daily-2026-09-25-algo-vtrace.html">V-trace</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      价值估计有两条极端路：<strong>TD(0)</strong> 只用一步 bootstrap（低方差、有偏，依赖当前 V）；
+      <strong>蒙特卡洛（MC）</strong> 用整条回报（无偏于真实回报，但方差大、要等回合结束）。
+      实践里两者之间还有一整段连续谱——这就是 <strong>TD(λ)</strong> 与 <strong>eligibility traces</strong> 要填的位置。
+    </p>
+    <p>
+      站内已有 <a href="daily-2026-09-02-algo-gae.html">GAE</a>（用 λ 混合多步 advantage）、
+      <a href="daily-2026-09-25-algo-vtrace.html">V-trace</a>（off-policy 截断 IS 的价值目标）。
+      本文回到经典 on-policy 叙事：λ-return、forward/backward view、迹的衰减与清除，
+      再接到现代 Actor-Critic / GAE / V-trace，而不是重写 PPO/DPO 专文。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：G_t^{λ} = (1−λ) Σ_{n=1}^∞ λ^{n−1} G_t^{(n)}；
+      λ=0 → TD(0)，λ=1 → MC；backward view 用 eligibility trace e_t(s) 把同一更新在线摊开。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① n-step return 与 λ-return</h3>
+    <pre><code># 一步 TD 目标
+G_t^{(1)} = R_{t+1} + γ V(S_{t+1})
+
+# n-step return
+G_t^{(n)} = R_{t+1} + γ R_{t+2} + … + γ^{n-1} R_{t+n} + γ^n V(S_{t+n})
+
+# λ-return：对所有 n 的几何混合
+G_t^{λ} = (1 − λ) Σ_{n=1}^{∞} λ^{n−1} G_t^{(n)}
+# 有限回合到 T 时，末尾用完整回报收口（教材标准写法）
+</code></pre>
+    <table>
+      <thead><tr><th>λ</th><th>退化</th><th>偏差–方差直觉</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>λ = 0</strong></td>
+          <td>只留 G_t^{(1)} → TD(0)</td>
+          <td>偏置来自 V；方差通常更小</td>
+        </tr>
+        <tr>
+          <td><strong>0 &lt; λ &lt; 1</strong></td>
+          <td>多步混合</td>
+          <td>更长信用 ↔ 更大方差；可拧旋钮</td>
+        </tr>
+        <tr>
+          <td><strong>λ = 1</strong></td>
+          <td>等价蒙特卡洛回报</td>
+          <td>不 bootstrap（在回合设定下）；方差最大</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      λ 不是「学习率」，而是<strong>多步目标怎么加权</strong>。
+      把它和步长 α、折扣 γ 分开调，才不会把「更新幅度」和「信用分配长度」拧成一团。
+    </p>
+
+    <h3>② Forward view vs Backward view</h3>
+    <table>
+      <thead><tr><th>视角</th><th>在算什么</th><th>实现含义</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Forward view</strong></td>
+          <td>对每个时刻 t，看未来构造 G_t^{λ}，再更新 V(S_t)</td>
+          <td>概念清晰；要等到足够未来（或整回合）才好看齐</td>
+        </tr>
+        <tr>
+          <td><strong>Backward view</strong></td>
+          <td>每步算 TD 误差 δ_t，按 eligibility 回写近期访问状态</td>
+          <td>在线、增量；与 forward 在适当条件下等价</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># TD 误差
+δ_t = R_{t+1} + γ V(S_{t+1}) − V(S_t)
+
+# 累积迹（accumulating trace）示意
+e_t(s) = γ λ e_{t−1}(s) + 1{S_t = s}
+# 替换迹（replacing）：访问时置 1，否则同样衰减
+
+# 半梯度式更新（表格情形示意）
+V(s) ← V(s) + α δ_t e_t(s)   for all s
+</code></pre>
+    <p>
+      Eligibility trace 回答的是：<strong>刚才这个 δ，该算在哪些「最近到过、且仍被 λ 记着」的状态头上</strong>。
+      γλ &lt; 1 时迹衰减；λ↑ 则信用传得更远，更接近 MC。
+    </p>
+
+    <h3>③ 接到 GAE、V-trace、Actor-Critic</h3>
+    <table>
+      <thead><tr><th>方法</th><th>与 TD(λ) 的关系</th><th>差别要点</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="daily-2026-09-02-algo-gae.html">GAE</a></td>
+          <td>对 advantage 做 λ 混合：Â_t^{GAE(γ,λ)} = Σ_l (γλ)^l δ_{t+l}</td>
+          <td>目标常是策略梯度的 A，而不只是 V；实践默认近 on-policy</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-25-algo-vtrace.html">V-trace</a></td>
+          <td>多步回传链上乘截断 c，δ 内含截断 ρ</td>
+          <td>服务 off-policy actor–learner；旋钮是 ρ̄/c̄ 而非单一 λ</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a></td>
+          <td>Critic 可用 TD(λ)/GAE 估 V 或 A；Actor 吃 advantage</td>
+          <td>迹既可在 V 上，也可在策略参数的 eligibility 形式上出现</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># GAE 与 λ-return 的亲缘（示意）
+δ_t = r_t + γ V(s_{t+1}) − V(s_t)
+Â_t = δ_t + (γλ) δ_{t+1} + (γλ)^2 δ_{t+2} + …
+# λ=0 → 一步 advantage；λ→1 → 更接近回报型优势
+
+# 不要把 GAE(λ) 直接当 off-policy V-trace
+# μ 与 π 差距大时，先看 IS / V-trace，而不是只拧 λ
+</code></pre>
+    <p>
+      记忆口诀：<strong>TD(λ) 管「多步价值目标怎么混」；GAE 把同一旋钮拧到 advantage；
+      V-trace 在混的同时还要截断 off-policy ratio</strong>。
+    </p>
+
+    <h3>④ 实现时容易踩的点</h3>
+    <table>
+      <thead><tr><th>点</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>迹的种类</td>
+          <td>accumulating vs replacing；函数近似下还有荷兰迹等变体——先弄清表格情形再上近似</td>
+        </tr>
+        <tr>
+          <td>回合边界</td>
+          <td>终止时 V(S_{T+1})=0；迹通常清零，避免跨局泄漏信用</td>
+        </tr>
+        <tr>
+          <td>与 α 耦合</td>
+          <td>λ↑ 方差↑，往往要更小 α 或更大 batch；别只猛加 λ</td>
+        </tr>
+        <tr>
+          <td>函数近似</td>
+          <td>半梯度 TD(λ) 是主流工程路径；收敛条件比表格情形更脆，需配合经验与目标网络等稳定技巧</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先画谱再选点。</strong> 短视野、V 较准 → 偏小 λ；稀疏奖励、bootstrap 不可靠 → 偏大 λ，并接受方差。</li>
+      <li><strong>现代策略梯度默认从 GAE 理解 λ。</strong> 读 PPO/AC 代码里的 <code>gae_lambda</code>，本质是本文同一旋钮。</li>
+      <li><strong>异步 / 明显 off-policy 先问 V-trace。</strong> 只调 GAE(λ) 纠正不了 μ≠π 的分布偏移。</li>
+      <li><strong>监控 δ 与回报方差。</strong> λ 加大后若梯度范数爆炸，优先降 λ 或加 batch，而不是只降 actor lr。</li>
+      <li><strong>终止与截断分开建模。</strong> 环境 done 与 time-limit truncation 对 bootstrap 边界不同，GAE 实现里常见 bootstrap 掩码。</li>
+      <li><strong>教学顺序：TD(0) → n-step → λ-return → eligibility → GAE。</strong> 跳步直接背 GAE 公式容易丢掉「连续谱」图像。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说 λ=0 与 λ=1 是同一家族的两端？</summary>
+      <p>λ-return 是对所有 n-step return 的几何混合；λ=0 只留一步 TD，λ=1 把权重推到完整 MC 回报。</p>
+    </details>
+    <details>
+      <summary>2. Forward view 与 Backward view 为何需要「等价」这句话？</summary>
+      <p>Forward 按未来构造目标，Backward 用迹在线摊销同一信用；等价保证：实现用迹，分析仍可按 λ-return 理解。</p>
+    </details>
+    <details>
+      <summary>3. GAE 的 λ 与 TD(λ) 的 λ 是不是同一个旋钮？</summary>
+      <p>同属「多步 TD 误差的指数混合」；GAE 作用在 advantage 估计上，TD(λ) 经典叙述多在价值函数更新上。</p>
+    </details>
+    <details>
+      <summary>4. 何时不该指望加大 GAE(λ) 解决问题？</summary>
+      <p>当数据明显 off-policy（异步 actor–learner、长延迟）时，缺的是 IS/V-trace 类修正，不是更大的 on-policy λ。</p>
+    </details>
+    <details>
+      <summary>5. Eligibility trace 衰减因子为什么是 γλ 而不是单独 λ？</summary>
+      <p>信用既随时间折扣 γ 衰减，也随 λ 控制的多步混合衰减；合成 γλ 才能与 λ-return 的折扣结构对齐。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>Sutton &amp; Barto · <em>Reinforcement Learning: An Introduction</em>（TD(λ) / eligibility traces）</li>
+      <li>站内：
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a> ·
+        <a href="daily-2026-09-25-algo-vtrace.html">V-trace</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

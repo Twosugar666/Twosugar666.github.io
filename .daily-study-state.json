@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 0,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -543,6 +543,27 @@
       "source": "algo",
       "topic": "V-trace：IMPALA 截断 IS；v_s=V+Σγ(∏c)δV；ρ̄/c̄；vs GAE / TIS（arXiv:1802.01561）",
       "file": "posts/daily-2026-09-25-algo-vtrace.html"
+    },
+    {
+      "date": "2026-09-28",
+      "domain": "infra agent",
+      "source": "frontline",
+      "topic": "DeepSeek DSec：统一 SDK FnCall/container/microVM/full VM；~160 节点 / ~3M sandbox/天 / >380K 并发 / >5000 创建/s；EROFS+3FS；pause/resume；AppArmor+eBPF（arXiv:2609.22978）",
+      "file": "posts/daily-2026-09-28-dsec.html"
+    },
+    {
+      "date": "2026-09-28",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Hard Stop：Epistemic Andon / eBPF LSM / cgroup.freeze / TOCTOH；tripwire≈0.40µs、SIGSTOP≈0.0048ms、freeze≈0.154ms（arXiv:2609.29808，据论文）",
+      "file": "posts/daily-2026-09-28-harness-hard-stop.html"
+    },
+    {
+      "date": "2026-09-28",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "TD(λ)/eligibility traces：λ-return；forward/backward；λ=0 TD(0)↔λ=1 MC；接 GAE / V-trace / AC（Sutton & Barto）",
+      "file": "posts/daily-2026-09-28-algo-td-lambda.html"
     }
   ]
 }

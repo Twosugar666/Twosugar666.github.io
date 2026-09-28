@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜DeepSeek DSec：统一 SDK 的大规模 Agentic 沙箱基础设施 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜DeepSeek DSec：统一 SDK 的大规模 Agentic 沙箱基础设施</h1>
+    <p class="post-meta">2026-09-28 · 收藏夹：Infra / Agent · 一线追踪<br />
+      报告：Huang / Tang / Chen 等（DeepSeek-AI / 清华）·
+      <em>DeepSeek Elastic Compute (DSec): A Sandbox Infrastructure for Effective Agentic Training at Scale</em>
+      · <a href="https://arxiv.org/abs/2609.22978" target="_blank" rel="noopener">arXiv:2609.22978</a>。
+      交叉：
+      <a href="daily-2026-09-23-rollart.html">ROLLART</a>、
+      <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a>、
+      <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a>、
+      <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a>、
+      <a href="daily-2026-08-31-miles-v01.html">Miles</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agentic 训练与评测不是「跑一段代码就结束」：模型要在隔离环境里读仓库、调工具、起服务、改文件，
+      轨迹跨多轮交互保留状态；一次 job 可突发创建上万沙箱，镜像语料大、复用率低。
+      单一种 runtime（纯 container 或纯 VM）很难同时覆盖 OJ 短任务、SWE、安全、computer-use 与完整 COTS OS。
+    </p>
+    <p>
+      DeepSeek Elastic Compute（DSec）把问题定义成<strong>弹性执行平台</strong>：统一 SDK 暴露多种后端，
+      用可组合层与按需镜像降低 setup，用内存回收与 CPU QoS 撑高密度，并与 RL 框架共设计，
+      把 stateful rollout 从可抢占 GPU 训练里解耦出来。下列规模与消融数字均为<strong>作者自报</strong>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：libdsec 统一 FnCall / container / microVM / full VM；
+      单单元约 <strong>160</strong> 节点、约 <strong>3M</strong> sandbox/天、并发 <strong>&gt;380K</strong>、创建速率 <strong>&gt;5000</strong>/s；
+      可组合 EROFS 层 + 3FS 按需加载；pause/resume 对齐抢占；AppArmor + eBPF 抑 reward hacking。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 统一 SDK 与四级后端</h3>
+    <table>
+      <thead><tr><th>后端</th><th>典型场景</th><th>隔离 / 开销（作者表述）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>FnCall</strong></td>
+          <td>OJ、短无状态、GPU kernel 评测</td>
+          <td>预创建容器复用；shared / exclusive GPU</td>
+        </tr>
+        <tr>
+          <td><strong>Container</strong></td>
+          <td>SWE、通用 tool-use</td>
+          <td>启动快、密度高；共享 host kernel</td>
+        </tr>
+        <tr>
+          <td><strong>MicroVM</strong>（Firecracker）</td>
+          <td>安全敏感、更强租户隔离</td>
+          <td>VM 边界 + Linux 兼容；内存与启动开销更高</td>
+        </tr>
+        <tr>
+          <td><strong>Full VM</strong></td>
+          <td>Android / GUI / graphics</td>
+          <td>完整 COTS OS；开销最高</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># libdsec 会话（作者示例浓缩）
+client = DSecClient()
+await client.open()
+sandbox = await client.run_container(DSecContainerRunArgs(
+    container_image="...", memory_limit_mb=4096, cpu_cores_limit=4,
+    network_rules={"npm": False, "pypi": True}, ...
+), timeout=120)
+result = await sandbox.run_shell("echo hello")
+await sandbox.stop()
+</code></pre>
+    <p>
+      接口统一、语义不完全抹平：调用方仍须按任务选后端。
+      与站内 <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a>「把执行面钉死」同向——
+      DSec 钉的是<strong>平台后端与生命周期</strong>，ActPlane 钉的是 harness 动作平面。
+    </p>
+
+    <h3>② 可组合 EROFS 层与 3FS 按需加载</h3>
+    <table>
+      <thead><tr><th>机制</th><th>做法</th><th>动机</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>可组合层</strong></td>
+          <td>base / workspace / toolkit 独立版本；overlayfs 动态叠 lowerdir</td>
+          <td>避免 monolithic OCI 升级 O(m·N) / O(k·N) 重建</td>
+        </tr>
+        <tr>
+          <td><strong>EROFS</strong></td>
+          <td>只读层；元数据可本地、数据留 3FS；支持压缩随机读</td>
+          <td>相对 tar 解包，setup 不做每沙箱全量展开</td>
+        </tr>
+        <tr>
+          <td><strong>3FS 按需</strong></td>
+          <td>写走本地 upper；读按访问从集群文件系统拉</td>
+          <td>镜像 fanout 低、运行时只摸到一小部分文件</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 环境分解（示意）
+lower:  base(EROFS) + workspace(EROFS) + toolkit*(EROFS)
+upper:  本地可写层（日志 / 安装 / 运行态）
+microVM: EROFS 只读层 + OverlayBD/ublk 可写盘；同样可组合
+</code></pre>
+    <p>
+      作者评测（10 节点、8192 container 突发）：eager pull 完成时间约 <strong>1.7×</strong>（文中约 1.71×），
+      按需路径累计写盘约 <strong>−57%</strong>。
+      这与「先把镜像全拉满再开训」的直觉相反——多样性 + 低访问比例时，全量 pull 既慢又抢跑中沙箱的 I/O。
+    </p>
+
+    <h3>③ 高密度：内存回收与 LS/BE CPU QoS</h3>
+    <table>
+      <thead><tr><th>问题</th><th>机制</th><th>作者自报</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>guest/host 页缓存重复；空闲页不还给宿主机</td>
+          <td>virtio-pmem+DAX（只读层共享）；DAMON + balloon free-page reporting</td>
+          <td>DAMON+balloon 时间积分内存约 <strong>−21.2%</strong></td>
+        </tr>
+        <tr>
+          <td>BE 与 LS 抢 SMT sibling</td>
+          <td>BE → <code>SCHED_IDLE</code>；LS 开 core scheduling</td>
+          <td>延迟膨胀 <strong>45.2% → 17.3%</strong>（50% BE 负载设定）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      生产观察点（作者）：单节点可稳定到至少约 3200 container 或 800 microVM；
+      CPU 平均占用常极低（约 90% 样本平均 ≤ 请求量的 5%），适合 overcommit，
+      但长 lifetime（中位约十余分钟、p99 超三小时）让<strong>驻留内存</strong>成为容量瓶颈。
+    </p>
+
+    <h3>④ 与 RL 解耦：stateful rollout vs preemptible GPU</h3>
+    <pre><code># 共设计要点（作者叙述）
+① agent sandbox（scaffold + tools）+ worker container（控制面）
+   → 跑在 DSec，不在可抢占 GPU pod 内
+② GPU 训练被抢占时：对关联沙箱发 pause
+   container: docker pause + swap/reclaim；microVM: 快照后停 Firecracker
+③ 后续请求透明 resume；rollout 状态以 DSec 侧为 SoT
+④ AppArmor：文件/socket（含 chronus 日志与 UDS）
+   eBPF：按任务域/mirror 的细粒度网络 allowlist
+</code></pre>
+    <table>
+      <thead><tr><th>对照</th><th>分工</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="daily-2026-09-23-rollart.html">ROLLART</a></td>
+          <td>异构 GPU 亲和、轨迹级异步、serverless reward——偏训练编排</td>
+        </tr>
+        <tr>
+          <td>DSec</td>
+          <td>沙箱供给、镜像/密度、pause/resume、防 reward hacking——偏执行平台</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-25-harness-growing.html">Growing Harness</a> / DSH</td>
+          <td>控制逻辑长在 harness；DSec 提供可组合 toolkit 层与隔离执行面</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a></td>
+          <td>内核级 Andon / 抢占；DSec 用 AppArmor+eBPF 做任务内访问控制——互补层</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      规模一览（单 production-scale unit，作者自报）：约 <strong>160</strong> 节点、约 <strong>3M</strong> sandbox/天、
+      并发 <strong>&gt;380K</strong>、创建 <strong>&gt;5000</strong>/s；共享 3FS 承载层与 workspace。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先选后端，再谈密度。</strong> OJ/短任务走 FnCall；SWE 走 container；安全与强隔离走 microVM；GUI/COTS 才上 full VM。</li>
+      <li><strong>环境拆成可版本化层。</strong> base / workspace / toolkit 分开发布；toolkit 升级不应触发全量镜像重建。</li>
+      <li><strong>镜像路径按「访问比例」设计。</strong> fanout 低、运行时只读小部分时，优先按需加载，而不是 eager pull。</li>
+      <li><strong>把 agent loop 移出可抢占 GPU pod。</strong> sandbox + worker 作 rollout SoT；训练抢占用 pause/resume，而不是靠命令日志硬重放。</li>
+      <li><strong>访问控制按任务阶段动态收紧。</strong> AppArmor 管文件/socket；eBPF allowlist 管外网与 mirror；默认拒绝比「事后 SIEM」更贴 agent 速度。</li>
+      <li><strong>overcommit 必须配 QoS。</strong> 只有 SCHED_IDLE 不够；LS 任务要 core scheduling，否则 SMT sibling 仍会抬延迟。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么统一 SDK 仍要求调用方显式选后端？</summary>
+      <p>FnCall / container / microVM / full VM 在启动成本、隔离边界、文件系统语义与 OS 能力上不可无损抹平；统一的是操作模型与入口，不是假装一种抽象适配所有任务。</p>
+    </details>
+    <details>
+      <summary>2. 可组合层相对 monolithic OCI 省在哪？</summary>
+      <p>base、workspace、toolkit 生命周期独立；升级 m 个 base 或 k 个 toolkit 只需重建对应层，而不是按组合数爆炸重建。</p>
+    </details>
+    <details>
+      <summary>3. 按需加载为何能同时缩短完成时间并减少写盘？</summary>
+      <p>沙箱通常只访问镜像的一小部分；eager 全量下载/解压既推迟就绪，又把多余 I/O 砸到已在跑的高密度邻居上。</p>
+    </details>
+    <details>
+      <summary>4. stateful rollout 与 preemptible GPU 解耦解决了什么？</summary>
+      <p>训练 job 被抢占时，若 agent loop 仍在 GPU pod 内会丢执行态；放到 DSec 后 sandbox/worker 保留 SoT，可 pause 收内存、resume 续跑。</p>
+    </details>
+    <details>
+      <summary>5. DSec 的访问控制与 Hard Stop 的 Andon 差在哪一层？</summary>
+      <p>DSec 侧重任务内文件/网络策略与 reward hacking 缓解；Hard Stop 强调越界即内核级硬停与 out-of-band 监督。生产上常需两层叠用。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.22978" target="_blank" rel="noopener">arXiv:2609.22978 · DeepSeek Elastic Compute (DSec)</a></li>
+      <li>站内：
+        <a href="daily-2026-09-23-rollart.html">ROLLART</a> ·
+        <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a> ·
+        <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a> ·
+        <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

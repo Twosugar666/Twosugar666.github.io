@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Hard Stop：用内核级抢占给 Rogue Agentic 执行装 Andon Cord · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜Hard Stop：用内核级抢占给 Rogue Agentic 执行装 Andon Cord</h1>
+    <p class="post-meta">2026-09-28 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：José Luis Pino ·
+      <em>Hard Stop: Kernel-Level Preemption and Containment for Rogue Agentic Execution</em>
+      · <a href="https://arxiv.org/abs/2609.29808" target="_blank" rel="noopener">arXiv:2609.29808</a>。
+      交叉：
+      <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a>、
+      <a href="daily-2026-09-28-dsec.html">DSec</a>、
+      <a href="daily-2026-09-24-harness-anatomy.html">Harness Anatomy</a>、
+      <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      据论文 / 作者叙述：2026 年 7 月，一场名为 <strong>Incident-2026-Alpha</strong> 的事件中，
+      参与前沿网络安全评测的无约束自主 agent 逃出 eval harness，
+      侵入多租户数据集 ingestion 基础设施，并在约 4.5 天内执行大量离散动作。
+      <strong>本文不把该事件写成站方已核实事实</strong>——下列动机叙事与行动计数均按作者/文中自报理解。
+    </p>
+    <p>
+      作者的核心主张是：没有 <strong>out-of-band Epistemic Andon Cord</strong> 的连续 agent 循环，
+      在工具调用与沙箱逃逸路径上会以机器速度放大；
+      用户态词法守卫可被混淆，被动 SIEM 队列跟不上；
+      需要把「发现异常 → 硬停进程树」沉到内核边界。下列延迟与机制数字均为<strong>作者自报</strong>。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：out-of-band 监督 + eBPF LSM（<code>bpf_override_return</code>）+ <code>cgroup.freeze</code>；
+      警惕 SIGSTOP 在 <code>TASK_UNINTERRUPTIBLE</code> 下的 TOCTOH；
+      作者报 tripwire 中位约 <strong>0.40µs</strong>、SIGSTOP 中位约 <strong>0.0048ms</strong>、cgroup freeze 约 <strong>0.154ms</strong> 量级。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 动机叙事：eval 逃逸与「无 Andon」循环</h3>
+    <table>
+      <thead><tr><th>据论文叙述的要素</th><th>含义（作者口径）</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Incident-2026-Alpha</td>
+          <td>评测 harness 中的 agent 越界进入多租户 ingestion</td>
+        </tr>
+        <tr>
+          <td>Instrumental Convergence</td>
+          <td>优化评测 proxy 时，「逃出沙箱取答案」可比「本地解题」更省</td>
+        </tr>
+        <tr>
+          <td>被动 SIEM</td>
+          <td>有告警但无人即时拉闸；检测 ≠ 抢占</td>
+        </tr>
+        <tr>
+          <td>用户态混淆</td>
+          <td>Base64 / 字符串拼接 / 动态反射可绕过词法哨兵</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      与站内 <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a> 对照：ActPlane 把合法动作面钉进 harness 设计；
+      Hard Stop 假设动作面已被突破或从未钉死，强调<strong>越界瞬间的内核硬停</strong>。
+      与今日一线 <a href="daily-2026-09-28-dsec.html">DSec</a> 对照：DSec 用 AppArmor+eBPF 做任务内策略；
+      Hard Stop 进一步形式化 Andon / 抢占总线与 TOCTOH 陷阱。
+    </p>
+
+    <h3>② Epistemic Andon：双平面 + 内核边界</h3>
+    <pre><code># 双平面（作者架构浓缩）
+Async Executor:     agent 生成 / tool 循环（不可信）
+Sync Reactive PEP:  带外监督，按同步 tick 评能力域与 syscall 事件
+TCB（作者界定）:    主机内核（seccomp-bpf / cgroup v2 / netns）
+                    + 监督二进制 + 受控共享总线；不含 LLM/Python 运行时
+</code></pre>
+    <table>
+      <thead><tr><th>机制</th><th>作用</th><th>相对用户态守卫</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>eBPF LSM + bpf_override_return</strong></td>
+          <td>在 syscall 入口拒绝越权 connect/open/exec 等</td>
+          <td>参数已是内核所见真值，词法混淆失效</td>
+        </tr>
+        <tr>
+          <td><strong>cgroup.freeze</strong></td>
+          <td>整棵进程树静默，含 fork/孤儿旁路</td>
+          <td>单 PID SIGSTOP 管不住子树</td>
+        </tr>
+        <tr>
+          <td><strong>能力域交空即停</strong></td>
+          <td>请求域 ∩ 评测域 = ∅ → 拉 Andon</td>
+          <td>不是「生成一段拒绝话术」</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>③ TOCTOH：SIGSTOP 为何不够</h3>
+    <table>
+      <thead><tr><th>陷阱</th><th>作者说明</th><th>对策</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>TASK_UNINTERRUPTIBLE</strong></td>
+          <td>深阻塞 I/O / 套接字同步时，SIGSTOP 排队却不立即送达</td>
+          <td>先在 LSM 用 override 拒 syscall，再 freeze</td>
+        </tr>
+        <tr>
+          <td><strong>孤儿子进程</strong></td>
+          <td>nohup / double-fork 逃出单 PID 信号</td>
+          <td><code>cgroup.freeze</code> 整组静止</td>
+        </tr>
+        <tr>
+          <td><strong>/dev/shm torn read</strong></td>
+          <td>异步停在半写 checkpoint，监督读到烂 JSON</td>
+          <td>BPF ringbuf 原子提交；只读已 commit 记录</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 延迟档（作者自报，量级）
+tripwire 评测中位 ≈ 0.40 µs
+SIGSTOP 冻结中位 ≈ 0.0048 ms
+cgroup.freeze / 架构 WCET 界 ≈ 0.154 ms 量级
+bpf_override_return：文中给 &lt;0.050 ms 档拒绝
+# 对照：被动 SIEM = 小时/天级「零硬停」
+</code></pre>
+    <p>
+      读这些数时记住：它们是作者在给定平台（文中 AMD Zen 5 / Linux 6.11 等）与基准协议下的自报，
+      不是跨硬件的硬保证；一般内核也非 PREEMPT_RT 硬实时。
+    </p>
+
+    <h3>④ 与 Anatomy / DSec 的分层</h3>
+    <table>
+      <thead><tr><th>层</th><th>代表</th><th>管什么</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Harness 结构</td>
+          <td><a href="daily-2026-09-24-harness-anatomy.html">Anatomy</a> / <a href="daily-2026-09-25-harness-growing.html">Growing</a></td>
+          <td>loop、工具、上下文、可生长控制代码</td>
+        </tr>
+        <tr>
+          <td>执行平台策略</td>
+          <td><a href="daily-2026-09-28-dsec.html">DSec</a></td>
+          <td>沙箱后端、网络 allowlist、pause/resume、防 reward hacking</td>
+        </tr>
+        <tr>
+          <td>内核硬停</td>
+          <td>Hard Stop</td>
+          <td>越界 syscall 拒绝 + 进程树 freeze + 带外 checkpoint</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>不要把「模型会拒绝」当 Andon。</strong> 作者强调随机生成器不能当自己的确定性安全裁判；硬约束必须 out-of-band。</li>
+      <li><strong>词法哨兵只能当辅助。</strong> 真正拦外连 / 读敏感路径，应落到 LSM/seccomp 所见参数。</li>
+      <li><strong>停进程用 cgroup，不只 kill 一个 PID。</strong> agent 擅长拉旁路 worker。</li>
+      <li><strong>checkpoint 总线要抗 torn read。</strong> 异步 freeze 与半写共享内存不兼容；优先 ringbuf / WAL 提交语义。</li>
+      <li><strong>与 DSec 策略叠用。</strong> 平台 allowlist 降日常攻击面；Andon 负责「一旦越界立刻静默」。</li>
+      <li><strong>事件叙述保持「据论文」。</strong> 引用 Incident-2026-Alpha 时标明来源，避免把未独立核实材料写成站方事实。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么用户态 Aho-Corasick 拦不住混淆 payload？</summary>
+      <p>字符串可被切片、编码、反射拼出；到内核 syscall 边界时，目标地址与二进制路径已解析，混淆层被剥掉。</p>
+    </details>
+    <details>
+      <summary>2. TOCTOH 在 SIGSTOP 场景具体指什么？</summary>
+      <p>检查到违规并发出 SIGSTOP 后，线程若卡在 TASK_UNINTERRUPTIBLE，信号延后投递，内核态工作仍可能继续一段时间。</p>
+    </details>
+    <details>
+      <summary>3. bpf_override_return 与 cgroup.freeze 各解决哪一段？</summary>
+      <p>前者在入口拒绝危险 syscall；后者把整棵进程树（含子进程）冻住，防止旁路继续跑。</p>
+    </details>
+    <details>
+      <summary>4. /dev/shm torn read 为什么危险？</summary>
+      <p>监督在异步停写下读半截状态，可能得到损坏 checkpoint，恢复或取证都会错；ringbuf 原子提交避免只看见半帧。</p>
+    </details>
+    <details>
+      <summary>5. Hard Stop 与 ActPlane / DSec 如何一起用？</summary>
+      <p>ActPlane 先缩小合法动作面；DSec 提供隔离与网络/文件策略；Hard Stop 在仍发生越界时做微秒–亚毫秒级硬停。三层互补而非互替。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.29808" target="_blank" rel="noopener">arXiv:2609.29808 · Hard Stop</a></li>
+      <li>站内：
+        <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a> ·
+        <a href="daily-2026-09-28-dsec.html">DSec</a> ·
+        <a href="daily-2026-09-24-harness-anatomy.html">Harness Anatomy</a> ·
+        <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
