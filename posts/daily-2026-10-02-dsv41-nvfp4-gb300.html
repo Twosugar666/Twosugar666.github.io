@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜DeepSeek-V4.1-Flash NVFP4 上 GB300：NVIDIA 预量化权重与 InferenceX 实测吞吐 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>一线追踪｜DeepSeek-V4.1-Flash NVFP4 上 GB300：NVIDIA 预量化权重与 InferenceX 实测吞吐</h1>
+    <p class="post-meta">2026-10-02 · 收藏夹：显卡 / Infra · 一线追踪<br />
+      发布方：NVIDIA Hugging Face / SemiAnalysis InferenceX · 信息来源：
+      <a href="https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-NVFP4" target="_blank" rel="noopener">nvidia/DeepSeek-V4.1-Flash-NVFP4</a>（Release <strong>2026-09-16</strong>）、
+      <a href="https://inferencex.semianalysis.com/run/deepseek-v41-flash-on-gb300-nvl72" target="_blank" rel="noopener">InferenceX · DeepSeek V4.1 Flash on GB300 NVL72</a>（runs <strong>2026-09-21 → 2026-09-29</strong>）；
+      交叉：
+      <a href="daily-2026-09-17-rubin-mlperf.html">Rubin MLPerf</a>、
+      <a href="daily-2026-09-28-dsec.html">DSec</a>、
+      <a href="daily-2026-08-31-gpu-rubin.html">GPU Rubin</a>。
+      文中吞吐 / 成本 / 评测数字除特别说明外均为<strong>上述来源自报</strong>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      DeepSeek-V4.1-Flash 本身是 552B MoE（prefill 激活约 8B、decode 激活约 16B，另加 196B Engram conditional memory）的多模态 CED + CSA2 模型；
+      源权重里 routed experts 已是 MXFP4。NVIDIA 用 <strong>Model Optimizer</strong> 把普通 routed experts 转成 <strong>NVFP4 W4A4（group size 16）</strong>，并在 GB300 上用 vLLM / SGLang 验过——这不是「又一个 GGUF」，而是把 Blackwell 原生 FP4 数据通路接到可商用的预量化 checkpoint。
+    </p>
+    <p>
+      站内 <a href="daily-2026-08-31-gpu-rubin.html">Rubin / NVFP4 硬件叙事</a>与
+      <a href="daily-2026-09-17-rubin-mlperf.html">Rubin MLPerf</a> 强调的是<strong>硅片与训练/推理系统级分数</strong>；
+      今天这条线补的是另一条生产力轴：<strong>软件栈 + 预量化权重 + 实测 serving 梯队</strong>。
+      同一块 GB300，没有对齐的 NVFP4 kernel / checkpoint / runtime，吞吐数字写不出来。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：源 MXFP4 experts → NVFP4 W4A4（group 16），checkpoint ~492 GiB；
+      InferenceX 在 AgentX 上：50 tok/s/user → 103,750 tok/s/GPU（vLLM fp4，$0.006/1M @ $2.31/GPU/hr）；
+      75 tok/s → 145,072（SGLang）；peak 154,403 tok/s/GPU。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① NVFP4 vs 源 MXFP4：转了什么、没动什么</h3>
+    <table>
+      <thead><tr><th>项</th><th>NVIDIA 模型卡口径</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>转换范围</strong></td>
+          <td>ordinary routed MoE experts 的 w1 / w2 / w3；384 experts × 40 layers；W4A4，group size 16</td>
+        </tr>
+        <tr>
+          <td><strong>保留源精度</strong></td>
+          <td>Attention、shared experts、vision、Engram lookup、MTP/DSpark 等；含适用的 MXFP8</td>
+        </tr>
+        <tr>
+          <td><strong>权重块</strong></td>
+          <td>16,986,931,200 个 weight blocks 报「lossless conversion」（dequantized 值 + signed-zero canonicalization）；激活 scale 经校准，46,080 个 projection entry 中 18 个用 fallback</td>
+        </tr>
+        <tr>
+          <td><strong>体积</strong></td>
+          <td>源 ~476 GiB → NVFP4 ~492 GiB（更细的 NVFP4 scale layout）；48 个 safetensors shards</td>
+        </tr>
+        <tr>
+          <td><strong>工具链</strong></td>
+          <td>nvidia-modelopt <strong>v0.47.0rc0</strong>；源 revision <code>dba1be0a40aa45a94ad051997016db3960a90277</code></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      「lossless weight conversion」≠「推理输出逐 token 相同」——模型卡明确写了这一点。
+      对部署方更重要的是：评测表上 NVFP4 相对 MXFP4 <strong>几乎持平甚至略涨</strong>（见下），说明这不是「砍精度换速度」的粗暴量化，而是对齐 Blackwell Tensor Core FP4 路径。
+    </p>
+
+    <h3>② 质量：MXFP4 vs NVFP4（vLLM，单位 %）</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Precision</th>
+          <th>GPQA Diamond</th>
+          <th>AA-LCR</th>
+          <th>SciCode</th>
+          <th>IFBench</th>
+          <th>MMMU-Pro</th>
+          <th>TB 2.1</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>MXFP4（source）</td>
+          <td>91.035</td>
+          <td>78.563</td>
+          <td>54.401</td>
+          <td>76.667</td>
+          <td>74.046</td>
+          <td>81.60</td>
+        </tr>
+        <tr>
+          <td><strong>NVFP4</strong></td>
+          <td><strong>91.288</strong></td>
+          <td>78.438</td>
+          <td><strong>55.843</strong></td>
+          <td><strong>77.267</strong></td>
+          <td>73.699</td>
+          <td><strong>82.16</strong></td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      普通请求：temperature=1.0、top_p=0.95、reasoning_effort=100、max_new_tokens=262144；
+      GPQA / AA-LCR 各 16 repeats，IFBench 5 repeats；Terminal-Bench 另用 agentic 配置（每任务 8 条轨迹）。
+      硬件：NVIDIA GB300（Blackwell）；评测引擎以 vLLM 为准，SGLang 做加载 / 生成 / reasoning·tool-call parsing / 图像 smoke。
+    </p>
+
+    <h3>③ 四卡 TP 部署要点（官方示例浓缩）</h3>
+    <pre><code># SGLang：lmsysorg/sglang:dev-cu13-dsv41，四卡 GB300
+# 测试 commit：da64c5cbb8cf6bfd39be19da43573fdfd484c43a
+python -m sglang.launch_server \
+  --model-path nvidia/DeepSeek-V4.1-Flash-NVFP4 \
+  --served-model-name DeepSeek-V4.1-Flash-NVFP4 \
+  --host 127.0.0.1 --port 30000 \
+  --tp 4 \
+  --context-length 1048576 \
+  --reasoning-parser deepseek-v41 \
+  --tool-call-parser deepseekv41 \
+  --chunked-prefill-size 4096 \
+  --max-running-requests 16
+
+# vLLM：vllm/vllm-openai:deepseekv41-flash-0909，四卡
+vllm serve nvidia/DeepSeek-V4.1-Flash-NVFP4 \
+  --tensor-parallel-size 4 \
+  --data-parallel-size 1 \
+  --tokenizer-mode deepseek_v41 \
+  --reasoning-parser deepseek_v41 \
+  --language-model-only \
+  --max-model-len 1048576 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 8192 \
+  --enable-chunked-prefill \
+  --no-enable-prefix-caching \
+  --model-loader-extra-config \
+    '{"enable_multithread_load": true, "num_threads": 128}'
+</code></pre>
+    <ul>
+      <li>SGLang 侧自动选 <code>flashinfer_trtllm_routed</code> 跑 NVFP4 experts；thinking 默认关，请求级 <code>reasoning_effort</code>（如 <code>"max"</code>）才打开。</li>
+      <li>vLLM 示例是 text-only；图像 serving 需另配 multimodal。DSpark tensors 保留，但官方 validation 未练习 speculative decoding。</li>
+      <li>共同前提：<strong>四卡 TP</strong> + 约 1M context 配置；staging 时可用本地 checkpoint 目录替换 repo ID。</li>
+    </ul>
+
+    <h3>④ InferenceX：吞吐–交互性梯队与成本</h3>
+    <p>
+      SemiAnalysis InferenceX 在真实 GB300 NVL72 上扫 concurrency（AgentX agentic coding workload），
+      取每个 per-user 速度目标下的最优 engine/precision 前沿。Precision 栏均为 <strong>fp4</strong>；run dates 2026-09-21 → 2026-09-29。
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>Per-user 目标</th>
+          <th>tok/s per GPU</th>
+          <th>$ / 1M tokens</th>
+          <th>Engine</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>30 tok/s</td><td>—</td><td>—</td><td>SGLang</td></tr>
+        <tr><td><strong>50 tok/s</strong></td><td><strong>103,750</strong></td><td><strong>$0.006</strong></td><td>vLLM</td></tr>
+        <tr><td><strong>75 tok/s</strong></td><td><strong>145,072</strong></td><td><strong>$0.004</strong></td><td>SGLang</td></tr>
+        <tr><td>100 tok/s</td><td>104,487</td><td>$0.006</td><td>SGLang</td></tr>
+        <tr><td>150 tok/s</td><td>48,363</td><td>$0.013</td><td>vLLM</td></tr>
+        <tr><td>200 tok/s</td><td>32,437</td><td>$0.020</td><td>vLLM</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>定价档（50 tok/s/user 工作点）</th><th>$ / GPU / hr</th><th>$ / 1M tokens</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Owning @ Large Hyperscaler Volume</td>
+          <td>$2.31</td>
+          <td>$0.006</td>
+        </tr>
+        <tr>
+          <td>Retail</td>
+          <td>$5.00</td>
+          <td>$0.013</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      Quick answer 口径：50 tok/s/user → 103,750 tok/s/GPU（vLLM）；跨配置 peak <strong>154,403 tok/s/GPU</strong>。
+      成本换算逻辑是固定：<code>($/GPU/hr) / (tok/s/GPU × 3600) × 1e6</code> → $/1M tokens；
+      同一吞吐下，retail $5 相对 hyperscaler $2.31 大约把单价抬到约 2.2×（表中 $0.013 vs $0.006）。
+      交互性越高，单卡吞吐越低、单位 token 越贵——梯队本身就是 serving 的 Pareto 面，不是「一个数字定输赢」。
+    </p>
+
+    <h3>⑤ 与 Rubin MLPerf 叙事的关系</h3>
+    <p>
+      <a href="daily-2026-09-17-rubin-mlperf.html">Rubin MLPerf</a> 讲的是系统提交与训练/推理基准分数；
+      本页讲的是<strong>同一代 Blackwell / GB300 硬件上，预量化权重 + vLLM/SGLang 是否把 FP4 算力吃满</strong>。
+      硬件峰值与 MLPerf 分数是「能跑多快」的上界叙事；InferenceX 梯队是「在给定交互性约束下，每美元买到多少 token」的运营叙事。
+      两条轴正交：只追芯片代际、忽略 NVFP4 checkpoint 与 kernel 路径，会低估软件栈对 $/token 的贡献。
+      与站内 <a href="daily-2026-09-28-dsec.html">DSec</a> 对照：DSec 管 agent 沙箱密度；本页管推理侧密度——大规模 agentic 部署两边都要算账。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先锁交互性目标再比吞吐。</strong> 50 vs 75 tok/s/user 会换掉「最优引擎」（vLLM ↔ SGLang），单看 peak 会误判。</li>
+      <li><strong>用官方四卡配方做 smoke。</strong> TP=4、1M context、对应 reasoning/tool parser；再谈扩 DP 或多节点。</li>
+      <li><strong>成本表按自己的 $/GPU/hr 重算。</strong> InferenceX 的 $0.006 / $0.013 绑定 $2.31 / $5；内部机时价不同，结论会平移。</li>
+      <li><strong>质量回归盯相对 MXFP4 的 delta，而不是绝对分。</strong> 上表多数项 NVFP4 ≥ MXFP4；若自家集上塌陷，优先查 runtime / calibration 而非「FP4 天生掉点」。</li>
+      <li><strong>把量化栈当成独立路线图。</strong> 与 Rubin 硬件采购并行跟踪 Model Optimizer 版本、flashinfer/TRT-LLM routed kernel、vLLM/SGLang 的 DSv4.1 分支。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为何源已是 MXFP4 仍要转 NVFP4，体积还从 ~476 涨到 ~492 GiB？</summary>
+      <p>都是 4-bit weights，但 scale layout / 激活量化路径不同；更细的 NVFP4 scale 会增大 checkpoint，换的是 Blackwell 原生 FP4 数据通路与 W4A4 对齐，而不是再砍一档权重位宽。</p>
+    </details>
+    <details>
+      <summary>2. 「lossless conversion」能保证在线输出一致吗？</summary>
+      <p>不能。模型卡只保证 dequantized 权重量值（含 signed-zero）转换无损；激活校准、kernel 数值与采样噪声仍会使输出分布偏移。</p>
+    </details>
+    <details>
+      <summary>3. 为什么 75 tok/s/user 的 GPU 吞吐可以高于 50 tok/s/user？</summary>
+      <p>梯队取的是「该交互性约束下的最优配置」；更高 per-user 目标可能换引擎/批策略，在某一段 Pareto 上吞吐反而更高，但继续加压到 150/200 后吞吐会明显掉下来。</p>
+    </details>
+    <details>
+      <summary>4. retail $5/hr 相对 hyperscaler $2.31 如何影响选型？</summary>
+      <p>同一 50 tok/s 工作点单价约从 $0.006 升到 $0.013。若业务对延迟极敏感、机时却是 retail 价，可能更该优化 batching / 缓存，而不是只加卡。</p>
+    </details>
+    <details>
+      <summary>5. 软件量化轴与 MLPerf 硬件轴如何一起写进容量规划？</summary>
+      <p>MLPerf/峰值定「集群理论上界」；NVFP4 + InferenceX 定「给定 SLA 的 $/token」。采购 Rubin/GB300 时同步预算 Model Optimizer 与 serving 分支，避免硬件到位后卡在 MXFP4 兼容路径。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://huggingface.co/nvidia/DeepSeek-V4.1-Flash-NVFP4" target="_blank" rel="noopener">Hugging Face · nvidia/DeepSeek-V4.1-Flash-NVFP4</a>（2026-09-16）</li>
+      <li><a href="https://inferencex.semianalysis.com/run/deepseek-v41-flash-on-gb300-nvl72" target="_blank" rel="noopener">InferenceX · DeepSeek V4.1 Flash on GB300 NVL72</a></li>
+      <li><a href="https://github.com/NVIDIA/Model-Optimizer" target="_blank" rel="noopener">NVIDIA Model Optimizer</a></li>
+      <li>站内：
+        <a href="daily-2026-09-17-rubin-mlperf.html">Rubin MLPerf</a> ·
+        <a href="daily-2026-09-28-dsec.html">DSec</a> ·
+        <a href="daily-2026-08-31-gpu-rubin.html">GPU Rubin</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

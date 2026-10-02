@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 3,
+  "next": 4,
   "daily_streams": [
     "frontline",
     "harness",
@@ -564,6 +564,27 @@
       "source": "algo",
       "topic": "TD(λ)/eligibility traces：λ-return；forward/backward；λ=0 TD(0)↔λ=1 MC；接 GAE / V-trace / AC（Sutton & Barto）",
       "file": "posts/daily-2026-09-28-algo-td-lambda.html"
+    },
+    {
+      "date": "2026-10-02",
+      "domain": "gpu infra",
+      "source": "frontline",
+      "topic": "DeepSeek-V4.1-Flash NVFP4 on GB300：Model Optimizer W4A4 group16；InferenceX 50→103750 tok/s/GPU vLLM；$0.006@$2.31；peak 154403；eval MXFP4 vs NVFP4",
+      "file": "posts/daily-2026-10-02-dsv41-nvfp4-gb300.html"
+    },
+    {
+      "date": "2026-10-02",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "EvoHarness-RL：BPE + track/commit/recall/note；SFT→cost-aware GRPO；ALFWorld Qwen3-8B seen 96.9%/unseen 86.6%；annealing ~1 call/ep；skill bank（arXiv:2608.05446）",
+      "file": "posts/daily-2026-10-02-harness-evoharness.html"
+    },
+    {
+      "date": "2026-10-02",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "SAC：最大熵 J=E[Σγ^t(r+αH)]；双Q min；reparameterization；自动温度；vs PPO/AC/熵bonus（Haarnoja et al.）",
+      "file": "posts/daily-2026-10-02-algo-sac.html"
     }
   ]
 }

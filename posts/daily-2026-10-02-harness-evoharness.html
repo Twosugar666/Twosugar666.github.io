@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜EvoHarness-RL：把 Belief / Progress / Experience 训成可学的运行时协调层 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜EvoHarness-RL：把 Belief / Progress / Experience 训成可学的运行时协调层</h1>
+    <p class="post-meta">2026-10-02 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Ning, Fu, Wei, Zeng et al. ·
+      <em>EvoHarness-RL: Learning Self-Evolving Runtime Harness for Long-Horizon LLM Agents</em>
+      · <a href="https://arxiv.org/abs/2608.05446" target="_blank" rel="noopener">arXiv:2608.05446</a>。
+      交叉：
+      <a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness 初读（09-11）</a>、
+      <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a>、
+      <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a>、
+      <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、
+      <a href="daily-2026-09-23-harness-heart.html">HEART</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 agent 外面通常挂着一堆「执行支持」：记世界状态、追子目标、调工具、验结果、跨 episode 复用经验。
+      难点往往不在「有没有 memory / tool」，而在两件事耦合：
+      <strong>(1) 从嘈杂轨迹形成外部状态</strong>；
+      <strong>(2) 运行时何时读 / 写这些状态</strong>。
+      多数系统把两者留给 prompt、启发式或领域约定——workspace 与用法策略都是人肉工程。
+    </p>
+    <p>
+      EvoHarness-RL 把问题立成 <strong>harness policy learning</strong>：离线学 harness 策略，在线部署时构造与更新外部 harness 状态。
+      站内 <a href="daily-2026-09-11-harness-evoharness-rl.html">09-11 初读</a>已铺过 BPE 与退火叙事；
+      本文换一个切面——把它当成<strong>可学的运行时协调层</strong>，并和近期
+      <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a>（越界硬停）、
+      <a href="daily-2026-09-25-harness-growing.html">Growing</a>（从失败窗口长控制代码）、
+      <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、<a href="daily-2026-09-23-harness-heart.html">HEART</a>
+      对照：谁管「状态怎么外置与何时访问」，谁管「越界怎么停 / 脚手架怎么长」。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：BPE 三态 + {track, commit, recall, note}；SFT → cost-aware GRPO；
+      ALFWorld + Qwen3-8B：seen <strong>96.9%</strong> / unseen <strong>86.6%</strong>；
+      annealing 至约 <strong>1 次 harness call / episode</strong>；Experience skill bank 巩固 / 遗忘。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① BPE：面向策略的三态外置</h3>
+    <table>
+      <thead><tr><th>状态</th><th>语义</th><th>典型 meta-action</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Belief B_t</strong></td>
+          <td>环境当前「以为为真」的世界状态</td>
+          <td><code>track</code>：查询 / 刷新 belief</td>
+        </tr>
+        <tr>
+          <td><strong>Progress P_t</strong></td>
+          <td>已完成 / 待办子目标与执行进度</td>
+          <td><code>commit</code>：提交或更新 progress</td>
+        </tr>
+        <tr>
+          <td><strong>Experience E_t</strong></td>
+          <td>跨 episode 可复用知识（skill bank）</td>
+          <td><code>recall</code> 检索；<code>note</code> 写入新洞察</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      异构 memory / planner / log 被压成<strong>策略可直接动作的接口</strong>，而不是再堆一套不可学的脚手架 DSL。
+      ALFWorld adapter 把 B/P/E 分别落地为 world-state tracker、committed subgoal plan、跨 episode skill bank；
+      抽象层不变，换环境主要换 grounding。
+    </p>
+
+    <h3>② 训练两段：先语义，再「值不值得花一步」</h3>
+    <pre><code># Stage 1 — Supervised harness fine-tuning
+#   目标：教会 BPE 动作语义，从轨迹外置有用的 B/P/E
+# Stage 2 — Cost-aware GRPO（Shao et al. 2024 系）
+#   harness action 与 env action 共享交互预算
+#   学的是：何时读/写/巩固外部状态才划算
+
+R(τ) = R_succ(τ)                 # 任务成功（主门控）
+     + λ_eff  R_eff(τ)           # 效率 bonus
+     + λ_div(u) R_div(τ)         # 动作多样性
+     − λ_spam R_spam(τ)          # 刷 harness / spam
+     − λ_inv  R_inv(τ)           # 非法格式
+</code></pre>
+    <p>
+      成功项是门控：没做成任务，效率 / 多样性再好看也撑不起策略。
+      spam / inv 把「疯狂 track/recall」和坏格式从高奖励区赶走——否则 GRPO 会学到用 harness 刷步数或刷多样性。
+      与站内 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 对照：这里把相对优势用在<strong>协调策略</strong>上，而不是纯答题 token。
+    </p>
+
+    <h3>③ 结果与消融（论文自报）</h3>
+    <table>
+      <thead><tr><th>设置</th><th>口径</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>EvoHarness-RL · ALFWorld seen</td>
+          <td><strong>96.9%</strong> success（Qwen3-8B；相对 base ReAct +49.0 abs）</td>
+        </tr>
+        <tr>
+          <td>EvoHarness-RL · unseen</td>
+          <td><strong>86.6%</strong>（ReAct 50.0%；prompt-time BPE 零样本约 77.6%）</td>
+        </tr>
+        <tr>
+          <td>消融直觉</td>
+          <td>去掉 Belief / Progress / Experience 任一模块，成功率明显掉（Experience 消融约到 48.6% 量级）</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      prompt-time BPE 已经抬高 stateful 任务；SFT + GRPO 再把「会用」推到「省着用」。
+      unseen 上 full RL 高于仅 prompt BPE，说明 cost-aware 阶段学到的是可迁移的访问策略，而不只是背训练房布局。
+    </p>
+
+    <h3>④ Harness annealing 与 harness evolution</h3>
+    <table>
+      <thead><tr><th>动态</th><th>现象（据论文）</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Annealing</strong></td>
+          <td>GRPO 中 harness call 从频繁脚手架用法快速下降，稳定在约 <strong>1 次 / episode</strong></td>
+          <td>例行模式内化进策略；外部访问留给期望收益盖过步成本的时刻</td>
+        </tr>
+        <tr>
+          <td><strong>Evolution</strong></td>
+          <td>Experience store：积累 → 巩固 → 遗忘；skill bank 从膨胀到紧凑（通用 / 任务 / 纠错 / 搜索优先级）</td>
+          <td>协调层不只调「何时调用」，还改写可复用底物本身</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      annealing ≠「最终删掉 harness」。删的是无效频繁调用；保留的是选择性外置。
+      与 <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a> 对照：Growing 从失败窗口长出可复用控制代码；
+      EvoHarness 用 RL 决定何时碰已有 BPE，并用 note/consolidate 演化 skill bank——一个偏「长出结构」，一个偏「学会调度与改写状态」。
+    </p>
+
+    <h3>⑤ 和 Hard Stop / ModularRSI / HEART 怎么叠</h3>
+    <table>
+      <thead><tr><th>系统</th><th>主问题</th><th>与 EvoHarness 关系</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a></td>
+          <td>越界后的内核级抢占</td>
+          <td>正交：EvoHarness 优化合法循环内的状态协调；Hard Stop 假设循环已 rogue</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a></td>
+          <td>模块化自我改进回路</td>
+          <td>可把 BPE 当作 RSI 循环里可学习的 memory/progress 接口</td>
+        </tr>
+        <tr>
+          <td><a href="daily-2026-09-23-harness-heart.html">HEART</a></td>
+          <td>harness 评估 / 组件视角</td>
+          <td>EvoHarness 提供「协调策略可训」的实例，便于放入 HEART 类评测轴</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先固定 BPE 接口，再写 adapter。</strong> 换环境时改 grounding，不改 meta-action 词汇表，策略才可迁移。</li>
+      <li><strong>SFT 与 GRPO 目标分开。</strong> SFT 只解决「会说 track/commit/recall/note」；何时值得说，交给带 spam/效率项的 RL。</li>
+      <li><strong>监控 harness calls / episode。</strong> 若长期停在高频脚手架用法，多半是奖励里缺成本项，或 SFT 示范过度依赖外置。</li>
+      <li><strong>Experience 要有巩固与遗忘。</strong> 只 append 的 skill bank 会胀死 context；论文里的合并 / 稀有条目淘汰是标配，不是可选美化。</li>
+      <li><strong>安全层另挂。</strong> 协调层学的是省步成功；越权、逃逸仍要 ActPlane / DSec / Hard Stop 一类边界。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 harness action 必须与 env action 共享预算？</summary>
+      <p>若外置读写「免费」，策略会倾向于无限 track/recall；共享步预算后，访问变成有机会成本的决策，GRPO 才能学选择性。</p>
+    </details>
+    <details>
+      <summary>2. annealing 到 ~1 call/episode 是否说明 BPE 只在开头有用？</summary>
+      <p>不一定。次数下降常伴随模式内化；关键时刻（失败恢复、跨房搜索）仍可能召回 Experience。看的是分布，不是「永远只调用一次」的硬规则。</p>
+    </details>
+    <details>
+      <summary>3. R_spam 与 R_div 会不会互相打架？</summary>
+      <p>会。多样性鼓励换动作，spam 惩罚无效重复 harness。权重与 curriculum（先学语义再加压成本）需要一起调，否则策略在「乱换动作」和「死刷同一 tool」间震荡。</p>
+    </details>
+    <details>
+      <summary>4. EvoHarness 与 Growing Harness 能否同栈？</summary>
+      <p>可以：Growing 负责从失败窗口沉淀控制代码；EvoHarness 负责运行时何时读写 BPE / skill bank。前者扩结构，后者学调度。</p>
+    </details>
+    <details>
+      <summary>5. unseen 上 RL 相对 prompt BPE 的增益说明什么？</summary>
+      <p>说明 cost-aware 阶段学到的访问策略可迁移到新房布局，而不是只记忆 seen 轨迹里的物体位置。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2608.05446" target="_blank" rel="noopener">arXiv:2608.05446 · EvoHarness-RL</a></li>
+      <li>站内：
+        <a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness 初读</a> ·
+        <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a> ·
+        <a href="daily-2026-09-25-harness-growing.html">Growing</a> ·
+        <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> ·
+        <a href="daily-2026-09-23-harness-heart.html">HEART</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

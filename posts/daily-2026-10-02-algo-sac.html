@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜SAC：最大熵 Actor-Critic 如何用温度 α 稳住探索 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+
+    <h1>学习笔记｜SAC：最大熵 Actor-Critic 如何用温度 α 稳住探索</h1>
+    <p class="post-meta">2026-10-02 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典：Haarnoja et al. · Soft Actor-Critic（ICML 2018 及后续自动温度 / 离散变体）。
+      交叉：
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>、
+      <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL</a>、
+      <a href="daily-2026-09-02-algo-gae.html">GAE</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      连续控制里，朴素 Actor-Critic 常在「探索不够」与「Q 过估计把策略拧死」之间反复横跳。
+      Soft Actor-Critic（SAC）把目标改成<strong>最大熵</strong>：既要高回报，也要策略在状态上保持足够随机。
+      温度 α 把「回报」和「熵」拧在同一标尺上——不是外挂一个越来越小的 ε-greedy，而是让最优策略本身偏好高熵。
+    </p>
+    <p>
+      站内已有 <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> 骨架、
+      <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a> 的温度直觉、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a> 的 on-policy 裁剪叙事。
+      本文聚焦 SAC 的 off-policy 最大熵机制：双 Q、reparameterization、自动 α，以及和「熵 bonus / KL 惩罚」的差别——不复述教科书定义堆砌。
+    </p>
+    <blockquote>
+      <strong>一句话</strong>：J(π) = E[Σ_t γ^t (r_t + α H(π(·|s_t)))]；
+      双 Q 取 min 抑过估计；重参数化稳策略梯度；α 可对 target entropy 自动调节。
+    </blockquote>
+
+    <h2>机制拆解</h2>
+
+    <h3>① 最大熵目标：回报 + 温度 × 熵</h3>
+    <pre><code># Soft 目标（无限期折扣形式，概念写法）
+J(π) = E_{τ~π} [ Σ_{t=0}^{∞} γ^t ( r(s_t, a_t) + α H(π(·|s_t)) ) ]
+
+# Soft Bellman backup（动作价值）
+Q(s,a) ← r + γ E_{s'} [ V(s') ]
+V(s)   = E_{a~π} [ Q(s,a) − α log π(a|s) ]   # soft value
+</code></pre>
+    <p>
+      α → 0 时退回普通期望回报最大化；α 越大，越偏向「在差不多好的动作上摊平概率」。
+      这与 <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax 温度</a>同族：温度是探索–利用的连续旋钮，但 SAC 把旋钮嵌进最优性条件，而不是只在采样时加噪。
+    </p>
+
+    <h3>② 与 PPO / 普通 AC / 「熵 bonus」对照</h3>
+    <table>
+      <thead><tr><th></th><th>SAC</th><th>PPO（典型）</th><th>AC + 熵 bonus</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>数据</strong></td>
+          <td>off-policy replay</td>
+          <td>on-policy 批次</td>
+          <td>两者皆可，常见 on-policy</td>
+        </tr>
+        <tr>
+          <td><strong>探索</strong></td>
+          <td>目标内最大熵（α）</td>
+          <td>采样随机性 + 可选熵系数</td>
+          <td>损失里加 β H(π)，β 常手调衰减</td>
+        </tr>
+        <tr>
+          <td><strong>价值</strong></td>
+          <td>soft Q / soft V</td>
+          <td>标准 V；advantage 常用 GAE</td>
+          <td>标准 Q/V</td>
+        </tr>
+        <tr>
+          <td><strong>策略更新</strong></td>
+          <td>最小化 α log π − Q（重参数化）</td>
+          <td>裁剪的重要性比 × advantage</td>
+          <td>策略梯度 ± 熵项</td>
+        </tr>
+        <tr>
+          <td><strong>与 KL</strong></td>
+          <td>不靠显式对旧策略 KL 裁剪</td>
+          <td>比率裁剪 ≈ 信任域直觉</td>
+          <td>无内建；可另加 KL</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>
+      「AC + 熵 bonus」看起来像 SAC，但 soft Bellman 与策略目标是否<strong>同一套 soft 最优性</strong>，决定了 α 能不能被解释成温度。
+      只在损失末尾加 βH、价值仍用硬 max/期望，探索激励与 backup 不一致时，β 往往只能当启发式。
+      相对 <a href="daily-2026-09-17-algo-kl.html">KL 约束</a>：PPO/TRPO 限制「别离旧策略太远」；SAC 的 α 限制的是「当前策略要有多随机」——一个管更新步长几何，一个管最优策略形状。
+    </p>
+
+    <h3>③ 双 Q、重参数化、自动温度</h3>
+    <table>
+      <thead><tr><th>组件</th><th>做什么</th><th>实现注意</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Twin Q（取 min）</strong></td>
+          <td>两套 Q_θ1, Q_θ2，backup / 策略用 min(Q1,Q2)</td>
+          <td>抑制过估计；别只训练一个又在目标里假装 twin</td>
+        </tr>
+        <tr>
+          <td><strong>Reparameterization</strong></td>
+          <td>a = f_φ(ε; s)，ε~噪声，梯度穿过 f</td>
+          <td>连续高斯策略标配；比 score-function 方差更低</td>
+        </tr>
+        <tr>
+          <td><strong>自动 α</strong></td>
+          <td>约束 E[−log π] ≈ H_target，对 log α 做对偶上升</td>
+          <td>H_target 常取 −dim(A)（每维约 e 纳特的启发式）；环境尺度变了要重校</td>
+        </tr>
+        <tr>
+          <td><strong>Target soft V / Q</strong></td>
+          <td>Polyak 平均目标网</td>
+          <td>与双 Q、replay 一起，构成稳定 off-policy 三角</td>
+        </tr>
+      </tbody>
+    </table>
+    <pre><code># 策略损失（概念）
+L_π(φ) = E_{s,ε} [ α log π_φ(a|s) − min_i Q_θi(s, a) ]
+         where a = f_φ(ε; s)
+
+# 温度（自动）：朝 target entropy 对齐
+L(α) = E_{a~π} [ −α log π(a|s) − α H_target ]   # 对 log α 优化更稳
+</code></pre>
+
+    <h3>④ 离散动作与常见坑</h3>
+    <ul>
+      <li><strong>Discrete SAC</strong>：动作可枚举时，Q(s,·) 与 π(·|s) 可在类别维上精确求和，不必重参数化高斯；温度与 soft value 形式保留。一笔带过：实现差异主要在「期望怎么算」，不是换掉最大熵目标。</li>
+      <li><strong>Target entropy 过大</strong>：策略过平，任务回报上不去；过小则塌成近乎确定性，失去 SAC 相对 DDPG 系的探索优势。</li>
+      <li><strong>只用一个 Q 或取 max</strong>：过估计回来，策略冲向虚高动作。</li>
+      <li><strong>把 α 当学习率调</strong>：α 改的是最优策略的熵，不是 SGD 步长；与 actor/critic lr 混拧会很难复现。</li>
+      <li><strong>和 GAE 混用时分清 on/off-policy</strong>：SAC 主路径是 replay + soft Q；GAE 是 on-policy advantage 工具（见 <a href="daily-2026-09-02-algo-gae.html">GAE</a>），不是 SAC 的必选配件。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>连续控制默认：twin Q + 重参数化 + 自动 α。</strong> 手调固定 α 只在动作维度极低、已有良好量级直觉时省事。</li>
+      <li><strong>先定 H_target，再谈 α 初值。</strong> 常见 −dim(A)；若早期熵远低于目标，检查 log_std 上下限是否被夹死。</li>
+      <li><strong>回报尺度变化时重做温度。</strong> 换 reward 归一化等于换「焦耳」定义，旧 α / H_target 可能全部失效。</li>
+      <li><strong>监控 Q1−Q2 间隙与策略熵。</strong> 间隙持续拉大 → 过估计风险；熵塌缩 → 探索不足或 α 过小。</li>
+      <li><strong>需要信任域时显式加 KL，而不是幻想 α 能替代 PPO 裁剪。</strong> 两者解决的问题不同（见上表）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. α→0 时 SAC 还「软」吗？</summary>
+      <p>目标退回标准期望回报；soft value 中的 −α log π 项消失，行为接近普通 off-policy actor-critic（仍可能保留双 Q 等实现细节）。</p>
+    </details>
+    <details>
+      <summary>2. 为什么策略损失是 α log π − Q，而不是直接最大化 Q？</summary>
+      <p>最大熵最优策略满足 π* ∝ exp(Q/α)；等价地最小化 α log π − Q。只最大化 Q 会推向确定性贪婪，丢掉熵项。</p>
+    </details>
+    <details>
+      <summary>3. 双 Q 取 min 会不会系统性低估？</summary>
+      <p>会有偏保守；换来的是抑制过估计导致的策略崩溃。实践中对连续控制通常净收益为正，但不是理论无偏。</p>
+    </details>
+    <details>
+      <summary>4. 自动温度与 PPO 熵系数退火有何不同？</summary>
+      <p>自动 α 对准设定的 target entropy（对偶）；PPO 的熵系数多是外源日程表。前者目标是「熵水平」，后者常是「逐渐关探索」。</p>
+    </details>
+    <details>
+      <summary>5. 何时更该用 PPO 而不是 SAC？</summary>
+      <p>强 on-policy 约束、离散大动作空间配合大规模 LLM RL、或必须严格信任域时，PPO/GRPO 系更常见；连续控制 + 可大规模 replay 时 SAC 往往更省样本。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>Haarnoja et al. · Soft Actor-Critic（ICML 2018）；后续 Automatic Temperature / Discrete SAC 扩展</li>
+      <li>站内：
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> ·
+        <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
