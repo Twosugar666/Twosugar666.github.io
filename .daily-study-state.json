@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 0,
   "daily_streams": [
     "frontline",
     "harness",
@@ -585,6 +585,27 @@
       "source": "algo",
       "topic": "SAC：最大熵 J=E[Σγ^t(r+αH)]；双Q min；reparameterization；自动温度；vs PPO/AC/熵bonus（Haarnoja et al.）",
       "file": "posts/daily-2026-10-02-algo-sac.html"
+    },
+    {
+      "date": "2026-10-05",
+      "domain": "infra agent",
+      "source": "frontline",
+      "topic": "WeEnv：layer composition / on-demand fetch / elastic provisioning；初始化 5.6–14.2×；环境税 53.4%→9.1%（arXiv:2609.30766）",
+      "file": "posts/daily-2026-10-05-weenv.html"
+    },
+    {
+      "date": "2026-10-05",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "PoS：显式 Belief + Sentinel + Belief Trapping 因子化恢复；ALF +22.68% / RCA joint +37.89%（arXiv:2610.01415）",
+      "file": "posts/daily-2026-10-05-harness-pos.html"
+    },
+    {
+      "date": "2026-10-05",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "TD3：Clipped Double Q / Delayed policy update / Target policy smoothing；vs DDPG/SAC/PPO（Fujimoto et al.）",
+      "file": "posts/daily-2026-10-05-algo-td3.html"
     }
   ]
 }

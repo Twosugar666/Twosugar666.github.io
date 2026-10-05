@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜PoS：用显式 Belief State 管住长程 Agent，而不只是堆 Memory · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜PoS：用显式 Belief State 管住长程 Agent，而不只是堆 Memory</h1>
+    <p class="post-meta">2026-10-05 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Luo, Jiang, Zuo, Wen et al. ·
+      <em>Beyond Memory: Harnessing Long-Horizon Agents with Explicit Belief States</em>
+      · <a href="https://arxiv.org/abs/2610.01415" target="_blank" rel="noopener">arXiv:2610.01415</a>
+      · 项目页 / 代码见论文脚注（2026-10）。
+      交叉：
+      <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-08-31-supo.html">SUPO</a>、
+      <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a>、
+      <a href="daily-2026-09-22-harness-dense.html">DENSE</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 Agent 的上下文管理，长期停在两条路：把轨迹<strong>原样堆着</strong>，或把历史<strong>压缩 / 检索 / 折叠</strong>成 memory。
+      两者都在优化「证据怎么存」，但不保证 Agent 对<strong>当前世界</strong>有一份可检查、可修订的估计——旧结论、冲突状态、已失效的中间判断，会跟着 history 一起漂进下一步决策。
+    </p>
+    <p>
+      PoS（Progression of States）把决策上下文从「memory as context」换成「<strong>belief as context</strong>」：在推理时持续维护显式 belief；用 Belief Sentinel 做一致性校验；再用三信号检测 <strong>Belief Trapping</strong>（还在动、但不朝目标推进），并按陷阱类型做因子化恢复。
+      这是 inference-time harness，不是再训一套策略。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① Belief 长什么样</h3>
+    <p>任务条件化的 belief 写成四元组（论文式 (1)，此处用代码记法）：</p>
+    <pre><code>B_t = (W_t, G, Delta_t^E, Delta_t^A)
+# W_t : 任务相关世界状态 —— Entity / State / Relation（带来源、置信度、证据）
+# G   : 目标与完成判据
+# Delta^E : epistemic gaps —— 还不知道、证据不够的信息
+# Delta^A : achievement gaps —— 相对目标态还差的动作结果</code></pre>
+    <p>
+      关键点不在「再发明一种 memory 结构」，而在把 <strong>还需要学什么</strong> 与 <strong>还需要做成什么</strong> 显式拆开，并选出一个 Active Gap 作为当前焦点，避免 gap 之间来回飘。
+    </p>
+
+    <h3>② Belief-Guided Interaction + Sentinel</h3>
+    <table>
+      <thead><tr><th>步骤</th><th>做什么</th><th>防什么</th></tr></thead>
+      <tbody>
+        <tr><td>选动作</td><td><code>a_t ~ π(· | B_t, Δ_t, C_t)</code>；正常时恢复约束 <code>C_t</code> 为空</td><td>多 gap 抢焦点</td></tr>
+        <tr><td>候选更新</td><td>观测后由 task agent 生成未提交的 <code>~B_{t+1}</code></td><td>—</td></tr>
+        <tr><td>Sentinel</td><td>审计新增/修改的 Entity·State·Relation·Gap；对照证据修订后再提交为 <code>B_{t+1}</code></td><td>内部冲突（如门既开又关）与外部冲突（与最新观测矛盾）</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ Belief Trapping：检测 → 诊断 → 恢复</h3>
+    <p>在最近 K 步已校验转移上估计健康度（论文式 (5) 的结构）：</p>
+    <pre><code>P_X   # gap persistence：窗口内仍未解决的 E/A gap 比例
+S_t   # progress stagnation：无进展转移占比
+R_t   # belief recurrence：相对 Active Gap 的世界态是否周期性重现
+H_t = 1 - max_X[ P_X * max(S_t, R_t) ]
+# H_t ≤ θ_H  → 判定 trapping</code></pre>
+    <p>诊断两轴：</p>
+    <ul>
+      <li><strong>动力学</strong>：Static（世界几乎不动）/ Cycle（周期重访）/ Drift（在动但不推进 Active Gap）；</li>
+      <li><strong>卡住的 gap 类型</strong>：E（缺判别证据）vs A（缺任务态变化）。</li>
+    </ul>
+    <p>恢复约束 = 模式约束 ∪ gap 约束：打断无效转移 / 破环 / 重新锚定 Active Gap，并要求「新证据」或「任务相关状态变化」。健康度回升后释放约束。</p>
+
+    <h2>主结果（作者自报，三骨干 × 四基准）</h2>
+    <table>
+      <thead><tr><th>骨干</th><th>ALFWorld</th><th>LOCA</th><th>RCA Joint</th><th>ClinDiag</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3.7-Plus · PoS</td><td><strong>88.81</strong></td><td><strong>56.38</strong></td><td><strong>38.83</strong></td><td><strong>45.03</strong></td></tr>
+        <tr><td>同骨干最强基线</td><td>72.39 (LH-Harness)</td><td>52.57 (LH-Harness)</td><td>28.16 (PACE/HiAgent)</td><td>41.89 (PACE)</td></tr>
+        <tr><td>Kimi-K3 · PoS</td><td><strong>94.03</strong></td><td><strong>74.29</strong></td><td><strong>51.46</strong></td><td><strong>54.80</strong></td></tr>
+        <tr><td>GLM-5.3 · PoS</td><td><strong>97.01</strong></td><td><strong>70.86</strong></td><td><strong>49.51</strong></td><td><strong>52.15</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      相对同骨干最强基线，论文摘要给出的相对增益上界约：ALFWorld <strong>22.68%</strong>、RCA-100 joint <strong>37.89%</strong>（作者自报）。
+      消融：去掉 Consistency Validation 或 Trapping Diagnosis，四基准均掉点；ALFWorld 上仅去校验可掉约 14.93 points（Qwen3.7-Plus）。
+      代价也要写清：RCA-100 上 PoS 总 token 约到 Raw Trajectory 的 <strong>5.06×</strong>，但 Task Agent 侧可少约 20.9%——钱花在维护 belief，而不是更长的原始轨迹。
+    </p>
+
+    <h2>和「只做 memory / compaction」差在哪</h2>
+    <table>
+      <thead><tr><th>路线</th><th>决策上下文</th><th>典型失败</th></tr></thead>
+      <tbody>
+        <tr><td>Raw / ACON / PACE / HiAgent</td><td>历史或其压缩/分层视图</td><td>证据在，但当前世界估计隐式、易过期</td></tr>
+        <tr><td>LongHorizon-Harness</td><td>可审计的 requirements / artifacts / facts</td><td>强依赖可验证中间产物；不确定诊断场景增益不稳</td></tr>
+        <tr><td>PoS</td><td>显式 W + gaps + 校验 + trapping 恢复</td><td>token 开销高；缺领域知识时 belief 再干净也推不出正确诊断</td></tr>
+      </tbody>
+    </table>
+    <p>
+      LOCA-Bench 上下文从 8K 扩到 256K 时，PoS 在 96K–256K 段相对更稳，256K 上可领先最强基线约 10.67–16.00 points（作者自报）——因为决策锚定的是「当前 belief」，而不是在越来越长的历史上反复重建世界。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>长程 harness 先问：决策读的是历史还是当前世界估计？</strong> 只有 memory 时，补一层可校验的状态面往往比再加压缩更有效。</li>
+      <li><strong>E/A gap 拆开写进 prompt 或结构化状态。</strong> 「还缺什么信息」和「还差哪步动作」混在一起时，最容易假忙。</li>
+      <li><strong>校验与恢复都要，不能只建 belief。</strong> 消融说明：脏更新和 trapping 是两类不同病。</li>
+      <li><strong>接受 inference 成本，监控 Task Agent token。</strong> 总 token 涨、任务侧降，才是「把算力花在维护上」的健康形状。</li>
+      <li><strong>和站内 EvoHarness 对照：</strong> EvoHarness 把 belief/progress/experience <em>训进</em>运行时；PoS 是纯推理期维护。产品上可先 PoS 挂载，再考虑是否值得 RL。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「保留更多历史」不等于更好的长程决策？</summary>
+      <p>历史混有过期事实与中间判断；没有显式当前世界估计时，模型每步都在隐式重建，错误会跨步累积。</p>
+    </details>
+    <details>
+      <summary>2. Belief Trapping 和「动作循环」是一回事吗？</summary>
+      <p>不是。动作重复可能仍在收集有用证据；PoS 看的是 gap 是否持续、进展是否停滞、相对 Active Gap 的信念是否复发。</p>
+    </details>
+    <details>
+      <summary>3. 健康度为什么用 P·max(S,R) 而不是三者几何平均？</summary>
+      <p>几何平均在 S 或 R 为 0 时会把整项打成「健康」；实践中「只停滞不复发」或「有复发但步进标签偶发为正」都应报警。</p>
+    </details>
+    <details>
+      <summary>4. 何时 LongHorizon-Harness 可能够用、PoS 过重？</summary>
+      <p>中间产物可独立验证、需求清单清晰的执行流；不确定假设演化为主的诊断/排查，PoS 的校验与恢复更对症。</p>
+    </details>
+    <details>
+      <summary>5. PoS 不能替代什么？</summary>
+      <p>工具执行能力与领域知识。论文也写明：Env.Ops 成功率仍偏低、ClinDiag 上「信息对了但解释错」仍会发生。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.01415" target="_blank" rel="noopener">arXiv:2610.01415 · Beyond Memory / PoS</a></li>
+      <li>站内：
+        <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-08-31-supo.html">SUPO</a> ·
+        <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

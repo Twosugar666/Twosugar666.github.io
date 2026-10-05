@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜TD3：双 Critic、延迟策略更新与目标策略平滑 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜TD3：双 Critic、延迟策略更新与目标策略平滑</h1>
+    <p class="post-meta">2026-10-05 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典论文：Fujimoto, van Hoof, Meger ·
+      <em>Addressing Function Approximation Error in Actor-Critic Methods</em>
+      · <a href="https://arxiv.org/abs/1802.09477" target="_blank" rel="noopener">arXiv:1802.09477</a>（ICML 2018）。
+      交叉：
+      <a href="daily-2026-10-02-algo-sac.html">SAC</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      连续控制里，DDPG 用确定性策略 + 单个 Q 做 off-policy actor-critic，样本效率好看，但常因 <strong>Q 过估计</strong> 崩掉：策略去剥削 Q 面上的尖峰，目标跟着飘，训练像在追自己的影子。
+      TD3（Twin Delayed Deep Deterministic policy gradient）在 DDPG 骨架上加三招，专门压函数逼近误差的连锁反应——读完再看站内 <a href="daily-2026-10-02-algo-sac.html">SAC</a>，能分清「双 Q 取 min」这条血脉是怎么从 TD3 流到最大熵设定的。
+    </p>
+
+    <h2>机制拆解：三招</h2>
+    <table>
+      <thead><tr><th>招式</th><th>做什么</th><th>针对的病</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Clipped Double Q</strong></td><td>两个 critic；Bellman 目标用 <code>min(Q1′, Q2′)</code></td><td>单 Q 过估计 → 策略剥削假高峰</td></tr>
+        <tr><td><strong>Delayed policy updates</strong></td><td>critic 多更新几次，再更新 actor / target（论文常用每 2 次 critic 更一次策略）</td><td>策略一动目标就变，值函数来不及跟</td></tr>
+        <tr><td><strong>Target policy smoothing</strong></td><td>算目标时给 target actor 的动作加截断高斯噪声</td><td>策略钻 Q 的窄峰；平滑后更难「精确点名」误差点</td></tr>
+      </tbody>
+    </table>
+
+    <h3>① 目标怎么写</h3>
+    <pre><code># 从 replay 采 (s, a, r, s', done)
+noise = clip(N(0, σ), -c, c)          # 常用 σ=0.2·a_max, c=0.5·a_max
+a' = clip( π_target(s') + noise, a_min, a_max )
+y   = r + γ·(1-done)·min( Q1_target(s', a'), Q2_target(s', a') )
+
+# 两个 critic 都回归同一个 y
+L(θ_i) = E[ (Q_θi(s,a) - y)^2 ]  for i in {1,2}
+
+# 策略（延迟触发）：只沿 Q1 做确定性策略梯度
+∇_φ J ≈ E[ ∇_a Q_θ1(s,a)|_a=π_φ(s) · ∇_φ π_φ(s) ]
+# 等价实现：minimize -Q_θ1(s, π_φ(s))</code></pre>
+    <p>
+      Target 网络用 Polyak 平均：<code>θ′ ← τθ + (1-τ)θ′</code>（常用 τ=0.005）。
+      注意：min 会偏保守（低估），换来的是少崩；这和 SAC 里 twin Q 取 min 是同一家族的工程选择。
+    </p>
+
+    <h3>② 和 DDPG / SAC / PPO 对照</h3>
+    <table>
+      <thead><tr><th></th><th>DDPG</th><th>TD3</th><th>SAC</th><th>PPO</th></tr></thead>
+      <tbody>
+        <tr><td>策略</td><td>确定性</td><td>确定性 + 探索噪声</td><td>随机（最大熵）</td><td>随机 on-policy</td></tr>
+        <tr><td>Critic</td><td>单 Q</td><td>双 Q + min</td><td>双 Q + min + 软价值</td><td>通常 V 或 GAE</td></tr>
+        <tr><td>更新节奏</td><td>actor/critic 同频</td><td>策略延迟</td><td>可同频；温度另训</td><td>多 epoch 小批量</td></tr>
+        <tr><td>探索</td><td>动作噪声</td><td>训练噪声 + target 平滑</td><td>熵系数 α</td><td>熵 bonus / 采样</td></tr>
+        <tr><td>典型场景</td><td>连续控制原型</td><td>更稳的确定性 off-policy</td><td>连续控制默认强基线</td><td>大规模 LLM RL 更常见</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ 实现时容易踩的坑</h3>
+    <ul>
+      <li><strong>只用一个 Q 做目标</strong>：等于退回 DDPG 过估计路径。</li>
+      <li><strong>策略每个 step 都更</strong>：丢掉 Delayed 的意义，目标抖动回来。</li>
+      <li><strong>target 噪声过大或未 clip</strong>：动作被推到边界，平滑变成乱探索。</li>
+      <li><strong>把探索噪声和 target 平滑噪声混成一把</strong>：前者加在与环境交互的动作上，后者只进 Bellman 目标。</li>
+      <li><strong>和 SAC 光谱对不上还硬比 sample efficiency</strong>：TD3 无熵目标；需要随机策略或自动温度时优先 SAC。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>连续控制离线复现：先 TD3 官方超参。</strong> γ=0.99，τ=0.005，policy_freq=2，policy_noise=0.2，noise_clip=0.5（相对动作尺度，见 Fujimoto 开源与 Spinning Up）。</li>
+      <li><strong>监控 Q1−Q2 间隙与回报方差。</strong> 间隙长期拉大 → 过估计压力还在；策略回报突然尖峰后塌陷 → 常见剥削假 Q。</li>
+      <li><strong>需要随机策略 / 自动温度 → SAC；需要 on-policy 信任域 → PPO/TRPO。</strong> TD3 不是万能替换。</li>
+      <li><strong>读 LLM RL 文献时的迁移点：</strong> 「双估计取保守」与「延迟更新降低目标抖动」在 token-level critic / value 头设计里仍常被借用；但动作空间与 replay 假设完全不同，不要直接搬超参。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么目标要用 min(Q1′,Q2′) 而不是平均？</summary>
+      <p>平均仍可能被偏高的那个拉高；min 显式偏向低估，专门对抗过估计驱动的策略崩坏。</p>
+    </details>
+    <details>
+      <summary>2. Delayed update 和「更大的 Polyak τ」能互相替代吗？</summary>
+      <p>不能干净替代。τ 控制 target 跟踪速度；delay 控制策略改变目标分布的频率。两者常一起用，机制不同。</p>
+    </details>
+    <details>
+      <summary>3. Target policy smoothing 和探索噪声的区别？</summary>
+      <p>探索噪声改变真实交互动作；smoothing 只在算 y 时扰动 target 动作，目的是正则化 Q，而不是直接探索环境。</p>
+    </details>
+    <details>
+      <summary>4. TD3 的双 Q 与 SAC 的双 Q 差在哪？</summary>
+      <p>形式都常取 min；SAC 还在软 Bellman / 策略目标里引入熵温度 α，最优策略是 Boltzmann 而非纯确定性贪婪。</p>
+    </details>
+    <details>
+      <summary>5. 何时不该上 TD3？</summary>
+      <p>离散大动作空间、必须 on-policy 约束、或目标本身是最大熵最优时；这些场景 PPO/GRPO 或 SAC 更贴。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1802.09477" target="_blank" rel="noopener">arXiv:1802.09477 · TD3</a></li>
+      <li><a href="https://spinningup.openai.com/en/latest/algorithms/td3.html" target="_blank" rel="noopener">OpenAI Spinning Up · TD3</a></li>
+      <li>站内：
+        <a href="daily-2026-10-02-algo-sac.html">SAC</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-11-algo-trpo.html">TRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
