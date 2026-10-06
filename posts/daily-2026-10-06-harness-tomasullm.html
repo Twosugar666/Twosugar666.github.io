@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜TomasuLLM：把 Tomasulo 乱序执行搬进 Agent Harness，工具调用先跑、按序提交 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜TomasuLLM：把 Tomasulo 乱序执行搬进 Agent Harness，工具调用先跑、按序提交</h1>
+    <p class="post-meta">2026-10-06 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Jiangnan Yu, Ceyu Xu, Mengming Li, …, Zhiyao Xie, Yuan Xie（HKUST 等） ·
+      <em>TomasuLLM: Out-of-Order Speculative Execution for LLM Agents</em>
+      · <a href="https://arxiv.org/abs/2609.38201" target="_blank" rel="noopener">arXiv:2609.38201</a>（v2，2026-10-01）。
+      交叉：
+      <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a>、
+      <a href="daily-2026-09-28-dsec.html">DSec</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Coding Agent 的循环是「LLM 出动作 → harness 执行工具 → 观察回填 → 下一轮」。专用硬件上 decode 已经到每秒数千 token，慢的变成了<strong>工具</strong>：编译、跑测试、重启服务，动辄几秒到几分钟。harness 在观察返回前没法让模型出下一轮动作，于是出现论文所说的 <strong>observation stall</strong>。
+    </p>
+    <p>
+      论文用 SWE-Marathon 公开的 212 条 Claude / Codex 串行参考轨迹量化（论文自报）：平均每条 242 轮、266 个动作，工具内耗时 9,315 s，而同轮多调用并行只省回 54 s；不到 10% 的轮次会一次发 ≥2 个动作。同轮并行够不着，空闲藏在<strong>跨轮</strong>。
+    </p>
+    <p>
+      这和 CPU 当年的处境一样：顺序接口掩盖了可预测、可提前开工的工作。TomasuLLM 的回答也来自体系结构——Tomasulo 算法：<strong>按序发射、操作数就绪即执行、按序提交</strong>，让可见状态永远不是推测态。和站内 <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>是同一个思想在不同层级：那边推测 token，这边推测工具调用。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 两个 drafter + 一个只认真执行的 validator</h3>
+    <table>
+      <thead><tr><th>组件</th><th>做什么</th><th>原型里是什么（论文自报）</th></tr></thead>
+      <tbody>
+        <tr><td>Action Drafter</td><td>从已提交历史（或预测历史）提出下一条具体工具调用</td><td>Qwen3-8B + LoRA，在 SWE-Marathon 工具调用轨迹上微调</td></tr>
+        <tr><td>Observation Drafter</td><td>不等候选跑完，先预测它的观察，作为下一次起草的上下文</td><td>现成 35B Qwen-AgentWorld，不做适配</td></tr>
+        <tr><td>Run-Ahead Controller</td><td>决定候选是立刻跑、fork 后挂起、还是走串行</td><td>深度 6、3 个在途候选、≤2 个并发 fork、8 个执行槽</td></tr>
+        <tr><td>COW overlay</td><td>每个候选在私有 copy-on-write 沙箱里执行，写入不外泄</td><td>E2B 快照；只读 fork 约 0.08 s，带私有数据拷贝 3–5.5 s</td></tr>
+        <tr><td>Trace IR + Validator</td><td>记录动作、读集合（含不存在检查）、观察、副作用；提交前逐项验证</td><td>沙箱内嵌 Riker 做保守 syscall 追踪</td></tr>
+      </tbody>
+    </table>
+    <p>
+      分工原则写得很硬：<strong>预测只负责提出工作，主 Agent 授权动作，提交验证授权发布</strong>。预测的观察永远不进提交判据；主模型、prompt、工具 schema、解码参数都不改。
+    </p>
+
+    <h3>② 操作数规则：ready vs in-flight</h3>
+    <table>
+      <thead><tr><th>操作数类型</th><th>例子</th><th>处理</th><th>CPU 类比</th></tr></thead>
+      <tbody>
+        <tr><td>Ready operand</td><td>工作区里某个文件的当前版本</td><td>拷进 overlay 立刻跑；提交时复查版本，过期就丢 overlay 串行重跑</td><td>寄存器重命名后的值</td></tr>
+        <tr><td>In-flight operand</td><td>服务重启后才产生的 loaded-version 记录</td><td>可以先 fork、准备，执行必须等生产者提交</td><td>store → load 的真依赖</td></tr>
+        <tr><td>Speculation barrier</td><td>起草的编辑（内容是编的）、服务重启、checkpoint、最终提交、不可追踪 / 不可逆副作用</td><td>不推测，走串行路径</td><td>serializing instruction</td></tr>
+      </tbody>
+    </table>
+    <p>两个极端都不行：把所有操作数当 ready，测试会跑在编辑之前，被拒后再串行付一次；任何写都作废所有挂起测试，又会把编辑–测试循环（延迟最集中的地方）的推测窗口压没。操作数规则夹在中间：<strong>读的东西都已存在就跑，否则只等最年轻的那个生产者</strong>。</p>
+
+    <h3>③ 提交验证：四个谓词对应一次工具调用的因果链</h3>
+    <pre><code>commit(candidate c) 当且仅当：
+  V_act : c 的规范化动作 == 主 Agent 在提交前沿发出的下一个动作      # 动作一致
+  V_dep : c 记录的读 / 不存在检查 / loaded-version 与已提交状态一致   # 依赖新鲜
+          （先查 lineage：父候选被 squash 或已过期 → 直接拒）
+  V_obs : 观察按 wrapper 规范化规则（去掉时间戳、随机数等）校验摘要   # 观察完整
+  V_eff : 记录的副作用 delta 仍能 promote / replay，后态摘要仍成立    # 副作用安全
+
+提交前沿 = 从下一个未提交步开始、连续通过验证的最长前缀
+overlay 直接挂在前沿上 → overlay 本身变成已提交状态；否则回放 effect delta
+
+V_pred（预测观察 == 真实观察）不在 commit 判据里：
+  c 自己照样提交；只 squash 基于错误预测起草的后代</code></pre>
+    <p>前提和 Riker 一样：读集合追踪足够保守时，工具的观察和副作用是其所读内容的函数，所以四项都过的记录，就等价于「现在从已提交状态重跑一次」。</p>
+
+    <h3>④ 结果（论文自报）</h3>
+    <table>
+      <thead><tr><th>基准</th><th>工具耗时占比</th><th>单次调用中位耗时</th><th>相对 Serial Pi</th></tr></thead>
+      <tbody>
+        <tr><td>SWE-bench Verified（100 题）</td><td>35%</td><td>2.1 s</td><td>1.31×</td></tr>
+        <tr><td>Terminal-Bench 2.0（28 题）</td><td>40%</td><td>8.5 s</td><td>1.35×</td></tr>
+        <tr><td>SWE-Marathon（18 个会话）</td><td>均值 24%（中位 12%）</td><td>12 s</td><td>1.27× matched progress</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>原型约 11,200 行 TypeScript，挂在开源 harness Pi v0.84.2 的工具执行边界上；深度设为 0 就是串行基线 Serial Pi。主模型 Qwen3.8-27B，vLLM FP8 跑在两张 H20 上。</li>
+      <li>SWE-Marathon 单任务 1.03×–2.07×，工具占比 74% 的 Parameter golf 最高；工具占比 &lt;15% 的任务平均 1.07×，&gt;40% 的平均 1.60×。重实现的 PASTE 式一步预取为 1.16×，TomasuLLM 每个任务都更快。</li>
+      <li>换 DeepSeek V4 Pro 当主模型（只重训 Action Drafter）：18 个任务几何均值同为 1.24×，17/18 个任务加速差在 0.03 以内。</li>
+      <li>正确性：4,010 条抽检提交记录零 false accept（95% 上界 0.075%）；20 个注入的隐藏依赖全部在提交前被拦下；SWE-bench Verified 解决率两边都是 41.7%。</li>
+      <li>延迟分解：总共藏掉基线 0.47 的时间（工具提前执行 0.30、保留下游推理 0.10、Trace IR 回放 0.07），被丢弃的后缀加回 0.05，净延迟 0.58。Action Drafter top-1 命中 0.46，端到端接受率 0.42；接受率每 +10 pp，归一化延迟再降 0.047，外推保本点约 0.20。</li>
+      <li>成本：主 Agent token 基本不变（8.3M vs 8.2M / 任务），推测额外 1.6M drafter token、1,480 GPU 秒，沙箱 CPU 时间 2,760 → 4,310 s；粗算每省 1 秒墙钟花约 2.1 秒推测算力。这是<strong>单会话延迟优化</strong>，不是吞吐优化。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量工具耗时占比再决定要不要上。</strong> 理论上限是 1/(1−工具占比)；论文里 Zstd decoder 工具只占 3.6%，上限 1.04×。工具重的任务（长测试、编译、训练脚本）才值得。</li>
+      <li><strong>单次候选要能「回本」。</strong> 论文测得只读 fork 路径的准备开销通常 1–3 s，带数据拷贝 8–12 s；亚秒级读几乎不回本，长测试怎么都回本。调度权重应偏向长测试，正是论文的默认做法。</li>
+      <li><strong>先把 tool wrapper 做规范化。</strong> 去掉时间戳、PID、随机种子等非确定字段，让观察可比较——这件事即使不做推测，也能改善 replay、缓存和 RL 训练里的 <a href="daily-2026-08-31-harness-tito.html">TITO</a> 一致性。</li>
+      <li><strong>把「不可追踪 / 不可逆」显式标成 barrier。</strong> 网络发送、外部 API、修改共享进程内存的调用不要推测。这和 <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a>、<a href="daily-2026-09-18-harness-actplane.html">ActPlane</a> 在内核层做策略约束是一致的安全观：副作用边界必须是 harness 的一等公民。</li>
+      <li><strong>RL rollout 里谨慎使用。</strong> 结果不改变轨迹语义，理论上可以加速 agentic RL 的环境步；但额外的 GPU 和 CPU 会和 rollout 抢资源，集群吞吐是否划算要按 <a href="daily-2026-10-05-weenv.html">WeEnv</a>、<a href="daily-2026-09-23-rollart.html">ROLLART</a> 那样的整体账本来算。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么起草的编辑必须是 speculation barrier，而主 Agent 真正发出的编辑可以在 overlay 里执行？</summary>
+      <p>起草的编辑内容是 drafter 编出来的，取决于 Agent 读过什么，几乎不可能和主 Agent 的真实编辑逐字一致，推测出来也大概率被 V_act 拒掉，还会污染后续候选的依赖。主 Agent 已发出的编辑是规范动作，内容确定，可以像其他调用一样在 overlay 里执行并按序提交。</p>
+    </details>
+    <details>
+      <summary>2. 观察预测错了，为什么当前候选还能提交？</summary>
+      <p>提交判据只看真实执行的证据（动作、依赖、观察、副作用），预测观察从不作为证据。预测错只说明「基于这个预测起草的后代」上下文是错的，所以只 squash 后代，当前候选的真实执行结果仍然有效，部分工作得以保留。</p>
+    </details>
+    <details>
+      <summary>3. 为什么服务重启产生的是 in-flight operand，而文件编辑产生的是 ready operand？</summary>
+      <p>文件的新版本可以被拷进 overlay，后续调用读到哪个版本都能在提交时复查。服务进程加载哪个版本的代码，只有重启动作真正执行之后才存在，overlay 里无从拷贝，所以依赖它的测试只能先准备、后执行。</p>
+    </details>
+    <details>
+      <summary>4. 「每省 1 秒花 2.1 秒推测算力」在什么场景下仍然划算？</summary>
+      <p>人在环路里等结果的交互式编码、对墙钟敏感的长任务、或 GPU / CPU 有闲置但会话数受限的场景。如果是高并发批处理，同样的算力用来多开 Serial 会话可能吞吐更高。</p>
+    </details>
+    <details>
+      <summary>5. 和推测解码对照：TomasuLLM 里的「接受率」扮演什么角色？</summary>
+      <p>与推测解码里 draft token 的接受率类似，决定了推测工作有多少能变成真实收益；论文测得加速与接受率近似线性。区别在于工具调用还要过依赖新鲜度和副作用检查，而且一次被拒的代价是秒级的沙箱和串行重跑，不是几毫秒的 token 计算。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2609.38201" target="_blank" rel="noopener">arXiv:2609.38201 · TomasuLLM</a></li>
+      <li><a href="https://doi.org/10.1147/rd.111.0025" target="_blank" rel="noopener">Tomasulo 1967 · An Efficient Algorithm for Exploiting Multiple Arithmetic Units</a></li>
+      <li><a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">arXiv:2211.17192 · Speculative Decoding（Leviathan et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1 SDK</a> ·
+        <a href="daily-2026-09-28-dsec.html">DSec</a> ·
+        <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

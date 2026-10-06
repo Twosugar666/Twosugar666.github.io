@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 0,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -606,6 +606,27 @@
       "source": "algo",
       "topic": "TD3：Clipped Double Q / Delayed policy update / Target policy smoothing；vs DDPG/SAC/PPO（Fujimoto et al.）",
       "file": "posts/daily-2026-10-05-algo-td3.html"
+    },
+    {
+      "date": "2026-10-06",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "DepGPO：命令依赖图（file/stdout edge）+ verifier 读集合回溯；写信用=到达 R 的行占比、读信用 λ^d 衰减；非负单位均值 step factor 重分配 GRPO 优势；TB2.0/2.1 八设置全第一（arXiv:2610.03634）",
+      "file": "posts/daily-2026-10-06-depgpo.html"
+    },
+    {
+      "date": "2026-10-06",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "TomasuLLM：Tomasulo 式乱序推测执行工具调用；Action/Observation Drafter + COW overlay + Riker Trace IR；V_act/V_dep/V_obs/V_eff 按序提交；SWE-bench V 1.31× / TB2.0 1.35× / SWE-Marathon 1.27×；0 false accept（arXiv:2609.38201）",
+      "file": "posts/daily-2026-10-06-harness-tomasullm.html"
+    },
+    {
+      "date": "2026-10-06",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "DQN / Double DQN：experience replay + target network；max 过估计；online 选 target 评；接 TD3/SAC 的 Clipped Double Q；PER/Dueling/Rainbow",
+      "file": "posts/daily-2026-10-06-algo-dqn.html"
     }
   ]
 }

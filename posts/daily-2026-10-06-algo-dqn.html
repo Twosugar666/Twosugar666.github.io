@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜DQN 与 Double DQN：Experience Replay、Target Network 与 max 算子的过估计 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜DQN 与 Double DQN：Experience Replay、Target Network 与 max 算子的过估计</h1>
+    <p class="post-meta">2026-10-06 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典论文：Mnih et al. · <em>Playing Atari with Deep Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/1312.5602" target="_blank" rel="noopener">arXiv:1312.5602</a>；
+      Mnih et al. · <em>Human-level control through deep reinforcement learning</em>（Nature 2015）；
+      van Hasselt, Guez, Silver · <em>Deep Reinforcement Learning with Double Q-learning</em>
+      · <a href="https://arxiv.org/abs/1509.06461" target="_blank" rel="noopener">arXiv:1509.06461</a>（AAAI 2016）。
+      交叉：
+      <a href="daily-2026-10-05-algo-td3.html">TD3</a>、
+      <a href="daily-2026-10-02-algo-sac.html">SAC</a>、
+      <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      上一篇 <a href="daily-2026-10-05-algo-td3.html">TD3</a> 讲「双 Critic 取 min 压过估计」，<a href="daily-2026-10-02-algo-sac.html">SAC</a> 也沿用了 twin Q。这条血脉的源头在离散动作的 value-based RL：Q-learning → DQN → Double DQN。
+      把它补上，后训练里很多「target 网络」「replay buffer」「过估计偏差」的说法就都有了出处。
+    </p>
+    <p>
+      表格型 Q-learning 收敛性很好，但一换成神经网络近似就容易发散。Sutton &amp; Barto 把这种危险组合叫 <strong>deadly triad</strong>：函数逼近 + bootstrapping + off-policy。DQN 没有从理论上消掉它，而是用两个工程手段把它压到可训练的范围内，第一次在 Atari 上用同一套网络和超参从像素学会了几十个游戏。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 从 Q-learning 到 DQN</h3>
+    <pre><code># 表格 Q-learning（off-policy TD 控制）
+Q(s,a) ← Q(s,a) + α · [ r + γ · max_a' Q(s',a') − Q(s,a) ]
+
+# DQN：Q 用网络 Q_θ 表示，最小化 TD 误差
+y       = r + γ · (1 − done) · max_a' Q_θ⁻(s', a')      # θ⁻ 是 target 网络
+L(θ)    = E_{(s,a,r,s')~D} [ ℓ( Q_θ(s,a) − y ) ]        # ℓ 常用 Huber
+# 行为策略：ε-greedy(Q_θ)，ε 随训练线性退火</code></pre>
+
+    <table>
+      <thead><tr><th>组件</th><th>做什么</th><th>解决什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Experience Replay</strong></td><td>把转移 (s,a,r,s′) 存进大缓冲 D，训练时均匀随机采 minibatch</td><td>打散时间相关性；一条样本复用多次，提高样本效率；平滑行为分布的突变</td></tr>
+        <tr><td><strong>Target Network</strong></td><td>目标 y 用一份冻结参数 θ⁻ 计算，每 C 步从 θ 硬拷贝一次</td><td>避免「自己追自己」：更新 θ 时目标不跟着同步移动，减少振荡和发散</td></tr>
+        <tr><td>Error / Reward clipping</td><td>TD 误差梯度截到 [−1, 1]（等价 Huber）；Atari 奖励截到 {−1, 0, +1}</td><td>不同游戏奖励尺度差异大，统一超参；防止大误差主导更新</td></tr>
+        <tr><td>预处理</td><td>84×84 灰度、4 帧堆叠、frame skip 4</td><td>部分可观测（速度信息）与算力</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Nature 版常被引用的超参（见原文表格）：replay 容量 1M，minibatch 32，γ=0.99，target 更新间隔 C=10,000，RMSProp 学习率 0.00025，ε 在前 1M 帧内从 1 退火到 0.1。注意 replay 让 DQN 天然是 off-policy：缓冲里的动作来自旧策略，但 Q-learning 的目标里是 max 而不是「行为策略的期望」，所以一步 TD 不需要 <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a>修正；改成 n-step 回报时才需要考虑。
+    </p>
+
+    <h3>② max 算子为什么会过估计</h3>
+    <p>
+      设真实 Q*(s′,·) 对所有动作相等，网络估计带零均值噪声 ε_a。那么 <code>E[max_a (Q* + ε_a)] ≥ max_a Q* </code>：对噪声取 max 会系统性偏高（Jensen 不等式 + 选择偏差）。
+      问题出在<strong>同一个估计既用来选动作又用来评估动作</strong>——被某个噪声高估的动作恰好被选中，然后它的高估值又被当成目标。过估计本身若是均匀的，不影响贪婪策略；但它往往不均匀，并且会沿 bootstrapping 一步步传播。
+    </p>
+
+    <h3>③ Double DQN：选择与评估解耦</h3>
+    <pre><code># DQN 目标：同一个 θ⁻ 既 argmax 又评估
+y_DQN    = r + γ · Q_θ⁻( s', argmax_a' Q_θ⁻(s', a') )
+
+# Double DQN：online 网络 θ 选动作，target 网络 θ⁻ 评估
+a*       = argmax_a' Q_θ(s', a')
+y_Double = r + γ · Q_θ⁻( s', a* )
+
+# 改动只有一行；不需要额外网络（复用现成的 target 网络当第二个估计器）</code></pre>
+    <p>
+      思想来自 van Hasselt 2010 的表格型 Double Q-learning：维护两套独立估计 Q^A、Q^B，用一套选、另一套评，两者噪声独立时，被选中的动作在另一套里不再系统性偏高。Double DQN 偷了个懒，直接拿 online / target 两份参数当「近似独立」的两个估计器。论文在 Atari 上展示了 DQN 的价值估计远高于真实折扣回报，而 Double DQN 的估计贴近真实值，且多数游戏分数更高（见原文图表）。
+    </p>
+
+    <h3>④ 一张表串起来：Double 系列的「保守」思想</h3>
+    <table>
+      <thead><tr><th>方法</th><th>动作空间</th><th>目标里怎么压过估计</th><th>偏差方向</th></tr></thead>
+      <tbody>
+        <tr><td>DQN</td><td>离散</td><td>不压；只靠 target 网络稳住训练</td><td>偏高</td></tr>
+        <tr><td>Double DQN</td><td>离散</td><td>online 选、target 评</td><td>接近无偏，仍可能略高</td></tr>
+        <tr><td><a href="daily-2026-10-05-algo-td3.html">TD3</a></td><td>连续</td><td>两个独立 critic 取 min（Clipped Double Q）</td><td>偏低（刻意保守）</td></tr>
+        <tr><td><a href="daily-2026-10-02-algo-sac.html">SAC</a></td><td>连续</td><td>twin Q 取 min + 熵项</td><td>偏低</td></tr>
+      </tbody>
+    </table>
+    <p>
+      TD3 论文明确指出，在 actor-critic 里 online 与 target 网络变化太慢、太相似，Double DQN 式解耦效果有限，于是改成两个独立 critic 再取 min，用低估换稳定。看懂这一条，就能理解为什么连续控制里「取 min」成了默认动作。
+    </p>
+
+    <h3>⑤ 之后的 DQN 家族（只列方向）</h3>
+    <ul>
+      <li><strong>Prioritized Experience Replay</strong>（Schaul et al.）：按 |TD 误差| 采样，并用重要性权重修正采样偏差。</li>
+      <li><strong>Dueling DQN</strong>（Wang et al.）：Q 拆成 V(s) + A(s,a) 两个头，A 减去均值保证可辨识。</li>
+      <li><strong>Rainbow</strong>（Hessel et al.）：Double、PER、Dueling、n-step、Distributional（C51）、Noisy Nets 六件套合一。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>默认就用 Double DQN 目标。</strong> 改动一行、零额外开销，几乎没有理由用原版 max 目标。</li>
+      <li><strong>Huber 损失 + 梯度裁剪是标配。</strong> 「error clipping」本意是截梯度，不是截损失值；直接把 TD 误差 clamp 到 [−1,1] 再平方，会让大误差的梯度变成 0，方向反了。</li>
+      <li><strong>监控「预测 Q 均值 vs 实际折扣回报」。</strong> 这是 Double DQN 论文的核心诊断图：两条曲线越拉越开，说明过估计在累积。</li>
+      <li><strong>target 更新方式二选一：</strong> 每 C 步硬拷贝（DQN 原版），或每步 Polyak 软更新 <code>θ⁻ ← τθ + (1−τ)θ⁻</code>（DDPG / TD3 / SAC 常用）。两者是同一个稳定化思想的不同节奏。</li>
+      <li><strong>迁移到 LLM 后训练时的对应关系：</strong> PPO / GRPO 里的 reference / old policy、value 头的 target、off-policy replay 的 staleness 处理，都能在 DQN 这两个组件里找到原型；但 LLM 动作空间是整个词表序列，Q 网络式 argmax 不可行，所以主流走策略梯度（见 <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、<a href="daily-2026-09-16-algo-grpo.html">GRPO</a>）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 如果只用 Experience Replay 不用 Target Network（或反过来），各会出现什么问题？</summary>
+      <p>只有 replay：样本去相关了，但目标随每次更新同步移动，仍容易振荡或发散。只有 target 网络：目标稳定了，但连续采样的强相关样本让梯度方差大、网络容易对最近的经验过拟合并遗忘旧状态。两者解决的是不同来源的不稳定。</p>
+    </details>
+    <details>
+      <summary>2. 为什么 DQN 的一步 TD 目标不需要重要性采样修正，而 n-step 版本需要考虑？</summary>
+      <p>一步目标 r + γ max Q(s′,·) 只依赖 (s,a,r,s′) 这一个转移，与行为策略在 s′ 之后的选择无关，评估的是贪婪策略。n-step 回报包含行为策略在中间状态选的动作，和目标策略不一致，严格来说要用 IS 或截断修正（如 Retrace、V-trace）；实践里 Rainbow 直接用未修正的 n-step，靠 n 较小来控制偏差。</p>
+    </details>
+    <details>
+      <summary>3. Double DQN 用 online 和 target 两份参数当两个估计器，这两个估计器真的独立吗？</summary>
+      <p>不独立，target 只是 online 的延迟副本，噪声高度相关，所以只能部分消除过估计。这正是 TD3 在 actor-critic 中改用两个独立训练 critic 并取 min 的原因。</p>
+    </details>
+    <details>
+      <summary>4. 过估计如果对所有动作都是均匀的，会不会影响策略？</summary>
+      <p>不会影响贪婪动作的选择，因为 argmax 对整体平移不变。问题在于实际过估计不均匀：访问少、噪声大的动作更容易被高估，策略就会被吸引过去，而且偏差会通过 bootstrapping 传播到前序状态。</p>
+    </details>
+    <details>
+      <summary>5. 为什么 Atari DQN 要做奖励裁剪？它有什么代价？</summary>
+      <p>不同游戏奖励尺度差几个数量级，裁剪到 {−1,0,+1} 后可以用同一学习率和网络。代价是丢失奖励大小信息，智能体分不清「吃一个小豆」和「吃一个大奖」，在某些游戏里会学到次优策略；后续工作用 value rescaling（如 R2D2 的 h 函数）或 PopArt 替代。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1312.5602" target="_blank" rel="noopener">arXiv:1312.5602 · Playing Atari with Deep RL</a></li>
+      <li><a href="https://www.nature.com/articles/nature14236" target="_blank" rel="noopener">Nature 518 · Human-level control through deep RL</a></li>
+      <li><a href="https://arxiv.org/abs/1509.06461" target="_blank" rel="noopener">arXiv:1509.06461 · Double DQN</a></li>
+      <li><a href="https://arxiv.org/abs/1511.05952" target="_blank" rel="noopener">arXiv:1511.05952 · Prioritized Experience Replay</a> ·
+          <a href="https://arxiv.org/abs/1511.06581" target="_blank" rel="noopener">arXiv:1511.06581 · Dueling DQN</a> ·
+          <a href="https://arxiv.org/abs/1710.02298" target="_blank" rel="noopener">arXiv:1710.02298 · Rainbow</a></li>
+      <li>站内：
+        <a href="daily-2026-10-05-algo-td3.html">TD3</a> ·
+        <a href="daily-2026-10-02-algo-sac.html">SAC</a> ·
+        <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a> ·
+        <a href="daily-2026-09-25-algo-vtrace.html">V-trace</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

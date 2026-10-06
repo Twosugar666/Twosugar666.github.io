@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜DepGPO：沿读写依赖把终端 Agent 的 GRPO 优势分给「真正起作用」的命令 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜DepGPO：沿读写依赖把终端 Agent 的 GRPO 优势分给「真正起作用」的命令</h1>
+    <p class="post-meta">2026-10-06 · 收藏夹：RL / Agent · 一线追踪<br />
+      论文：Yu Li, Guangfeng Cai, Long-Fei Li, Shuo Han, …, Lei Feng（东南大学 / 华为诺亚方舟） ·
+      <em>Credit Where It Matters: Dependency-Aware Policy Optimization for Terminal Agents</em>
+      · <a href="https://arxiv.org/abs/2610.03634" target="_blank" rel="noopener">arXiv:2610.03634</a>（2026-10-02 提交）。
+      交叉：
+      <a href="daily-2026-09-14-t1.html">T1</a>、
+      <a href="daily-2026-09-15-gaca.html">GACA</a>、
+      <a href="daily-2026-09-01-ahead.html">AHEAD</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      终端 Agent 的 RL 已经是标准配方：SFT 冷启动 → 在 Docker 任务上 rollout → 任务 verifier 给 0/1 → GRPO / DAPO 做组内相对优势。
+      问题在最后一步：outcome-only 的 GRPO 把<strong>同一个轨迹优势</strong>摊给轨迹里所有 token。一条成功轨迹里可能有「cat 了一个无关文件」「写了又被覆盖的草稿」，它们和真正修好 bug 的那条 <code>sed</code> 拿到一样的奖励。
+    </p>
+    <p>
+      站内之前追过几条 step-level credit 的路线：<a href="daily-2026-09-15-gaca.html">GACA</a> 用 NLL 关键度混合步级 / 轨迹级优势，<a href="daily-2026-09-01-ahead.html">AHEAD</a> 做 step-aware 信用，<a href="daily-2026-09-14-t1.html">T1</a> 用 value model 做终端 RL 的信用分配。DepGPO 换了一个角度：<strong>终端是有物理痕迹的</strong>——哪个命令写了哪几行、哪个命令读了哪个文件、哪个端口被 verifier 检查，执行 trace 里都能看到。那就别猜了，直接沿读写依赖从 verifier 往回追。
+    </p>
+    <p>论文的 pilot study（论文自报）把动机量化得很清楚：</p>
+    <ul>
+      <li>SFT 策略每题采 4 条，1,376 个任务组里 <strong>61%</strong> 奖励全同、组内优势为 0（DAPO 的 dynamic sampling 能滤掉，但剩下的优势怎么在命令间分配仍没解决）。</li>
+      <li>GiGPO 依赖「相同环境状态」做锚点，在终端里精确匹配出的复现锚点极少：两个锚点最多的任务里，25 个状态只有 4 个复现。</li>
+      <li>Terminal-Bench 2.0 的 51 条通过参考解里，落在「通往 verifier 读集合的依赖路径」上的命令占比中位数 <strong>0.57</strong>；命令数 ≥5 的 18 条轨迹里降到 <strong>0.18</strong>。轨迹越长，均匀分优势越浪费。</li>
+    </ul>
+
+    <h2>机制拆解</h2>
+    <h3>① 命令依赖图（Command Dependency Graph）</h3>
+    <p>每条轨迹在执行时记录：文件读写、端口 / 进程事件、stdout。写按<strong>行</strong>追踪（执行前后 diff 出写入行范围），读只能到<strong>文件</strong>粒度（不知道程序用了哪几行）。命令分成两类且互斥：有任何写记录的算 write command，其余算 read command。</p>
+    <table>
+      <thead><tr><th>边 / 集合</th><th>怎么来</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr><td>File edge</td><td>后一个命令读了一个文件，里面还残留前一个命令写入、未被覆盖的行</td><td>覆盖本身不建边——替换内容不代表读过它</td></tr>
+        <tr><td>Stdout edge</td><td>后一个命令的文本里出现了前面某命令 stdout 打印过的类型化值（路径、端口）</td><td>任务描述里已给的值不算，避免伪依赖</td></tr>
+        <tr><td>Verifier 读集合 R</td><td>同样 trace verifier，记下它检查的文件、端口、进程（含存在性 / 元数据检查）</td><td>verifier 自己写的文件排除</td></tr>
+      </tbody>
+    </table>
+    <p>两种边都顺着执行顺序，所以图天然是 DAG。</p>
+
+    <h3>② 写命令的信用：有多少行「活到」了 verifier</h3>
+    <pre><code># 对写命令 c：
+L(c)      = c 写入、被追踪的行集合（文件 + 行号）
+L_R(c)    = L(c) 中直接或间接贡献到 R 的那些行
+credit_w(c) = |L_R(c)| / |L(c)|          # 不做距离衰减，每行只计一次
+
+# 直接贡献：行所在文件被 verifier 读，且之后没被 agent 覆盖
+# 间接贡献：之后某写命令 c' 读了这个文件（行未被覆盖），c' 的输出再到达 R
+#   保守规则：c' 必须写到「另一个文件」，且不能覆盖被计数的输入行
+
+# 端口 / 进程类命令没有行粒度：被 verifier 检查 → 1，否则 → 0</code></pre>
+
+    <h3>③ 读命令的信用：它支撑了哪些有用的写</h3>
+    <pre><code># 读命令 r 没有写记录，它的影响从 stdout edge 起步，然后沿 file/stdout 边传播
+W(r)     = 从 r 可达的 agent 写命令集合
+d(r, w)  = r 到 w 的最短路径边数
+credit_r(r) = Σ_{w ∈ W(r)}  λ^(d(r,w)-1) · credit_w(w)     # 默认 λ = 0.5
+# 多条路径到同一 w 只取最短；不同 w 的贡献相加；到不了任何正信用写 → 0</code></pre>
+    <p>这里的衰减按<strong>依赖图的边</strong>计，不是按交互步数。论文的敏感性实验（Qwen3.5-9B / SETA，TB2.0 / TB2.1 pass@1，论文自报）：λ=0.25 → 24.27 / 23.75，0.5 → 25.24 / 24.64，0.75 → 24.87 / 24.12，1.0（不衰减）→ 23.97 / 23.45。结论是不敏感，但「完全不衰减」略差。</p>
+
+    <h3>④ 从命令信用到 per-step 优势</h3>
+    <pre><code># 同一交互步内的命令信用相加，得到步信用 C_t（只在有 trace 的步之间比较）
+C_min = min_t C_t
+f_t   = (C_t - C_min) / mean_t(C_t - C_min)      # 非负、均值为 1；最低信用步 → 0
+# 无 trace 的步 f_t = 1；全相等或无可用信用 → 全部 f_t = 1，退回 GRPO
+
+# 按 token 数再归一，避免长回复步被放大
+f̄   = Σ_t n_t·f_t / Σ_t n_t
+A_t  = A_traj · f_t / f̄          # A_traj 是 GRPO 组内标准化优势
+
+# 之后照常用 clipped surrogate（含负优势的 dual clip），只是每个 token 拿所属步的 A_t</code></pre>
+    <p>
+      关键设计：<strong>符号由组内结果定，分配由依赖定</strong>。因为 f_t ≥ 0，失败轨迹的负优势同样会集中压到「和 verifier 相关」的命令上，而不会翻号；优势为 0 的组仍然是 0。整体尺度（token 加权均值）不变，所以和 GRPO 的学习率、clip 配置可直接对齐。
+    </p>
+
+    <h3>⑤ 结果（论文自报，pass@1 %，三轮评测均值）</h3>
+    <table>
+      <thead><tr><th>设置</th><th>SFT</th><th>GRPO</th><th>DAPO</th><th>DPPO</th><th>GiGPO</th><th>DepGPO</th></tr></thead>
+      <tbody>
+        <tr><td>9B · SETA · TB2.0</td><td>15.28</td><td>11.09</td><td>13.11</td><td>15.36</td><td>11.24</td><td><strong>25.24</strong></td></tr>
+        <tr><td>9B · TMAX · TB2.1</td><td>10.56</td><td>17.83</td><td>13.86</td><td>18.95</td><td>11.31</td><td><strong>22.17</strong></td></tr>
+        <tr><td>27B · SETA · TB2.0</td><td>25.92</td><td>25.09</td><td>27.34</td><td>28.24</td><td>16.55</td><td><strong>37.75</strong></td></tr>
+        <tr><td>27B · TMAX · TB2.1</td><td>24.27</td><td>24.94</td><td>25.09</td><td>26.67</td><td>18.65</td><td><strong>36.70</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      模型是 Qwen3.5-9B 与 Qwen3.6-27B，训练数据 SETA / TMAX，评测 Terminal-Bench 2.0 / 2.1。八个设置全部第一，相对最强 RL 基线 +3.22 到 +10.03 pp，相对 GRPO +4.34 到 +14.53 pp。值得注意的一个副信号：9B·SETA 上 GRPO（11.09）甚至<strong>低于 SFT 起点</strong>（15.28），GiGPO / GraphGPO 在 27B 上也明显掉到 SFT 之下——这和论文的稳定性曲线一致：GRPO 先升后退化、熵后期上涨，GiGPO 熵早早塌掉，两者后期梯度范数都趋近 0，DepGPO 保持非零梯度。
+    </p>
+    <p>消融（9B·SETA，TB2.0 / 2.1）：去掉 verifier 过滤（所有写都给 1）掉 6.59 / 6.89 pp，最伤；去掉读信用掉 3.82 / 4.49；二值化写信用掉 2.17 / 2.09；只算直接写掉 1.79 / 1.64。开销：每次更新 wall-clock +7.0%，峰值显存 +1.0%，每条轨迹依赖处理约 3.8 s，零额外前向。trace 统计：每轨迹平均 6.8 条命令，82.4% 轨迹有可用依赖信用，17.6% 退回均匀分配；38.7% 的写和 27.9% 的读拿到正信用，读到写的平均最短距离 1.74 条边。</p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先把 trace 基础设施做起来，再谈算法。</strong> DepGPO 的前提是 sandbox 能给出「命令级读写 + 行级 diff + verifier 读集合」。如果环境层已经有 eBPF / syscall trace（参见站内 <a href="daily-2026-09-18-harness-actplane.html">ActPlane</a>、<a href="daily-2026-09-28-dsec.html">DSec</a>），边际成本很低；如果只有 stdout，就只剩 stdout edge，效果会打折。</li>
+      <li><strong>verifier 读集合是最值钱的信号。</strong> 消融里它的贡献最大。哪怕不做完整依赖图，「这条命令写的东西最终有没有被 verifier 看到」本身就是很强的步级过滤器。</li>
+      <li><strong>保留 GRPO 的符号语义。</strong> 只做非负重加权、按 token 加权均值归一，是这类方法能「即插即用」的关键；自己改的时候别让 f_t 变负或改变总尺度，否则学习率和 clip 要重调。</li>
+      <li><strong>小心 verifier 过拟合。</strong> 信用直接锚在 verifier 检查的资源上，verifier 写得窄，策略就会被训练成只照顾 verifier 看得到的地方——和站内 <a href="daily-2026-09-22-codemidas.html">CodeMidas</a> 讨论的 verifier 质量问题是同一件事。</li>
+      <li><strong>监控 f_t 的方差。</strong> 论文观察到训练中 step factor 标准差持续上升（越来越挑）。如果它一开始就很大或长期为 0，多半是 trace 缺失或全部退回了 unit factor。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么写信用不做距离衰减，读信用却要衰减？</summary>
+      <p>写命令的贡献以「有多少行最终被用到」度量，是对产物本身的直接计数；读命令只是提供信息，它和最终结果之间隔着若干次「被谁用了」，链越长归因越不确定，衰减是对这种不确定性的保守折扣。</p>
+    </details>
+    <details>
+      <summary>2. 失败轨迹（负优势）里，DepGPO 会把惩罚集中到哪里？这合理吗？</summary>
+      <p>集中到与 verifier 读集合相关的写及其支撑读上。合理性在于：失败往往正是这些「改了 verifier 检查的东西但改错了」的命令造成的；无关的探索命令被少罚，有助于保留探索行为。代价是如果失败源于「根本没去改该改的文件」，相关命令可能为空，退回均匀分配。</p>
+    </details>
+    <details>
+      <summary>3. 为什么覆盖（overwrite）不建边？</summary>
+      <p>覆盖只说明后一个命令替换了内容，不说明它读过或依赖旧内容。若建边，会把被覆盖的草稿错误地归因为后续命令的前提，反而奖励无效写入。若后一命令先读后写，读那一步会单独建边。</p>
+    </details>
+    <details>
+      <summary>4. 和 GiGPO 的状态锚点方法相比，DepGPO 的优势和局限各是什么？</summary>
+      <p>优势：不需要状态复现，终端环境状态几乎不重复时依然可用，且信用有物理依据。局限：依赖 trace 完整性（读只有文件粒度、跨进程 / 网络副作用难追），也不能评估「没执行的更好命令」，本质是在已发生轨迹内重新分配，不提供反事实比较。</p>
+    </details>
+    <details>
+      <summary>5. 这种方法能迁移到 SWE / 浏览器 Agent 吗？</summary>
+      <p>SWE 场景很自然：verifier 是测试，读集合就是测试 import 和读取的文件，git diff 天然给行级写。浏览器 Agent 难一些：DOM 状态和网络请求的「读写」不像文件那样有稳定标识，需要先定义可追踪的资源单位（如表单字段、URL 状态）再建依赖图。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.03634" target="_blank" rel="noopener">arXiv:2610.03634 · DepGPO（Credit Where It Matters）</a></li>
+      <li><a href="https://arxiv.org/abs/2505.10978" target="_blank" rel="noopener">arXiv:2505.10978 · GiGPO（Group-in-Group Policy Optimization）</a></li>
+      <li><a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">arXiv:2503.14476 · DAPO</a></li>
+      <li>站内：
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-02-algo-gae.html">GAE</a> ·
+        <a href="daily-2026-09-14-t1.html">T1</a> ·
+        <a href="daily-2026-09-15-gaca.html">GACA</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-08-13-prm.html">PRM</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
