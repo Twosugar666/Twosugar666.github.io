@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜ThunderSyncRL：零 Staleness 的梯度流式化，把 Agentic RL 的 learner 气泡塞回 rollout 窗口 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜ThunderSyncRL：零 Staleness 的梯度流式化，把 Agentic RL 的 learner 气泡塞回 rollout 窗口</h1>
+    <p class="post-meta">2026-10-07 · 收藏夹：Infra / RL · 一线追踪<br />
+      论文：Seil Kang, Hangoo Kang, Tarun Suresh, Youngeun Kim, Shreyas Pimpalgaonkar, Seong Jae Hwang, Azalia Mirhoseini（Stanford / Yonsei / Korea Univ. / Bespoke Labs） ·
+      <em>ThunderSyncRL: Lossless Acceleration of Agentic Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/2610.05935" target="_blank" rel="noopener">arXiv:2610.05935</a>（v1，2026-10-05）；代码：<a href="https://github.com/seilk/thundersync" target="_blank" rel="noopener">github.com/seilk/thundersync</a>（论文给出的链接）。
+      交叉：
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-09-23-rollart.html">ROLLART</a>、
+      <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a>、
+      <a href="daily-2026-10-05-weenv.html">WeEnv</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agentic RL 的一个 step 由两段昂贵工作组成：rollout（多轮生成 + 沙箱工具调用 + verifier 打分）和 learner（前向 + 反向 + 优化器）。轨迹长度是长尾分布——最慢的那几条 SWE 任务决定整批何时结束。batch-synchronous 训练里，learner 必须等到<strong>最后一个 reward</strong> 回来才开工。论文在 SWE-smith 上的 GRPO 实测里，learner GPU 每个 step 有 <strong>49.5%</strong> 的时间在空等（论文自报，Figure 3）。
+    </p>
+    <p>
+      主流解法是异步：rollout 与 learning 跨 update 重叠（one-step off-policy），或者干脆 fully async，在轨迹飞行途中就换权重（AReaL 风格）。代价是 <strong>policy staleness</strong>：样本来自旧策略，于是要上 <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a>修正、截断、过滤或 staleness bound（站内 <a href="daily-2026-09-25-algo-vtrace.html">V-trace</a>、<a href="daily-2026-09-23-rollart.html">ROLLART</a>、<a href="daily-2026-08-31-miles-v01.html">Miles</a> 都在处理这件事）。
+    </p>
+    <p>
+      ThunderSyncRL 的论点很尖锐：「重叠」和「零 staleness」之间的取舍是<strong>人为的</strong>，源于过粗的执行屏障。同步更新确实需要整批数据，但<em>梯度计算</em>可以更早开始——只要它的数学依赖已经满足。于是框架只遵循一条原则：<strong>每份计算在其数学依赖满足的最早时刻释放</strong>，但优化器步仍然整批同步。用论文自己的话说：执行上异步，策略更新上同步。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 四种执行协议对比</h3>
+    <table>
+      <thead><tr><th>协议</th><th>learner 何时开工</th><th>policy lag</th><th>需要的算法补丁</th></tr></thead>
+      <tbody>
+        <tr><td>Sync</td><td>整批 rollout + reward 全部到齐后</td><td>0</td><td>无</td></tr>
+        <tr><td>Async（one-step）</td><td>与下一批 rollout 重叠</td><td>1</td><td>off-policy 修正 / clip</td></tr>
+        <tr><td>Fully Async</td><td>无批屏障；轨迹飞行中换权重</td><td>可变（有界）</td><td>IS、staleness bound、过滤</td></tr>
+        <tr><td><strong>ThunderSyncRL</strong></td><td>每个 objective source 就绪即反向；一次同步 optimizer step</td><td>0</td><td>无（目标函数不变）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      关键抽象是 <strong>objective source</strong>：一份可独立释放的 learner 计算单元，在其所有输入固定的时刻 τ<sub>j</sub> 就绪。GRPO 的 source 是「一条轨迹 + 它的 reward」；OPD（on-policy distillation）的 source 是「一个 agentic turn 的动作 token + teacher 打分」。
+    </p>
+
+    <h3>② GRPO：组统计没到齐，也能先算反向</h3>
+    <p>
+      难点在于 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 的优势依赖整组 reward：A_i = (r_i − μ_G) / (σ_G + ε)。看起来必须等组内 m 条全部结束。论文的观察是：优势在求导时被 detach，是个标量权重，于是组梯度可以拆成两个与 μ、σ 无关的累加量：
+    </p>
+    <pre><code># 轨迹 i 的 masked score 与它在 θ_k 处的梯度
+S_i(θ) = Σ_{t∈M_i} w_{i,t} · log π_θ(a_{i,t} | h_{i,t})
+H_i    = ∇_θ S_i(θ) |_{θ=θ_k}
+
+# 原始组梯度（优势 detach）
+g_G = (1/m) · Σ_i  (r_i − μ_G)/(σ_G + ε) · H_i
+
+# 精确等价的分解：两个 running sum 只需要各自轨迹的 r_i 与 H_i
+G1 = Σ_i r_i · H_i          # reward 加权梯度和
+G2 = Σ_i H_i                # 无权梯度和
+g_G = (1/m) · (G1 − μ_G · G2) / (σ_G + ε)   # 组关闭时才用到 μ_G、σ_G
+
+# 批方向：g_k = Σ_G g_G ；clip 后只做一次 Opt(θ_k, clip(g_k))</code></pre>
+    <p>
+      所以第 i 条轨迹的反向可以在<strong>它自己的 reward 到达时</strong>立刻开跑，并把 r_i·H_i 与 H_i 累加进组的两个 FP32 缓冲；组关闭时只做一次标量组合。代价是每个「打开中」的组要多存两份参数量大小的梯度统计。
+    </p>
+
+    <h3>③ OPD：按 turn 释放，工具在沙箱里跑时 learner 已经在反向</h3>
+    <pre><code># 冻结 teacher π_T 给学生动作 token 打分后，turn j 立刻成为 source
+A_{j,t} = sg[ log π_T(a_{j,t}|h_{j,t}) − log π_θk(a_{j,t}|h_{j,t}) ]
+g_j     = Σ_{t∈M_j} A_{j,t} · ∇_θ log π_θ(a_{j,t}|h_{j,t}) |_{θ=θ_k}
+
+# 批归一化用的总 token 数 N_k 要等整批关闭才知道 → 只把这个标量除法推迟
+g_k = (1/N_k) · Σ_j g_j ,   N_k = Σ_j |M_j|</code></pre>
+    <p>
+      OPD 的优势只依赖已采样 token、其因果上下文和两份固定策略，因此比 GRPO 更早就绪：一个 turn 结束、teacher 打完分就能反向，与随后的工具执行、后续 turn 并行。论文还提到需要在轨迹关闭时补做「穿过早期上下文的延迟梯度传播」（deferred context backward / shared-prefix backward），它作为单独的 learner 工作项排队。
+    </p>
+
+    <h3>④ 调度模型与「2× 上界」</h3>
+    <pre><code># 单 learner lane：工作项 j 的释放时刻 τ_j、服务时长 p_j
+c_j = max(τ_j, c_{j−1}) + p_j
+# R_k：整批 rollout 关闭时刻；P_k：最终 reduce + optimizer + 发布权重
+T_k = max(R_k, c_n) + P_k
+# Sync 把所有工作推迟到 R_k 之后；ThunderSyncRL 把可开工的部分搬进 rollout 区间</code></pre>
+    <p>
+      当 rollout 时长 ≈ learner 时长、learner 尾巴与发布开销可忽略时，完美重叠把两段串行时间折半，加速比逼近 <strong>2×</strong>。任一阶段占主导就封顶：rollout 主导时 learner 再快也没用，learner 主导时 rollout 已经被藏住。这也解释了后面的硬件差异。
+    </p>
+
+    <h3>⑤ 零 staleness 屏障</h3>
+    <p>
+      批内所有 source 都绑定 θ_k：轨迹用 π_θk 采样、梯度在 θ_k 处求。等所有轨迹、组和延迟反向完成后，做分布式 reduce 与目标相关的归一化，clip，<strong>恰好一次</strong> optimizer step 得到 θ_{k+1}；发布到 rollout 副本，每个副本加载新版本、清理策略相关状态（如 KV/prefix cache）并 ack 之后，下一轮才开始。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <table>
+      <thead><tr><th>设置</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td>配置</td><td>Qwen-3.8-27B 全参；单节点 8×B200（4 learner + 4 rollout，OPD 为 2 rollout + 2 teacher）；GRPO 每步 32 prompt × 8 = 256 条，OPD 32 × 4 = 128 条；最多 300 turn、每 turn 1,024 token；训练数据 SWE-smith / SETA-Env</td></tr>
+        <tr><td>Step wall time</td><td>rollout+verify 约 650 s 后，Sync 还要 646.4 s（GRPO）/ 656.2 s（OPD）learner 工作，ThunderSyncRL 只剩 20.5 s / 11.6 s；总 step 1.91× / 1.94× 快于 Sync</td></tr>
+        <tr><td>达到同等 pass@3</td><td>SWE-bench Verified：GRPO 和 OPD 都快 1.9×（GRPO 目标 74.01%：121.3 vs 233.5 GPU-hours）；Terminal Bench 4.0：GRPO 1.8×、OPD 1.9×</td></tr>
+        <tr><td>固定 128 GPU-hours</td><td>相对 Async：SWE-bench V +2.47（GRPO）/ +1.27（OPD）pp；TB 4.0 +1.52 / +2.02 pp</td></tr>
+        <tr><td>模型 / 硬件</td><td>GLM-4.7-Flash-31B（约 3B 激活）learner 很短、rollout 主导 → 1.64× / 1.63×；H200 上同一 Qwen 变 learner 主导 → 1.63× / 1.67×</td></tr>
+        <tr><td>Trainer active MFU</td><td>Qwen/B200 GRPO：Sync 24.0% → 45.9%；H200 最高 51.0%</td></tr>
+        <tr><td>代价</td><td>learner 峰值显存上升（Qwen GRPO 117.0 → 122.8 GB/GPU），另有 pinned host RAM 存 FP32 累加器与组统计</td></tr>
+        <tr><td>等价性验证</td><td>回放 10 个真实批次：FP32 下梯度逐坐标一致，相对误差 5.1e-7（GRPO）/ 1.1e-6（OPD，B200）；10 步参数差 &lt; 6e-5，比 BF16 vs FP32 的差距小近三个数量级</td></tr>
+      </tbody>
+    </table>
+    <p>
+      一个值得注意的细节：在吞吐上，Async / Fully Async 和 ThunderSyncRL 基本同档（Qwen/B200 GRPO 1.89× / 1.90× / 1.91×）。ThunderSyncRL 的卖点不是「比异步更快」，而是<strong>以 Sync 的语义拿到异步的吞吐</strong>，于是固定预算下的最终分数反超异步。轨迹长度越分散，GRPO 收益越大：分散度低时 1.58×，分散度高时 1.95×；OPD 按 turn 释放，稳定在 1.73–1.94×（论文 Figure 7a）。
+    </p>
+    <p>
+      内存账也要算清：每个 rank 上 FP32 批累加器加上每个打开组的 G1/G2，最多 4(2k+1)P 字节（k 为每 rank 允许同时持有统计的组数上限，P 为参数量）。论文取 k=1，四个 learner rank 合计约 1.30 TB（Qwen）/ 1.49 TB（GLM）host 内存——这是用 host RAM 换 wall time。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量气泡，再选方案。</strong> 在现有 Sync 管线里打 learner 空闲占比和 rollout/learner 时长比。比值接近 1、轨迹长度方差大，是梯度流式化收益最大的区间；严重 rollout-bound（如小激活 MoE）时收益会被封顶。</li>
+      <li><strong>先检查你的目标函数是否「可流式」。</strong> 判据是：每条样本的梯度能否写成「只依赖自身的向量 × 之后才确定的标量」的线性组合。原版 GRPO、OPD 可以；只做一次梯度步的 on-policy 目标都值得推一遍代数。</li>
+      <li><strong>小心 token 归一化。</strong> DAPO 风格的 token-level loss 按全批 token 数归一化，和 OPD 的 N_k 一样只能推迟标量除法；按组或按序列归一化则放进 w_{i,t}。写错一个分母就不再「无损」（见 <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>）。</li>
+      <li><strong>和 TITO / prefix 复用一起设计。</strong> 多轮 agent 的 shared-prefix backward、turn 级释放都要求 token 序列在 harness 与 trainer 间严格一致，参考 <a href="daily-2026-08-31-harness-tito.html">TITO</a>。</li>
+      <li><strong>把 host 内存列入容量规划。</strong> 组统计按参数量线性增长，k（并发打开组上限）是吞吐与内存的旋钮；多节点扩展论文尚未覆盖（Appendix A 自述为下一步）。</li>
+      <li><strong>环境侧也要跟上。</strong> learner 气泡消掉后，瓶颈会更集中到沙箱启动与 verifier 上，配合 <a href="daily-2026-10-05-weenv.html">WeEnv</a>、<a href="daily-2026-09-28-dsec.html">DSec</a> 这类环境基础设施看。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 GRPO 的组梯度可以在组统计未知时先算？哪一步假设是关键？</summary>
+      <p>关键是优势在求导时被 detach，且所有梯度都在同一个固定参数 θ_k 处计算。于是 g_G 对 H_i 是线性的，μ_G、σ_G 只作为标量系数出现，可以把 Σ r_i H_i 和 Σ H_i 先累加，组关闭后再做标量组合。若优势不 detach 或梯度点在变化，分解就不成立。</p>
+    </details>
+    <details>
+      <summary>2. 如果用 PPO 式多 epoch、多 minibatch 更新（每批数据做好几次 optimizer step），ThunderSyncRL 的等价性还成立吗？</summary>
+      <p>不能直接成立。第二个 minibatch 的梯度要在更新后的参数处计算，依赖第一次 optimizer step 的结果，不能在 rollout 期间预先算好。论文的框架是「一批一次 optimizer step」，这正是它能做到零 staleness 且精确等价的前提；多步更新时最多能流式化第一步。</p>
+    </details>
+    <details>
+      <summary>3. 为什么 GLM-4.7-Flash（约 3B 激活）的加速比低于 Qwen-3.8-27B？H200 上又为什么变低？</summary>
+      <p>加速上界由两段时长的平衡决定。小激活 MoE 的 learner 工作很短，step 由 rollout 主导，能藏进 rollout 的 learner 时间本来就少；H200 算力低于 B200，同一负载变成 learner 主导，rollout 已被完全覆盖，剩余 learner 时间藏不住。两种失衡都让加速离 2× 更远。</p>
+    </details>
+    <details>
+      <summary>4. 吞吐上 Async 已经 1.89×，为什么固定预算下 ThunderSyncRL 分数还更高？</summary>
+      <p>Async 的样本有一步策略滞后，fully async 的滞后可变，需要 IS/clip 等修正，有效学习信号会打折或带偏差。ThunderSyncRL 每步更新与 Sync 在数学上相同，同样的 GPU-hours 里步数与 Async 相当，但每步都是 on-policy 的干净更新，所以最终 pass@3 更高（论文自报 +1.27 到 +2.47 pp）。</p>
+    </details>
+    <details>
+      <summary>5. 为什么发布新权重后 rollout 副本必须「清理策略相关状态并 ack」？</summary>
+      <p>vLLM 的 prefix cache / KV cache 是旧权重算出的激活，若新一批生成复用这些 KV，生成分布就不再是严格的 π_θ{k+1}，等于又引入了隐性 staleness。ack 屏障确保下一批所有 token 都来自新策略，这是「零 lag」这一声明在系统层面的落实。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.05935" target="_blank" rel="noopener">arXiv:2610.05935 · ThunderSyncRL: Lossless Acceleration of Agentic Reinforcement Learning</a></li>
+      <li><a href="https://arxiv.org/html/2610.05935v1" target="_blank" rel="noopener">HTML 全文（含 Appendix F 调度理论、Appendix G 等价性验证）</a></li>
+      <li><a href="https://github.com/seilk/thundersync" target="_blank" rel="noopener">github.com/seilk/thundersync</a></li>
+      <li>站内：
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-25-algo-vtrace.html">V-trace</a> ·
+        <a href="daily-2026-09-23-rollart.html">ROLLART</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-10-06-depgpo.html">DepGPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

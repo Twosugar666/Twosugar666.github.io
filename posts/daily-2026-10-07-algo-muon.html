@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Muon：用 Newton-Schulz 正交化动量，把矩阵参数的更新拉成「各向同性」（谱范数最速下降 / RMS 对齐 / QK-Clip） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Muon：用 Newton-Schulz 正交化动量，把矩阵参数的更新拉成「各向同性」（谱范数最速下降 / RMS 对齐 / QK-Clip）</h1>
+    <p class="post-meta">2026-10-07 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Keller Jordan et al. · <em>Muon: An optimizer for hidden layers in neural networks</em>（博客，2024-12-08）
+      · <a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noopener">kellerjordan.github.io/posts/muon</a>；
+      Bernstein &amp; Newhouse · <em>Old Optimizer, New Norm: An Anthology</em>
+      · <a href="https://arxiv.org/abs/2409.20325" target="_blank" rel="noopener">arXiv:2409.20325</a>；
+      Liu, Su, Yao et al.（Moonshot AI） · <em>Muon is Scalable for LLM Training</em>
+      · <a href="https://arxiv.org/abs/2502.16982" target="_blank" rel="noopener">arXiv:2502.16982</a>；
+      Kimi Team · <em>Kimi K2: Open Agentic Intelligence</em>
+      · <a href="https://arxiv.org/abs/2507.20534" target="_blank" rel="noopener">arXiv:2507.20534</a>（MuonClip）。
+      交叉：
+      <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a>、
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a>、
+      <a href="special-2026-08-27-new-models-arch.html">2026 新模型全景</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a> 是逐坐标的：每个标量参数有自己的一阶、二阶矩，更新时把矩阵当成一袋独立的数。但 Transformer 里绝大多数参数是线性层的权重矩阵，它们的作用是「算子」——把一个空间映射到另一个空间。逐坐标的几何忽略了这层结构。
+    </p>
+    <p>
+      Keller Jordan 的博客给出一个经验观察：SGD-momentum 和 Adam 对 Transformer 2D 参数产生的更新矩阵<strong>条件数很高</strong>，几乎是低秩的——所有神经元的更新被少数几个方向主导。Muon 的做法简单粗暴：把动量矩阵的奇异值全部拉成 1，只保留方向 UVᵀ，让那些幅度小但重要的「稀有方向」也得到同等步长。
+    </p>
+    <p>
+      它最初靠 NanoGPT speedrun 这种「竞争性任务」站住脚（相对 AdamW 把达到 3.28 val loss 的训练速度提升 1.35×，博客自报），随后 Moonshot 把它扩到 16B MoE（Moonlight，5.7T token），Kimi K2 又在 1T 参数 MoE、15.5T token 上用 MuonClip 做到全程无 loss spike（论文自报）。对后训练从业者来说，Muon 已经是读懂新一代基座训练配方绕不开的一环。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 定义：SGD-momentum + 正交化后处理</h3>
+    <pre><code># 对每个 2D 隐藏层参数 W ∈ R^{A×B}
+M_t = μ · M_{t−1} + G_t                 # 动量（公开实现默认 Nesterov 版）
+O_t = NewtonSchulz5(M_t) ≈ U Vᵀ          # 其中 M_t = U Σ Vᵀ 是 SVD
+W_t = W_{t−1} − η · O_t
+
+# 等价写法：O = (M Mᵀ)^{−1/2} M = U Vᵀ
+# 即在 Frobenius 意义下离 M 最近的半正交矩阵：argmin_O ||O − M||_F  s.t. OᵀO=I 或 OOᵀ=I</code></pre>
+    <p>
+      注意动量放在正交化<em>之前</em>。Tuddenham et al.（2022）的 Orthogonal-SGDM 是先 SVD 正交化梯度再做动量，博客称 Muon 的顺序经验上更好，且用 Newton-Schulz 代替了 SVD。
+    </p>
+
+    <h3>② Newton-Schulz：为什么 5 步 bf16 就够</h3>
+    <pre><code>def newtonschulz5(G, steps=5, eps=1e-7):      # 博客给出的 PyTorch 实现
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps)                       # Frobenius 归一化 → 所有奇异值 ≤ 1
+    if G.size(0) > G.size(1): X = X.T           # 让 X Xᵀ 是较小的那个方阵
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X                       # X ← aX + b(XXᵀ)X + c(XXᵀ)²X
+    if G.size(0) > G.size(1): X = X.T
+    return X</code></pre>
+    <p>
+      关键在于这个矩阵多项式只作用在奇异值上：若 X = U S Vᵀ，则一步迭代得到 U·φ(S)·Vᵀ，其中 <code>φ(x) = a·x + b·x³ + c·x⁵</code> 逐个作用于奇异值。N 步后是 U·φᴺ(S)·Vᵀ。所以只需要两件事：初始奇异值落在 [0,1]（Frobenius 范数 ≥ 谱范数，归一化即可保证）；φᴺ(x) 对 [0,1] 里的 x 收敛到 1 附近。
+    </p>
+    <table>
+      <thead><tr><th>系数</th><th>特点</th></tr></thead>
+      <tbody>
+        <tr><td>(2, −1.5, 0.5)</td><td>基线，收敛到精确 1，但小奇异值爬升慢，需要更多步</td></tr>
+        <tr><td>(3.4445, −4.7750, 2.0315)</td><td>最大化 φ′(0)=a 以加速小奇异值；代价是不精确收敛到 1，而是在约 [0.7, 1.3] 内振荡。博客发现 ε≈0.3 的误差不伤 loss 曲线，5 步即可</td></tr>
+      </tbody>
+    </table>
+    <p>
+      为什么不用别的方法：SVD 太慢；Shampoo 实现里常用的 coupled Newton 迭代需要至少 FP32 才数值稳定；而 Newton-Schulz 只有矩阵乘法，可以在 bf16 下稳定运行，正好吃满 Tensor Core。
+    </p>
+    <p>
+      开销估算（博客）：对 n×m（m ≤ n）参数，每步 NS 约 2(2nm² + m³) FLOPs；相对一次前反向 6nmB FLOPs（B 为该步 token 数），额外开销上界约 <code>T·m/B</code>。NanoGPT speedrun（m=768，B=524288，T=5）约 0.7%；按 Llama 405B 的 m=16384、B≈16M 估算约 0.5%。
+    </p>
+
+    <h3>③ 理论视角：谱范数下的最速下降</h3>
+    <pre><code># 在不同范数球里找让一阶近似下降最多的步
+ΔW* = argmin_{ΔW}  ⟨G, ΔW⟩   s.t.  ||ΔW|| ≤ η
+
+||·|| = Frobenius     →  ΔW* = −η · G / ||G||_F          （归一化 SGD）
+||·|| = ℓ∞（逐坐标）  →  ΔW* = −η · sign(G)              （Adam 去掉 EMA 后的极限 ≈ signSGD）
+||·|| = 谱范数        →  ΔW* = −η · U Vᵀ                 （Muon，G = U Σ Vᵀ）
+
+# Shampoo 去掉预条件累积：
+(G Gᵀ)^{−1/4} · G · (Gᵀ G)^{−1/4} = U Σ^{−1/2} Σ Σ^{−1/2} Vᵀ = U Vᵀ</code></pre>
+    <p>
+      这是 Bernstein &amp; Newhouse 的框架：优化器之间的区别主要是「用什么范数度量一步走多远」。线性层权重是作用在（局部近似欧氏的）隐藏空间上的算子，用诱导算子范数（即谱范数）约束更新更自然：保证每一步对任何输入向量的输出改变量都有上界。Muon 关掉动量时可以看成「无累积的 Shampoo」（博客引 Anil 的说法）。
+    </p>
+
+    <h3>④ 哪些参数用 Muon，哪些不用</h3>
+    <table>
+      <thead><tr><th>参数</th><th>优化器</th><th>原因</th></tr></thead>
+      <tbody>
+        <tr><td>隐藏层 2D 权重（attention 投影、MLP）</td><td>Muon</td><td>Muon 的设计对象</td></tr>
+        <tr><td>Q、K、V 投影</td><td>Muon，<strong>分开</strong>正交化</td><td>博客：分开比合成一个 QKV 矩阵效果更好</td></tr>
+        <tr><td>卷积核</td><td>Muon（展平后三维）</td><td>当作矩阵处理</td></tr>
+        <tr><td>Embedding、LM head</td><td>AdamW</td><td>虽是 2D，但输入/输出层的几何不同；embedding 由 modular norm 理论支持，head 主要是经验结论</td></tr>
+        <tr><td>标量、向量（bias、RMSNorm gain）</td><td>AdamW</td><td>没有矩阵结构</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 扩展到 LLM：weight decay 与 update RMS 对齐（Moonshot）</h3>
+    <p>
+      Moonshot 发现小规模的优势放大后会衰减，给出两个关键补丁：
+    </p>
+    <pre><code># (1) 加 weight decay：否则权重与层输出 RMS 持续增长，超出 bf16 高精度区间
+# (2) 对齐 update RMS
+#   对满秩 A×B 矩阵，O = U Vᵀ 有 min(A,B) 个奇异值为 1：
+#   ||O||_F² = min(A,B)  →  RMS(O) = sqrt(min(A,B)/(A·B)) = sqrt(1/max(A,B))
+#   问题：max(A,B) 大（MLP）→ 更新太小；max(A,B) 小（把 GQA/MLA 每个 KV head 单独当参数）→ 更新太大
+#   AdamW 的 update RMS 经验上约 0.2–0.4，于是：
+W_t = W_{t−1} − η_t · ( 0.2 · O_t · sqrt(max(A,B)) + λ · W_{t−1} )
+#   好处：Muon 可以直接复用为 AdamW 调好的 η 和 λ</code></pre>
+    <p>
+      论文自报的结果：scaling law 实验下 Muon 在计算最优训练时约有 AdamW <strong>2×</strong> 的计算效率；Moonlight（3B 激活 / 16B 总参 MoE，5.7T token）推进了「性能–训练 FLOPs」的 Pareto 前沿。
+    </p>
+
+    <h3>⑥ 分布式：为什么 ZeRO-1 不能直接套</h3>
+    <table>
+      <thead><tr><th>维度</th><th>Distributed AdamW（ZeRO-1）</th><th>Distributed Muon（Moonshot）</th></tr></thead>
+      <tbody>
+        <tr><td>更新粒度</td><td>逐元素，本地分片即可算</td><td>需要完整矩阵做 NS 迭代</td></tr>
+        <tr><td>额外步骤</td><td>—</td><td>DP Gather 拼出完整梯度矩阵 → 算完整更新 → 丢掉非本地部分</td></tr>
+        <tr><td>优化器状态</td><td>两个动量缓冲（m、v）</td><td>一个动量缓冲，额外内存约为 AdamW 的一半</td></tr>
+        <tr><td>通信量</td><td>4（fp32 G reduce-scatter）+ 4（fp32 P all-gather）</td><td>再加 2（bf16 gather），总量为 AdamW 的 (1, 1.25] 倍，多 DP 时接近下界</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑦ MuonClip：Kimi K2 的 QK-Clip</h3>
+    <p>
+      Kimi K2 报告，放大 Muon 训练时 attention logit 爆炸更常见（比 AdamW 更频繁）。logit soft-cap 是在 softmax 前截断，但 q·k 本身可能已经长得过大；QK-Norm 又不适用于 MLA，因为推理时 Key 矩阵不完整物化。K2 的方案是在<strong>优化器步之后</strong>按头缩放权重：
+    </p>
+    <pre><code># 每个头 h 在本批的最大 softmax 输入
+S_max^h = max_{X∈B} max_{i,j} q_i^h · k_j^h   （含缩放）
+γ_h     = min(1, τ / S_max^h)                  # K2 取 τ = 100
+W_q^h ← γ_h^α     · W_q^h
+W_k^h ← γ_h^(1−α) · W_k^h                      # α 通常 0.5，Q、K 均摊
+# MLA：只对非共享的头内分量做裁剪
+# 不改变当前步的前向/反向，只用 max logit 当信号控制权重增长</code></pre>
+    <p>
+      MuonClip = Muon + weight decay + RMS 对齐 + QK-Clip。K2 报告最大 logit 先被压在 100，约 30% 训练步后自然回落到正常区间，之后 QK-Clip 不再触发；小规模消融显示即使 τ=30 对 loss 影响也可忽略（论文自报）。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>参数分组先写对。</strong> 一个常见实现：<code>p.ndim == 2 且 不是 embedding/lm_head</code> → Muon；其余 → AdamW。QKV 融合实现要拆成三个矩阵分别正交化；MoE 的每个 expert 权重是独立矩阵。</li>
+      <li><strong>用 0.2·sqrt(max(A,B)) 缩放，复用 AdamW 超参。</strong> 这是 Moonshot 的建议做法，省掉为 Muon 单独扫学习率；不缩放时不同形状矩阵的有效步长不一致，按 head 切分的 KV 投影尤其危险。</li>
+      <li><strong>监控两件事：</strong> 各矩阵的实际 update RMS（应接近目标值），以及每头最大 attention logit。后者持续上升是 Muon 特有的风险信号，考虑 QK-Clip 或降低学习率。</li>
+      <li><strong>预训练与微调优化器尽量一致。</strong> Moonshot 的 SFT 消融里，Muon 预训练 + Muon SFT 最好；预训练与 SFT 优化器不一致时，Muon SFT 相对 AdamW 没有显著优势（论文自报）。基于 AdamW 预训练的开源模型做后训练时，不要预期换 Muon 一定有收益。</li>
+      <li><strong>RL 后训练仍是开放问题。</strong> 博客写作时作者明确把「Muon 是否只适用于预训练、在微调和 RL 上是否有效」列为未知；RL 的梯度噪声大、有效 batch 小，NS 的相对 FLOP 开销 T·m/B 也会更高，需要自己做对照实验。</li>
+      <li><strong>评估要有硬基线。</strong> Keller Jordan 特意强调：新优化器常输给调好的 AdamW。比较时务必扫好 AdamW 的学习率和 weight decay，或者像 speedrun 那样以已有记录为基线。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 NS 迭代前用 Frobenius 范数归一化就能保证收敛到正交阵附近？会不会改变结果？</summary>
+      <p>Frobenius 范数是奇异值平方和的平方根，必然 ≥ 最大奇异值（谱范数），除以它后所有奇异值落在 [0,1]，满足多项式 φ 迭代收敛的前提。正交化对正标量缩放不变，Ortho(cG)=Ortho(G)，所以不改变最终方向。代价是若矩阵很多奇异值都较大，归一化后最小奇异值会被压得很小，需要 φ′(0)=a 足够大才能几步内拉起来，这正是调大 a 的动机。</p>
+    </details>
+    <details>
+      <summary>2. 推导满秩 A×B 矩阵的 Muon update RMS，并说明为什么「把每个 KV head 当成独立参数」会导致不稳定。</summary>
+      <p>O=UVᵀ 有 min(A,B) 个奇异值为 1，||O||_F² = min(A,B)，元素个数 A·B，RMS = sqrt(min(A,B)/(A·B)) = sqrt(1/max(A,B))。按 head 切分后 max(A,B) 变小（例如只剩 head_dim 那一维），RMS 变大，同一学习率下这些小矩阵的每元素步长远大于大矩阵，容易不稳定。乘以 sqrt(max(A,B)) 再乘 0.2 把所有矩阵拉到统一的 RMS 0.2。</p>
+    </details>
+    <details>
+      <summary>3. 从「范数约束下最速下降」的角度，Adam 和 Muon 的区别是什么？</summary>
+      <p>Adam 去掉 EMA 后退化为 sign 下降，对应 ℓ∞（逐坐标最大值）约束：每个坐标最多走 η。Muon 对应谱范数约束：更新矩阵对任意单位输入向量造成的输出变化最多为 η。前者不看矩阵结构，后者把权重当作算子处理，各个奇异方向得到相同步长。</p>
+    </details>
+    <details>
+      <summary>4. 为什么 Distributed Muon 的额外内存约是 AdamW 的一半，通信却更多？</summary>
+      <p>Muon 只维护一个动量缓冲，AdamW 要维护 m 和 v 两个，因此优化器状态少一半。但 NS 迭代需要完整的矩阵，ZeRO-1 的分片只持有一部分，所以要额外做一次 DP gather 把梯度矩阵拼完整（bf16，2 个单位），总通信从 AdamW 的 8 增到最多 10，即 (1, 1.25] 倍。</p>
+    </details>
+    <details>
+      <summary>5. QK-Clip 为什么选择在优化器步之后缩放 W_q / W_k，而不是在前向里截断 logit？</summary>
+      <p>前向截断（soft-cap）只限制送进 softmax 的值，q·k 本身仍可能持续变大，梯度和数值问题还在。直接按 γ_h 缩放权重，从源头限制 logit 的增长，并且不改变当前步的前向/反向，只在 logit 超阈时作用于出问题的那几个头，满足「最小干预」。QK-Norm 虽然也能控 logit，但在 MLA 下推理时 Key 不完整物化，无法使用。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noopener">Keller Jordan · Muon: An optimizer for hidden layers in neural networks</a></li>
+      <li><a href="https://github.com/KellerJordan/modded-nanogpt" target="_blank" rel="noopener">modded-nanogpt（NanoGPT speedrun）</a></li>
+      <li><a href="https://arxiv.org/abs/2409.20325" target="_blank" rel="noopener">arXiv:2409.20325 · Old Optimizer, New Norm: An Anthology</a></li>
+      <li><a href="https://arxiv.org/abs/2502.16982" target="_blank" rel="noopener">arXiv:2502.16982 · Muon is Scalable for LLM Training（Moonlight）</a></li>
+      <li><a href="https://arxiv.org/abs/2507.20534" target="_blank" rel="noopener">arXiv:2507.20534 · Kimi K2: Open Agentic Intelligence（MuonClip / QK-Clip）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a> ·
+        <a href="daily-2026-09-09-algo-attention.html">Attention</a> ·
+        <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Temperature / Entropy</a> ·
+        <a href="special-2026-08-27-new-models-arch.html">2026 新模型全景</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

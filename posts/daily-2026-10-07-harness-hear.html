@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜HEAR：让 Agent Harness 与推理引擎「互相听见」的双向协议（KV 驻留 / 等待保护 / 角色级执行模式） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜HEAR：让 Agent Harness 与推理引擎「互相听见」的双向协议（KV 驻留 / 等待保护 / 角色级执行模式）</h1>
+    <p class="post-meta">2026-10-07 · 收藏夹：Harness / Infra · 学习笔记<br />
+      论文：Jiaqi Zhao, Haodong Chen, Jitai Hao, Wei Zhao, Jinghao Pang, Qiang Huang, Jun Yu（哈尔滨工业大学（深圳）） ·
+      <em>Can Agent Harnesses and Inference Engines Hear Each Other? The HEAR Protocol for Agentic LLM Serving</em>
+      · <a href="https://arxiv.org/abs/2610.06597" target="_blank" rel="noopener">arXiv:2610.06597</a>（v1，2026-10-05）。
+      交叉：
+      <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a>、
+      <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a>、
+      <a href="daily-2026-08-14-deepseek-harness.html">DeepSeek dsh</a>、
+      <a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      一个 Agent 系统里，决定效率的信息被劈成了两半。<strong>Harness</strong>（LangGraph、AutoGen、Deep Agents、dsh 这类）知道工作流依赖、哪个上下文下一轮还会用、哪个子 Agent 已经结束、任务目标是延迟还是吞吐；<strong>推理引擎</strong>（vLLM、SGLang）知道请求队列、KV cache 驻留在哪一层、显存压力和自己支持哪些执行模式。今天两者之间通常只有一条 OpenAI 兼容的 <code>/chat/completions</code>：harness 只能发 prompt，引擎只能回 token。
+    </p>
+    <p>
+      论文 Figure 1 的例子很直观：引擎不知道某段上下文马上要复用，在复用前一刻把 KV 驱逐掉，只能重新 prefill；harness 不知道哪个请求的前缀还热在 GPU 上，在两个都可以合法重排的就绪请求里先调度了冷的那个。两个方向都丢了钱。
+    </p>
+    <p>
+      这类跨层优化以前有很多点状方案——Parrot 暴露请求依赖、KVFlow 用工作流结构做保留与预取、InferCept / Continuum 在工具暂停期间保住 KV、CONCUR 按 cache 压力控并发。HEAR 的切入点不是再做一个策略，而是补一层缺失的<strong>控制面抽象</strong>：标准化 harness 与引擎之间双向「说什么、各自是什么分量」，把协议语义和优化策略拆开。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 四类消息</h3>
+    <table>
+      <thead><tr><th>方向</th><th>类别</th><th>代表内容</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="2">Harness → Engine</td><td><strong>Execution Description and Intent</strong></td><td>Agent 角色与阶段、依赖与就绪状态、请求大小与输出上限、上下文生命周期、已知的未来复用和显式标注的预测</td></tr>
+        <tr><td><strong>Execution Requirements and Control</strong></td><td>调度偏好与等待时间约束；cache 准备 / 保留 / 释放请求；允许或要求的执行配置与 serving 目标</td></tr>
+        <tr><td rowspan="2">Engine → Harness</td><td><strong>State and Capabilities</strong></td><td>可复用前缀区间与驻留层级、可分配容量、队列状态、资源压力、支持的控制与配置、标定或估计的执行成本</td></tr>
+        <tr><td><strong>Execution Outcomes</strong></td><td>推理与控制请求的状态（accepted / completed / rejected / unsupported / failed）、实际配置与允许的 fallback、cache 复用、延迟、资源、重试与错误</td></tr>
+      </tbody>
+    </table>
+    <p>
+      每条消息都绑定到具体的 request、context version 或 serving instance。类别是语义角色而不是报文格式：一次交换可以混合多类；引擎可以只实现子集，harness 通过 capability 报告发现支持哪些控制，而不是假设每个引擎都实现了全部。
+    </p>
+
+    <h3>② 四对语义区分：协议真正的价值</h3>
+    <table>
+      <thead><tr><th>区分</th><th>含义</th><th>例子</th></tr></thead>
+      <tbody>
+        <tr><td>Intent vs. Control</td><td>描述只提供决策上下文，只有显式控制请求才要求对方动作</td><td>「上下文 c 会复用」≠「请保留 c 的 KV」</td></tr>
+        <tr><td>Preference vs. Requirement</td><td>偏好尽力而为；要求约束合法执行，不满足必须拒绝或走显式允许的 fallback</td><td>优先级提示能重排请求，但不能越过强制的等待保护</td></tr>
+        <tr><td>Observation vs. Guarantee</td><td>状态 / 能力报告只描述现状，不预留资源、不保证未来准入</td><td>「A 的前缀在 GPU 上」不等于为 A 锁住这块 KV</td></tr>
+        <tr><td>Acceptance vs. Completion</td><td>被接受 ≠ 效果已实现；拒绝、不支持、失败是不同结果</td><td>cache 预取请求被 accept 后可能仍在进行</td></tr>
+      </tbody>
+    </table>
+    <p>
+      这四对区分防止策略把描述当命令、把观察当预留、把「已接受」当「已完成」。做过分布式系统的人会很熟悉：这和 RPC 里区分 ack 与 commit、hint 与 constraint 是一回事。没有这层语义，每个跨层优化都得自己约定信号含义，策略就被绑死在特定 harness 和引擎上。
+    </p>
+
+    <h3>③ 联合信息策略</h3>
+    <pre><code># 决策点 T_i：harness 侧信息 h_i，最近一次相关的引擎更新 s_j（j 可以早于 i，两层异步演化）
+d_i = π(h_i, s_j)
+
+# 退化情形
+d_i = π(h_i)        # 没有引擎反馈：只有 harness 本地决策
+d_i = π(s_j)        # 没有工作流信息：引擎只能看请求本地状态
+
+# 策略可以在任一层执行：本地直接应用，或通过 Control 消息交给另一层</code></pre>
+
+    <h3>④ 实例 1：Cache-Aware 运行时协调（秒级）</h3>
+    <pre><code>h_i = (R_i 就绪请求, C_i 上下文, U_i 执行要求，含 waiting protection)
+s_j = (K_j KV 可用性, Q_j 队列状态)
+d_i = π_sched(h_i, s_j) = (p_i 优先级, U_i)
+
+# 附录 A.2 的具体规则（论文实现）
+对每个请求，从 prompt 开头顺序匹配可复用的前缀块，遇到第一个缺失/被驱逐的块就停
+覆盖 ≥ 50% prompt → hot；否则 cold（保持默认优先级）
+hot 请求 priority = −N_reuse     # 引擎先调度小值 → 热请求先跑，且前缀越长越先
+Guard-W：请求等待超过 W 秒后不再被插队/抢占（强制 requirement）</code></pre>
+    <p>
+      实现上，引擎的 KV 事件更新 harness 维护的一份<strong>驻留目录</strong>（residency directory）；每个调度点 harness 查询可复用前缀块、构造偏好、附上等待约束，引擎执行后回报实际执行顺序、cache 复用、重试与错误。Mooncake 上还加了 <strong>Session-Aware</strong> 保留：harness 根据会话深度和历史轮间隔估计「会话还会继续」的概率，并<strong>显式标注为 intent 而非 requirement</strong>；引擎把它与访问时间结合决定驱逐顺序。
+    </p>
+    <table>
+      <thead><tr><th>SCBench（Qwen3-8B，1×RTX PRO 6000，论文自报）</th><th>TTFT P50 / P95 / MAX（s）</th><th>批完成（s）</th><th>复用率</th></tr></thead>
+      <tbody>
+        <tr><td>FCFS（vLLM 默认）</td><td>63.1 / 74.2 / 79.0</td><td>481</td><td>19.2%</td></tr>
+        <tr><td>Cache-Aware</td><td>4.6 / 75.8 / 93.9</td><td>224</td><td>87.6%</td></tr>
+        <tr><td>Cache-Aware + Guard-40</td><td>28.3 / 51.1 / 65.0</td><td>299（1.61×）</td><td>66.1%</td></tr>
+        <tr><td>Cache-Aware + Guard-60</td><td>4.5 / 64.0 / 80.4</td><td>230</td><td>84.7%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：纯 Cache-Aware 中位 TTFT 降 13.6×、批完成 2.15×，但冷请求被反复推后，<strong>最大 TTFT 反而变差</strong>。加上 harness 下发的等待保护后，P50/P95/MAX 全面优于 FCFS，同时保住 1.61× 批加速。这正是「双向」的含义：引擎反馈发现复用机会，harness 的要求约束调度器能多激进地利用它。
+    </p>
+    <p>
+      Mooncake 生产 trace（Qwen3-8B，1×H100）给出的结论更有意思：<strong>没有哪个策略在所有负载下占优</strong>。50% 负载时排队少，空闲期驱逐是复用损失的主因，Session-Aware 把复用率从 19.5% 提到 31.9%；75% 时 Session-Aware 与 Cache-Aware+Guard 互补，组合最好；100% 过载时 Cache-Aware 的 P50 TTFT 改善最大（1.89×），Session-Aware 改善尾延迟和复用。未来复用意图必须结合实时引擎状态才有益——协议不变，策略随负载切换。
+    </p>
+
+    <h3>⑤ 实例 2：角色级执行模式选择（工作流级）</h3>
+    <pre><code># 候选空间：Main 侧 × Reader/子 Agent 侧
+C = {vLLM, OmniKV} × {vLLM, H2O, SnapKV}
+# 离线：开发集上做质量/稳定性过滤，在通过者里最小化 makespan，然后冻结
+d*_BrowseComp-Plus   = (vLLM,   H2O)
+d*_DeepResearchBench = (OmniKV, H2O)
+# 在线：workflow 初始化时加载映射，每次派发请求做常数时间查表</code></pre>
+    <table>
+      <thead><tr><th>基准（GLM-4.7-Flash，Main 与 Reader 分卡 H100，论文自报）</th><th>vLLM–vLLM</th><th>选中配置</th><th>质量</th></tr></thead>
+      <tbody>
+        <tr><td>BrowseComp-Plus（208 题）</td><td>5.69 h</td><td>vLLM–H2O：4.62 h（1.23×）</td><td>Judge 准确率 46.15% → 46.63%</td></tr>
+        <tr><td>DeepResearchBench（100 例）</td><td>5.93 h</td><td>OmniKV–H2O：2.42 h（2.45×）</td><td>RACE 40.6% → 41.1%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      归因：最大的稳定收益来自 Reader / 子 Agent 侧换成 H2O，平均延迟降 5.60×（BrowseComp-Plus，prefill token −76.2%，复用率 6.2% → 80.3%）和 7.22×（DeepResearchBench）。Main 侧偏好取决于负载形态：BrowseComp-Plus 的 Main 请求平均只输出约 0.4K token，vLLM 比 OmniKV 快 1.14×；DeepResearchBench 约 4.4K token，长 decode 摊薄了 OmniKV 的开销，反而快 1.08×。把任何一个映射硬套到另一个基准上都更差（+7.8% / +14.0% 时间）。这说明执行模式需要 harness 告诉引擎「这个角色是什么负载、要什么目标」。
+    </p>
+
+    <h3>⑥ 协议开销</h3>
+    <p>
+      HEAR 只加控制面元数据处理：状态更新、对象查找、策略输入构造、控制处理与结果上报，不加模型层、不加逐 token GPU 算子。H2O / SnapKV / OmniKV 的计算算在执行模式头上，不算协议的。论文强调所有正式结果都已包含在线控制面路径，报告的是净收益。
+    </p>
+
+    <h2>放进 Harness 工程的坐标系</h2>
+    <p>
+      站内已经写过 harness 的几个维度：<a href="daily-2026-08-28-harness-runtime.html">运行时如何接管工具与上下文</a>、<a href="daily-2026-09-07-harness-compaction.html">上下文压缩</a>、<a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM 的推测工具执行</a>（隐藏工具延迟）。HEAR 补的是 harness 的<strong>下边界</strong>：harness 对推理引擎不再是黑盒客户端。同一天的另一篇实证论文 Liu &amp; Han《What Does a Harness Buy? Tokens, Mostly》（<a href="https://arxiv.org/abs/2610.04433" target="_blank" rel="noopener">arXiv:2610.04433</a>）从摘要看结论是：固定模型时，Claude Code / mini-SWE-agent / OpenCode 之间的 SWE-bench Verified 分差大多落在重跑噪声里，但每任务成本最多差 3×，差距主要来自每一步都重发的 system prompt + tool schema 前缀。两篇合起来读：harness 设计首先决定账单，而账单的大头是前缀 prefill——正是 HEAR 的 Cache-Aware 协调要抢回来的部分。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先做「驻留目录」这一条反向通道。</strong> 订阅引擎的 KV 事件（块被缓存 / 驱逐），在 harness 维护前缀块驻留视图。仅这一条反馈就能支撑 Cache-Aware 排序，收益最大、侵入最小。</li>
+      <li><strong>任何「热优先」都要配等待保护。</strong> SCBench 的结果说明不加 Guard 的 cache 优先会饿死冷请求；W 是中位延迟与尾延迟之间的旋钮，按 SLO 定。</li>
+      <li><strong>在接口里区分 hint 和 constraint。</strong> 「可能复用」用 intent 字段，「必须保留」用 control 字段并检查 outcome；把 accepted 当 completed 是跨层 bug 的常见来源。</li>
+      <li><strong>按角色选执行模式。</strong> 子 Agent / Reader 这类长输入、短输出、高并发角色最适合 KV 压缩（H2O / SnapKV）；主 Agent 是否压缩取决于输出长度。离线标定、冻结映射、在线查表，并在开发集上守住质量。</li>
+      <li><strong>稳定前缀。</strong> system prompt 与 tool schema 尽量不随步变化、按固定顺序拼接，让前缀复用真正发生；需要压缩时参考 <a href="daily-2026-09-07-harness-compaction.html">Compaction</a> 的检查点思路，避免每次压缩都打碎前缀。</li>
+      <li><strong>训练侧同样适用。</strong> RL rollout 也是 harness + 引擎，<a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a> 的 LLM proxy、<a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a> 的 PD 复用都可以视作在这条边界上加信号。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 HEAR 坚持「Observation 不是 Guarantee」？如果引擎报告的驻留状态被当成预留会出什么问题？</summary>
+      <p>引擎状态随并发请求持续变化，报告发出到 harness 决策之间 KV 可能已被驱逐。若当成预留，harness 会以为请求必然命中缓存而做出错误排序或容量假设；若引擎真的为每份报告预留，又会把显存锁死、降低吞吐。正确做法是把驻留当作概率性的调度提示，需要保证时显式发 retention control 并检查 outcome。</p>
+    </details>
+    <details>
+      <summary>2. 纯 Cache-Aware 为什么中位 TTFT 大降而最大 TTFT 变差？Guard-40 与 Guard-60 的取舍是什么？</summary>
+      <p>热请求一直被优先，冷请求在持续有热请求到达时会被反复推后，形成饥饿，尾部被拉长。Guard-W 规定等待超过 W 秒的请求不再被插队：W 小（40）尾延迟保护强，但更多冷请求被提前执行，复用率和批完成时间变差；W 大（60）更偏向复用与吞吐，尾延迟保护变弱。</p>
+    </details>
+    <details>
+      <summary>3. Session-Aware 的「会话继续概率」为什么必须标注为 intent，而不是直接要求引擎保留？</summary>
+      <p>它是 harness 基于会话深度和轮间隔的预测，可能出错；在过载时强制保留会挤占正在执行请求的 KV 空间。标成 intent 后，引擎可以结合访问时间和实时压力权衡，Mooncake 100% 负载的结果也说明未来复用意图必须以引擎实时状态为条件才有益。</p>
+    </details>
+    <details>
+      <summary>4. 为什么 Reader / 子 Agent 侧换 H2O 收益远大于 Main 侧换 OmniKV？</summary>
+      <p>Reader 处理大量检索文档，输入长、输出短、并发高，主要成本是 prefill 与 KV 占用，KV 驱逐/压缩直接降低显存压力并提升复用（BrowseComp-Plus prefill −76.2%）。Main 侧输出相对长、调用少，执行模式本身的开销需要足够长的 decode 才能摊薄，所以只在 DeepResearchBench（约 4.4K 输出）上 OmniKV 才占优。</p>
+    </details>
+    <details>
+      <summary>5. 如果把 HEAR 接到 RL 训练的 rollout 系统上，哪些 harness 信息最值得下发给引擎？</summary>
+      <p>（开放题）候选：同一 prompt 的 GRPO 组内 n 条轨迹共享前缀（提示一起调度、保留前缀）；工具调用期间的暂停预计时长（决定保留还是换出 KV）；轨迹是否已注定被过滤（如组内全对/全错，可降低优先级）；以及权重版本号，在权重更新后让引擎主动失效旧 KV。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.06597" target="_blank" rel="noopener">arXiv:2610.06597 · The HEAR Protocol for Agentic LLM Serving</a></li>
+      <li><a href="https://arxiv.org/html/2610.06597v1" target="_blank" rel="noopener">HTML 全文（附录 A.2 调度规则、A.3 协议开销）</a></li>
+      <li><a href="https://arxiv.org/abs/2610.04433" target="_blank" rel="noopener">arXiv:2610.04433 · What Does a Harness Buy? Tokens, Mostly（Liu &amp; Han）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a> ·
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-08-14-deepseek-harness.html">DeepSeek dsh</a> ·
+        <a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

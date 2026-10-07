@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 1,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -627,6 +627,27 @@
       "source": "algo",
       "topic": "DQN / Double DQN：experience replay + target network；max 过估计；online 选 target 评；接 TD3/SAC 的 Clipped Double Q；PER/Dueling/Rainbow",
       "file": "posts/daily-2026-10-06-algo-dqn.html"
+    },
+    {
+      "date": "2026-10-07",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "ThunderSyncRL：objective source 就绪即反向 + 单次同步 optimizer step（零 staleness）；GRPO 拆 G1=Σr_iH_i / G2=ΣH_i 流式累加，OPD 按 turn 释放、N_k 推迟；Qwen-3.8-27B 8×B200 step 1.91×/1.94×，SWE-bench V 达标快 1.9×，128 GPU-h 比 Async +1.27–2.47pp（Kang et al. arXiv:2610.05935）",
+      "file": "posts/daily-2026-10-07-thundersyncrl.html"
+    },
+    {
+      "date": "2026-10-07",
+      "domain": "harness infra",
+      "source": "harness",
+      "topic": "HEAR：Harness–Engine 双向协议，四类消息（Intent / Control / State&Capabilities / Outcomes）+ 四对语义区分；Cache-Aware+Guard SCBench 1.61× 批加速、P50 TTFT 2.23×；Mooncake 负载相关；角色级执行模式 BrowseComp-Plus 1.23× / DeepResearchBench 2.45×（Zhao et al. arXiv:2610.06597）",
+      "file": "posts/daily-2026-10-07-harness-hear.html"
+    },
+    {
+      "date": "2026-10-07",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "Muon：SGD-momentum + Newton-Schulz5 正交化（3.4445,−4.7750,2.0315，bf16）；谱范数最速下降 / 无累积 Shampoo；Embedding/head 用 AdamW；Moonshot weight decay + 0.2·sqrt(max(A,B)) RMS 对齐、Distributed Muon；Kimi K2 QK-Clip（Jordan et al. / arXiv:2502.16982 / arXiv:2507.20534）",
+      "file": "posts/daily-2026-10-07-algo-muon.html"
     }
   ]
 }
