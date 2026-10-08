@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜ReFold：只压「渲染出来的上下文」、不动历史——可逆的轮间折叠与 Prefix-Cache 友好的分块渲染 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜ReFold：只压「渲染出来的上下文」、不动历史——可逆的轮间折叠与 Prefix-Cache 友好的分块渲染</h1>
+    <p class="post-meta">2026-10-08 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Yupeng Su、Jiayi Tian、Zheng Zhang（UC Santa Barbara）、Souvik Kundu（Intel） ·
+      <em>ReFold: Training-Free Reversible Inter-Turn Context Folding for Long-Horizon Agents</em>
+      · <a href="https://arxiv.org/abs/2610.07863" target="_blank" rel="noopener">arXiv:2610.07863</a>（cs.CL，v1，2026-10-06 提交；作者称代码将开源）。
+      交叉：
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-10-07-harness-hear.html">HEAR</a>、
+      <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      ReAct 式 Agent 的上下文是 append-only 的：每一步把系统提示、任务、全部历史动作与观察重新发给模型。若每轮长度大致恒定，T 步累计送入模型的 token 量是 Θ(T²)。这不是小众问题——论文引用的 GitHub Copilot 分析（约 95 万亿 token）显示，只有 7.8% 的 Agent 会话触发了 context compaction，但它们消耗了 44.2% 的 token。少数长会话决定了账单。
+    </p>
+    <p>
+      现有做法都在<strong>预测「过去的内容以后还要不要」</strong>：① 位置淘汰（只保留最近 N 条观察，旧的换占位符）；② 内容裁剪（规则、0.6B 打分模型或额外 LLM 调用删掉「无关」行）；③ 外部存储（淘汰到可寻址存储，Agent 需要时去查）；④ 摘要（Claude Code / Codex 在固定阈值调用一次模型写总结，或像 <a href="daily-2026-08-31-supo.html">SUPO</a> 那样把写总结训练进策略）。ReFold 的出发点是：这些方案都有三笔系统成本——运行时开销、打碎 prefix cache、永久丢信息——而且可以不靠预测。
+    </p>
+
+    <h2>动机实验：六种策略的三笔账</h2>
+    <p>作者在同一个 harness（mini-swe-agent）、同一批 50 个 SWE-bench Verified 任务、16k 上下文预算下对比六种策略（论文自报）：</p>
+    <table>
+      <thead><tr><th>策略</th><th>代表</th><th>主要代价</th></tr></thead>
+      <tbody>
+        <tr><td>base</td><td>完整历史</td><td>超预算率 86%；工具输出约占峰值 KV 的 59%</td></tr>
+        <tr><td>clip</td><td>旧观察截断到固定字符数</td><td>淘汰的观察 token 中有一部分不可恢复</td></tr>
+        <tr><td>mask</td><td>最近窗口外的观察换占位符</td><td>每步改历史 → prefix cache 命中率从 84% 掉到 23%，丢缓存本身多花 5.1 ¢/任务，占总成本 31%</td></tr>
+        <tr><td>prune</td><td>0.6B 打分模型裁行</td><td>每任务 14 次调用、每次约 0.4 s</td></tr>
+        <tr><td>recall</td><td>淘汰到外部存储</td><td>可完整找回，但峰值 KV 仍接近预算</td></tr>
+        <tr><td>compact</td><td>75% 阈值调用模型摘要</td><td>中位每任务 4 次、每次约 38 s；摘要调用约 1.6 ¢，占 11.4 ¢ 总成本的 14%</td></tr>
+      </tbody>
+    </table>
+    <p>三条观察：</p>
+    <ul>
+      <li><strong>只裁工具输出管不住上限。</strong> mask / recall 把工具输出占比压到 24–29%，峰值 KV 仍接近 1.0 GiB 的预算——剩下的系统提示、任务描述以及 Agent <em>自己的</em>命令与推理随步数累积。只有同时压缩 Agent 消息的 compact 做到了 0% 超预算。</li>
+      <li><strong>辅助操作吃掉一部分收益。</strong> 净收益 = 省下的 token − 辅助调用次数 × 单次开销 − 失去的 prefix cache。</li>
+      <li><strong>淘汰既打碎缓存又不可逆。</strong> clip / mask / prune / compact 淘汰了 37–61% 的观察 token，其中占全部观察 17–48% 的内容无法找回（重新执行读未修改文件可复现的不算丢）。</li>
+    </ul>
+
+    <h2>机制拆解</h2>
+    <h3>① 历史与渲染分离</h3>
+    <pre><code>h_t = p_sys ⊕ p_task ⊕ z_1 ⊕ … ⊕ z_t,   z_i = a_i ⊕ o_i     # 真实交互历史，永远 append-only，永不修改
+c_t = R(h_t)                                               # 模型看到的上下文，由渲染函数生成
+# ReFold 只改 R，不改 h，也不改工具、环境、交互协议</code></pre>
+    <p>
+      这是整篇论文最值得借鉴的抽象：<strong>「存什么」和「给模型看什么」是两件事</strong>。一旦分开，压缩就不必是有损的——任何被隐藏的内容都还在 h 里。
+    </p>
+
+    <h3>② 两个算子：去重与折叠</h3>
+    <table>
+      <thead><tr><th>算子</th><th>作用对象</th><th>判定依据</th><th>替换成</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Deduplication</strong></td><td>观察 o<sub>i</sub> 内的 span</td><td>与更早出现的 span 全文完全相同（同一文件区间、同样的命令输出、同样的搜索结果）</td><td>引用 stub：指向保留副本所在的步；长 span 额外保留顶层 class / function 签名</td></tr>
+        <tr><td><strong>Folding</strong></td><td>整轮 z<sub>i</sub>（动作 + 观察）</td><td>Agent 自己在回复里声明的 <code>STALE</code> 步号</td><td>一行 note：该步的 <code>PROGRESS</code> + 关键细节 e<sub>i</sub>（函数签名、保留的搜索命中）</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 每次回复开头的两行元数据（附录 C.2 的 prompt，与正常回复一起生成，不额外调用模型）
+PROGRESS: reading serializer.py to find the encode path
+STALE: 3, 4
+
+# 只接受最近 k 步内的 STALE：S_t = S_{t-1} ∪ (STALE_t ∩ {t-k, …, t-1})
+
+# 渲染出来的 stub / note 长这样
+[context-manager] &lt;path&gt;:&lt;start&gt;-&lt;end&gt; omitted: identical to step &lt;src&gt;. `restore &lt;step&gt;` shows it again.
+[context-manager] steps &lt;i&gt;-&lt;j&gt; folded: &lt;PROGRESS i&gt; · … · &lt;PROGRESS j&gt;. `restore &lt;i&gt;-&lt;j&gt;` shows them again.
+    &lt;file&gt;: &lt;extracted function signatures&gt;
+    $ &lt;search command&gt; -&gt; &lt;retained search hits&gt;</code></pre>
+    <p>
+      关键设计：<strong>谁判断「已用完」</strong>。其他方案用外部打分器或摘要模型预测，ReFold 把判断交给正在执行任务的 Agent 本身——它最清楚自己读完一个文件是否已经得出结论。prompt 里明确要求：STALE 指的是「不会再看的<em>输出</em>」，不要标即将修改的文件、正在对照的测试结果、确定根因的那次读取；只有最近 3 步可标，攒着最后统一清理是无效的。回复缺了这两行时，harness 在最新工具输出后追加提醒，连续缺失就换成更强硬的 FORMAT VIOLATION 文案。
+    </p>
+
+    <h3>③ 分块渲染：让前缀只每 k 步变一次</h3>
+    <pre><code>b_t = max(0, k · ⌊(t − k) / k⌋)          # 边界每 k 步前进一次，论文取 k = 3
+
+c_t = p_sys ⊕ p_task ⊕ ⨁_{i=1..t}
+        f_i            若 i ≤ b_t 且 i ∈ S_t     # 已声明完成 → 折叠 note
+        a_i ⊕ o_i      若 i &gt; b_t               # 边界之后 → 原样
+        a_i ⊕ d_i      否则                      # 边界之前未折叠 → 去重后的观察</code></pre>
+    <p>
+      在两次边界推进之间，渲染上下文严格 append-only，prefix cache 完整复用；只在边界前进那一步重写一次前缀。消融（论文自报）：每步都重新渲染时单条轨迹 prefix 命中率掉到 51%；分块渲染保持在 87%，与 base 的 84% 相当。k 的扫描显示峰值 KV 与中位耗时在 k=3–5 最低，向两端都上升——k 太小前缀改得太勤，k 太大保留的未压缩轮太多。
+    </p>
+
+    <h3>④ 可逆：两条恢复路径</h3>
+    <ul>
+      <li><strong><code>restore &lt;step&gt;</code>：</strong>Agent 以 bash 命令形式发出，harness 拦截、不转发给环境，从 h 中取出原始输出作为<em>新的一轮追加到末尾</em>——不回填到原位置，所以已有前缀不变、缓存不破。</li>
+      <li><strong>重新执行原命令：</strong>得到环境的最新状态；重新执行得到的观察完整保留，并豁免后续压缩。附录的 xarray-2905 例子里，Agent 把定位根因的那一步错标成 STALE，后来原样重跑了一次命令，问题就被一次 re-run 修正，最终任务解决。</li>
+    </ul>
+    <p>
+      消融：关掉可逆性后 ReFold 能删 53% 的观察 token，但约三分之一的观察无法找回（与 compact 丢失的比例相同）；打开可逆性只删 41%（与 compact 淘汰量相当），但每个被删 token 都能找回。渲染开销平均 0.4 ms/步，对比 compact 3.3 s、prune 0.15 s、recall 8.5 ms。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <p>设置：mini-swe-agent；Qwen3.6-27B（dense）与 Qwen3.6-35B-A3B（MoE），vLLM 开 prefix caching，各用两张 RTX 6000 Ada 做 TP；temperature 0，单步最多生成 16,384 token，250 步上限，256k 窗口；五个基准各 50 题。</p>
+    <table>
+      <thead><tr><th>Qwen3.6-27B，全窗口，w=8 并发</th><th>Resolve</th><th>Tokens（k）</th><th>峰值 KV（GiB）</th><th>成本（¢）</th></tr></thead>
+      <tbody>
+        <tr><td>SWE-bench Verified</td><td>38 → 38</td><td>965 → 505（−48%）</td><td>1.71 → 0.83（−52%）</td><td>19.5 → 12.9（−34%）</td></tr>
+        <tr><td>SWE-bench Pro</td><td>5 → 6</td><td>1097 → 899（−18%）</td><td>1.96 → 1.20（−39%）</td><td>20.8 → 20.5（−2%）</td></tr>
+        <tr><td>Multi-SWE-bench</td><td>25 → 25</td><td>1372 → 956（−30%）</td><td>1.55 → 0.93（−40%）</td><td>25.5 → 22.3（−13%）</td></tr>
+        <tr><td>Terminal-Bench 1.0</td><td>23 → 23</td><td>1279 → 596（−53%）</td><td>1.02 → 0.58（−43%）</td><td>27.4 → 19.0（−31%）</td></tr>
+        <tr><td>Terminal-Bench 2.1</td><td>23 → 26</td><td>3989 → 1909（−52%）</td><td>1.60 → 0.68（−58%）</td><td>75.7 → 49.2（−35%）</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>MoE 模型上 token 降 42–60%，峰值 KV 降 30–55%，成本降 18–45%；十个设置中九个轨迹变短（最多 −40% 步数）。resolve 差在 −1 到 +3 / 50，作者归为重跑噪声。</li>
+      <li><strong>受限预算：</strong>32k 时强制 compaction 从每任务 1.0 次降到 0.1 次（−92%）；24k 时 −83%；16k 时 −33%。</li>
+      <li><strong>并发 serving 才是大头：</strong>w=32 时 base 只解 20 题、ReFold 35 题；w=48 时 7 → 32 题，平均排队延迟 8.96 s → 0.02 s，成本 −71%。原因不是模型变聪明，而是 base 把 KV 池占满，任务在执行上限内跑不完。</li>
+      <li><strong>闭源模型：</strong>Claude Opus 4.8（Bedrock，开 prompt caching）21 题，token −24%、步数 −17%、成本 −11%、耗时 −19%；该模型中位只需 18 步，prompt cache 已覆盖 94% 的输入，所以收益小于开源模型。</li>
+    </ul>
+
+    <h2>放进 Harness 工程的坐标系</h2>
+    <p>
+      对照站内旧文：<a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> 讲的是「爆窗前主动压缩」，属于预测 + 有损；ReFold 把大部分压力在 compaction 之前就卸掉了，两者可以叠加（论文的 compact + ReFold 组合正是如此）。<a href="daily-2026-10-07-harness-hear.html">HEAR</a> 从引擎侧论证 harness 应该让前缀复用真正发生，ReFold 从 harness 侧给出一个具体手法：把对历史的修改集中到每 k 步一次。<a href="daily-2026-10-05-harness-pos.html">PoS</a> 用显式 belief state 管理长程信息，ReFold 的 <code>PROGRESS</code> 行可以看作一个极简的、每步一行的进度账本。
+    </p>
+    <p>
+      另一个值得注意的点：论文用的 harness 正是 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>，只有 bash、无状态子进程——<code>restore</code> 被设计成「看起来像一条 bash 命令、实际被 harness 截获」，这是在不增加工具 schema 的前提下给 Agent 加能力的典型做法。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先把历史和渲染拆开。</strong> 哪怕暂时不做任何压缩，也让 harness 存一份不可变的原始历史，模型输入由渲染函数生成。之后任何压缩策略都能变成可逆的，排查问题时也能看到模型实际看到了什么。</li>
+      <li><strong>先做精确去重，再谈语义裁剪。</strong> 重复读同一文件区间、同一 traceback 跑两次在 coding agent 里极常见，全文比较零误判、零模型调用。</li>
+      <li><strong>修改历史要批量、要对齐边界。</strong> 每步都改前缀（mask 式）会让缓存账单反超省下的 token；固定每 k 步改一次，k 从 3–5 起调。</li>
+      <li><strong>恢复内容追加到末尾，不要回填。</strong> 回填原位置会使之后的全部前缀失效。</li>
+      <li><strong>让 Agent 自报完成状态，但设窗口与兜底。</strong> STALE 只接受最近 k 步，防止一次性大清理；错标的代价是一次 restore 或 re-run，而不是任务失败。</li>
+      <li><strong>先在高并发下评估。</strong> 单会话省 token 只是开始，真正的差异出现在 KV 池被打满的并发场景（w=48 时 7 vs 32 题），离线评测若只跑 w=1 会严重低估收益。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 mask 这种「零模型调用」的策略反而可能比 base 更贵？</summary>
+      <p>mask 每步把滑出窗口的观察换成占位符，等于每步修改历史中间位置，修改点之后的 prefix cache 全部失效。论文中单条轨迹命中率从 84% 掉到 23%，丢缓存带来的额外 prefill 成本约 5.1 ¢/任务，占总成本 31%。省下的 token 不足以抵消重新 prefill 的代价，因此净成本可能更高。</p>
+    </details>
+    <details>
+      <summary>2. 只裁剪工具输出为什么不能保证上下文在预算内？ReFold 用什么补上了这一块？</summary>
+      <p>峰值上下文里除工具输出外，还有固定的系统提示和任务描述，以及 Agent 每步的命令与推理，后者同样随步数线性累积。mask / recall 把工具输出占比压到约四分之一，总量仍接近预算。ReFold 的 folding 以整轮为单位，把动作 a_i 和观察 o_i 一起替换成一行 note，因此也压缩了 Agent 自己的消息。</p>
+    </details>
+    <details>
+      <summary>3. 分块渲染里 k 取 1 和取很大分别会怎样？为什么最优点在 3–5？</summary>
+      <p>k=1 等价于每步重新渲染，前缀几乎每步都变，缓存命中率大幅下降（论文中约 51%）；k 很大时边界很少前进，边界之后的轮都原样保留，压缩量变小、峰值 KV 变大。3–5 是缓存复用与压缩率的折中，论文消融中峰值 KV 和耗时都在这一区间最低。</p>
+    </details>
+    <details>
+      <summary>4. 把 ReFold 接进 RL 训练（参考 TITO）会遇到什么问题？</summary>
+      <p>训练时需要模型实际看到的 token 序列。ReFold 下每 k 步渲染上下文会改写一次前缀，整条轨迹不再是一个单一的、逐步扩展的 token 序列，不能像 <a href="daily-2026-08-31-harness-tito.html">TITO</a> 那样一次前向算完所有步的 logprob；每个边界段都要作为独立样本按其渲染上下文计算，训练成本与实现复杂度上升。另外 PROGRESS / STALE 本身成了策略输出的一部分，奖励会间接塑造 Agent 的「标记习惯」，需要防止为省 token 而过度标记 STALE。</p>
+    </details>
+    <details>
+      <summary>5. 「可逆」在什么情况下仍然不够？如何补？</summary>
+      <p>（开放题）restore 返回的是当时的输出，而环境状态可能已经变化（文件被修改后，旧读取结果已经过时）；Agent 若用 restore 而不是 re-run，可能基于陈旧信息行动。可以在 stub 里标注「该文件自 step N 后已被修改」，或在 restore 时检测相关路径的修改记录并提示改用 re-run。另外，可逆性要求 harness 永久保存原始历史，长会话的存储和隐私（例如密钥出现在工具输出里）也需要额外治理。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.07863" target="_blank" rel="noopener">arXiv:2610.07863 · ReFold: Training-Free Reversible Inter-Turn Context Folding for Long-Horizon Agents</a></li>
+      <li><a href="https://arxiv.org/abs/2610.08722" target="_blank" rel="noopener">arXiv:2610.08722 · Does an Agent's History Tell You When Compaction Will Hurt?（同日相关：590 个 AppWorld compaction 边界的重放分析）</a></li>
+      <li><a href="https://github.com/SWE-agent/mini-swe-agent" target="_blank" rel="noopener">mini-swe-agent（论文的实现载体）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-10-07-harness-hear.html">HEAR</a> ·
+        <a href="daily-2026-10-05-harness-pos.html">PoS</a> ·
+        <a href="daily-2026-08-31-supo.html">SUPO</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

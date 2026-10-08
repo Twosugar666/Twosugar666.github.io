@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜FlashAttention：用 Online Softmax + Tiling 把注意力从「搬内存」拉回「算矩阵」（IO 复杂度 / 重计算 / FA2 并行 / FA3 异步与 FP8） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜FlashAttention：用 Online Softmax + Tiling 把注意力从「搬内存」拉回「算矩阵」（IO 复杂度 / 重计算 / FA2 并行 / FA3 异步与 FP8）</h1>
+    <p class="post-meta">2026-10-08 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré · <em>FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</em>（NeurIPS 2022）
+      · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135</a>；
+      Tri Dao · <em>FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</em>
+      · <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">arXiv:2307.08691</a>；
+      Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao · <em>FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</em>
+      · <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">arXiv:2407.08608</a>；
+      前置：Milakov &amp; Gimelshein · <em>Online normalizer calculation for softmax</em>
+      · <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">arXiv:1805.02867</a>；
+      Rabe &amp; Staats · <em>Self-attention Does Not Need O(n²) Memory</em>
+      · <a href="https://arxiv.org/abs/2112.05682" target="_blank" rel="noopener">arXiv:2112.05682</a>。
+      交叉：
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a>、
+      <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Temperature / Entropy</a>、
+      <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a>、
+      <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a> 一文写过 scaled dot-product 的数学：S = QKᵀ/√d，P = softmax(S)，O = PV。数学上它是三步；实现上，朴素写法会把 N×N 的 S 和 P <strong>完整写回 HBM 再读出来</strong>。粗算：N=8K、FP16，单个头的 S 就是 8192² × 2 B = 128 MiB，32 个头就是 4 GiB，而且前向写一次、softmax 读写一次、PV 再读一次，反向还要再来一遍。
+    </p>
+    <p>
+      问题在于 GPU 的内存层级极不对称。FlashAttention 论文给的 A100 数字：HBM 40–80 GB、带宽 1.5–2.0 TB/s；片上 SRAM 每个 SM 192 KB、共 108 个 SM，带宽估计约 19 TB/s。attention 的 softmax、mask、dropout 都是逐元素操作，算术强度极低，朴素实现的时间几乎全耗在 HBM 读写上。2022 年之前大量「近似注意力」（稀疏、低秩）降低了 FLOPs，却常常没有墙钟加速——它们优化错了对象。
+    </p>
+    <p>
+      FlashAttention 的论点是：<strong>attention 应该是 IO-aware 的</strong>。不改数学、不做近似，只改计算顺序，让 S 和 P 永远不落 HBM。实现这件事的关键是一个看起来很朴素的代数技巧：online softmax。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 障碍：softmax 需要整行</h3>
+    <p>
+      按块计算 QKᵀ 很容易，难点在 softmax：第 i 行的归一化需要该行<em>所有</em>列的 max 和指数和。如果只能一块一块看 K，看到第一块时并不知道全行的最大值，似乎只能先算完整行。
+    </p>
+
+    <h3>② Online Softmax：可合并的统计量</h3>
+    <p>
+      Milakov &amp; Gimelshein（2018）的观察：维护两个统计量（行最大值 m、以 m 为基准的指数和 ℓ），它们可以<strong>增量合并</strong>。看到新块时，旧统计量只需乘一个修正因子：
+    </p>
+    <pre><code># 处理第 j 个 K/V 块，S_j = q · K_jᵀ（已乘 1/√d）
+m_new = max(m, rowmax(S_j))
+P̃_j   = exp(S_j − m_new)
+α     = exp(m − m_new)                  # 旧统计量相对新基准的缩放
+ℓ     = α · ℓ + rowsum(P̃_j)
+acc   = α · acc + P̃_j · V_j             # 未归一化输出，同样修正
+m     = m_new
+
+# 全部块处理完
+O = acc / ℓ
+L = m + log(ℓ)                           # logsumexp，反向时用</code></pre>
+    <p>
+      正确性一行就能看出：任何时刻 acc = Σ<sub>已见列</sub> exp(s − m)·v、ℓ = Σ<sub>已见列</sub> exp(s − m)，换基准只是同乘 exp(m<sub>old</sub> − m<sub>new</sub>)。最终 acc/ℓ 与基准无关，恰好等于完整 softmax 的结果。减去最大值保证 exp 不上溢——这和 <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax</a> 一文里的数值稳定写法是同一回事，只是变成了流式。
+    </p>
+
+    <h3>③ Tiling：一个可运行的参考实现</h3>
+    <p>下面是 NumPy 版的前向（FA2 的循环顺序：外层 Q 块、内层 K/V 块），与朴素实现对比最大误差约 1e-15（N=300、d=64，含不能整除块大小的尾块，因果与非因果都测过）：</p>
+    <pre><code>import numpy as np
+
+def flash_attn_fwd(Q, K, V, Br=64, Bc=64, causal=False):
+    N, d = Q.shape
+    scale = 1.0 / np.sqrt(d)
+    O = np.zeros_like(Q); L = np.zeros(N)
+    for i in range(0, N, Br):                      # 外循环：Q 块（FA2 顺序，可并行）
+        q = Q[i:i+Br] * scale
+        m = np.full(q.shape[0], -np.inf)           # 行最大值
+        l = np.zeros(q.shape[0])                   # 行指数和
+        acc = np.zeros((q.shape[0], d))            # 未归一化输出
+        for j in range(0, N, Bc):                  # 内循环：K/V 块
+            if causal and j &gt; i + q.shape[0] - 1:  # 整块在对角线之上：跳过
+                break
+            s = q @ K[j:j+Bc].T
+            if causal:
+                rows = np.arange(i, i+q.shape[0])[:, None]
+                cols = np.arange(j, j+s.shape[1])[None, :]
+                s = np.where(cols &gt; rows, -np.inf, s)
+            m_new = np.maximum(m, s.max(axis=1))
+            p = np.exp(s - m_new[:, None])
+            alpha = np.exp(m - m_new)              # 旧统计量的修正因子
+            l = alpha * l + p.sum(axis=1)
+            acc = alpha[:, None] * acc + p @ V[j:j+Bc]
+            m = m_new
+        O[i:i+Br] = acc / l[:, None]               # 最后只归一化一次
+        L[i:i+Br] = m + np.log(l)                  # 反向只需保存 logsumexp
+    return O, L</code></pre>
+    <p>
+      GPU 上，每个线程块把一个 Q 块常驻 SRAM，依次把 K<sub>j</sub>、V<sub>j</sub> 块载入 SRAM，在片上完成 QKᵀ、mask、exp、PV，只把最终的 O 和每行一个标量 L 写回 HBM。额外存储从 O(N²) 降到 O(N)。FA1 的块大小取 B<sub>c</sub> = ⌈M / 4d⌉、B<sub>r</sub> = min(⌈M / 4d⌉, d)，M 是 SRAM 容量，目的是让 Q、K、V、O 四个块同时放得下。
+    </p>
+
+    <h3>④ 反向：宁可重算，也不存 P</h3>
+    <p>
+      标准反向需要 P（N×N）来算梯度。FlashAttention 只保存 O 和 L，反向时在 SRAM 里<strong>重算</strong> S 和 P：
+    </p>
+    <pre><code>P_ij = exp(S_ij − L_i)                   # 由 Q、K 与保存的 L 直接恢复，无需 m 和 ℓ 两个量
+dV  += P_ijᵀ · dO_i
+dP_ij = dO_i · V_jᵀ
+D_i  = rowsum(dO_i ∘ O_i)                # 预先算好，每行一个标量
+dS_ij = P_ij ∘ (dP_ij − D_i)              # softmax 的雅可比，借 D 避免存整行
+dQ_i += dS_ij · K_j  (× 1/√d)
+dK_j += dS_ijᵀ · Q_i (× 1/√d)</code></pre>
+    <p>
+      这是典型的「用 FLOPs 换 IO」。论文 Figure 2 的实测（GPT-2 medium：序列 1024、head dim 64、16 头、batch 64，A100，前向 + 反向）：
+    </p>
+    <table>
+      <thead><tr><th>实现</th><th>GFLOPs</th><th>HBM 读写（GB）</th><th>运行时间（ms）</th></tr></thead>
+      <tbody>
+        <tr><td>Standard attention</td><td>66.6</td><td>40.3</td><td>41.7</td></tr>
+        <tr><td>FlashAttention</td><td>75.2（重算使 FLOPs 增加）</td><td>4.4</td><td>7.3</td></tr>
+      </tbody>
+    </table>
+    <p>FLOPs 多了约 13%，HBM 流量降到约 1/9，时间降到约 1/5.7——运行时间跟着 IO 走，而不是跟着 FLOPs 走。</p>
+
+    <h3>⑤ IO 复杂度：为什么这是最优的</h3>
+    <table>
+      <thead><tr><th></th><th>HBM 访问量（前向，反向同阶）</th><th>额外显存</th></tr></thead>
+      <tbody>
+        <tr><td>Standard attention</td><td>Θ(Nd + N²)</td><td>O(N²)</td></tr>
+        <tr><td>FlashAttention</td><td>Θ(N²d² / M)</td><td>O(N)</td></tr>
+        <tr><td>Block-sparse FlashAttention（非零块比例 s）</td><td>Θ(Nd + N²d²s / M)</td><td>O(N)</td></tr>
+      </tbody>
+    </table>
+    <p>
+      d 通常是 64–128，而 M 约为 100 KB 量级，d² 远小于 M，所以 FlashAttention 的 HBM 访问比标准实现少很多倍（论文 Theorem 2）。论文同时给出下界（Proposition 3）：对 d ≤ M ≤ Nd 范围内的所有 M，不存在 HBM 访问量为 o(N²d²/M) 的精确注意力算法。也就是说，在这个模型下 FlashAttention 是渐近最优的——再往上提速只能靠更好地利用硬件，而不是更少的 IO。这正是 FA2、FA3 的方向。
+    </p>
+    <p>
+      注意 FLOPs 仍是 O(N²d)。FlashAttention 解决的是「慢」和「显存」，没有改变注意力的二次复杂度；长上下文的计算量问题要靠稀疏、线性注意力或 <a href="daily-2026-09-01-kv-cache.html">KV cache</a> 层面的优化。
+    </p>
+
+    <h3>⑥ FlashAttention-2：减少非矩阵运算、改并行与分工</h3>
+    <p>FA1 在 A100 上只跑到理论峰值的 25–40%。FA2 的分析是：A100 的 FP16/BF16 matmul 峰值 312 TFLOPs/s，而非 matmul 的 FP32 只有 19.5 TFLOPs/s——每个非 matmul FLOP 贵 16 倍。改动有三点：</p>
+    <table>
+      <thead><tr><th>改动</th><th>FA1</th><th>FA2</th></tr></thead>
+      <tbody>
+        <tr><td>减少非 matmul FLOPs</td><td>每处理一个块都对 O 做一次归一化重缩放；保存 m 与 ℓ</td><td>循环内保持未归一化的 acc，最后除一次 ℓ；只保存 logsumexp L</td></tr>
+        <tr><td>并行维度</td><td>batch × heads；外层循环遍历 K/V 块</td><td>额外在序列维度并行：外层遍历 Q 块，不同 Q 块分给不同线程块——长序列、小 batch 时占用率高得多</td></tr>
+        <tr><td>warp 分工（前向）</td><td>「split-K」：K、V 切给 4 个 warp，最后经 shared memory 汇总</td><td>「split-Q」：Q 切给 4 个 warp，K、V 所有 warp 共享，warp 之间无需通信</td></tr>
+        <tr><td>因果 mask</td><td>—</td><td>完全在对角线之上的块直接跳过，每行只有一个块需要真正做 mask；相对无 mask 约 1.7–1.8× 加速</td></tr>
+      </tbody>
+    </table>
+    <p>结果（论文自报）：比 FA1 快约 2×，达到 A100 理论峰值的 50–73%；端到端训练 GPT 类模型达到每卡 225 TFLOPs/s（72% MFU）。</p>
+
+    <h3>⑦ FlashAttention-3：Hopper 上的异步与 FP8</h3>
+    <p>
+      FA2 在 H100 上只有 35% 利用率。Hopper 的新硬件特性——异步的 Tensor Core 指令 WGMMA 和数据搬运单元 TMA——要求把「搬数据」和「算」显式重叠。更尖锐的数字：H100 SXM5 FP16 matmul 989 TFLOPS，而 exp 这类特殊函数只有 3.9 TFLOPS；head dim 128 的前向里 matmul FLOPs 是 exp 的 512 倍，但 exp 的吞吐低 250 多倍，所以 <strong>softmax 的 exp 会吃掉相当大一部分时间</strong>。
+    </p>
+    <ul>
+      <li><strong>Warp specialization（producer–consumer）：</strong>一部分 warp 只负责用 TMA 把 K/V 块搬进 shared memory，其余 warpgroup 只做 WGMMA 和 softmax，用环形缓冲同步。</li>
+      <li><strong>Pingpong 调度：</strong>两个 warpgroup 交替——一个做 softmax 时另一个做 GEMM。FP16 前向（head dim 128）从约 570 提到 620–640 TFLOPS。</li>
+      <li><strong>Warpgroup 内重叠：</strong>当前块的 softmax 与下一块的 QKᵀ GEMM 流水交错。</li>
+      <li><strong>FP8：</strong>e4m3 只有 3 位尾数，且 LLM 激活有离群值。FA3 用 <em>block quantization</em>（每个 B<sub>r</sub>×d / B<sub>c</sub>×d 块一个 scale，可融合进 RoPE）和 <em>incoherent processing</em>（Q、K 同乘随机正交矩阵 M，(QM)(KM)ᵀ = QKᵀ 不变，把离群值摊平；M 取随机 ±1 对角阵乘 Hadamard 矩阵，O(d log d) 可算）。</li>
+    </ul>
+    <p>结果（论文自报）：H100 上比 FA2 快 1.5–2.0×，FP16 最高 740 TFLOPs/s（75% 利用率），FP8 接近 1.2 PFLOPs/s；在有离群特征的场景下，FP8 FA3 的数值误差比 per-tensor 量化的标准 FP8 attention 低 2.6×。</p>
+
+    <h3>⑧ 代际对比</h3>
+    <table>
+      <thead><tr><th>版本</th><th>核心想法</th><th>硬件利用（自报）</th></tr></thead>
+      <tbody>
+        <tr><td>Online softmax（2018）</td><td>可合并的 (m, ℓ) 统计量，单遍完成 softmax 归一化</td><td>softmax 最高 1.3×，softmax+TopK 融合最高 5×</td></tr>
+        <tr><td>Rabe &amp; Staats（2021）</td><td>按块计算注意力，内存 O(√n)；反向用 checkpoint 重算</td><td>省显存为主：N=16384 时推理显存开销降 59×、求导降 32×</td></tr>
+        <tr><td>FlashAttention（2022）</td><td>IO-aware tiling + 融合 kernel + 反向重算；IO 最优性证明</td><td>A100 25–40% 峰值；GPT-2 端到端 3×</td></tr>
+        <tr><td>FlashAttention-2（2023）</td><td>减少非 matmul、序列维并行、split-Q</td><td>A100 50–73% 峰值，训练 225 TFLOPs/s</td></tr>
+        <tr><td>FlashAttention-3（2024）</td><td>warp specialization、pingpong、FP8 block quant + incoherent processing</td><td>H100 FP16 75%，FP8 ≈1.2 PFLOPs/s</td></tr>
+      </tbody>
+    </table>
+
+    <h2>放进今天的 LLM 系统</h2>
+    <p>
+      训练侧，FlashAttention 已是默认：PyTorch 的 <code>scaled_dot_product_attention</code> 会在满足条件时分派到 flash 后端，flash-attn 库提供 varlen 接口，把多条不同长度的序列拼成一维、用累计长度数组定位边界，省掉 padding——<a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 这类 RL 训练里回答长度差异巨大，varlen 打包直接决定吞吐。
+    </p>
+    <p>
+      推理侧，decode 阶段每步只有一个（或推测解码下少数几个）query token，Q 块很小，瓶颈变成读 KV cache。这时并行维度要换到 KV 序列上（split-KV，再用同样的 (m, ℓ) 合并规则归约各段的部分结果）——online softmax 的「可合并」性质在这里第二次派上用场。分页 KV（PagedAttention）、<a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> 的多 token 验证、PD 分离下的 prefill kernel，本质上都是在同一套 tiling + 合并的框架里换块的形状和遍历顺序。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先确认真的走了 flash 后端。</strong> 自定义 mask（任意稠密 bool 矩阵）、某些 dtype（FP32）、不支持的 head dim 都可能让 SDPA 回退到 math 后端，显存瞬间回到 O(N²)。用 profiler 看 kernel 名字，不要只看调用了哪个 API。</li>
+      <li><strong>能用 causal / 滑窗参数就别传 mask 张量。</strong> kernel 内部按块判断即可跳过整块计算（约 1.7–1.8× 的来源）；传一个稠密 mask 既要读 N² 的 mask，又失去了跳块机会。</li>
+      <li><strong>RL / SFT 训练用 varlen 打包，而不是 pad 到最长。</strong> 但要确认 position id 和 loss mask 也按包内边界重置，否则跨样本的位置编码会出错。</li>
+      <li><strong>训推一致性要算上 attention kernel。</strong> 训练用 FA2、rollout 用另一种 kernel 或 FP8 FA3，logprob 会有可测量的差异；做 importance ratio 时这部分 mismatch 也在其中（参见 <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>）。</li>
+      <li><strong>FP8 attention 先测离群值。</strong> 若模型激活有明显离群通道，per-tensor scale 误差会很大；block quantization + Hadamard 旋转是低成本的第一步。</li>
+      <li><strong>自己写 kernel 时，从 online softmax 的不变式出发。</strong> 每一步都检查「acc / ℓ 等于已见列上的精确 softmax 加权和」，这是 split-KV、跨设备 ring attention 等变体正确性的统一判据。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 FlashAttention 的 FLOPs 比标准实现更多，运行反而快 5 倍以上？</summary>
+      <p>反向时要重算 S 和 P，FLOPs 增加（GPT-2 medium 例子中 66.6 → 75.2 GFLOPs）。但标准实现的瓶颈是 HBM 读写：N×N 的 S、P 要多次写入和读出 HBM（40.3 GB），而 softmax、mask 等逐元素操作的算术强度很低，GPU 大部分时间在等内存。FlashAttention 让 S、P 只存在于 SRAM，HBM 流量降到 4.4 GB，时间随之降到 7.3 ms。在 memory-bound 区间，运行时间由 IO 决定，而不是由 FLOPs 决定。</p>
+    </details>
+    <details>
+      <summary>2. online softmax 合并时为什么要乘 exp(m_old − m_new)？如果不减最大值会怎样？</summary>
+      <p>acc 和 ℓ 都是以当时的 m 为基准计算的指数和。当新块带来更大的最大值时，旧的项要换到新基准下，即同乘 exp(m_old − m_new)，否则新旧两部分基准不一致，相加就是错的。若完全不减最大值，exp(s) 在 FP16/FP32 中很容易上溢（FP16 下 s 超过约 11 就溢出），结果变成 inf/NaN；减去最大值保证所有指数都 ≤ 1。</p>
+    </details>
+    <details>
+      <summary>3. FA2 为什么把循环顺序改成「外层 Q 块、内层 K/V 块」？这对长序列训练意味着什么？</summary>
+      <p>外层遍历 Q 块时，不同 Q 块的输出互不依赖，可以分给不同线程块并行，同时每个 Q 块的 acc、m、ℓ 留在寄存器 / SRAM 中直到算完再写回一次。FA1 外层遍历 K/V，每个 Q 块的 O 要反复读写 HBM，且并行只在 batch × heads 上。长序列训练通常 batch 小、heads 有限，只靠 batch × heads 无法填满 108 个 SM，加上序列维并行后占用率大幅提升。</p>
+    </details>
+    <details>
+      <summary>4. decode 阶段只有 1 个 query token，FlashAttention 的哪些假设不再成立？怎么改？</summary>
+      <p>Q 块只有一行，按 Q 块并行几乎没有并行度，而且一次 QKᵀ 是矩阵–向量乘，Tensor Core 利用率低，瓶颈是读整段 KV cache。做法是在 KV 序列维度切分（split-KV / Flash-Decoding 思路）：各线程块各自对一段 KV 算出局部 (m, ℓ, acc)，最后用 online softmax 的合并规则归约。GQA / MQA 下还可以把共享同一组 KV 的多个 query head 拼成一个块，提高算术强度。</p>
+    </details>
+    <details>
+      <summary>5. FA3 的 incoherent processing 为什么不改变 attention 输出？它能用在 V 上吗？</summary>
+      <p>M 是正交矩阵，MMᵀ = I，所以 (QM)(KM)ᵀ = Q M Mᵀ Kᵀ = QKᵀ，logits 完全不变；它只是把离群值通过随机符号 + Hadamard 混合摊到所有维度上，降低量化误差。对 V 同样可以右乘 M 变成 VM，此时输出变成 OM，需要在之后乘 Mᵀ 还原（或把 Mᵀ 并入输出投影矩阵）。论文里只对 Q、K 做，因为这样可以与 RoPE 融合、不需要额外的还原步骤。（开放部分：V 侧是否值得做取决于 V 的离群程度与 PV GEMM 的量化方式。）</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135 · FlashAttention（Dao et al., NeurIPS 2022）</a></li>
+      <li><a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">arXiv:2307.08691 · FlashAttention-2（Dao, 2023）</a></li>
+      <li><a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">arXiv:2407.08608 · FlashAttention-3（Shah et al., 2024）</a></li>
+      <li><a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">arXiv:1805.02867 · Online normalizer calculation for softmax</a></li>
+      <li><a href="https://arxiv.org/abs/2112.05682" target="_blank" rel="noopener">arXiv:2112.05682 · Self-attention Does Not Need O(n²) Memory</a></li>
+      <li><a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">Dao-AILab/flash-attention（官方实现）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-09-algo-attention.html">Attention</a> ·
+        <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Temperature / Entropy</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a> ·
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-10-07-algo-muon.html">Muon</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

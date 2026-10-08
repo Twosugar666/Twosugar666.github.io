@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜NeMo-DCR：只传 1% 的变化、却与全量 refit 逐比特一致——万亿参数跨集群 Agentic RL 的权重同步 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜NeMo-DCR：只传 1% 的变化、却与全量 refit 逐比特一致——万亿参数跨集群 Agentic RL 的权重同步</h1>
+    <p class="post-meta">2026-10-08 · 收藏夹：Infra / RL · 一线追踪<br />
+      论文：Songlin Jiang（Aalto University / NVIDIA 实习）、Zhiyu Li、Terry Kong、Yu Yao、Youngeun Kwon、Bernard Nguyen、Ashwath Aithal（NVIDIA）、Mario Di Francesco（Aalto University） ·
+      <em>NeMo-DCR: Bit-Exact Delta-Compressed Refit for Scalable Agentic RL at Trillion-Parameter Scale</em>
+      · <a href="https://arxiv.org/abs/2610.08430" target="_blank" rel="noopener">arXiv:2610.08430</a>（cs.DC，v1，2026-10-06 提交）；
+      代码：<a href="https://github.com/NVIDIA-NeMo/RL/pull/2444" target="_blank" rel="noopener">NVIDIA-NeMo/RL PR #2444</a>。
+      交叉：
+      <a href="daily-2026-09-23-rollart.html">ROLLART</a>、
+      <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>、
+      <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-10-02-dsv41-nvfp4-gb300.html">DSV4.1-Flash NVFP4</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agentic RL 的墙钟时间大头在 rollout（论文引述 70% 以上），所以主流系统都把 rollout 从训练里拆出去，跑在推理集群上——<a href="daily-2026-09-23-rollart.html">ROLLART</a> 的异构解耦、ROSE 的「借空闲 serving GPU」、乃至跨机房 rollout。拆开之后每一步都多出一道工序：<strong>refit</strong>，即把更新后的策略权重送到所有 rollout rank，下一批 rollout 才能开始。
+    </p>
+    <p>
+      跨集群时这道工序很贵。论文给的参考数字（两个 AWS region 之间、经对象存储、只算传输）：120B 模型 247.2 GB 的 checkpoint 要 750 s；1T 规模（Kimi K2 量级，实验用两倍层数的 Nemotron-3-Ultra，2,242 GB）要 <strong>87.5 min</strong>。粗算一下，后者相当于每个 rollout 节点持续约 0.43 GB/s（≈3.4 Gbps），与论文测得的单节点跨集群上限 5 Gbps 同量级——瓶颈确实是广域带宽，而不是哪段代码写得慢。
+    </p>
+    <p>
+      但真正需要传的东西很少。BF16 只有 8 位有效位，一次优化器更新只有「跨过舍入边界」才会改变存储比特；论文在六个模型（Qwen2.5 0.5B/1.5B/7B、Llama-3.2-3B、Gemma-3-4B、Qwen3-30B-A3B）的前五步 GRPO（常数学习率 1e-6，agentic SWE RL 配方）里测得每步只有 <strong>0.6–1.2%</strong> 的元素变了；其他来源给的是 Qwen3 RL 1.5–2.0%（AReaL-DTE）和 1,024 GiB checkpoint 平均 1.98%（Fireworks 博客）。也就是说，全量传输 98–99% 的字节在搬没变的值。
+    </p>
+    <p>
+      「只传变化」本身不新——AReaL-DTE、PULSE、SparseRL-Sync、slime、verl、TRL 都做过。NeMo-DCR 的贡献在于把它做成<strong>系统级正确</strong>：五项要求同时满足，并且给出逐比特等价的证明和故障恢复协议。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 五项要求与现有方案的缺口</h3>
+    <table>
+      <thead><tr><th>要求</th><th>含义</th><th>典型失败方式</th></tr></thead>
+      <tbody>
+        <tr><td>G1 Bit-exact</td><td>接收端得到与 dense refit 完全相同的参数与 buffer 比特</td><td>算术重建 α + (β − α) 在浮点下可能 ≠ β，误差跨版本累积（AReaL-DTE 一类）</td></tr>
+        <tr><td>G2 Delta</td><td>传输量随变化值、位置、元数据增长，而不是随模型大小</td><td>NCCL-Reshard、checkpoint-engine、TensorHub 仍发全量</td></tr>
+        <tr><td>G3 Native</td><td>由 serving runtime 自己的 loader 决定放置，refit 系统里没有模型特定规则</td><td>重写 vLLM 的 QKV 融合 / 专家切分规则（ROSE、AReaL-DTE），或先拼完整张量再转换（SparseRL-Sync）</td></tr>
+        <tr><td>G4 Decoupled</td><td>训练与 rollout 集群之间不跨 collective</td><td>跨集群 NCCL 把 receiver 成员关系绑死在训练侧，故障即超时</td></tr>
+        <tr><td>G5 Recovery</td><td>去重、可修复的部分写入、一条权威 commit 记录绑定新版本与源基线</td><td>论文表 1 中没有任何既有系统完整满足；每个最多完整满足五项中的两项</td></tr>
+      </tbody>
+    </table>
+    <p>
+      核心抽象是 <strong>canonical coordinates</strong>：Hugging Face checkpoint 的张量名 + 扁平索引。训练侧（Megatron 的 TP/PP/EP 分片）和推理侧（vLLM 的融合与切分）各自都能和这套坐标互转，于是 refit 被拆成两半：训练侧负责把变化翻译到 canonical 坐标，推理侧交给原生 loader 翻译到本 rank 的存储。论文的比喻是页表——虚拟地址到物理地址。
+    </p>
+
+    <h3>② 七步流水线</h3>
+    <pre><code>❶ 变化检测   每个唯一源元素只有一个 owner（按张量名 hash 在 DP rank 间均衡）
+             C_T = { j ∈ J_T | bits(S_T^{v+1})_j ≠ bits(A_T^v)_j }   # 比较存储比特，而非浮点相等
+❷ 投影/转换  affine 任务：d = π_T(j)，直接算出 canonical 目的地（行切分：k = (i0 + i)·w + y）
+             residual 任务（融合 QKV、stacking、padding、tied、量化 scale…）：先构造 canonical 张量，再与 residual baseline 比比特
+❸ 编码       表示保持的 affine 路径 → XOR mask；其余 → 绝对 overwrite；位置做 run-length / gap 编码，zstd level-1
+❹ 传输       对象存储（S3，manifest 列出预期 payload）或 relay tree（一个根 + 本地平衡树转发）
+❺ 校验去重   receiver 按 payload id 去重——XOR 应用两次会还原旧值
+❻ 原生 loader 应用  散射到 host scratch → vLLM loader 照常做名字解析与变换 → PyTorch dispatch hook 拦截最终 aten.copy_，只写 active 位置
+❼ joint commit  所有 required receiver ACK 后，coordinator 对版本记录做 compare-and-set；owner 原地更新基线</code></pre>
+    <p>
+      affine 映射覆盖了 Qwen3-30B-A3B checkpoint 96.3% 的权重字节、Nemotron-3-Ultra-550B-A55B 97.0%。剩下 3–4% 走 residual 转换——比如一个共享 scale λ 变了，即使其他源值没动，乘 λ 再 cast 后的输出比特也会变，必须转换后再比较。实现约 7K 行 Python，构建在 Megatron Bridge 转换和 vLLM 原生 loader 之上，同一套代码同时跑 Qwen3 和 Mamba-Transformer 混合的 Nemotron，没有模型特定逻辑。
+    </p>
+
+    <h3>③ 为什么用 XOR，而不是「加 delta」或「全量覆盖」</h3>
+    <table>
+      <thead><tr><th>编码</th><th>精确性</th><th>体积</th><th>幂等性</th></tr></thead>
+      <tbody>
+        <tr><td>算术 delta（β − α）</td><td>✗ 浮点舍入可能使 α + (β − α) ≠ β</td><td>小</td><td>非幂等</td></tr>
+        <tr><td>绝对 overwrite</td><td>✓</td><td>大：变化值里没变的高位比特也重发</td><td>✓ 幂等，适合重试</td></tr>
+        <tr><td>XOR mask</td><td>✓（仅在投影与 loader 都保持存储比特时）</td><td>小：小更新不动符号与指数位，mask 前导零多，好压缩</td><td>✗ 应用两次还原旧值，必须去重</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 论文的例子：BF16 0.50390625 → 0.5078125
+old   0x3F01 = 0011 1111 0000 0001
+new   0x3F02 = 0011 1111 0000 0010
+XOR   0x0003 = 0000 0000 0000 0011   ← 14 个前导零
+# overwrite 要发完整的 0x3F02；XOR 只需 0x0003，zstd 之后差距被放大</code></pre>
+    <p>
+      合成基准（2,000 万个 BF16，加 FP32 噪声后舍入回 BF16）：zstd 后 XOR 比 overwrite 小 <strong>1.7–2.2×</strong>（噪声 σ=1e-4 时 0.33 vs 0.74 MB）。在 Qwen3 上，混合 XOR/overwrite 比纯 overwrite 少 38–40% payload 字节（30B 3%：1.49 vs 2.44 GB；235B 5%：17.58 vs 29.36 GB）。代价是 XOR 模式构建时间多 7–13%，但 relay tree 下传输主导延迟，所以默认仍选 XOR。
+    </p>
+
+    <h3>④ 恢复：XOR 的不幂等反而逼出一个干净的协议</h3>
+    <p>
+      in-place 应用省掉了 receiver 端的基线副本，但中途失败会留下「一半旧一半新」的权重——既不是 v 也不是 v+1。NeMo-DCR 的做法：
+    </p>
+    <ul>
+      <li>失败的 attempt 先停下，等它的写入不可能再生效；</li>
+      <li>用同一份候选权重和<strong>未变的</strong>已提交基线 B<sup>v</sup> 重新算完整变化集，<strong>全部编码成 overwrite</strong>——不管之前哪些写成功了，overwrite 都能给出目标比特；</li>
+      <li>receiver 成员变化只在 attempt 之间生效，新加入或重启的 receiver 先用 dense refit 恢复到已提交版本；</li>
+      <li>joint commit 只有在版本记录仍等于 K<sup>v</sup> 时才 compare-and-set 成功，coordinator 换人时新 coordinator 读同一份记录决定是否重试。</li>
+    </ul>
+    <p>
+      Proposition 1 给出等价性：在候选权重、基线、ownership、转换规则、loader 设置在 commit 前都固定的前提下，bits(apply<sub>r</sub>(Δ, P<sub>r</sub><sup>v</sup>)) = bits(L<sub>r</sub>(W<sup>v+1</sup>))，对所有 receiver 成立；KV cache 等请求状态不在其列，每次转换都会使其失效。
+    </p>
+
+    <h3>⑤ 传输与重叠：sync / async RL 的门控时机不同</h3>
+    <pre><code>owner：   [conv|cmp|zstd 桶ℓ] [conv|cmp|zstd 桶ℓ+1] ...
+传输：               [send ℓ]            [send ℓ+1] ...
+sync RL： 首个 attempt 开始即关门 → 边到边 apply ℓ、ℓ+1 → 开门服务 v+1
+async RL：继续用 v 服务，压缩 delta 先 staged 在 host → 最后一个 payload 到齐后关门 → 当前请求结束后原地 apply → 开门</code></pre>
+    <p>
+      分块参数（附录 C）：chunk 目标对象存储 64 MiB、relay tree 256 MiB，bucket 目标 512 MiB；120B 时 32 个 owner 共产生 482 个 payload。对象存储每个 rollout 节点都要下载一遍，跨边界字节随节点数增长；relay tree 每个 payload 每次 attempt 只跨边界一次（V<sub>cross</sub> ≈ V<sub>payload</sub>）。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <p>测试床：训练侧 32 张 GB300（8 节点，一个 AWS region），rollout 侧 64 张 H100（8 节点，另一个 region），单节点跨集群流量实测最高 5 Gbps；3% / 5% 元素变化率是刻意高于实测 0.6–1.2% 的压力设定。</p>
+    <table>
+      <thead><tr><th>120B（Nemotron-3-Super-120B-A12B，247.2 GB）</th><th>变化率</th><th>延迟</th><th>payload</th><th>加速</th></tr></thead>
+      <tbody>
+        <tr><td>对象存储</td><td>3%</td><td>24.5 s</td><td>5.86 GB</td><td>30.6×</td></tr>
+        <tr><td>Relay tree</td><td>3%</td><td>22.6 s</td><td>5.82 GB</td><td>33.2×</td></tr>
+        <tr><td>对象存储</td><td>5%</td><td>49.7 s</td><td>9.38 GB</td><td>15.1×</td></tr>
+        <tr><td>Relay tree</td><td>5%</td><td>41.6 s</td><td>9.35 GB</td><td>18.0×</td></tr>
+        <tr><td>参考：只算传输的全量 checkpoint</td><td>—</td><td>750 s</td><td>247.2 GB</td><td>1×</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>规模曲线：</strong>30B–1T 全部 12–40× 快于参考；延迟从 30B 的 8.3–14.5 s 增长到 1T 的 150–300 s。1T、3%、relay tree：<strong>150 s vs 87.5 min</strong>。5% 时 relay tree 在所有规模上都优于对象存储，优势从 30B 的 1.13× 增长到 1T 的 1.36×。</li>
+      <li><strong>压缩后 payload 含位置信息</strong>只占 checkpoint 的 2.4–3.8%，比未压缩的变化值本身（约 3% / 5%）还少 21–24%。</li>
+      <li><strong>时间去哪了：</strong>Nsight 追踪显示传输下界占 relay-tree refit 延迟的 77–94%，构建下界只占 18–45%，二者重叠；finalization（同步、ACK、commit、基线更新）0.2–1.7 s；剩下 1.8–9.2 s 花在流水线启动、排空与交接。</li>
+      <li><strong>直接投影</strong>让 Qwen3 delta 构建比全量转换快 1.08–1.16×（例如 235B 3%：18.38 vs 19.87 s）。</li>
+      <li><strong>故障下训练不偏：</strong>Qwen3-30B-A3B agentic tool-call GRPO 50 步（训练与 rollout 各 4 个 H100 节点，真实更新平均每步 1.2% 元素变化），每 5 步随机杀掉一个 vLLM 实例、5 步后重启；两种传输的 mean reward 都是 0.41，与 dense NCCL 相同，KL 轨迹重合；所有 refit 与 overwrite 重试都通过 post-apply 检查。</li>
+      <li><strong>Host 内存代价：</strong>源基线放在 host 内存而非显存，总量约 1.03–1.04× checkpoint；550B 的 1,121 GB checkpoint 摊到 32 个训练 rank 每个约 36 GB。</li>
+    </ul>
+
+    <h2>放进 Agentic RL 系统的坐标系</h2>
+    <p>
+      站内最近几篇 RL 系统文可以排成一条链：<a href="daily-2026-09-23-rollart.html">ROLLART</a> 解耦了训练与 rollout 的硬件；<a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a> 在同步语义下把 learner 气泡塞回 rollout 窗口；<a href="daily-2026-08-31-miles-v01.html">Miles</a> 走全异步。所有这些方案都默认「权重同步够快」，一旦 rollout 搬到另一个机房，这个默认就塌了——87.5 min 的 refit 会让任何调度优化失去意义。NeMo-DCR 补的正是这块地基。
+    </p>
+    <p>
+      另一条线是<strong>训推一致性</strong>。论文坚持逐比特，理由是 rollout–training mismatch 已知会让 RL 失稳（引用 FP16 消除 mismatch 的工作，arXiv:2510.26788）。这与 <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> 里讲的 TIS / 截断修正是同一问题的两端：算法侧容忍 mismatch，系统侧尽量不制造 mismatch。在系统层引入「近似 delta」，等于给算法侧再加一份无法估计的偏差。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量自己的元素变化率。</strong> 比较存储比特（bitcast 成 int16 后比较），不要用浮点 <code>==</code>：+0/−0、NaN 都会骗过浮点比较。学习率、warmup 阶段、是否用 BF16 存权重都会显著改变这个数；论文的 3%/5% 是压力上限，不是常态。</li>
+      <li><strong>XOR 只用在表示保持的路径上。</strong> 一旦 loader 里有 cast、乘 scale、量化，源 mask 就不再对应目标比特，必须转换后比较再 overwrite。自研 delta sync 时最常见的 bug 就是把 XOR 用到了融合/量化张量上。</li>
+      <li><strong>任何 XOR 通道都要配去重 + overwrite 重试。</strong> 把 payload id 当幂等键；重试路径一律 overwrite，不要试图「补发缺失的 XOR」。</li>
+      <li><strong>不要重写推理引擎的放置规则。</strong> 拦截 loader 最终的 copy 比复刻 QKV 融合、专家切分、padding 的规则稳得多，也能跟上引擎升级。</li>
+      <li><strong>有直连就用 relay tree，没有就用对象存储。</strong> 前者跨边界字节与 rollout 节点数无关；后者部署最简单但下载量随节点数线性增长。</li>
+      <li><strong>注意适用范围。</strong> 论文验证的是 BF16 receiver。如果 rollout 跑 FP8 / <a href="daily-2026-10-02-dsv41-nvfp4-gb300.html">NVFP4</a> 量化权重，训练侧 1% 的 BF16 变化可能让整块的量化 scale 变化，affine + XOR 的比例会大幅下降——这是留给后续工作的空白。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 BF16 训练每步只有约 1% 的元素变化？哪些因素会把这个比例推高？</summary>
+      <p>BF16 只有 8 位有效位，相邻可表示值的相对间距约为 2^-8 到 2^-7。优化器在 FP32 master 权重上做的更新通常远小于这个间距，只有当累计更新跨过舍入边界时存储的 BF16 比特才变。学习率越大、训练越早期（论文明确指出这两点会改变更多存储值）、权重绝对值越小（同样的绝对更新，相对幅度更大），跨边界的概率越高，变化率就越高。</p>
+    </details>
+    <details>
+      <summary>2. XOR 编码比 overwrite 更省字节，为什么重试时反而要全部改成 overwrite？</summary>
+      <p>XOR 不是幂等的：对同一位置应用两次会还原旧值，应用零次则保持旧值。失败的 attempt 可能已经在部分 receiver 的部分位置写入了 mask，重试时无法廉价地知道哪些写成功了。overwrite 直接给出目标比特，与之前写没写过无关，因此一次 overwrite 重试就能把所有 receiver 拉到 L_r(W^{v+1})。</p>
+    </details>
+    <details>
+      <summary>3. 共享 scale λ 变化为什么不能走 affine 直接投影？</summary>
+      <p>affine 任务要求每个输出元素只依赖一个源元素，且映射固定。若转换规则是「源值 × λ 再 cast」，λ 一变，所有输出都可能变，哪怕源值本身没动；而且乘法和 cast 不保持存储比特，源 mask 不能直接映射成目标 mask。所以这类任务必须构造 canonical 张量，与 residual baseline 比较比特，再用 overwrite 发送。</p>
+    </details>
+    <details>
+      <summary>4. async RL 下 rollout 一直在用 v 服务，NeMo-DCR 为什么仍需要关门（gate）？这和 off-policy 程度有什么关系？</summary>
+      <p>in-place 应用期间权重处于 v 与 v+1 的混合态，若此时继续服务请求，生成的轨迹来自一个不存在的策略，log-prob 无法与任何版本对齐，重要性采样修正也会失效。所以只在 payload 全部 staged 之后短暂关门、等当前请求结束再 apply。关门窗口越短，rollout 持续使用旧版本的时间越短，轨迹的 staleness 越低；refit 从 87.5 min 降到 150 s，本身就大幅降低了跨集群 async RL 的 off-policy 程度。</p>
+    </details>
+    <details>
+      <summary>5. 如果 rollout 端跑 NVFP4 量化权重，NeMo-DCR 的设计哪些部分需要重做？</summary>
+      <p>（开放题）一是放置与比特保持：NVFP4 有 block scale，训练侧少量 BF16 变化可能改变整个 block 的 scale，几乎所有转换都变成 residual，XOR 覆盖率急剧下降；二是变化率：量化后的比特变化率不再是 0.6–1.2%，需要重新测量；三是精确性的定义：要对齐的是「训练侧按同一规则量化后的比特」，量化必须确定性且在 owner 侧可复现。可能的方向是在训练侧维护量化后的 residual baseline，或像 TRACE / TRIAGE 这类 FP4 RL 工作一样让训练侧直接感知 rollout 侧的量化结果。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.08430" target="_blank" rel="noopener">arXiv:2610.08430 · NeMo-DCR: Bit-Exact Delta-Compressed Refit for Scalable Agentic RL at Trillion-Parameter Scale</a></li>
+      <li><a href="https://github.com/NVIDIA-NeMo/RL/pull/2444" target="_blank" rel="noopener">NVIDIA-NeMo/RL PR #2444 · feat: add delta-compressed collective refit</a></li>
+      <li><a href="https://arxiv.org/abs/2510.26788" target="_blank" rel="noopener">arXiv:2510.26788 · Defeating the Training-Inference Mismatch via FP16（论文引用的 mismatch 证据）</a></li>
+      <li><a href="https://arxiv.org/abs/2610.07043" target="_blank" rel="noopener">arXiv:2610.07043 · TRIAGE：Native NVFP4 RL 的 mismatch 稳定（同日相关）</a> ·
+        <a href="https://arxiv.org/abs/2610.07767" target="_blank" rel="noopener">arXiv:2610.07767 · TRACE：FP4 RL 的 rollout 引导 QAT（同日相关）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-23-rollart.html">ROLLART</a> ·
+        <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-10-02-dsv41-nvfp4-gb300.html">DSV4.1-Flash NVFP4</a> ·
+        <a href="daily-2026-09-28-dsec.html">DeepSeek DSec</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -648,6 +648,27 @@
       "source": "algo",
       "topic": "Muon：SGD-momentum + Newton-Schulz5 正交化（3.4445,−4.7750,2.0315，bf16）；谱范数最速下降 / 无累积 Shampoo；Embedding/head 用 AdamW；Moonshot weight decay + 0.2·sqrt(max(A,B)) RMS 对齐、Distributed Muon；Kimi K2 QK-Clip（Jordan et al. / arXiv:2502.16982 / arXiv:2507.20534）",
       "file": "posts/daily-2026-10-07-algo-muon.html"
+    },
+    {
+      "date": "2026-10-08",
+      "domain": "infra rl",
+      "source": "frontline",
+      "topic": "NeMo-DCR：canonical coordinates 上的 bit-exact delta refit；affine 直接投影（Qwen3-30B-A3B 96.3% / Nemotron-3-Ultra 97.0% 字节）+ residual 转换；XOR/overwrite 混合编码 + zstd（XOR 小 1.7–2.2×，payload −38–40%）；去重 + overwrite 重试 + joint commit（CAS）；对象存储 / relay tree 流水线；32×GB300→64×H100 跨 region，120B 22.6–49.7 s（15–33×），30B–1T 12–40×，1T@3% 150 s vs 87.5 min；receiver kill 下 reward 0.41 与 dense NCCL 一致（Jiang et al. NVIDIA/Aalto arXiv:2610.08430）",
+      "file": "posts/daily-2026-10-08-nemo-dcr.html"
+    },
+    {
+      "date": "2026-10-08",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "ReFold：历史 append-only、只压渲染上下文；Deduplication（重复 span→stub）+ Folding（Agent 自报 PROGRESS/STALE→一行 note）；分块渲染 k=3（prefix 命中 87% vs 每步重渲 51%）；restore 追加到末尾可逆；mini-swe-agent + Qwen3.6-27B/35B-A3B 五基准 token −18–60%、峰值 KV −30–58%；32k compaction −92%；w=48 解题 7→32、排队 8.96→0.02 s（Su et al. UCSB/Intel arXiv:2610.07863）",
+      "file": "posts/daily-2026-10-08-harness-refold.html"
+    },
+    {
+      "date": "2026-10-08",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "FlashAttention：online softmax (m, ℓ) 可合并统计量 + tiling + 反向重算（只存 O 与 logsumexp）；IO Θ(N²d²/M) vs Θ(Nd+N²) 及下界；GPT-2 medium 40.3→4.4 GB、41.7→7.3 ms；FA2 未归一化 acc / 序列维并行 / split-Q / 因果跳块，A100 50–73%、225 TFLOPs/s；FA3 warp specialization + pingpong + FP8 block quant + Hadamard incoherent processing，H100 740 TFLOPs/s、FP8≈1.2 PFLOPs/s（arXiv:2205.14135 / 2307.08691 / 2407.08608）",
+      "file": "posts/daily-2026-10-08-algo-flashattention.html"
     }
   ]
 }
