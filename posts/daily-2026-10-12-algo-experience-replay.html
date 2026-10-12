@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Experience Replay：从 Lin 1992 到 DQN——打破时间相关、复用样本，再到 RLVR 里「按 mode 均匀」的练习分布 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Experience Replay：从 Lin 1992 到 DQN——打破时间相关、复用样本，再到 RLVR 里「按 mode 均匀」的练习分布</h1>
+    <p class="post-meta">2026-10-12 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典来源：Long-Ji Lin · <em>Self-Improving Reactive Agents Based On Reinforcement Learning, Planning and Teaching</em>（Machine Learning, 1992）；
+      Mnih et al. · <em>Playing Atari with Deep Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/1312.5602" target="_blank" rel="noopener">arXiv:1312.5602</a>；
+      Mnih et al. · Nature 2015 Human-level control；
+      Schaul et al. · <em>Prioritized Experience Replay</em>
+      · <a href="https://arxiv.org/abs/1511.05952" target="_blank" rel="noopener">arXiv:1511.05952</a>；
+      Oh et al. · <em>Self-Imitation Learning</em>（SIL）
+      · <a href="https://arxiv.org/abs/1806.05635" target="_blank" rel="noopener">arXiv:1806.05635</a>；
+      Rolnick et al. · <em>Experience Replay for Continual Learning</em>
+      · <a href="https://arxiv.org/abs/1811.11682" target="_blank" rel="noopener">arXiv:1811.11682</a>。
+      今日对照：
+      <a href="daily-2026-10-12-modebench-remax.html">ModeBench / Re:Max</a>；
+      交叉：
+      <a href="daily-2026-10-06-algo-dqn.html">DQN</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-10-02-algo-sac.html">SAC</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      在线 RL 的样本流是时间相关的：连续帧几乎一样，一串更新都沿着同一条轨迹走。神经网络在这种非平稳、强相关的流上做 SGD，容易过拟合近期经验、忘掉更早的状态分布。1992 年 Lin 把「把过去经验拿出来再学一遍」写成 experience replay；2013–2015 的 DQN 把它做成深度 RL 的标配；之后 PER、SIL、continual learning 里的 replay 各自改了<strong>采样分布</strong>。
+    </p>
+    <p>
+      今天一线文 <a href="daily-2026-10-12-modebench-remax.html">ModeBench / Re:Max</a> 又一次动到了采样分布：不是按转移出现频率均匀采，而是<strong>每个已发现 solution mode 存一条、均匀复习</strong>。把经典 ER 的设计轴捋清，才能看懂「均匀」到底均匀在什么测度上。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① Circular buffer 与均匀 minibatch</h3>
+    <pre><code># 环形缓冲 D，容量 N（DQN Nature：常取 1M）
+# 写入：满则覆盖最旧
+D[t mod N] ← (s_t, a_t, r_t, s_{t+1}, done_t)
+
+# 训练：均匀随机采 B 条
+batch ∼ Uniform(D)
+# DQN：用 batch 最小化 TD 误差（target 网络算 y）
+y_i = r_i + γ · (1 − done_i) · max_a' Q_θ⁻(s'_i, a')
+L   = mean_i ℓ( Q_θ(s_i, a_i) − y_i )</code></pre>
+    <table>
+      <thead><tr><th>作用</th><th>机制</th><th>若不做</th></tr></thead>
+      <tbody>
+        <tr><td>打破时间相关</td><td>相邻训练样本来自缓冲里随机位置，不再是轨迹上连续帧</td><td>梯度高度相关，方差估计失真，易发散</td></tr>
+        <tr><td>样本复用</td><td>一条转移可被多次采到，提高数据效率</td><td>纯 on-policy 每条经验用一次就丢</td></tr>
+        <tr><td>平滑行为分布</td><td>缓冲混合了多段 ε-greedy / 旧策略的经验</td><td>策略一变，训练分布跟着跳</td></tr>
+      </tbody>
+    </table>
+    <p>
+      重要推论：一旦用了 replay，学习就变成 <strong>off-policy</strong>——更新用的动作来自行为策略（写进缓冲时的策略），而 Q-learning 目标里是 max，不是行为策略的期望，所以一步 TD <strong>不需要</strong> <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a>。改成 n-step 回报或 Actor-Critic 式策略梯度时，off-policy 修正才重新出现。
+    </p>
+
+    <h3>② Lin 1992 → DQN：同一想法，不同算力约束</h3>
+    <ul>
+      <li><strong>Lin 1992：</strong>在反应式 agent 上把过去的 (s,a,r,s′) 存下来再学；同时讨论 planning / teaching。思想已经是「经验可复用」，实现是小规模表格或浅层网络。</li>
+      <li><strong>DQN 2013/2015：</strong>同样接口，但 N 到百万级、与 target network、帧堆叠、reward clipping 绑在一起，第一次在 Atari 像素上稳定住 deadly triad（函数逼近 + bootstrapping + off-policy）的工程形态。细节见站内 <a href="daily-2026-10-06-algo-dqn.html">DQN</a>。</li>
+    </ul>
+
+    <h3>③ 改采样分布：PER 与 SIL</h3>
+    <table>
+      <thead><tr><th>方法</th><th>谁更容易被采到</th><th>要解决什么</th><th>代价</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Uniform ER</strong></td><td>缓冲内每条转移等权</td><td>相关与复用的基线</td><td>大量「已经学好」的转移浪费更新</td></tr>
+        <tr><td><strong>Prioritized ER (PER)</strong></td><td>TD 误差 |δ| 大的优先（常加 α、重要性权重 β）</td><td>把梯度花在「惊讶」样本上</td><td>引入偏置，需 IS 权重校正；实现更复杂</td></tr>
+        <tr><td><strong>Self-Imitation Learning (SIL)</strong></td><td>回报高于当前值估计的过去好回合</td><td>在 on-policy actor-critic 上模仿自己的高回报轨迹</td><td>偏「曾经好过」的模式；与探索目标需权衡</td></tr>
+      </tbody>
+    </table>
+    <pre><code># PER 优先级（Schaul et al.）
+p_i = |δ_i| + ε
+P(i) ∝ p_i^α
+# 校正偏置：w_i = (N · P(i))^(-β) / max_j w_j
+
+# SIL 直觉（Oh et al.）：对缓冲中 return R 高于 V_φ(s) 的样本
+# 额外做类似「向好动作靠拢」的更新——复用的是好轨迹，不是均匀历史</code></pre>
+
+    <h3>④ Continual learning 里的 replay（Rolnick et al.）</h3>
+    <p>
+      当任务序列非平稳（学完任务 A 再学 B），神经网络会灾难性遗忘。Rolnick 等人论证：在持续学习设定下，<strong>保留并回放旧任务的少量样本</strong>是简单而强的基线——不必存全部历史，但必须让优化器周期性再见到旧分布。这里 replay 的「均匀」往往是<strong>跨任务</strong>均匀或按任务配额，而不是 Atari 里按时间均匀。单位仍是转移 / 样本，目标从「稳 Q」变成了「稳旧任务性能」。
+    </p>
+
+    <h3>⑤ 对照今日：Re:Max 的 mode-uniform replay</h3>
+    <table>
+      <thead><tr><th></th><th>DQN Uniform ER</th><th>PER / SIL</th><th>Re:Max（今日一线）</th></tr></thead>
+      <tbody>
+        <tr><td>缓冲条目</td><td>(s,a,r,s′)</td><td>同上，改采样权</td><td>每个 prompt 下，每个已发现 mode 一条 exemplar 文本</td></tr>
+        <tr><td>「均匀」的对象</td><td>缓冲内转移</td><td>故意不均匀</td><td><strong>已发现 mode</strong>（每种解法一份）</td></tr>
+        <tr><td>更新形式</td><td>TD / Q 回归</td><td>加权 TD 或模仿</td><td>teacher-forcing loglik（不与 fresh advantage 混用）</td></tr>
+        <tr><td>要对抗的失败</td><td>相关、低效、发散</td><td>学不动的硬样本 / 好轨迹丢失</td><td>RLVR 正确概率坍缩到少数 mode</td></tr>
+        <tr><td>按出现频率采？</td><td>是（写入频率≈采样频率期望）</td><td>否（|δ| 或高回报）</td><td><strong>否</strong>——刻意切断 discovery 频率</td></tr>
+      </tbody>
+    </table>
+    <p>
+      关键对比：经典 ER 的 Uniform 在「转移计数测度」上均匀；若某种错误模式在环境里出现得特别多，它也会被练得特别多。Re:Max 认为在 RLVR 里有害的正是这种「常见正确解练得更多」——所以把测度改成 mode 计数。PER 改测度是为了难样本；Re:Max 改测度是为了稀有正确解。同叫 replay，均匀的轴不同。
+    </p>
+    <pre><code># 三种「练习分布」示意
+# 环境产生正确 mode 的频率：  q_env = (0.7, 0.2, 0.1)
+# DQN 式按轨迹写入再均匀采：  练习 ≈ q_env（大数下）
+# PER：                         练习 ∝ |TD|（与 mode 无直接关系）
+# Re:Max（三 mode 都已发现）：  练习 = (1/3, 1/3, 1/3)  ← 与 q_env 脱钩</code></pre>
+
+    <h2>和 on-policy LLM RL 的边界</h2>
+    <p>
+      PPO / GRPO / RLOO 主流配方是 on-policy：用完当批 rollout 就丢。直接套 DQN 式大缓冲会碰到：① 策略更新快，旧序列的 logprob 过期，需要 IS 或拒绝；② token 序列占用远大于 Atari 转移；③ 二值 verifier 奖励下，TD 目标不如 group-relative advantage 好用。Re:Max 的做法是折中——<strong>只缓冲稀缺的「mode 代表」</strong>，更新走 likelihood 而不是过期 advantage，从而把 ER 的「复习」搬进 RLVR，又避开完整 off-policy actor-critic。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先写清均匀在哪个测度。</strong> 按时间、按任务、按 TD 误差、按 mode——改的是不同的失败模式。照抄「replay buffer」而不写采样分布，等于没设计。</li>
+      <li><strong>Value-based 用 ER 几乎是默认；纯 on-policy PG 要谨慎整库回放。</strong> 需要时优先小缓冲 + IS / truncated IS，或像 SIL / Re:Max 那样限制条目语义。</li>
+      <li><strong>容量与覆盖权衡。</strong> N 太小 → 近期偏差；太大 → 过旧策略污染（DQN 常靠 ε 与慢更新缓解）。LLM 上更要限制每题条数（Re:Max 的 M=16 是显式上限）。</li>
+      <li><strong>PER 不是免费午餐。</strong> 记得 β 退火的 IS 权重；优先级与模式坍缩可能共振（总采同一难 mode）。</li>
+      <li><strong>做 RLVR 多样性时，优先 mode-uniform，而不是再加大均匀轨迹缓冲。</strong> 加大缓冲只会按原频率多练常见解。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么一步 Q-learning + ER 可以不做重要性采样，而 off-policy 策略梯度通常要做？</summary>
+      <p>Q-learning 的 TD 目标使用 max<sub>a′</sub> Q(s′,a′)，不依赖行为策略 π_b 在 s′ 上的动作分布，估计的是最优动作值，行为策略只影响采样覆盖。策略梯度估计的是当前 π_θ 的期望回报，必须用 π_θ / π_b 把旧动作的贡献校正回当前策略（或限制缓冲极新）。见 <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>。</p>
+    </details>
+    <details>
+      <summary>2. Circular buffer 覆盖最旧样本，和 continual learning 里「必须留下旧任务样本」是否矛盾？</summary>
+      <p>不矛盾，目标不同。单任务 Atari 假设大致平稳，覆盖最旧是为了跟踪当前状态分布；多任务持续学习里旧任务分布不会再自然出现，必须<strong>显式保留</strong>配额，否则被新任务写穿。实现上往往是「每任务一个小缓冲」或水库采样，而不是单一大环形缓冲。</p>
+    </details>
+    <details>
+      <summary>3. PER 的高 |δ| 优先，会不会加剧 solution mode collapse？</summary>
+      <p>有可能。若某一正确 mode 的 TD / 优势信号长期更大，PER 会更频繁回放它，等价于强化「已经强」的模式。RLVR 二值奖励下 group 内成功轨迹的优势形状也可能不等。要保 mode 多样，应把优先级定义在 mode 覆盖上（如稀有 mode 加成），而不是裸 |δ|。</p>
+    </details>
+    <details>
+      <summary>4. Re:Max 为什么把 replay 做成 likelihood 而不是把 exemplar 塞进 GRPO group 当普通样本？</summary>
+      <p>Exemplar 来自旧策略，混进 on-policy group 会污染 advantage 基线，并需要 IS。Likelihood 抬升不依赖「相对同组其他样本的优势」，只要求模型提高该 mode 代表序列的概率，与 fresh group 的相对比较解耦——正是 ER「复习」与「当场打分」分离的 LLM 版。</p>
+    </details>
+    <details>
+      <summary>5. 若把 Experience Replay 用到工具调用 Agent 的轨迹上，应缓冲整段 trajectory 还是单步 transition？</summary>
+      <p>（开放题）整段保留信用分配完整，但离策略更快、存储贵；单步利于 TD，但工具后果常是非马尔可夫（依赖隐藏文件状态）。实务折中：缓冲「子目标达成片段」或像 Re:Max 只留成功 mode 的代表轨迹，并在回放时重算 logprob。与 harness 是否 TITO（<a href="daily-2026-08-31-harness-tito.html">TITO</a>）强相关。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li>Lin, L.-J. (1992). Self-Improving Reactive Agents Based On Reinforcement Learning, Planning and Teaching. <em>Machine Learning</em>.</li>
+      <li><a href="https://arxiv.org/abs/1312.5602" target="_blank" rel="noopener">arXiv:1312.5602 · Playing Atari with Deep Reinforcement Learning</a></li>
+      <li><a href="https://arxiv.org/abs/1511.05952" target="_blank" rel="noopener">arXiv:1511.05952 · Prioritized Experience Replay</a></li>
+      <li><a href="https://arxiv.org/abs/1806.05635" target="_blank" rel="noopener">arXiv:1806.05635 · Self-Imitation Learning</a></li>
+      <li><a href="https://arxiv.org/abs/1811.11682" target="_blank" rel="noopener">arXiv:1811.11682 · Experience Replay for Continual Learning</a></li>
+      <li>站内：
+        <a href="daily-2026-10-12-modebench-remax.html">ModeBench / Re:Max</a> ·
+        <a href="daily-2026-10-06-algo-dqn.html">DQN</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-10-02-algo-sac.html">SAC</a> ·
+        <a href="daily-2026-09-24-algo-rloo.html">RLOO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

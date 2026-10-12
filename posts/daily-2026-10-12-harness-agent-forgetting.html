@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Agent-Controlled Forgetting：工具结果曝光后再由模型原位换成短 note——可逆归档、原子提交与 workload 依赖 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Agent-Controlled Forgetting：工具结果曝光后再由模型原位换成短 note——可逆归档、原子提交与 workload 依赖</h1>
+    <p class="post-meta">2026-10-12 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Jan-Peter Franke ·
+      <em>Agent-Controlled Forgetting for Tool-Using Agents: Reversible Context Curation in Practice</em>
+      · <a href="https://arxiv.org/abs/2610.10590" target="_blank" rel="noopener">arXiv:2610.10590</a>（cs.AI，v1，2026-10-06 提交；
+      代码 / 工件：<a href="https://github.com/boldprojekte/agent-forgetting-research" target="_blank" rel="noopener">boldprojekte/agent-forgetting-research</a>）。
+      交叉：
+      <a href="daily-2026-10-08-harness-refold.html">ReFold</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-10-05-harness-pos.html">PoS</a>、
+      <a href="daily-2026-10-07-harness-hear.html">HEAR</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      调试 Agent 可能翻完整条分布式 trace 才定位一次失败调用；编码 Agent 可能只需要构建日志末尾的 verdict，但后续请求仍背着前面每一行进度。许多工具输出「值得看一次」，不「值得一直占着上下文」。问题不只是上下文能塞多少，而是<strong>已经看过的信息哪些还应继续占用 active context</strong>。
+    </p>
+    <p>
+      这篇工作研究的是 <strong>agent-controlled forgetting</strong>：工具结果先完整曝光给 acting model，再由同一模型决定把哪些结果原位换成短 note + <code>archive_ref</code>，原文进入可恢复 archive。它不省掉第一次阅读的成本，潜在收益在于减少后续请求里的重复输入，并清掉已判定过时的材料。与「读之前过滤 MCP / 浏览器输出」互补：有些内容只有在模型解释之后才知道可以丢掉。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 单位：结果出现（occurrence），不是工具名</h3>
+    <pre><code># 活跃对话 H：有序消息序列；外部 archive A
+# 每条合格 tool-result 带稳定 id r（会话内从 r1 起，不复用）、
+# tool-call 元数据、文本 x、可选图像 v
+
+# 选择单位 = 某一次结果出现，而不是「某个文件」或「某个工具名」
+# 同一工具调用两次 → 两个可独立归档的 id</code></pre>
+
+    <h3>② 两个工具：context_apply / context_recover</h3>
+    <table>
+      <thead><tr><th>调用</th><th>行为</th><th>不变量</th></tr></thead>
+      <tbody>
+        <tr><td><code>context_apply([(result_id, note), …])</code></td><td>批量：校验 → 原文进 A → 原位换成 stub（note + archive_ref）</td><td>整批原子；任一非法则整批拒绝、无部分写入</td></tr>
+        <tr><td><code>context_recover(archive_ref)</code></td><td>把原文<strong>追加</strong>为对话末尾的新 tool result（新 id）</td><td>不重跑原工具；旧 stub 仍可寻址</td></tr>
+      </tbody>
+    </table>
+    <pre><code>apply(batch):
+    resolve every result ID and validate every note
+    reject the whole batch if any target is invalid   # 未知 / 重复 / 已归档 → 纠错，不半提交
+    stage originals and provenance in the archive
+    commit notes and archive_refs at selected locations
+    return { result_id → archive_ref }
+
+recover(ref):
+    load stored text / images
+    append as new tool result with a fresh result ID
+    # 恢复的是「当时的观察」，不是环境的最新测量</code></pre>
+    <p>
+      主动表示是有损的（note 不必保留所有细节）；「可逆」指的是<strong>能取回存档载荷</strong>，不是无损推理或保证未来决策依赖都还在。文中的 forgetting = 从 active request 驱逐，不是从磁盘删除、不是模型 unlearning、也不是隐私擦除。
+    </p>
+
+    <h3>③ 保护边界：user / system / assistant 不可归档</h3>
+    <ul>
+      <li>context 工具<strong>不能</strong>选中 user、system、assistant 消息——只动 tool-result 出现。</li>
+      <li>关联的 tool <em>call</em> 留在轨迹里，被替换的是 result body。</li>
+      <li>归档不编辑工作区文件；trace 里仍保留与 archived payload 可比对的原始观察，用于完整性校验（校验存储，不校验 note 的语义是否够用）。</li>
+    </ul>
+
+    <h3>④ 提示与提醒：何时该忘</h3>
+    <p>
+      Method 臂收到 context-management 说明、工具描述、示例，以及 ephemeral runtime reminder。模型被要求：在有用的调研 / 诊断进展之后再整理、批量处理大块目标、保留未决证据、继续原任务。提示里约 25%「无关内容」只是启发式，不是标注阈值或分类器阈值。实现上大约在投影请求文本 ~40k token（或有图像）时允许提醒；提醒后再触发需要新增足够多的合格输出（配置为约 20k 字符或新图像）；新的用户任务会重置提醒资格。提醒以 user-role 追加在出站请求末尾，不写入持久历史。
+    </p>
+
+    <h2>与 ReFold 的交叉对比</h2>
+    <table>
+      <thead><tr><th></th><th>本文 Agent-Controlled Forgetting</th><th><a href="daily-2026-10-08-harness-refold.html">ReFold</a></th></tr></thead>
+      <tbody>
+        <tr><td>改什么</td><td>活跃消息里的 <strong>tool-result body</strong>（原位 stub）</td><td>只改<strong>渲染上下文</strong> R(h)；真实历史 h append-only</td></tr>
+        <tr><td>谁决定</td><td>acting model 调 <code>context_apply</code></td><td>Agent 在回复里自报 <code>STALE</code> / <code>PROGRESS</code></td></tr>
+        <tr><td>恢复</td><td><code>context_recover</code> → 追加为新 tool result</td><td><code>restore</code> → 追加到末尾（不回填）</td></tr>
+        <tr><td>保护</td><td>user/system/assistant 不可归档</td><td>历史永不改；压缩只发生在渲染层</td></tr>
+        <tr><td>典型收益场景</td><td>嘈杂工具轨迹（大日志、trace、浏览器页）</td><td>长 horizon coding，重复读文件 / 重复观察</td></tr>
+        <tr><td>共同主题</td><td colspan="2">可逆；曝光后再决定；恢复追加而非回填以免打碎前缀假设</td></tr>
+      </tbody>
+    </table>
+    <p>
+      一句话：一个管 <strong>tool-result 可逆驱逐</strong>，一个管 <strong>渲染上下文可逆折叠</strong>。生产 harness 可以叠用——先对单次巨大 tool 输出做 forgetting，再对多轮历史做 ReFold 式分块渲染。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <h3>主案例：OpenTelemetry 调试 + 任务切换</h3>
+    <p>
+      环境：公开 OpenTelemetry Demo 源码（某次 upstream checkout 修复前的 commit）。主任务：用浏览器与可观测性面诊断失败的 checkout、实现安全的前端错误契约并验证；背景负载与并发故障制造现实的竞争观察。主提交后，同一会话接到无关的 C++ currency-service 优雅关停任务——对比的是整条轨迹，不是在相同历史上做干预。
+    </p>
+    <table>
+      <thead><tr><th>指标</th><th>Method（可遗忘）</th><th>Retained history</th></tr></thead>
+      <tbody>
+        <tr><td>终局 provider 报告 prompt tokens</td><td><strong>231,951</strong></td><td>912,492</td></tr>
+        <tr><td>累计输入 token</td><td>约减半（−50%）</td><td>基线</td></tr>
+        <tr><td>估计 API 成本</td><td><strong>$1.28–1.44</strong></td><td>≈ $4.38</td></tr>
+        <tr><td>主 oracle（两行为用例）</td><td>2/2 通过</td><td>2/2 通过</td></tr>
+        <tr><td>Follow-up 评估</td><td>未完全满足</td><td>未完全满足</td></tr>
+        <tr><td>请求数 / 墙钟</td><td>更多请求；慢约 <strong>17%</strong></td><td>基线</td></tr>
+      </tbody>
+    </table>
+    <p>
+      解释：省的是重复携带的大观察，不是第一次阅读；归档 / 恢复本身增加工具往返，所以请求更多、略慢，但 token 与美元账单下降一个量级档。两侧主行为都过，说明压缩没有以主任务失败为代价（在该案例上）。
+    </p>
+
+    <h3>对照与负面：Planroom 与浏览器续跑</h3>
+    <ul>
+      <li><strong>Planroom</strong> 应用开发对照对：<strong>没有</strong>上下文或成本节省——workload 依赖是中心结论，不是「永远更省」。</li>
+      <li>更早的浏览器续跑：上下文降了，但人工评估质量更差——可逆不等于「note 写得够好」。</li>
+      <li>作者明确不把多任务池化成一个准确率分数：任务、评分器、历史、harness 版本都不同。这是探索性案例研究，不是 held-out 排行榜。</li>
+    </ul>
+
+    <h2>放进 Harness 工程的坐标系</h2>
+    <p>
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> 多在「爆窗前摘要 / 裁剪」；本文把决策权交给<strong>已经看过结果的 acting model</strong>，并且单位细到单次 tool-result。<a href="daily-2026-10-05-harness-pos.html">PoS</a> 用显式 belief 管长程信息；这里的 note 可以看成极简、附着在原位置上的 belief 残片。<a href="daily-2026-10-07-harness-hear.html">HEAR</a> 强调前缀与引擎协同——原位替换会改历史中间，可能影响 prefix cache；若缓存敏感，更宜学习 ReFold 的「追加恢复 + 分块边界」时机，或把 stub 替换对齐到缓存边界。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>只开放 tool-result，保护指令通道。</strong> 让模型改 user/system 是事故面；assistant 推理被归档也会毁掉可审计轨迹。</li>
+      <li><strong>批量 + 原子。</strong> 半提交的 stub/原文不一致极难排障；未知 id 应整批失败并返回可修正错误。</li>
+      <li><strong>恢复追加到末尾。</strong> 与 ReFold 相同：回填原位置会让其后前缀全部失效（对 prompt cache 不友好）。</li>
+      <li><strong>先在「噪声工具」轨迹上试。</strong> OpenTelemetry / 大日志 / 浏览器 DOM 这类收益大；干净的小文件读写密集任务可能像 Planroom 一样省不到钱，却多付工具调用。</li>
+      <li><strong>分开报：终局 prompt、累计输入、美元、任务结果、请求数、墙钟。</strong> 缩小 prompt ≠ 更强推理；本文主案就是省钱但更慢。</li>
+      <li><strong>note 质量要有兜底。</strong> 可要求 note 保留「结论 + 关键路径 / 错误码」；对可能再需要的原始页，宁可晚一点归档。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「读之前过滤工具输出」不能替代曝光后的 forgetting？</summary>
+      <p>过滤发生在模型看见结果之前，可能丢掉当时看起来无关、事后证明关键的证据。有些材料只有在模型排除了某个假说、或用户切换任务之后，才变成可弃。Post-exposure curation 保留第一次完整观察，只决定<strong>以后还要不要带着走</strong>。</p>
+    </details>
+    <details>
+      <summary>2. context_recover 为什么不重跑原工具？</summary>
+      <p>归档的是历史观察（某次 trace、某次测试日志、某次浏览器快照）。重跑得到的是环境<strong>当前</strong>状态，语义不同。需要新鲜测量时应显式再调原工具；recover 保证的是证据可复查，不是状态同步。</p>
+    </details>
+    <details>
+      <summary>3. 原位替换 stub 对 prefix cache 可能有什么影响？如何缓解？</summary>
+      <p>改历史中间位置会使该点之后的缓存前缀失效，频繁小归档可能把省下的 token 重新花在 prefill 上（ReFold 文对 mask 策略有定量例子）。缓解：批量、对齐较大边界再提交；或像 ReFold 一样把「压缩」放在渲染层并分块推进；恢复一律追加。</p>
+    </details>
+    <details>
+      <summary>4. 主案例省了约一半累计输入、成本降到约 1/3，为什么还会慢 17%？</summary>
+      <p>归档与恢复增加了工具往返和模型决策步；provider 报告的终局 prompt 变小，但总请求数上升。墙钟由「请求次数 × 单次延迟 + 工具时间」决定，不完全由单次 prompt 长度决定。优化目标若是延迟而非美元，需要另算。</p>
+    </details>
+    <details>
+      <summary>5. 若与 ReFold 同时启用，如何划分职责以免双重压缩打架？</summary>
+      <p>（开放题）建议分层：Forgetting 负责「单次过大 / 已证伪」的 tool-result 原位移除；ReFold 负责跨多轮的重复 span 与整轮 STALE 折叠。同一结果不要既被 stub 成一句 note、又被 folding 再压成更空的 note。共享一条「可恢复 id」命名空间，恢复时任一条路径都能找回原文。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.10590" target="_blank" rel="noopener">arXiv:2610.10590 · Agent-Controlled Forgetting for Tool-Using Agents</a></li>
+      <li><a href="https://github.com/boldprojekte/agent-forgetting-research" target="_blank" rel="noopener">boldprojekte/agent-forgetting-research</a></li>
+      <li>站内：
+        <a href="daily-2026-10-08-harness-refold.html">ReFold</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-10-05-harness-pos.html">PoS</a> ·
+        <a href="daily-2026-10-07-harness-hear.html">HEAR</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

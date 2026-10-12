@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜ModeBench / Re:Max：RLVR 把正确解压到更少 mode——用「每 mode 一条」均匀 replay 对抗 solution mode collapse · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜ModeBench / Re:Max：RLVR 把正确解压到更少 mode——用「每 mode 一条」均匀 replay 对抗 solution mode collapse</h1>
+    <p class="post-meta">2026-10-12 · 收藏夹：RL / Agent · 一线追踪<br />
+      论文：Liv G. d’Aliberti、Marwa Abdulhai、Sofiia Druchyna、Peter Henderson、Manoel Horta Ribeiro（Princeton University） ·
+      <em>Measuring and Mitigating Solution Mode Collapse in RLVR</em>
+      · <a href="https://arxiv.org/abs/2610.11064" target="_blank" rel="noopener">arXiv:2610.11064</a>（cs.LG，v1，2026-10-08 提交）。
+      交叉：
+      <a href="daily-2026-10-06-depgpo.html">DepGPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-09-24-algo-rloo.html">RLOO</a>、
+      <a href="daily-2026-10-06-algo-dqn.html">DQN</a>、
+      <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      RLVR（reinforcement learning with verifiable rewards）对「哪一种正确解」无差别：同一道题，第 1000 次抄写熟悉答案与第一次写出从未见过的正确解，奖励都是 1。若目标只是 pass rate，这没问题；若还希望模型保留多种解题路径——给用户选择、给后续推理留多种入口——现有 RLVR 配方会系统性丢掉这些路径。
+    </p>
+    <p>
+      这篇 Princeton 工作把问题钉成可测现象：<strong>solution mode collapse</strong>——准确率持平或上升时，正确概率质量集中到更少的解模式（mode）。他们做了三件事：① ModeBench，五域可执行多解任务，verifier 同时返回正确性与 mode id；② 指标 PCMD，条件于正确时的成对 mode 多样性；③ 缓解方法 Re:Max / Re:Dr——每个发现的 mode 只存一条 exemplar，按 mode 均匀 replay likelihood，与 on-policy 更新分离。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① ModeBench：五域、可执行、mode 可辨</h3>
+    <table>
+      <thead><tr><th>域</th><th>任务形态</th><th>mode 是什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Graph</strong></td><td>图着色（如三空节点、邻接异色）</td><td>一种合法着色方案</td></tr>
+        <tr><td><strong>Countdown</strong></td><td>归一化计算树</td><td>一种达到目标的表达式结构</td></tr>
+        <tr><td><strong>Python</strong></td><td>可执行代码题</td><td>通过 verifier 的一种程序语义/行为类</td></tr>
+        <tr><td><strong>MathIR</strong></td><td>代数 / 符号推理</td><td>一种规范形式的代数解（同一解多种写法会归并）</td></tr>
+        <tr><td><strong>Pantry</strong></td><td>约束优化</td><td>一种满足约束的配置</td></tr>
+      </tbody>
+    </table>
+    <p>
+      对 prompt <code>x</code> 与规格 <code>s_x</code>，verifier <code>V(y, s_x)</code> 要么返回失败 ⊥，要么返回 mode <code>m ∈ C_x</code>。两条被接受输出同 mode，当且仅当 verifier 输出相同。学习者<strong>只看到自己生成过的 mode</strong>，从未拿到完整 <code>C_x</code> 或其大小——这很关键：缓解方法不能依赖「已知有多少解」。
+    </p>
+
+    <h3>② 为什么 pass@K / distinct@K 不够：PCMD</h3>
+    <pre><code># 设 P = Pr[正确]，q_c = Pr[mode=c | 正确]，Σ_c q_c = 1
+pass@K      = 1 − (1 − P)^K
+E[distinct@K] = Σ_c [1 − (1 − P·q_c)^K]
+
+# 问题：P 上升会同时抬高两者——更准的策略可能看起来「更多样」，即使条件分布更尖
+
+# Pairwise Correct-Mode Diversity（论文式 (2)）
+PCMD = 1 − Σ_c q_c²
+     = Pr[ Z1 ≠ Z2 | 两条响应都通过 verifier ]
+
+# PCMD = 0 ⇒ 所有正确回答属于同一 mode
+# 均匀分布在 |C| 个 mode 上时 PCMD = 1 − 1/|C|</code></pre>
+    <p>
+      PCMD 把「准不准」从「准了之后散不散」里拆出来。论文用它测到：Dr.GRPO / GRPO / MaxRL 在 ModeBench 上准确率持平或上升时，PCMD 系统性下降；前沿模型（文中测的 Claude / GPT 等闭源与开源旗舰）在若干域上 PCMD 已经很低——collapse 不完全是「小模型 RL 后才有」的现象，基座里就有。
+    </p>
+
+    <h3>③ 为什么 RLVR 会压 mode</h3>
+    <p>
+      直觉上，reward 对所有正确 mode 相同，策略梯度会更常强化「已经更容易被采样到」的 mode：高频 mode 在 group 里出现得更多，拿到更多正优势更新，进一步升高其概率——正反馈。这和 <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> / <a href="daily-2026-10-06-depgpo.html">DepGPO</a> 里讨论的「稀疏成功信号如何分配」是同一家族：信号在成功轨迹之间并不均匀。ModeBench 只是把「成功」进一步拆成了可辨的 mode 标签。
+    </p>
+    <pre><code># 标准 on-policy RLVR group（G 条）
+y_i ∼ π_θ(· | x)
+R_i = 1{ V(y_i, s_x) ≠ ⊥ }
+# advantage 只看 R_i——两个不同正确 mode 的优势统计上同分布
+# ⇒ 采样频率差异会被梯度放大，而不是被奖励纠正</code></pre>
+
+    <h3>④ Re:Max / Re:Dr：每 mode 一条 + 均匀 replay</h3>
+    <table>
+      <thead><tr><th>组件</th><th>做法</th><th>意图</th></tr></thead>
+      <tbody>
+        <tr><td>Buffer 单位</td><td>每个训练 prompt 一份 buffer；每个发现的 mode 最多存 1 条 exemplar</td><td>发现频率 ≠ 练习频率</td></tr>
+        <tr><td>Exemplar 选择</td><td>同 mode 多条首次出现时，保留规范化 token 序列字典序最小者</td><td>与 rollout 顺序无关</td></tr>
+        <tr><td>容量</td><td>每 buffer 最多 M=16 个 mode；满后新 mode 不再进 replay</td><td>有界；无 eviction</td></tr>
+        <tr><td>调度</td><td>确定性 round-robin 选一个非空 buffer</td><td>跨 prompt 均匀练</td></tr>
+        <tr><td>损失</td><td>对 buffer 内每条 exemplar 做 teacher-forcing 平均 logprob，取负均值</td><td>抬似然，不靠 advantage</td></tr>
+        <tr><td>与 on-policy 的关系</td><td>stored exemplar <strong>不</strong>拿 fresh advantage；L = L_PPO(A) + λ_replay · 权重 · L_replay</td><td>两路更新解耦</td></tr>
+        <tr><td>命名</td><td>fresh 目标是 Dr.GRPO → Re:Dr；是 MaxRL → Re:Max</td><td>同一 replay 壳，换 on-policy 目标</td></tr>
+      </tbody>
+    </table>
+    <pre><code># Algorithm 1（论文附录 D，简化）
+G = { y_i ∼ π_θ(·|x) }_{i=1..G}
+for each y_i:  m_i ← V(y_i, s_x);  R_i ← 1{m_i ≠ ⊥}
+A ← fresh_advantages(o, {R_i})          # o ∈ {Dr.GRPO, MaxRL}
+# 整组验证后：每个新发现的 m ≠ ⊥ 往 B_x 塞一条 exemplar（容量 M）
+if 存在非空 buffer:
+    (z, exemplars) ← next_buffer_round_robin(B)
+    L_replay ← − mean_m [ mean_token log π_θ(e_m | z) ]
+else:
+    L_replay ← 0
+θ ← update( θ, L_PPO(A) + λ_replay · (G−1)/G² · L_replay )</code></pre>
+    <p>
+      关键设计决策：<strong>按 discovery 频率采样 vs 按 mode 均匀</strong>。若 replay 按「历史上出现次数」加权，高频 mode 仍然练得更多，collapse 只会变慢。Re:Max 强制「发现一次 = 练一次份额」，把练习分布从采样分布里拔出来。这与经典 <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a> 的「均匀采转移」同构，但单位从 (s,a,r,s′) 换成了「已验证 mode 的 exemplar」。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>现象：</strong>在 ModeBench Levels 上，Dr.GRPO / MaxRL 等 RLVR 目标把概率压到更少正确 mode；图示（论文 Fig.1）用固定种子 32 样本对比 Qwen2.5-3B：Dr.GRPO 侧 mode 覆盖窄，Re:Max 侧同一题上出现更多不同合法着色。</li>
+      <li><strong>前沿已浓缩：</strong>多个闭源 / 开源旗舰在 pass@8 不低的情况下 PCMD 偏低——「再 RL 一层」之前多样性库存就已经薄。</li>
+      <li><strong>缓解有效：</strong>三档模型规模（含 Qwen2.5-0.5B / 3B / 7B 设定）、两种 fresh 目标、更难 level 构造上，mode-uniform replay 同时改善成功率与条件多样性（论文 Part III / 附录 E）。</li>
+      <li><strong>对照：</strong>附录含「按 fresh 频率 replay」对照——均匀按 mode 优于按发现频率，支撑上文机制解释。</li>
+      <li><strong>适用范围：</strong>需要 verifier 能返回稳定 mode id；纯「对/错」二值 reward 不够。编程 / 代数等可规范化的域最贴合。</li>
+    </ul>
+
+    <h2>放进 RLVR 后训练的坐标系</h2>
+    <p>
+      站内最近的 RLVR 文多在谈<strong>信用分配</strong>（<a href="daily-2026-10-06-depgpo.html">DepGPO</a> 的依赖图）和<strong>系统吞吐</strong>（<a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>、<a href="daily-2026-10-08-nemo-dcr.html">NeMo-DCR</a>）。ModeBench 补的是第三条轴：<strong>成功解的条件多样性</strong>。pass rate 涨、PCMD 跌，在只报准确率的排行榜上看不见。
+    </p>
+    <p>
+      与 entropy bonus / KL 到参考策略的关系：那些正则在 token 空间鼓励分散，不保证「不同正确 mode」；一个 mode 内部换措辞也能吃满熵。Re:Max 的单位是 verifier 定义的 mode，直接对准可执行多样性。与 <a href="daily-2026-09-24-algo-rloo.html">RLOO</a> / GRPO 的 leave-one-out 基线也不冲突——replay 路不走 advantage，只走 likelihood。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先问 verifier 能不能标 mode。</strong> 没有稳定 mode id，就测不了 PCMD，也做不了 per-mode buffer。代码题可对 AST / 行为指纹归并；数学题需规范到 canonical form，避免「写法不同、mode 不同」的假多样。</li>
+      <li><strong>报表同时报 pass 与 PCMD。</strong> 只看 pass@K 会掩盖 collapse；只看 distinct@K 会被准确率上升带偏。</li>
+      <li><strong>Replay 与 on-policy 权重分开调。</strong> λ_replay 过大可能拖慢攀准确率；过小则 mode 护不住。论文用 (G−1)/G² 缩放，是为了和单条成功 on-policy 贡献量级对齐——移植时按自己的 advantage 归一化重标定。</li>
+      <li><strong>Buffer 满了要有策略。</strong> 无 eviction + M=16 意味着晚期发现的 mode 得不到练习。若任务 mode 空间很大，需要 LRU、按稀有度优先，或动态扩容。</li>
+      <li><strong>不要假设「加熵就够」。</strong> 先测 RLVR 前后的 PCMD；若基座已经很低，优先 mode-aware 数据或 replay，而不是只拧 temperature。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么准确率上升时 distinct@K 也可能上升，却仍然发生了 mode collapse？</summary>
+      <p>distinct@K 的期望含因子 (1 − P·q_c)^K。P 变大时，即使 q 变得更尖（少数 q_c→1，其余→0），E[DK] 仍可能因「更常抽到至少一个正确样本」而上升。PCMD = 1−Σ q_c² 只看条件分布，把 P 消掉，才能单独暴露「对了之后是否总是同一种对法」。</p>
+    </details>
+    <details>
+      <summary>2. Re:Max 为什么不给 buffer 里的 exemplar 算 fresh advantage？</summary>
+      <p>Exemplar 来自旧策略，若当 on-policy 样本用 advantage，需要重要性采样或接受 off-policy 偏差（见 <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>）。论文选择把 replay 做成纯 likelihood 抬升，与当前 group 的 PPO/GRPO 式更新分离：一边用新鲜 R 做信用分配，一边用均匀 mode 集合做「复习」，避免把过期 advantage 混进 on-policy 估计。</p>
+    </details>
+    <details>
+      <summary>3. 「按发现频率 replay」和「按 mode 均匀 replay」在梯度上差在哪？</summary>
+      <p>前者的期望更新仍近似正比于各 mode 被采样到的历史频率，高频 mode 继续获得更多正似然梯度；后者把每个已发现 mode 的权重钉成 1/|B_x|，稀有 mode 只要进过 buffer，就与常见 mode 同权复习。collapse 的正反馈被练习分布切断，而不是被奖励函数切断。</p>
+    </details>
+    <details>
+      <summary>4. 若两个写法不同、verifier 却标成同一 mode，Re:Max 会不会扼杀措辞多样性？</summary>
+      <p>会，而且这是刻意的：目标是 solution-mode 多样性，不是 surface-form 多样性。若产品还需要措辞多样，应在 mode 之内另加熵或 paraphrase 目标；把写法差当成 mode 差，会让 PCMD 虚高、buffer 被同解占满。</p>
+    </details>
+    <details>
+      <summary>5. 把 ModeBench 思路接到终端 Agent RL（如 DepGPO 设定）时，mode 该怎么定义？</summary>
+      <p>（开放题）候选：最终补丁的行为测试指纹、最小化 diff 的归一化 patch、关键中间状态的达成集合。难点是 mode 既要可自动计算，又要对「用户可感知的不同解法」稳定。过细则 buffer 爆、过粗则测不出 collapse。可先在单一仓库的多解 bug 上人工标定一小撮 mode，再训练自动归并器。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.11064" target="_blank" rel="noopener">arXiv:2610.11064 · Measuring and Mitigating Solution Mode Collapse in RLVR</a></li>
+      <li>站内：
+        <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a> ·
+        <a href="daily-2026-10-06-depgpo.html">DepGPO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-24-algo-rloo.html">RLOO</a> ·
+        <a href="daily-2026-10-06-algo-dqn.html">DQN</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

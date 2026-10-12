@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 3,
+  "next": 4,
   "daily_streams": [
     "frontline",
     "harness",
@@ -669,6 +669,27 @@
       "source": "algo",
       "topic": "FlashAttention：online softmax (m, ℓ) 可合并统计量 + tiling + 反向重算（只存 O 与 logsumexp）；IO Θ(N²d²/M) vs Θ(Nd+N²) 及下界；GPT-2 medium 40.3→4.4 GB、41.7→7.3 ms；FA2 未归一化 acc / 序列维并行 / split-Q / 因果跳块，A100 50–73%、225 TFLOPs/s；FA3 warp specialization + pingpong + FP8 block quant + Hadamard incoherent processing，H100 740 TFLOPs/s、FP8≈1.2 PFLOPs/s（arXiv:2205.14135 / 2307.08691 / 2407.08608）",
       "file": "posts/daily-2026-10-08-algo-flashattention.html"
+    },
+    {
+      "date": "2026-10-12",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "ModeBench / Re:Max：PCMD=1−Σq_c²；RLVR 准确率持平或上升时压到更少 mode；每 mode 一条 exemplar 均匀 replay likelihood，与 on-policy 分离（d’Aliberti et al. Princeton arXiv:2610.11064）",
+      "file": "posts/daily-2026-10-12-modebench-remax.html"
+    },
+    {
+      "date": "2026-10-12",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Agent-Controlled Forgetting：tool-result 原位 note+archive_ref；context_apply 原子批量；保护 user/system/assistant；OpenTelemetry 终局 231951 vs 912492、成本 $1.28–1.44 vs $4.38；Planroom 无节省；对照 ReFold（Franke arXiv:2610.10590）",
+      "file": "posts/daily-2026-10-12-harness-agent-forgetting.html"
+    },
+    {
+      "date": "2026-10-12",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "Experience Replay：Lin 1992 / DQN circular buffer；打破时间相关、off-policy 复用；PER / SIL / Rolnick continual；对照 Re:Max 按 mode 均匀 vs 按 discovery 频率",
+      "file": "posts/daily-2026-10-12-algo-experience-replay.html"
     }
   ]
 }
