@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Full Sandbox Snapshots：把 Go-Explore 搬进编码 Agent——整机快照什么时候比「从头重试」更值（17/25 vs 6/25 的反面结果与 4/5 vs 0/5 的边界） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Full Sandbox Snapshots：把 Go-Explore 搬进编码 Agent——整机快照什么时候比「从头重试」更值（17/25 vs 6/25 的反面结果与 4/5 vs 0/5 的边界）</h1>
+    <p class="post-meta">2026-10-13 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Daniel Thi Graviet（Daytona）、Tanmay Shah（University of Waterloo） ·
+      <em>Returning to Development States: When Full Sandbox Snapshots Help Coding Agents</em>
+      · <a href="https://arxiv.org/abs/2610.13841" target="_blank" rel="noopener">arXiv:2610.13841</a>（cs.LG，v1，2026-10-09 提交；7 页 preprint，作者注明未经同行评审）。
+      实验规模很小（5 个任务 × 5 seed、单一模型档），下文数字均为<strong>论文自报</strong>。
+      交叉：
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1 SDK</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a>、
+      <a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a>、
+      <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      编码 Agent 失败时很少是「干净地失败」：它可能已经装好依赖、复现了失败测试、改了几个文件、建好了应用需要的本地数据库，然后一处错误编辑把任务搞砸。标准做法是 retry-from-scratch——从原始仓库重来，坏编辑和之前所有有用的机器状态一起丢掉。
+    </p>
+    <p>
+      现有 test-time scaling 大多工作在机器状态之上：独立重试从初始环境重新采轨迹；memory / Reflexion 保留文字；搜索方法（SWE-Search 等）保留 commit 与文件上下文。这些都<strong>不一定保留完整执行环境</strong>：已装的包、运行中的服务、生成的产物、数据库、缓存。这篇 Daytona 的短文问了一个 harness 设计里很实际的问题：<strong>如果把整台 sandbox 快照当作可搜索的状态，像 Go-Explore 那样「先回到有希望的状态再探索」，能不能比同预算的独立重试解更多题？</strong>
+    </p>
+    <p>
+      答案在其测试的 Terminal-Bench 子集上是<strong>不能</strong>（17/25 vs 6/25）；但它同时给出了一个清楚的边界：当进度落在仓库之外（例如 SQLite 数据库）时，整机快照 4/5、只恢复 git diff 0/5。负结果 + 边界条件，比又一个「全面 SOTA」更有用。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 下一次尝试「从哪开始」：四档状态保留</h3>
+    <table>
+      <thead><tr><th>恢复原语（论文 Fig.1）</th><th>保留什么</th><th>丢什么</th><th>典型实现</th></tr></thead>
+      <tbody>
+        <tr><td>(a) Retry from scratch</td><td>原始仓库</td><td>全部进度</td><td>独立重试 / best-of-N</td></tr>
+        <tr><td>(b) Text + git patch</td><td>笔记、反思、源码 diff</td><td>未跟踪文件、包、服务、DB</td><td>Reflexion、memory、commit 级搜索</td></tr>
+        <tr><td>(c) Filesystem checkpoint</td><td>磁盘上的文件</td><td>进程状态、运行中服务</td><td>overlay / volume 快照</td></tr>
+        <tr><td><strong>(d) Full sandbox snapshot</strong></td><td>整台活机器：文件、依赖、进程状态、数据库、产物</td><td>agent 的<strong>认知</strong>（上下文）</td><td>Daytona 快照（本文研究对象）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      注意 (d) 那一格的「丢什么」：快照冻结的是机器，不是 agent 的理解。这是后面 handoff cost 的根源，也是它与上下文侧工作（<a href="daily-2026-09-07-harness-compaction.html">Compaction</a>、<a href="daily-2026-10-08-harness-refold.html">ReFold</a>、<a href="daily-2026-10-12-harness-agent-forgetting.html">Forgetting</a>）互补而非替代的原因——那些管「脑子里装什么」，这篇管「机器停在哪」。
+    </p>
+
+    <h3>② Go-Explore over sandboxes：选 → 回 → 探 → 存</h3>
+    <pre><code># 论文 §4.1 / Fig.2（简化）
+archive = []
+root = run_agent(initial_sandbox, budget=b_root)
+  # 运行中在「有用进度」后周期性快照：编辑文件后、跑测试后……
+  archive += snapshots(root)            # 每个快照 = 整台 Daytona sandbox
+for child in 1..N_children:
+    s = select(archive)                 # 按简单信号排序：文件编辑、测试活动
+    sb = restore(s)                     # Go-Explore 的 "go to state"
+    traj = run_agent(sb, fresh_context, budget=b_child)
+                                        # 继承机器状态，但 agent 上下文是全新的
+    if verifier(traj): return success
+    archive += snapshots(traj)
+
+# 对照：independent retry —— 同一模型、同一总 token 预算，所有尝试都从初始状态开始</code></pre>
+    <table>
+      <thead><tr><th>实验设置（§4.2）</th><th>取值</th></tr></thead>
+      <tbody>
+        <tr><td>模型</td><td>Claude Haiku 4.5（刻意选低成本档，贴近大规模 rollout 的实际）</td></tr>
+        <tr><td>Benchmark / 运行框架</td><td>Terminal-Bench 2.0，经 Harbor 与 Daytona 运行</td></tr>
+        <tr><td>任务</td><td>5 个「单次尝试中等难度」任务，<strong>预注册</strong>（比较前固定任务与协议）</td></tr>
+        <tr><td>预算</td><td>每 seed 共 1,000,000 token，5 seed / 任务</td></tr>
+        <tr><td>Retry</td><td>3 次独立新尝试</td></tr>
+        <tr><td>Snapshot search</td><td>1 条 root 轨迹 + 至多 2 个从快照恢复的 child</td></tr>
+      </tbody>
+    </table>
+
+    <h3>③ Headline：同预算下 retry 赢</h3>
+    <table>
+      <thead><tr><th>任务（Table 1）</th><th>Retry</th><th>Snapshot branching</th></tr></thead>
+      <tbody>
+        <tr><td>git-multibranch</td><td>5/5</td><td>1/5</td></tr>
+        <tr><td>extract-elf</td><td>4/5</td><td>3/5</td></tr>
+        <tr><td>custom-memory-heap-crash</td><td>3/5</td><td>1/5</td></tr>
+        <tr><td>code-from-image</td><td>3/5</td><td>1/5</td></tr>
+        <tr><td>large-scale-text-editing</td><td>2/5</td><td>0/5</td></tr>
+        <tr><td><strong>合计</strong></td><td><strong>17/25（68%）</strong></td><td><strong>6/25（24%）</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      但快照并非没恢复出有用计算：有 4 次 root 失败、而从该 root 恢复的 child 后来成功（3 次在 extract-elf、1 次在 custom-memory-heap-crash）。专门测「从失败 root 救回」的后续实验里，extract-elf 上快照分支救回 67% 的失败 root，高于该任务独立重试 38% 的总成功率；regex-log 上只有 13%。结论是：有用中间态存在时分支能救，但在这些任务上这种中间态<strong>不够常见</strong>，摊不平预算拆分的损失。
+    </p>
+
+    <h3>④ 边界：进度在不在仓库里</h3>
+    <p>
+      §6 对比「保存同一段中间进度」的不同方式。extract-elf 这种几乎全靠文件的任务，从 git diff 或重放命令恢复的 child 4/4 seed 成功，整机快照的 child 反而常常耗尽预算——进度已经在仓库里，恢复整机不加分。
+    </p>
+    <p>
+      反过来，作者构造了 <code>staged-service-repair</code>：verifier 要求 <code>/var/lib/inventory/store.db</code>（SQLite）存在且正确，这是 git 永远不跟踪的状态。中途冻结快照，剩余预算统一 200,000 token：
+    </p>
+    <table>
+      <thead><tr><th>下一个 agent 从哪开始</th><th>成功</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr><td>Clean restart</td><td>0/5</td><td>消耗明显更多 token 仍失败</td></tr>
+        <tr><td>Git diff applied（无 DB）</td><td>0/5</td><td>有一次耗尽 200k 预算</td></tr>
+        <tr><td><strong>Full snapshot restore</strong></td><td><strong>4/5</strong></td><td>成功的用 21k–41k token</td></tr>
+      </tbody>
+    </table>
+    <p>
+      唯一失败的快照 seed 不是恢复失败：数据库在，agent 读了剩余 migration、启了 HTTP server，却没应用那条 migration 就宣布完成。<strong>恢复到正确机器状态的新 agent，仍然得自己发现「还剩什么没做」。</strong>
+    </p>
+
+    <h3>⑤ 为什么快照搜索在文件型任务上输：四种失败模式（§7）</h3>
+    <table>
+      <thead><tr><th>失败模式</th><th>现象</th><th>论文给的方向</th></tr></thead>
+      <tbody>
+        <tr><td>Budget fragmentation</td><td>root 与 child 分一份预算；弱 root → 弱 archive，短命 child 修到一半没预算</td><td>自适应 / 学习式预算分配（现为均匀分配）</td></tr>
+        <tr><td>Wrong-state attractors</td><td>恢复忠实地保留错误；child 围着「看似合理但错误」的实现继续改，不回头</td><td>状态质量评估、多样性机制、检测并逃离错误吸引子</td></tr>
+        <tr><td>Handoff cost</td><td>child 拿到机器，没拿到父 agent 的理解；一例中 child 用约 190,000 token / 26 步，成功的新 retry 只用约 90,000 token / 11 步</td><td>状态摘要、环境文档、显式 handoff 协议</td></tr>
+        <tr><td>Weak state selection</td><td>文件编辑、命令成功、局部测试通过都是弱代理；早期 selector 曾把「装好包」「声称完成」当强进度</td><td>学习式选择、任务进度指标、verifier 反馈；或像 Intelligent Go-Explore 用基础模型选状态</td></tr>
+      </tbody>
+    </table>
+    <p>
+      作者的一句总结值得抄下来：<strong>snapshotting 解决了 state-restoration，没解决 state-selection；环境级搜索两者都要。</strong>
+    </p>
+
+    <h2>放进 harness 设计的坐标系</h2>
+    <p>
+      从 harness 角度看，这篇其实在讨论「sandbox 原语」该暴露什么。<a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> 的 Workspace 工厂、<a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> 的无状态 subprocess，默认都把 sandbox 当一次性的；RL 训练框架里的环境 reset 也是。快照 / restore 若成为一等原语，harness 就能做「从中间态分叉」，而这正是 Go-Explore 在 Atari 上奏效的关键（Ecoffet et al. 2021 的 first return, then explore）。
+    </p>
+    <p>
+      但 Atari 的 cell 是紧凑状态，编码 sandbox 是一台活机器：可能带着错误的半成品，下一个 agent 不知道它怎么来的，回访还要花 token。这和 <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a> 的老问题同构——<strong>存什么不难，挑什么回放才难</strong>；也和 <a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a> 的预算问题同构：root 与 child 的预算切分本身就是一个需要闭环的旋钮。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先判断进度住在哪里。</strong> 文件型任务（多数 SWE / Terminal-Bench 题）用 git diff / 命令重放做 checkpoint 就够，便宜且不吃亏；任务涉及数据库、服务、迁移、包安装等仓库外状态时，再上整机快照。</li>
+      <li><strong>快照恢复必须配 handoff。</strong> 只给机器不给理解，child 可能比新 retry 更贵。最低限度：父 agent 退出前写一份「已做 / 未做 / 如何跑测试」的状态摘要随快照存，思路与 <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> 清窗后重注目标一致：新上下文必须被显式喂回「目标与进度」。</li>
+      <li><strong>不要用「活动量」选快照。</strong> 编辑数、命令成功率、「声称完成」都会选出吸引子。能拿到 verifier 部分信号（子测试通过数）时优先用；否则给 archive 加多样性约束，别总从同一个 root 分叉。</li>
+      <li><strong>预算分配别均分。</strong> 至少保证 child 拿到足以完成一次修复的预算；root 弱时宁可回退到独立重试。</li>
+      <li><strong>比较要同预算、预注册。</strong> 本文的可信度很大程度来自 matched budget + 预注册任务集；自己做 test-time 搜索消融时照抄这个协议，并把 best-of-N judging、SWE-Search 一类更强基线加上（作者自认未比）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么在 1M token 的固定预算下，snapshot branching 即使能「救回」失败 root，总成功率仍远低于独立重试？</summary>
+      <p>预算被拆成 root + 至多 2 个 child：child 的有效预算比一次完整 retry 小，而且还要为 handoff 付「重新理解环境」的 token。只有当失败 root 里常常存在「离成功很近且方向正确」的中间态时，拆分才划算；在文件型任务上，这种中间态不常见，且 retry 的多次独立机会本身就提供了多样性。</p>
+    </details>
+    <details>
+      <summary>2. 「wrong-state attractor」与 RL 里的什么现象类似？有哪些缓解思路？</summary>
+      <p>类似从错误 replay 状态反复 bootstrap 造成的确认偏差，或搜索中在局部最优附近反复展开。缓解：在 archive 中保留多样的 cell（按状态特征去重而非只按得分）；为 child 注入「重新审视既有实现」的提示；以概率回到初始状态做独立重试；用 verifier 的部分信号而非活动量来评估状态。</p>
+    </details>
+    <details>
+      <summary>3. staged-service-repair 里 git diff 恢复为何 0/5？这说明 checkpoint 设计应该如何分层？</summary>
+      <p>verifier 依赖 /var/lib/inventory/store.db，git 不跟踪它，diff 恢复后 DB 不存在或不正确，agent 必须重建数据状态，200k 预算内做不完。分层建议：源码层用 diff（便宜、可审计），数据/服务层用卷或整机快照，按任务声明的状态位置选择；harness 最好能显式枚举「仓库外可变状态」（数据库路径、服务、已装包）。</p>
+    </details>
+    <details>
+      <summary>4. 唯一失败的快照 seed 说明了什么？harness 可以怎样补？</summary>
+      <p>说明机器状态正确 ≠ 任务状态被理解：新 agent 读到了剩余 migration 却没执行就宣布完成。补法：快照附带结构化的「未完成清单」；在 agent 声称完成前强制跑 verifier 或其代理检查（如 migration 状态查询）；把「声称完成」从进度信号里剔除——论文的 selector 早期恰恰错把它当强证据。</p>
+    </details>
+    <details>
+      <summary>5. 若把整机快照用在 Agentic RL 训练（而不是推理时搜索）里，能带来什么？要警惕什么？</summary>
+      <p>（开放题）可以从中间态开始 rollout，做 Go-Explore 式的「回到难点再练」、降低长程任务的 credit assignment 难度，也能减少重复 setup 的环境开销。警惕：从快照起步的轨迹不再服从「从初始状态出发」的策略分布，训练目标需要明确是条件于起始状态的；快照选择本身是一个会被利用的课程（偏向容易状态）；快照存储与恢复的 I/O 成本会进入 rollout 吞吐账，需要和 sandbox 池化方案一起评估。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.13841" target="_blank" rel="noopener">arXiv:2610.13841 · Returning to Development States: When Full Sandbox Snapshots Help Coding Agents</a></li>
+      <li>Ecoffet, A., Huizinga, J., Lehman, J., Stanley, K. O., Clune, J. (2021). First return, then explore. <em>Nature</em> 590:580–586. <a href="https://doi.org/10.1038/s41586-020-03157-9" target="_blank" rel="noopener">doi:10.1038/s41586-020-03157-9</a></li>
+      <li><a href="https://arxiv.org/abs/2405.15143" target="_blank" rel="noopener">arXiv:2405.15143 · Intelligent Go-Explore（Lu, Hu, Clune）</a></li>
+      <li><a href="https://arxiv.org/abs/2410.20285" target="_blank" rel="noopener">arXiv:2410.20285 · SWE-Search</a> · <a href="https://arxiv.org/abs/2501.14723" target="_blank" rel="noopener">arXiv:2501.14723 · CodeMonkeys</a> · <a href="https://arxiv.org/abs/2303.11366" target="_blank" rel="noopener">arXiv:2303.11366 · Reflexion</a></li>
+      <li>站内：
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1 SDK</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-10-08-harness-refold.html">ReFold</a> ·
+        <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> ·
+        <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a> ·
+        <a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a> ·
+        <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

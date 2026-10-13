@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 0,
   "daily_streams": [
     "frontline",
     "harness",
@@ -690,6 +690,27 @@
       "source": "algo",
       "topic": "Experience Replay：Lin 1992 / DQN circular buffer；打破时间相关、off-policy 复用；PER / SIL / Rolnick continual；对照 Re:Max 按 mode 均匀 vs 按 discovery 频率",
       "file": "posts/daily-2026-10-12-algo-experience-replay.html"
+    },
+    {
+      "date": "2026-10-13",
+      "domain": "rl infra",
+      "source": "frontline",
+      "topic": "S³R：同参数稀疏注意力 self-drafting + 全注意力验证 + 精确 speculative sampling，保持 dense response-group 分布；证明 GRPO 下 response 级精确 IS 仍有残差（同伴分布）；break-even α_BE 与 KV-aware AIMD 调度；Qwen3-1.7B/8B 训练吞吐 1.39×/1.35×（He et al. HKUST-GZ arXiv:2610.13202）",
+      "file": "posts/daily-2026-10-13-s3r.html"
+    },
+    {
+      "date": "2026-10-13",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Full Sandbox Snapshots：Go-Explore over Daytona 整机快照；Terminal-Bench 2.0 预注册 5 任务×5 seed、1M token，retry 17/25 vs 分支 6/25；staged-service-repair（SQLite 在 git 外）快照 4/5 vs git diff 0/5；四失败模式 budget fragmentation / wrong-state attractor / handoff cost / weak selection（Graviet & Shah arXiv:2610.13841）",
+      "file": "posts/daily-2026-10-13-harness-sandbox-snapshots.html"
+    },
+    {
+      "date": "2026-10-13",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "RoPE：二维旋转分块对角、qᵀR_{n−m}k 相对性、θ_i=10000^(−2(i−1)/d)、波长/频谱视角、long-term decay、线性注意力兼容；PI（m·L/L′）/ NTK-aware（b′=b·s^{|D|/(|D|−2)}）/ NTK-by-parts（α=1, β=32）/ YaRN 温度 √(1/t)=0.1 ln s+1 / Dynamic Scaling；DeepSeek-V2 decoupled RoPE + YaRN s=40（arXiv:2104.09864 / 2306.15595 / 2309.00071 / 2405.04434）",
+      "file": "posts/daily-2026-10-13-algo-rope.html"
     }
   ]
 }

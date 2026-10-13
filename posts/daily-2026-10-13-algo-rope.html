@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜RoPE：用旋转把绝对位置写进 q/k、让点积只剩相对距离——频谱视角、长度外推失败，以及 PI / NTK-aware / YaRN 怎样扩上下文 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜RoPE：用旋转把绝对位置写进 q/k、让点积只剩相对距离——频谱视角、长度外推失败，以及 PI / NTK-aware / YaRN 怎样扩上下文</h1>
+    <p class="post-meta">2026-10-13 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Jianlin Su、Yu Lu、Shengfeng Pan、Ahmed Murtadha、Bo Wen、Yunfeng Liu ·
+      <em>RoFormer: Enhanced Transformer with Rotary Position Embedding</em>
+      · <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">arXiv:2104.09864</a>；
+      Shouyuan Chen、Sherman Wong、Liangjian Chen、Yuandong Tian · <em>Extending Context Window of Large Language Models via Positional Interpolation</em>
+      · <a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener">arXiv:2306.15595</a>；
+      Bowen Peng、Jeffrey Quesnelle、Honglu Fan、Enrico Shippole · <em>YaRN: Efficient Context Window Extension of Large Language Models</em>
+      · <a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">arXiv:2309.00071</a>；
+      工程案例：DeepSeek-V2 · <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">arXiv:2405.04434</a>（decoupled RoPE + YaRN）。
+      交叉：
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a>、
+      <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-09-algo-attention.html">Scaled dot-product attention</a> 本身对 token 顺序是置换等变的：打乱输入，输出只是跟着打乱。位置信息必须另外注入。早期两条路线：<strong>加性绝对位置</strong>（Vaswani et al. 的 sinusoidal <code>p_{k,2t} = sin(k/10000^{2t/d})</code>，或 BERT / GPT 的可学习位置向量）加到输入上；<strong>相对位置</strong>（Shaw et al.、T5 bias 等）在 attention logit 里加一项与 m−n 有关的偏置。前者对长度外推不友好，后者要改 attention 计算本身。
+    </p>
+    <p>
+      RoPE（Rotary Position Embedding，Su et al. 2021）走了第三条路：<strong>乘性</strong>。把 q、k 的每两维看成一个复数 / 二维平面，按位置 m 旋转角度 m·θ_i。旋转矩阵正交，于是 <code>⟨R_m q, R_n k⟩ = qᵀ R_{n−m} k</code>——绝对位置写进向量，点积里只剩相对距离。今天几乎所有开源 LLM 都用它；随之而来的「训练 4K、推理 128K」问题，又催生了 PI、NTK-aware、YaRN 这一串上下文扩展方法。本文把这条线串起来。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 定义：二维旋转的分块对角</h3>
+    <pre><code># RoFormer 式 (14)(15)：d 维向量拆成 d/2 对，第 i 对用频率 θ_i
+θ_i = 10000^(−2(i−1)/d),   i = 1 … d/2
+
+f(x, m) = R_{Θ,m} · W x,   R_{Θ,m} = blockdiag( [[cos mθ_i, −sin mθ_i],
+                                                [sin mθ_i,  cos mθ_i]] )_{i=1..d/2}
+
+# 关键性质（RoFormer 式 (16)）
+q_mᵀ k_n = (R_m W_q x_m)ᵀ (R_n W_k x_n) = x_mᵀ W_qᵀ R_{n−m} W_k x_n
+# R 正交 ⇒ 范数不变；点积只依赖 n − m</code></pre>
+    <p>
+      直接做稀疏矩阵乘不划算，论文给了逐元素实现：<code>x ⊙ cos(mθ) + rotate(x) ⊙ sin(mθ)</code>。下面是能跑的 numpy 版本（相邻两维成对，即论文原式；在 box 上实测：同一相对距离 7 下，位置 (3,10)、(103,110)、(5003,5010) 的点积完全相同，范数旋转前后一致）：
+    </p>
+    <pre><code>import numpy as np
+def rope(x, pos, base=10000.0):
+    d = x.shape[-1]
+    theta = base ** (-np.arange(0, d, 2) / d)      # θ_i
+    ang = pos[:, None] * theta[None, :]            # [T, d/2]
+    cos, sin = np.cos(ang), np.sin(ang)
+    x1, x2 = x[..., 0::2], x[..., 1::2]            # interleaved 配对
+    out = np.empty_like(x)
+    out[..., 0::2] = x1 * cos - x2 * sin
+    out[..., 1::2] = x1 * sin + x2 * cos
+    return out
+# 只作用于 q、k（每个 head 内、投影之后），不作用于 v</code></pre>
+    <p>
+      工程上要注意<strong>配对布局</strong>：论文是相邻两维 (0,1)(2,3)… 成对；很多实现（GPT-NeoX / Hugging Face Llama 系的 <code>rotate_half</code>）是前半与后半成对 (i, i+d/2)。两者数学等价但权重不可互换——转换 checkpoint 时要对 W_q / W_k 的行做置换，否则模型看似能跑、输出全乱。
+    </p>
+
+    <h3>② 频谱视角：每对维度是一个「时钟」</h3>
+    <p>
+      第 i 对维度以角速度 θ_i 旋转，YaRN 把它写成波长 <code>λ_d = 2π / θ_d = 2π · b^{2d/|D|}</code>（b=10000）：转一整圈需要多少 token。以 head 维 128 为例（自算）：最快的一对波长 2π ≈ 6.3 token，最慢的一对约 54,410 token。
+    </p>
+    <table>
+      <thead><tr><th>维度区段</th><th>波长 vs 训练长度 L</th><th>编码的是什么</th><th>外推到 L′&gt;L 时</th></tr></thead>
+      <tbody>
+        <tr><td>高频（i 小）</td><td>λ ≪ L，训练中转过很多圈</td><td>局部、相对的细粒度位置</td><td>角度早已「见过所有相位」，基本安全</td></tr>
+        <tr><td>中频</td><td>λ 与 L 同量级</td><td>中程距离</td><td>部分相位没见过</td></tr>
+        <tr><td>低频（i 大）</td><td>λ &gt; L，训练中连一圈都没转完</td><td>近似「绝对位置」</td><td><strong>出现从未见过的角度</strong>，注意力分数失控</td></tr>
+      </tbody>
+    </table>
+    <p>
+      按 YaRN 的比值 <code>r(d) = L / λ_d</code> 自算：head 维 128、L=4096 时，有 18 对维度 r&lt;1（一圈都没转完），21 对 r&gt;32。外推失败主要来自前者——这为后面「分频段处理」埋下伏笔。RoFormer 还证明了该 θ 设置带来 <strong>long-term decay</strong>：相对距离增大时内积上界衰减，符合「远处 token 关联更弱」的直觉。
+    </p>
+
+    <h3>③ 另外两个常被忽略的性质</h3>
+    <ul>
+      <li><strong>兼容线性注意力：</strong>旋转不改范数，RoFormer 把旋转乘在线性注意力的非负特征映射 ϕ(q)、φ(k) 之后（只作用于分子），从而给 linear attention 也配上相对位置。</li>
+      <li><strong>与低秩 KV 压缩冲突：</strong>DeepSeek-V2 的 MLA 想在推理时把 W^{UK} 吸收进 W^Q，但 RoPE 的位置相关旋转矩阵夹在两者之间，矩阵乘不交换，吸收不成立，只能对所有前缀重算 key。DeepSeek-V2 的解法是 <strong>decoupled RoPE</strong>：另用一组多头 query 与一个共享 key 专门承载 RoPE，其余维度走无位置的压缩路径。</li>
+    </ul>
+
+    <h3>④ 上下文扩展：同一个框架下的四种改法</h3>
+    <p>
+      YaRN 把各方法统一成修改 RoPE 的两个函数：位置映射 <code>g(m)</code> 与频率映射 <code>h(θ_d)</code>，扩展倍数 <code>s = L′/L</code>。
+    </p>
+    <table>
+      <thead><tr><th>方法</th><th>g(m)</th><th>h(θ_d)</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr><td>直接外推</td><td>m</td><td>θ_d</td><td>不改；低频维度遇到没见过的角度</td></tr>
+        <tr><td><strong>PI</strong>（Chen et al. 2023）</td><td>m / s（即 m·L/L′）</td><td>θ_d</td><td>把 [0, L′) 线性压回 [0, L)：只内插不外推，但高频维度也被压扁，局部分辨率下降</td></tr>
+        <tr><td><strong>NTK-aware</strong>（bloc97）</td><td>m</td><td>b′^{−2d/|D|}，<code>b′ = b · s^{|D|/(|D|−2)}</code></td><td>改 base：高频几乎不动、最低频恰好被压 s 倍——插值量随频率连续分摊</td></tr>
+        <tr><td><strong>NTK-by-parts</strong></td><td>m</td><td><code>(1−γ(r))·θ_d/s + γ(r)·θ_d</code></td><td>按 r(d) 分段：r&lt;α 全部内插（同 PI），r&gt;β 完全不动，中间线性 ramp；Llama 系推荐 α=1、β=32</td></tr>
+        <tr><td><strong>YaRN</strong></td><td>m</td><td>同 NTK-by-parts</td><td>再加 attention 温度：<code>softmax(q·k / (t·√|D|))</code>，Llama 推荐 <code>√(1/t) = 0.1·ln(s) + 1</code></td></tr>
+      </tbody>
+    </table>
+    <pre><code># YaRN 的温度可以「零开销」实现：把 q、k 都乘 √(1/t)
+# 等价于直接缩放预计算好的 cos/sin 表，不改 attention kernel（兼容 FlashAttention 2）
+s = 16  →  √(1/t) = 0.1·ln16 + 1 ≈ 1.277      # 自算
+s = 32  →  √(1/t) ≈ 1.347
+
+# Dynamic Scaling（Dynamic NTK）：推理时每次前向按当前长度 l′ 取
+s = max(1, l′ / L)
+# 短序列时完全不扩展，长了才逐步插值；免微调即可外推
+# 代价：s 随长度变 ⇒ 每个 token 的 RoPE 都会变 ⇒ KV cache 要存「RoPE 之前」的 k（YaRN §3.4 提醒）</code></pre>
+
+    <h3>⑤ 这些方法的效果（均为原论文自报）</h3>
+    <ul>
+      <li><strong>PI：</strong>LLaMA 7B–65B 扩到最长 32768，微调在 1000 步以内；理论上内插的上界比外推「至少小约 600 倍」（LLaMA 7B 设定）。对照的直接微调外推：训练超过 10000 步，有效上下文只从 2048 涨到 2560。</li>
+      <li><strong>YaRN：</strong>相比此前方法所需 token 少 10×、训练步数少 2.5×，微调数据不到原预训练的约 0.1%。Llama 2 7B / 13B 用 s=16 在 PG19 64k 切块上训 400 步（global batch 64，lr 2×10⁻⁵，AdamW β=(0.9, 0.95)，20 步线性 warmup）；s=32 从 s=16 的 checkpoint 再训 200 步，仍用 64k 数据，却能外推到 128k。</li>
+      <li><strong>工业落地（DeepSeek-V2）：</strong>预训练后用 YaRN 把上下文从 4K 扩到 128K，YaRN 只作用于承载 RoPE 的 decoupled shared key；s=40、α=1、β=32，目标最大长度 160K；因注意力结构不同，温度改成 <code>√t = 0.0707·ln s + 1</code>；再以 32K 序列、batch 576 训 1000 步。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>转 checkpoint 先核对配对布局与 base。</strong> interleaved vs rotate_half、rope base（config 里常叫 <code>rope_theta</code>）、是否 partial rotary——任一不一致都不会报错，只会悄悄掉点。用「同相对距离点积相等」这种单元测试兜底。</li>
+      <li><strong>cos/sin 表用 fp32 生成。</strong> 位置 m 很大时 m·θ_i 是大数，低精度下角度误差会被放大；预计算表通常也只占很小显存。</li>
+      <li><strong>扩上下文的默认顺序：</strong>免训练先试 Dynamic NTK / Dynamic-YaRN；有少量长文本预算就做 YaRN（NTK-by-parts + 温度）微调；PI 简单但会牺牲高频分辨率，短文本质量可能受损，需回测原窗口内的任务。</li>
+      <li><strong>KV cache 与 RoPE 的耦合要想清楚。</strong> 主流实现缓存已旋转的 k；一旦 scale 随长度动态变化、或要做非前缀 KV 复用（把一段 KV 挪到新位置），就需要缓存旋转前的 k 或对已缓存 k 再旋转一次 Δ 角度（旋转可合成：R_{a}R_{b}=R_{a+b}）。见 <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a>。</li>
+      <li><strong>和 kernel 融合。</strong> RoPE 是逐元素的，适合融合进 QKV 投影之后、<a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> 之前的同一个 kernel，避免单独一趟 HBM 读写；YaRN 温度直接折进 cos/sin 表即可，不必改 attention kernel。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 RoPE 是「用绝对位置实现相对位置」？写出关键一步。</summary>
+      <p>q 在位置 m 被旋转 R_m，k 在位置 n 被旋转 R_n，二者各自只依赖自己的绝对位置；点积 (R_m q)ᵀ(R_n k) = qᵀ R_mᵀ R_n k = qᵀ R_{n−m} k，因为二维旋转满足 R_mᵀ = R_{−m} 且 R_a R_b = R_{a+b}。所以 attention logit 只依赖 n−m，而编码时无需维护 m×n 的相对位置表。</p>
+    </details>
+    <details>
+      <summary>2. 为什么 RoPE 不作用于 v？如果也旋转 v 会怎样？</summary>
+      <p>位置信息只需要影响「谁关注谁」（logit），输出聚合的内容不该依赖源 token 的绝对位置。若旋转 v，输出 Σ a_{mn} R_n v_n 中混入了与源位置 n 相关的旋转，下游层收到的是被绝对位置扭过的内容向量，破坏了只依赖相对位置的性质，也会让相同内容在不同位置的表示不一致。</p>
+    </details>
+    <details>
+      <summary>3. PI 压缩所有频率，NTK-aware 改 base，NTK-by-parts 分段——它们各自在保护什么？</summary>
+      <p>PI 保护「不出现没见过的角度」，代价是高频维度也被压 s 倍，相邻 token 的角度差变小、局部分辨率下降。NTK-aware 通过 b′ = b·s^{|D|/(|D|−2)} 让最高频几乎不变、最低频恰好被压 s 倍，保护局部分辨率。NTK-by-parts 进一步按 r(d)=L/λ_d 显式划线：训练中已转过很多圈（r&gt;β）的维度完全不动，连一圈都没转完（r&lt;α）的维度全额内插，中间平滑过渡。</p>
+    </details>
+    <details>
+      <summary>4. YaRN 的温度 t 为什么能用「同时缩放 q、k」实现？缩放因子是多少？</summary>
+      <p>softmax(qᵀk/(t√|D|)) 中的 1/t 可以拆成 (√(1/t)·q)ᵀ(√(1/t)·k)。RoPE 已经把 q、k 乘了 cos/sin 表，把表整体乘 √(1/t) 就同时完成了旋转与缩放，推理和训练都零额外开销，也无需修改 FlashAttention 一类 kernel。Llama 推荐 √(1/t) = 0.1·ln(s)+1；DeepSeek-V2 因 MLA 结构不同改用 0.0707·ln s + 1。</p>
+    </details>
+    <details>
+      <summary>5. Dynamic NTK 让 s 随当前长度变化，这对 PagedAttention / prefix caching 意味着什么？</summary>
+      <p>若缓存的是已旋转的 k，s 变化后旧 k 的旋转角度就「过期」了，严格做法是缓存旋转前的 k、每步按新 s 重新旋转（YaRN §3.4 的提醒），这会增加带宽与计算；prefix cache 的命中也要把 s（或长度桶）纳入 key，否则不同长度请求共享的前缀 KV 不一致。工程折中通常是固定 s（按目标最大长度一次性设定），以牺牲短序列上的少量精度换取缓存简单。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">arXiv:2104.09864 · RoFormer: Enhanced Transformer with Rotary Position Embedding</a></li>
+      <li><a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener">arXiv:2306.15595 · Extending Context Window of Large Language Models via Positional Interpolation</a></li>
+      <li><a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">arXiv:2309.00071 · YaRN: Efficient Context Window Extension of Large Language Models</a></li>
+      <li><a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">arXiv:2405.04434 · DeepSeek-V2（§2.1.3 Decoupled RoPE，§3.1.4 Long Context Extension）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-09-algo-attention.html">Attention</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a> ·
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

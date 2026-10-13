@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜S³R：拿策略自己的稀疏注意力当 drafter、全注意力精确验证——RLVR rollout 提速 1.35–1.39×，GRPO 的 response group 分布一点不变 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜S³R：拿策略自己的稀疏注意力当 drafter、全注意力精确验证——RLVR rollout 提速 1.35–1.39×，GRPO 的 response group 分布一点不变</h1>
+    <p class="post-meta">2026-10-13 · 收藏夹：RL / Infra · 一线追踪<br />
+      论文：Yuhang He、Hongyu Ge、Zihan Lin、Siyi Liu、Yongqi Zhang（The Hong Kong University of Science and Technology (Guangzhou)） ·
+      <em>S³R: Fast and Faithful RL Rollouts via Self-Sparse Speculative Decoding</em>
+      · <a href="https://arxiv.org/abs/2610.13202" target="_blank" rel="noopener">arXiv:2610.13202</a>（cs.LG，v1，2026-10-09 提交）。
+      文中所有数字均为<strong>论文自报</strong>（单节点 8×H100、veRL、Qwen3-1.7B / 8B）。
+      交叉：
+      <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、
+      <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a>、
+      <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长上下文 RLVR 的 step 时间大头在 rollout：GRPO 每个 prompt 采一组 G 条长响应，自回归解码一步步读越来越长的 KV cache。论文 profile 的 RLVR workload 里，<strong>attention 占自回归解码 kernel 时间的 72–76%</strong>（自报，Fig.1a）——瓶颈是读 KV，而不是 FFN。
+    </p>
+    <p>
+      最自然的提速是稀疏注意力 / KV 压缩：每步只读一部分历史 KV。但直接用稀疏策略采样，<strong>behavior policy 就变了</strong>。已有做法（论文引的 Luo et al. 2026）在训练侧做过滤 + token 级重要性重加权来补偿。S³R 的出发点是一个对 GRPO 特有的观察：<strong>即使用精确的 response 级似然比重加权，也不能恢复 dense 策略下的期望更新</strong>——因为一条响应的 advantage 依赖组内其他响应的 reward，而那些「同伴」仍是从稀疏分布采出来的。
+    </p>
+    <p>
+      结论是把稀疏性关进「提案」里：稀疏注意力只负责猜 token，最终由全注意力 + 精确 speculative sampling 决定输出。drafter 与 verifier 是<strong>同一套策略参数</strong>，所以没有「drafter 随策略更新变 stale」的问题——这正是 RL 场景里外挂 EAGLE 一类 drafter 最头疼的地方。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 为什么训练侧修正不够：group-relative advantage 的「同伴」问题</h3>
+    <pre><code># 记号（论文 §3）
+P(o|x)   = π_dense_θold(o|x)       # dense 快照下整条响应的概率
+Q_s(o|x) = π_sparse_θold,s(o|x)    # 同一参数、稀疏预算 s 下的概率
+token 级 IS 比 = [π_θ / π_dense] × [π_dense / π_sparse]
+               =   w(θ) 标准策略更新  ×   w_s 稀疏性引入的失配
+
+# 以 G=2 为例，GRPO 里响应 u 的更新贡献 ∝ A(u, v) · ∇log π_θ(u)，v 是同组另一条
+dense 期望    : Σ_u Σ_v  P(u) P(v)  A(u,v) ∇log π(u)
+稀疏 + 精确 W : Σ_u Σ_v  Q(u) Q(v)  W(u) A(u,v) ∇log π(u),   W(u) = P(u)/Q(u)
+             = Σ_u P(u) Σ_v Q(v) A(u,v) ∇log π(u)
+#            ↑ u 的分布被修好了，但「同伴」v 仍服从 Q，A(u,v) 的期望没修
+# 论文 Proposition 1；附录 A.2 用三个单 token 响应 a,b,c、reward (0,1,2)、
+# P=(1/3,1/3,1/3)、Q_s=(1/2,1/3,1/6)、W=(2/3,1,2) 给出显式反例</code></pre>
+    <p>
+      这个推导值得记住：在 PPO 式「每条样本独立 advantage」下，response 级 IS 是无偏的；一旦 advantage 是组内归一化（GRPO / <a href="daily-2026-09-24-algo-rloo.html">RLOO</a> 一类 leave-one-out 基线），<strong>修正就得在 group 级做</strong>，而 group 级的精确修正要对同伴分布积分，代价不现实。S³R 干脆不修：保证 group 本身就是 dense 分布采出来的。
+    </p>
+
+    <h3>② 精确采样：稀疏只影响速度，不影响分布</h3>
+    <p>
+      标准 speculative sampling（Leviathan et al. 2023 / Chen et al. 2023，站内 <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> 有完整推导）：草稿 token v 以 <code>min{1, p(v)/q_s(v)}</code> 接受；首个拒绝处丢弃后缀，从残差分布 <code>r_s(v) = [p(v) − q_s(v)]₊ / Σ_u [p(u) − q_s(u)]₊</code> 采一个修正 token。逐位置恢复 dense 条件分布 ⇒ 整条响应服从 P ⇒ G 条独立生成的组服从 <code>∏ P(o^i|x)</code>（论文 Proposition 2）。
+    </p>
+    <p>
+      推论有两条：learner 只需标准比率 <code>w(θ)</code>，不再有 <code>w_s</code>；稀疏预算 s 变成纯粹的<strong>效率旋钮</strong>，可以激进地调到 s=0.05（只保留约 5% 的历史 KV）而不碰学习信号。前提是所有 G 条响应在同一个冻结快照 θ_old 下完成、保持原 group 身份——这也约束了下文的调度器设计。
+    </p>
+
+    <h3>③ Self-sparse drafting 与全注意力验证</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>做法（论文 §4）</th><th>要点</th></tr></thead>
+      <tbody>
+        <tr><td>Prefill</td><td>dense prefill 产出第一个 token；第一个 draft block 用完整 KV</td><td>没有可用的验证注意力分数之前不稀疏</td></tr>
+        <tr><td>选 KV</td><td>每层每 KV head：保留验证边界附近的近期位置 R，其余按上一轮<strong>验证时的注意力分数</strong>取 TopK，凑满 ⌈s·|C|⌉（沿用 Zhao et al. 2025）</td><td>选择信号来自 dense verifier，不另训打分器</td></tr>
+        <tr><td>Draft</td><td>k 步自回归（默认 k=6），历史选择固定，新 token 以 provisional KV 追加；记录每个候选的完整 proposal 分布</td><td>精确采样需要 q_s 的全词表分布</td></tr>
+        <tr><td>Verify</td><td>一次全注意力 causal forward，<strong>在 dense 历史 KV 上重算整个 proposed block 的所有层</strong></td><td>只用 full attention 但复用近似状态也不够</td></tr>
+        <tr><td>Refresh</td><td>用重算的 dense KV 替换 provisional 状态、删掉未接受后缀；平均验证注意力权重得到新分数，刷新 I_ℓ</td><td>drafter 的上下文选择每轮跟着 verifier 更新</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ 什么时候真的快：成本账</h3>
+    <pre><code># 论文式 (5)：每轮 draft k 个、平均每请求产出 τ 个 token（含修正 / bonus）
+T_SD = k·T_q + T_V
+η    = T_p / (T_SD / τ)          # 相对 AR 的加速
+η > 1  ⇔  τ > (k·T_q + T_V) / T_p
+
+# k=6 时的 break-even 接受率（附录式 (23)）
+α_BE = (1/6) · ((6·T_q + T_V)/T_p − 1)
+
+# Qwen3-8B、s=0.05、k=6 实测（附录 Table 7，ms，自报）
+B=16, S=4K  (N_KV=64K) : 7T_p=54.42  draft=40.06  verify=28.06  合计 68.12 → 满接受也亏（α_BE &gt;100%）
+B=16, S=16K (N_KV=256K): 7T_p=88.51  合计 70.48                         → α_BE ≈ 76.2%
+N_KV = 512K 档                                                          → α_BE ≈ 45.5–46.7%</code></pre>
+    <p>
+      要点：self-drafting 省的只是历史 KV 读，<strong>每个 draft 步仍要做全部投影和 FFN</strong>。所以短上下文、小 batch 时它根本赚不回来；只有聚合 KV 体量（B·S）够大、处在 attention-dominated 区间才划算。正文给的另一个数：N_KV ≈ 5.24×10⁵ 时 break-even 的 block efficiency 降到约 3.8 token / 轮。论文也坦白这暴露了「共享权重 drafter」的上限，并建议未来在不利状态回退到 AR。
+    </p>
+
+    <h3>⑤ KV-aware AIMD 调度：dense 验证意味着完整 KV 必须留着</h3>
+    <p>
+      稀疏 drafting 减少了读，但没减少<strong>存</strong>：验证仍要完整历史 KV。长响应一多，GPU 放不下，被 offload 的请求反复换入换出就是 KV thrashing。S³R 用类似 TCP 拥塞控制的 AIMD 调并发上限 C：
+    </p>
+    <pre><code># 附录 B.2 式 (18)，按顺序判断
+if   u_j &lt; u_low:                     C ← C + δ          # KV 利用率低：加性增
+elif u_j &gt; u_high or O_j &gt; O_th:      C ← ⌊β·C⌋          # 利用率高 或 待恢复积压多：乘性减
+else:                                 C ← C
+C ← clip(C, C_min, C_max)
+# u_j = GPU KV 利用率；O_j = 已 offload 到 CPU、等待恢复的暂停请求数
+# 暂停请求优先于新请求恢复；保留 token 与 proposal 状态；不改 group 身份</code></pre>
+    <table>
+      <thead><tr><th>配置（Qwen3-1.7B，10 个 RL step 聚合，自报）</th><th>生成吞吐 tok/s/GPU</th><th>相对 AR</th></tr></thead>
+      <tbody>
+        <tr><td>AR</td><td>3,989.0</td><td>—</td></tr>
+        <tr><td>Recompute-256</td><td>5,894.9</td><td>+47.8%</td></tr>
+        <tr><td>Offload-128 / 160 / 256</td><td>5,411.8 / 5,699.8 / 6,014.9</td><td>+35.7% / +42.9% / +50.8%</td></tr>
+        <tr><td><strong>AIMD（并发在 160–256 间自适应）</strong></td><td><strong>6,362.1</strong></td><td><strong>+59.5%</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      与 Offload-256 相比，AIMD 把 offload 次数从 1,097 降到 59、每千生成 token 搬运页数从 18.0 降到 1.3、峰值 CPU KV 占用从 52,464 页降到 21,358 页。固定低并发（128 / 160）反而更差——说明问题不是「并发太高」，而是「没跟着 KV 压力动态调」。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>设置：</strong>Qwen3-1.7B / 8B，DAPO-MATH-17k，DAPO 变体 GRPO；每批 256 prompt × 8 响应，temperature 1.0；最大响应长度 16K / 24K；veRL 单节点 8×H100；S³R 用 k=6、s=0.05。</li>
+      <li><strong>端到端：</strong>训练吞吐 1.7B 从 2308.6 → 3213.8（<strong>1.39×</strong>），8B 从 964.8 → 1302.6 tok/s/GPU（<strong>1.35×</strong>）；rollout 时间 −38.6% / −33.2%，step 时间 −28.5% / −25.5%。AIME26 pass@1：1.7B 37.2 vs 37.1，8B 65.42 vs 65.42。</li>
+      <li><strong>基线：</strong>N-gram Lookup（τ≈1.3）反而变慢（0.72× / 0.91×）；History Retrieval（RhymeRL 式，τ≈2.0）基本持平；冻结的 EAGLE3 Auxiliary Proposer 1.11× / 1.09×，且接受率随训练下降。S³R 的 τ≈5.5。</li>
+      <li><strong>稳定性：</strong>同为 s=0.05，「直接稀疏采样 + 训练侧过滤与 token 级 IS」在约第 70 步出现梯度范数尖峰并奖励崩坏；S³R 100 步内无此现象。不加任何修正的直接稀疏采样在 s=0.05 早期崩、在 0.7 / 0.8 仍不稳，只有 0.9 相对稳。</li>
+      <li><strong>预算扫描</strong>（8B，step-60 冻结 checkpoint，B=64，初始上下文 8K）：s 从 0.05 升到 0.50，接受率 80.4% → 96.7%，加速却从 1.370× 降到 1.058×；s=0.03 两者都降。接受率高不等于快。</li>
+      <li><strong>策略漂移：</strong>8B 上 S³R 整体接受率相对下降约 5%（后位 draft 下降更多）；中位接受率 78.2%，中位生成时间 0.0630 ms / processed token，为各 speculative 方法最低。</li>
+    </ul>
+
+    <h2>放进 RL 系统的坐标系</h2>
+    <p>
+      站内最近的 RL Infra 文分别在压 learner 气泡（<a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>）、权重同步（<a href="daily-2026-10-08-nemo-dcr.html">NeMo-DCR</a>）和数值失配（FP4 / NVFP4 rollout 一类工作）。S³R 打的是<strong>单条 rollout 的解码成本</strong>，与编排层正交。它和低精度 rollout 的对比最有意思：低精度路线接受「behavior ≠ learner」再在训练侧补；S³R 的立场是 GRPO 下训练侧补不干净，宁可多付一次 dense 验证，也要让 group 分布严格等于 dense。
+    </p>
+    <p>
+      另一个对照是外挂 drafter。RL 中策略每步都在变，冻结 EAGLE 接受率会下滑；在线 co-train drafter 又多一套优化与部署。self-drafting 用「同参数、不同注意力范围」绕开了这件事——代价是每个 draft 步仍是全模型的投影与 FFN，只在长上下文 KV 主导时划算。论文未来工作提到 MoE 与线性注意力扩展，这两类模型 attention 占比不同，账要重算。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先 profile attention 占比。</strong> 72–76% 是论文 workload 的数；若你的响应短、batch 小，或已经是 MLA / 线性注意力，self-sparse drafting 可能根本到不了 break-even。用式 (23) 拿实测 T_q / T_V / T_p 先算 α_BE。</li>
+      <li><strong>GRPO 下慎用「稀疏/低精度采样 + 训练侧 IS」。</strong> 平均 reward 看起来一样不代表更新稳定；同时盯 gradient norm。group-relative advantage 让 response 级修正天然有残差。</li>
+      <li><strong>预算 s 按吞吐调，不按接受率调。</strong> 论文扫描里接受率从 80% 涨到 97%，速度反而掉一截。</li>
+      <li><strong>KV 存储是隐藏成本。</strong> dense verification 要求完整历史 KV 常驻或可恢复；调度器要感知 KV 利用率与恢复积压，固定并发上限两头不讨好。</li>
+      <li><strong>守住 group 完整性。</strong> 若调度器会暂停 / 迁移请求，务必保证同组 G 条都在同一 θ_old 下完成，否则 Proposition 2 的前提就破了，与异步 / partial rollout 方案组合时尤其要查。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么在 PPO（每条样本独立 advantage）下 response 级 IS 足以修正采样失配，而在 GRPO 下不够？</summary>
+      <p>PPO 中样本 u 的贡献只依赖 u 本身（及 critic），E_Q[W(u)·f(u)] = E_P[f(u)]，一个比率就修平。GRPO 中 u 的贡献是 A(u, v₁..v_{G−1})·∇log π(u)，同伴 v 仍从 Q 采样；只乘 W(u) 后期望变成 Σ_u P(u)·E_{v∼Q}[A(u,v)]·∇log π(u)，同伴分布没被修正。要精确修复须对整组乘 ∏W(v_j)，方差随 G 指数级爆炸。</p>
+    </details>
+    <details>
+      <summary>2. S³R 的 drafter 与 verifier 共享参数，相比外挂小 drafter，它省了什么、又付出了什么？</summary>
+      <p>省了：drafter 训练、随策略更新的对齐与部署，以及 RL 中 drafter 变 stale 导致的接受率下降（论文冻结 EAGLE3 的接受率随训练下滑）。付出：每个 draft 步仍跑全模型投影与 FFN，只省历史 KV 读；所以短上下文或小 KV 体量时，即使 100% 接受也亏（Table 7 中 N_KV=64K/128K 档 α_BE &gt;100%）。</p>
+    </details>
+    <details>
+      <summary>3. 为什么验证阶段要在 dense 历史 KV 上重算整个 proposed block，而不是直接复用 draft 时写入的 provisional KV？</summary>
+      <p>draft 时新 token 的 KV 是在稀疏上下文下算出的（更深层的隐状态受上层稀疏注意力影响），与 dense 前向的 KV 不同。若验证复用这些近似状态，得到的 p 就不是 dense 条件分布，精确采样的保证失效；后续 token 也会在被污染的 KV 上继续生成。所以 verifier 必须用 dense 历史并逐层重算该块，再用结果替换 provisional KV。</p>
+    </details>
+    <details>
+      <summary>4. AIMD 里为什么除了 GPU KV 利用率 u，还要看待恢复积压 O？</summary>
+      <p>请求被 offload 到 CPU 后，GPU 利用率可能看起来不高，但已有大量暂停请求等着搬回来；此时若继续加性增并发，新请求会挤占恢复所需的空间，造成反复换入换出。O 捕捉的是「GPU 利用率看不到的未完成需求」，O 超阈值即乘性回退，并让暂停请求优先恢复。</p>
+    </details>
+    <details>
+      <summary>5. 若把 S³R 搬到多轮 Agentic RL（工具返回长 observation、每轮重新 prefill）里，收益会更大还是更小？</summary>
+      <p>（开放题）利：上下文更长，attention 占比可能更高，break-even 更容易达到。弊：工具调用打断解码，单段生成短、draft 轮数少；每轮 observation 插入后需重建 sparse 选择（首块要用完整 KV）；环境等待期间 KV 驻留与 offload 的权衡会和 harness 的 KV 驻留协议（见 <a href="daily-2026-10-07-harness-hear.html">HEAR</a>）纠缠。需要按「每段生成长度 × 上下文长度」分桶重新测 α_BE。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.13202" target="_blank" rel="noopener">arXiv:2610.13202 · S³R: Fast and Faithful RL Rollouts via Self-Sparse Speculative Decoding</a></li>
+      <li><a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">arXiv:2211.17192 · Fast Inference from Transformers via Speculative Decoding（Leviathan et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2302.01318" target="_blank" rel="noopener">arXiv:2302.01318 · Accelerating Large Language Model Decoding with Speculative Sampling（Chen et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-24-algo-rloo.html">RLOO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a> ·
+        <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a> ·
+        <a href="daily-2026-10-08-nemo-dcr.html">NeMo-DCR</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
