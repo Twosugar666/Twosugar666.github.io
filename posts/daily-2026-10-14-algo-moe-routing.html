@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜MoE 路由与负载均衡：Noisy Top-k Gating、Switch 辅助损失 α·N·Σf·P、capacity factor、router z-loss，到 DeepSeek-V3 的无辅助损失偏置 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜MoE 路由与负载均衡：Noisy Top-k Gating、Switch 辅助损失 α·N·Σf·P、capacity factor、router z-loss，到 DeepSeek-V3 的无辅助损失偏置</h1>
+    <p class="post-meta">2026-10-14 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Noam Shazeer et al. · <em>Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer</em>
+      · <a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">arXiv:1701.06538</a>；
+      William Fedus、Barret Zoph、Noam Shazeer · <em>Switch Transformers</em>
+      · <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">arXiv:2101.03961</a>；
+      Barret Zoph et al. · <em>ST-MoE: Designing Stable and Transferable Sparse Expert Models</em>
+      · <a href="https://arxiv.org/abs/2202.08906" target="_blank" rel="noopener">arXiv:2202.08906</a>；
+      DeepSeek-AI · <em>DeepSeek-V3 Technical Report</em>
+      · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437</a>。
+      超参均引自原论文；文中「玩具实验」一节的数字是本文用 numpy 自跑的示意，不代表任何真实模型。
+      交叉：
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a>、
+      <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-14-t1.html">T1（R3 routing replay）</a>、
+      <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a>、
+      <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      MoE（Mixture-of-Experts）层把一个 FFN 换成 N 个并列的 expert FFN，再用一个 router 给每个 token 选 k 个。参数量随 N 涨，每个 token 的计算量只随 k 涨——这就是「大参数、小激活」的来源。站内 <a href="special-2026-08-27-new-models-arch.html">新模型架构全景</a> 里几乎所有旗舰都是 MoE。
+    </p>
+    <p>
+      难点全在 router。它是一个离散选择，梯度只能流过被选中的 expert 的 gate 值；一旦某几个 expert 早期稍好一点，就会被选得更多、训得更好、再被选得更多——<strong>routing collapse</strong>（Shazeer 2017 的原话是 self-reinforcing）。在 expert parallel 部署下，负载不均还直接变成算力浪费和丢 token。所以 MoE 的路由算法其实是三件事的组合：<strong>怎么选（gating）、怎么防偏（balancing）、偏了怎么办（capacity / drop）</strong>，外加一条数值稳定性（z-loss）。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① Noisy Top-k Gating（Shazeer et al. 2017）</h3>
+    <pre><code>G(x)      = Softmax( KeepTopK( H(x), k ) )
+H(x)_i    = (x·W_g)_i + StandardNormal() · Softplus( (x·W_noise)_i )
+KeepTopK(v, k)_i = v_i  若 v_i 在前 k 大；否则 −∞   # softmax 后为 0
+y         = Σ_i G(x)_i · E_i(x)                      # 只算 G 非零的 expert</code></pre>
+    <ul>
+      <li><strong>先 TopK 再 softmax：</strong>只在被选中的 k 个上归一化，未选中的 gate 恰为 0、完全不计算。k&gt;1 时被选中的 gate 对 W_g 有非零梯度——这是 router 能被反向传播训练的原因（k=1 时 Switch 改为用 softmax 概率乘输出来保留梯度）。</li>
+      <li><strong>可学习噪声：</strong>W_noise 控制每个 expert 的噪声幅度，作用是在训练早期打散选择、帮负载均衡（论文附录 A 用它构造了可微的 Load 估计）。</li>
+      <li><strong>两条均衡损失：</strong>Importance(X)=Σ_x G(x)，L_importance = w_importance · CV(Importance)²；以及基于噪声下「被选中概率」的平滑 Load，L_load = w_load · CV(Load)²。CV 是变异系数（std / mean）。论文的实验配置里两者常取 0.1 或 0.01。</li>
+    </ul>
+    <p>
+      为什么要两条？Importance 均衡只保证「gate 权重总和」相等，可能出现某 expert 收到很少的 token 但每个权重很大——Load 才是真正对应计算量的那个量。
+    </p>
+
+    <h3>② Switch Transformer：k=1 + 单一辅助损失 + capacity factor</h3>
+    <pre><code># 每层，N 个 expert，batch B 含 T 个 token
+f_i = (1/T) Σ_{x∈B} 1{ argmax p(x) = i }     # 实际派发比例（不可导）
+P_i = (1/T) Σ_{x∈B} p_i(x)                   # router 概率质量比例（可导）
+loss_aux = α · N · Σ_{i=1..N} f_i · P_i       # α = 1e-2（论文扫 1e-1 ~ 1e-5）
+
+# 均匀路由时 Σ f_i P_i = N·(1/N·1/N) = 1/N，乘 N 后 loss_aux = α，与 N 无关
+
+expert capacity = (tokens per batch / num experts) × capacity factor
+# 超出容量的 token 在本层被丢弃（走残差直通）；论文报告 drop 通常 &lt; 1%
+# 低 capacity factor（1.0、1.25）在它们的实验里表现更好</code></pre>
+    <p>
+      这条损失的巧妙之处：f 不可导，P 可导，二者点积的梯度 ∂loss/∂P_i ∝ f_i——<strong>哪个 expert 实际收到的 token 越多，就越用力压它的 router 概率</strong>。这是一个用「不可导的观测」去加权「可导的代理」的模式，和 straight-through 思路相近。
+    </p>
+
+    <h3>③ ST-MoE：router z-loss 解决数值不稳定</h3>
+    <pre><code>L_z(x) = (1/B) Σ_{i=1..B} ( log Σ_{j=1..N} exp(x_j^{(i)}) )²    # x ∈ R^{B×N} 为 router logits
+L_tot  = L_CE + c_B · L_B + c_z · L_z                            # c_z = 0.001</code></pre>
+    <p>
+      MoE 训练的发散常从 router 开始：logits 一大，exp 在 bfloat16 下舍入误差急剧放大（论文提到 bf16 的舍入误差最多可比 fp32 差 65,536 倍）。z-loss 直接惩罚 logsumexp 的平方，把 logits 拉回小数值区间。论文 Table 4 对比：Adafactor update clipping 也能稳住训练但质量大跌，z-loss 稳住且质量略升。与站内 <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Temperature</a> 一文对照：z-loss 相当于给 router softmax 的「温度尺度」加了一个软约束。
+    </p>
+
+    <h3>④ DeepSeek-V3：无辅助损失的偏置均衡</h3>
+    <pre><code># 亲和度：sigmoid 而非 softmax；选中后再在 Top-K 内归一化
+s_{i,t}  = Sigmoid( u_tᵀ e_i )
+选择:    i ∈ TopK( { s_{j,t} + b_j } , K_r )          # 偏置 b 只参与「选谁」
+g'_{i,t} = s_{i,t}（若被选中）否则 0                   # gate 值仍来自原始 s，不含 b
+g_{i,t}  = g'_{i,t} / Σ_j g'_{j,t}
+
+# 每个训练 step 结束，按整个 batch 的负载：
+b_i ← b_i − γ   若 expert i 过载
+b_i ← b_i + γ   若 expert i 欠载
+# γ = 0.001（前 14.3T token），最后 500B token 设为 0
+
+# 补充的序列级均衡损失（防止单条序列内极端失衡）
+L_Bal = α Σ_i f_i P_i,   f_i = N_r/(K_r·T) Σ_t 1{i ∈ TopK(s_t)},   P_i = (1/T) Σ_t s'_{i,t}
+# α = 0.0001（"just to avoid extreme imbalance"）；DeepSeek-V3：256 routed + 1 shared，激活 8 个</code></pre>
+    <p>
+      核心思想：<strong>把「均衡」从损失函数里拿出来，变成一个只影响选择、不影响梯度的控制量</strong>。辅助损失的问题在于它的梯度和语言建模梯度混在一起，α 太大伤效果、太小压不住；偏置 b 是一个按符号更新的积分控制器，不往主损失里加任何梯度。DeepSeek-V3 的消融（Table 5）报告无辅助损失策略在多数基准上优于纯辅助损失基线；4.5.3 节进一步发现关键在于<strong>均衡的范围</strong>：batch 级均衡（无论用偏置还是 batch 级辅助损失）都比序列级好——1B 模型验证 loss 2.258（序列级）vs 2.253（偏置）vs 2.253（batch 级辅助损失），因为 batch 级约束允许 expert 按领域专精。
+    </p>
+
+    <h3>⑤ 一张表看演进</h3>
+    <table>
+      <thead><tr><th>方案</th><th>选择</th><th>均衡手段</th><th>系数（原文）</th><th>溢出处理</th></tr></thead>
+      <tbody>
+        <tr><td>Shazeer 2017</td><td>Noisy Top-k softmax</td><td>CV(Importance)² + CV(Load)²</td><td>0.1 / 0.01 等</td><td>—</td></tr>
+        <tr><td>Switch 2021</td><td>Top-1 softmax</td><td>α·N·Σ f·P</td><td>α=1e-2</td><td>capacity factor + drop</td></tr>
+        <tr><td>ST-MoE 2022</td><td>Top-2</td><td>同上 + router z-loss</td><td>c_z=1e-3</td><td>capacity factor</td></tr>
+        <tr><td>DeepSeek-V3 2024</td><td>Sigmoid + Top-K 内归一化</td><td>选择偏置 b（γ 符号更新）+ 极小序列级损失</td><td>γ=1e-3，α=1e-4</td><td>训练不丢 token（论文称得益于均衡策略）</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑥ 玩具实验：偏置控制器到底有多快（本文自跑）</h3>
+    <pre><code>import numpy as np
+rng = np.random.default_rng(0)
+N, K, T = 16, 2, 4096
+pop = np.linspace(-1.5, 1.5, N)              # 人为制造「冷门/热门」expert
+topk = lambda x, k: np.argpartition(-x, k-1, axis=1)[:, :k]
+load = lambda sel: np.bincount(sel.ravel(), minlength=N) / sel.size
+
+b = np.zeros(N)
+for step in range(300):
+    s = 1 / (1 + np.exp(-(rng.normal(size=(T, N)) + pop)))   # sigmoid 亲和度
+    l = load(topk(s + b, K))                                  # b 只影响选择
+    b -= 0.01 * np.sign(l - 1/N)                              # 过载降、欠载升</code></pre>
+    <table>
+      <thead><tr><th>设置（N=16、K=2、T=4096，示意）</th><th>最忙 expert / 平均</th><th>负载 CV</th><th>CF=1.0 丢弃率</th><th>CF=1.25 丢弃率</th></tr></thead>
+      <tbody>
+        <tr><td>不做均衡</td><td>3.79×</td><td>1.167</td><td>48.3%</td><td>40.4%</td></tr>
+        <tr><td>偏置控制，γ=0.01，300 步（取最后 50 步平均）</td><td>1.02×</td><td>0.009</td><td>0.3%</td><td>0.0%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      收敛后 b 的范围约 [−0.22, 0.32]，正好抵消人为设定的热度梯度。这个玩具只说明控制回路本身的行为：真实模型里亲和度会随训练变化，γ 的大小决定了跟踪速度与抖动的取舍，DeepSeek-V3 在训练末段把 γ 置 0 也是为了冻结路由。
+    </p>
+
+    <h2>和后训练 / RL 的交叉</h2>
+    <ul>
+      <li><strong>路由抖动放大 IS 比率噪声。</strong> MoE 上同一个 token 在 rollout 引擎和训练框架里可能被路由到不同 expert，token 级比率 π/µ 会出现大幅跳变。<a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 用序列级比率缓解，<a href="daily-2026-09-14-t1.html">T1</a> 用 R3（rollout routing replay）把推理时的路由结果回放到训练前向。</li>
+      <li><strong>RL 阶段要不要继续均衡？</strong> 预训练的偏置 / 辅助损失是为了算力效率；RL 阶段 batch 小、分布窄（只有数学或代码），强行 batch 级均衡可能拉扯 expert 专精。常见做法是冻结 router 或冻结偏置，这是一个需要显式决定的超参，而不是默认值。</li>
+      <li><strong>推理侧：</strong>expert 负载不均直接影响 EP 下的尾延迟与 All-to-All 通信，<a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a> 讨论过分布式 MoE rollout 的通信相位问题；冗余 expert（把热门 expert 复制多份）是部署侧的对应手段。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先监控，再调。</strong> 每层记录 max-load / mean-load、负载 CV、丢弃率和 router logits 的 logsumexp；发散前通常先看到 logsumexp 上涨。</li>
+      <li><strong>辅助损失的 α 按 N 归一化来理解。</strong> Switch 的 α·N·Σf·P 在均匀时恒等于 α，换 expert 数时不必重调；自己实现时别漏了这个 N。</li>
+      <li><strong>bf16 训练默认加 z-loss。</strong> c_z=1e-3 是 ST-MoE 扫出来的值，成本几乎为零。</li>
+      <li><strong>用偏置时记住它只进选择、不进 gate。</strong> 如果把 b 加到 gate 值里，等于直接改变模型输出，均衡控制就和建模目标耦合了，这正是无辅助损失方案要避免的。</li>
+      <li><strong>均衡范围选 batch 级而非序列级。</strong> DeepSeek-V3 的对比显示约束范围比手段更关键；序列级损失只保留一个极小的 α 防极端情况。</li>
+      <li><strong>RL / 微调阶段显式决定 router 策略。</strong> 冻结 router、冻结偏置、或保留小 γ，三种选择对稳定性影响很大，最好与 routing replay 一起评估。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. Switch 的 loss = α·N·Σ f_i·P_i 中 f_i 不可导。那这条损失的梯度到底在推动什么？为什么它能导向均匀分布？</summary>
+      <p>梯度只经过 P_i：∂loss/∂P_i = α·N·f_i。实际派发越多（f_i 大）的 expert，其平均 router 概率被压得越狠，于是下一步它被 argmax 选中的机会下降，f_i 随之下降。在 Σf=ΣP=1 的约束下，f 与 P 的点积在两者都均匀时取到最小值 1/N，所以这个反馈把路由推向均匀。</p>
+    </details>
+    <details>
+      <summary>2. Shazeer 2017 为什么同时需要 Importance 损失和 Load 损失？只用一个会出什么问题？</summary>
+      <p>Importance 是 gate 权重之和，Load 是被分到的样本数。只均衡 Importance 时，可能出现某 expert 收到极少样本但每个权重很大，它的 Importance 不低但计算负载很低，另一些 expert 则过载。Load 才对应真实计算与显存；而 Load 是离散计数、不可导，所以论文借助噪声构造了平滑的 Load 估计来做梯度。</p>
+    </details>
+    <details>
+      <summary>3. DeepSeek-V3 的偏置 b 为什么只加在选择上、不加在 gate 值上？如果加到 gate 上会怎样？</summary>
+      <p>只加在选择上，b 改变的是「哪些 expert 参与计算」，而参与后的加权仍由模型学到的亲和度 s 决定，b 不进入前向输出值，也就不会通过主损失产生梯度，均衡控制与语言建模解耦。若加到 gate 上，b 会直接改变层输出，均衡调整变成对模型函数的扰动，等于又把均衡和建模目标混在一起。</p>
+    </details>
+    <details>
+      <summary>4. capacity factor 设成 1.0 和 2.0 各有什么代价？为什么 Switch 论文偏好较低的值？</summary>
+      <p>CF 越大，每个 expert 预留的槽位越多，溢出丢弃越少，但 padding 带来的计算、显存与 All-to-All 通信都按 CF 线性增长。CF=1.0 只要负载稍有不均就会丢 token（丢弃的 token 走残差直通，这一层等于没算）。Switch 的结论是在负载均衡损失足够有效时，较低 CF（1.0、1.25）的速度—质量权衡更好。但 CF 与速度并非总是单调：论文 Table 1 里 top-2 的 MoE Transformer 从 CF 2.0 降到 1.25 反而变慢（840 → 790 样本/秒），作者自己也称之为「unexpected」，说明实际吞吐还受实现与硬件影响，需要实测。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）在 MoE 上做 GRPO 时，你会怎么处理 router？请从比率稳定性、均衡目标和专精三个角度讨论。</summary>
+      <p>可讨论方向：(a) 比率稳定性：routing replay（R3）或序列级比率（GSPO）减少 π/µ 中由路由切换带来的跳变；(b) 均衡目标：RL batch 分布窄，继续 batch 级均衡可能强迫无关 expert 参与，倾向冻结偏置或把 γ 调到很小；(c) 专精：冻结 router 保住预训练的领域分工，但也放弃了 RL 学出新路由的可能，可以只在后期或只对部分层放开；(d) 监控 rollout 引擎与训练框架的路由一致率，作为是否需要 replay 的判据。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">arXiv:1701.06538 · Outrageously Large Neural Networks: The Sparsely-Gated MoE Layer（Shazeer et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">arXiv:2006.16668 · GShard（Lepikhin et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">arXiv:2101.03961 · Switch Transformers（Fedus, Zoph, Shazeer）</a></li>
+      <li><a href="https://arxiv.org/abs/2202.08906" target="_blank" rel="noopener">arXiv:2202.08906 · ST-MoE（Zoph et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2408.15664" target="_blank" rel="noopener">arXiv:2408.15664 · Auxiliary-Loss-Free Load Balancing Strategy for MoE（Wang et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437 · DeepSeek-V3 Technical Report</a></li>
+      <li>站内：
+        <a href="daily-2026-09-09-algo-attention.html">Attention</a> ·
+        <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-14-t1.html">T1</a> ·
+        <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a> ·
+        <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

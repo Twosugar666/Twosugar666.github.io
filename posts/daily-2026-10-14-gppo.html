@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜GPPO：把 PPO / DAPO / DPPO / RIPO 放进同一张「Divergence × Estimator」表——clip 区间其实是 f-散度的 sublevel set，KL × Atomic 比 GRPO 数学均分高 49.8% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜GPPO：把 PPO / DAPO / DPPO / RIPO 放进同一张「Divergence × Estimator」表——clip 区间其实是 f-散度的 sublevel set，KL × Atomic 比 GRPO 数学均分高 49.8%</h1>
+    <p class="post-meta">2026-10-14 · 收藏夹：RL · 一线追踪<br />
+      论文：Zhicheng Cai、Xinyuan Guo、Hanlin Wu、Weinan Dai、Yuyan Zhou、Wei-Ying Ma、Ya-Qin Zhang、Hao Zhou（清华 AIR；SIA-Lab of Tsinghua AIR and ByteDance Seed） ·
+      <em>Generalized Proximal Policy Optimization: Unifying LLM RL Algorithms from the Perspective of Divergence</em>
+      · <a href="https://arxiv.org/abs/2610.13015" target="_blank" rel="noopener">arXiv:2610.13015</a>（cs.LG，v1，2026-10-09 提交）。
+      文中实验数字均为<strong>论文自报</strong>（Qwen3-8B-Base、veRL、8×H20）；「不同 µ 下的实际 clip 区间」一表是本文按论文公式自行计算。
+      交叉：
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-09-11-algo-trpo.html">TRPO</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL 散度</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-08-31-algo-gspo.html">GSPO</a>、
+      <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      过去一年 LLM RL 的「PPO 变体」几乎都在改同一个地方：clip。DAPO 把上界放宽到 1+ε_high（Clip-Higher），DPPO 把约束从比率换成概率差 |π−µ|≤δ，RIPO 让 clip 宽度随 µ(a|s) 变化，GSPO / GMPO 把 clip 的单位从 token 换成整条序列……每个都有一段经验动机，但彼此怎么关联、为什么有效，一直缺一个统一说法。
+    </p>
+    <p>
+      GPPO 给的说法很干净：<strong>PPO-Clip 本质是在约束一个单样本 Monte Carlo 估计的 TV 散度</strong>。因为 D_TV(π‖µ)=½·E_µ|r−1|，所以 |r−1| 就是 TV 的单样本估计，clip 到 [1−ε,1+ε] 等于要求这个估计 ≤ ε。一旦这样看，PPO 的设计就只剩两个自由度——<strong>约束哪个散度 f</strong>，以及<strong>用什么估计器 T 去估它</strong>。论文把四种 f（TV / Pearson χ² / Hellinger / KL）和三种 T（MC / Atomic / Binary）摆成 4×3 的表，发现 GRPO、DAPO、DPPO、RIPO 恰好各占一格。
+    </p>
+    <p>
+      站内 <a href="daily-2026-09-11-algo-trpo.html">TRPO</a> 推过 Kakade–Langford / Schulman 的单调改进下界，<a href="daily-2026-08-28-algo-ppo.html">PPO</a> 讲过 clip 如何「近似」信赖域。这篇正好补上那块缺口：把「近似」写成一个具体的散度与估计器选择。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 理论底座：任意 f-散度都能接上 TRPO 的单调改进下界</h3>
+    <pre><code># Theorem 1（Schulman 2015，TV 版）
+η(π) − η(µ) ≥ 1/(1−γ) · L_µ(π) − 4ξγ/(1−γ)² · D_TV^max(π‖µ)²
+L_µ(π) = E_{s∼ρ_µ, a∼µ}[ r(s,a) · A_µ(s,a) ],   r = π(a|s)/µ(a|s)
+
+# 关键一步：Vajda 紧下界（Theorem 2）
+D_f(P‖Q) ≥ L_f(V) := inf_{β∈[0,1−V]}  β·f(1+V/β) + (1−β)·f(1−V/(1−β)),   V = D_TV(P‖Q)
+# 证明思路：按 Hahn 分解把样本空间压成 {A, Aᶜ} 两点，Jensen / 数据处理不等式，
+#           二点分布可取到下界，所以是紧的
+
+# 取最优二次常数
+C_f^Vajda := inf_{0&lt;V≤1} L_f(V)/V²     ⇒   D_TV² ≤ D_f / C_f^Vajda
+
+# Theorem 3：广义 f-散度信赖域
+η(π) − η(µ) ≥ 1/(1−γ)·L_µ(π) − 4ξγ / (C_f^Vajda·(1−γ)²) · D_f^max(π‖µ)
+# 只要 C_f^Vajda &gt; 0，约束任何 f-散度到足够小的 level set 都保证单调改进
+# 附录还给出局部系数 C_f^local = 2f''(1) ≥ C_f^Vajda</code></pre>
+    <p>
+      这一步本身不新（Pinsker 就是 KL 的特例：D_TV² ≤ ½·D_KL），价值在于把它推广到一族散度，从而<strong>允许你按「想要什么样的阻力曲线」挑 f</strong>，而不丢理论保证。
+    </p>
+
+    <h3>② 几何：不同 f 在 r≈1 附近一样，在 r 远离 1 时才分家</h3>
+    <p>
+      对光滑 f 在 r=1 做 Taylor 展开，一阶项因 E_µ[r−1]=0 消失，得到 D_f ≈ f''(1)/2 · E_µ[(r−1)²]——所有 f''(1)&gt;0 的散度局部都是同一个 Fisher–Rao 几何，只差缩放。区别全在<strong>有限位移区</strong>：
+    </p>
+    <table>
+      <thead><tr><th>f</th><th>f(r)</th><th>f''(r)</th><th>形状（论文 §3.2）</th><th>对 clip 的含义</th></tr></thead>
+      <tbody>
+        <tr><td>TV</td><td>½|r−1|</td><td>0（r≠1）</td><td>多面体、零曲率、对称</td><td>阻力与偏移大小无关，固定阈值硬切——PPO-Clip</td></tr>
+        <tr><td>Pearson χ²</td><td>(r−1)²</td><td>2</td><td>椭球（Mahalanobis）</td><td>偏移越大阻力越大，但仍对称</td></tr>
+        <tr><td>KL</td><td>−log r</td><td>1/r²</td><td>非对称、对数扭曲</td><td>r→0（压低概率）越来越贵，r 变大边际阻力递减 ⇒ 利于把低概率 token 拉起来</td></tr>
+        <tr><td>Hellinger</td><td>(√r−1)²</td><td>1/(2r^{3/2})</td><td>平方根嵌入下的球面</td><td>同样向 r→0 方向更硬，比 KL 温和</td></tr>
+      </tbody>
+    </table>
+    <p>
+      注意记号：论文约定 D_f(π‖µ)=E_{a∼µ}[f(r)]，所以 f=−log r 对应的是 KL(µ‖π)。另外严格说 −log r 在 r&gt;1 时为负、sublevel set 没有上界；论文在复现 DAPO 时实际使用的是对称区间 −δ≤log r≤δ（即 |log r|≤δ），下文计算沿用这个处理。
+    </p>
+
+    <h3>③ 估计器拓扑：MC / Atomic / Binary</h3>
+    <pre><code># 统一形式（式 10–11）：clip 区间 = 估计器的 δ-sublevel set
+R̂_f(δ) = { r &gt; 0 : D̂_f(r) ≤ δ }
+J_GPPO = E[ min( r·Â,  clip_{R̂_f(δ)}(r)·Â ) ]
+
+MC     : D̂ = f(r)                                   # 只看采到的 token 的比率
+Atomic : D̂ = µ(a|s)·f(r)                            # 按旧策略概率加权的「原子贡献」
+Binary : D̂ = µ·f(r) + (1−µ)·f( (1−µ·r)/(1−µ) )      # 采到的 token vs 其余全部（二点分布）
+
+# 附录 B：二阶矩 v_Atom(a) = µ(a|s)² · v_MC(a)   → 低概率 token 的长尾被压掉
+# 论文还试过 Top-K 估计：O(K) 显存、方差大、δ 难调，放弃</code></pre>
+    <p>
+      一个容易被忽略的事实：Atomic 不是 D_f 的无偏估计（E_µ[µ·f(r)] = Σµ²f ≠ Σµf），论文称它为「probability-aware」的约束而非更准的点估计，附录给的也是二阶矩对比。理解它最直接的方式是把 sublevel set 解出来——<strong>Atomic / Binary 本质上都是「clip 宽度随 µ(a|s) 变化」</strong>。
+    </p>
+
+    <h3>④ 已有方法各占一格</h3>
+    <table>
+      <thead><tr><th>方法</th><th>(f, T)</th><th>sublevel set 解出来的 clip 区间</th></tr></thead>
+      <tbody>
+        <tr><td>PPO / GRPO</td><td>(TV, MC)</td><td>[1−ε, 1+ε]</td></tr>
+        <tr><td>GSPO / GMPO</td><td>(TV, MC)，单位换成整条 rollout</td><td>序列级比率上的对称区间</td></tr>
+        <tr><td>DAPO</td><td>(KL, MC)</td><td>[e^{−δ}, e^{δ}]；δ=0.23 ⇒ [0.80, 1.26]，与 DAPO 的 ε_low=0.2 / ε_high=0.28 近似对应</td></tr>
+        <tr><td>DPPO</td><td>(TV, Binary)</td><td>|π−µ| ≤ δ ⇔ [1−δ/µ, 1+δ/µ]</td></tr>
+        <tr><td>RIPO</td><td>(χ², Atomic)</td><td>µ(r−1)² ≤ δ ⇔ [1−√(δ/µ), 1+√(δ/µ)]</td></tr>
+      </tbody>
+    </table>
+    <p>
+      这张表最有用的地方是把 DAPO 的「上界比下界宽」解释成 KL 几何的自然产物，而不是拍脑袋；同时它也说明 DPPO 与 RIPO 本质上都在做「µ 越小 clip 越宽」，只是放宽的速率不同（1/µ vs 1/√µ）。
+    </p>
+
+    <h3>⑤ 实际 clip 区间长什么样（自算）</h3>
+    <p>
+      论文的标定方式：固定收缩侧下界 r_min=0.8，令 δ=f(0.8)，得 δ_TV=0.2、δ_χ²=0.04、δ_H≈0.011、δ_KL≈0.223；Atomic / Binary 复用同一个 δ。按这个 δ 解 sublevel set（TV 用 |r−1|，KL 用 |log r|，与论文数值一致）：
+    </p>
+    <table>
+      <thead><tr><th>f</th><th>MC（与 µ 无关）</th><th>Atomic µ=0.5</th><th>Atomic µ=0.1</th><th>Atomic µ=0.01</th><th>Binary µ=0.1</th><th>Binary µ=0.01</th></tr></thead>
+      <tbody>
+        <tr><td>TV</td><td>[0.80, 1.20]</td><td>[0.60, 1.40]</td><td>[0, 3.0]</td><td>[0, 21]</td><td>[0, 2.0]</td><td>[0, 11]</td></tr>
+        <tr><td>χ²</td><td>[0.80, 1.20]</td><td>[0.72, 1.28]</td><td>[0.37, 1.63]</td><td>[0, 3.0]</td><td>[0.40, 1.60]</td><td>[0, 2.99]</td></tr>
+        <tr><td>Hellinger</td><td>[0.80, 1.22]</td><td>[0.72, 1.32]</td><td>[0.44, 1.78]</td><td>[0, 4.23]</td><td>[0.46, 1.72]</td><td>[0, 4.18]</td></tr>
+        <tr><td>KL</td><td>[0.80, 1.25]</td><td>[0.64, 1.56]</td><td>[0.11, 9.31]</td><td>[0, ≈e^{22}]</td><td>[0.23, 2.30]</td><td>[0, 18.6]</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：µ 接近 1 时三种估计器差不多；µ 一小，Atomic 迅速放开——KL × Atomic 在 µ=0.01 的 token 上基本等于不 clip，此时真正起作用的是论文统一使用的 <strong>dual-clip（比率下限 0.5、上限 10）</strong>。所以「最佳配方」的实际行为可以概括为：<strong>高概率 token 按 KL 几何温和 clip，低概率 token 几乎放任，再用一个粗的全局比率护栏兜底</strong>。这与 <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> Clip-Higher「给低概率 token 涨价空间以防熵塌」的动机一脉相承，只是放宽程度更激进、且两侧都放。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>设置：</strong>Qwen3-8B-Base；数学用 DAPO-Math-17k，代码用 Eurus-Code-25k；group size 8、最大响应 20k token；每轮 1024 条 rollout、train batch 128、更新 8 次、mini-batch 16；0/1 奖励；去掉 KL 惩罚；token-mean 聚合；AdamW 常数 lr 1e-6；数学 400 步、代码 600 步；veRL、8×H20；avg@8。</li>
+      <li><strong>数学</strong>（AIME24 / AIME25 / BRUMO25 / SMT25 平均）：GRPO（TV-MC）27.7；DAPO（KL-MC）34.6；DPPO（TV-Binary）39.0；RIPO（χ²-Atomic）40.5；<strong>KL-Atomic 41.5（+49.8%）</strong>。GSPO / GMPO 35.1，SAPO 35.0，CISPO 30.5，Clip-Cov 31.5。</li>
+      <li><strong>代码</strong>（Codeforces / CodeContests / TACO / APPS 平均）：GRPO 52.4；<strong>KL-Atomic 59.7（+13.9%）</strong>，Atomic 在代码表每一列都排第一。</li>
+      <li><strong>估计器比散度更关键：</strong>四种散度上平均，Binary 相对 MC 提升 21.3%（数学）/ 3.2%（代码），Atomic 为 28.3% / 7.7%。训练曲线里 MC 的熵很快塌到接近 0、分数早早平台，Atomic / Binary 熵维持在中等水平且持续上涨。</li>
+      <li><strong>几何受估计器「过滤」：</strong>MC 下 KL 比 TV 高 24.9% / 3.6%；但 Binary 下数学上 TV 反而最强（39.0 vs KL 37.2）。论文的解释是 TV-Binary 直接约束绝对概率质量变化，而曲面散度会把同一 δ 变成对稀有 token 更紧的比率惩罚。</li>
+      <li><strong>标定巧合：</strong>TV-MC 与 χ²-MC 结果完全相同（都是 27.7 / 52.4），因为按 r_min=0.8 标定后两者的 MC 区间都是 [0.8, 1.2]——这本身就是一个「区间相同则算法相同」的好例子。</li>
+    </ul>
+
+    <h2>怎么看这篇</h2>
+    <p>
+      <strong>值得拿走的：</strong>一个统一坐标系。以后看到新的「PPO 变体」，第一件事可以是把它的 clip 规则写成 {r : D̂(r) ≤ δ}，看它落在哪一格、相对 µ 的放宽速率是多少。站内 <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> 讲过 k1/k2/k3 三种单样本 KL 估计；GPPO 的 Atomic / Binary 是在「约束」而非「惩罚」这一侧做同类思考。
+    </p>
+    <p>
+      <strong>需要打折的：</strong>(1) 单模型（Qwen3-8B-Base）、单次训练、avg@8，没有多 seed 方差；(2) 所有方法共用 r_min=0.8 的标定，等于把每种散度锁在同一收缩下界，DAPO / RIPO 等并未用各自原论文调过的超参；(3) 低 µ 下 Atomic 的区间几乎无界，真实约束由 dual-clip 0.5 / 10 承担，消融里没有单独拆 dual-clip 的贡献；(4) Theorem 3 的单调改进保证针对 D_f^max（逐状态最大），实际实现是逐 token clip，二者之间的距离与 PPO 原本的「近似信赖域」同样存在。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先把你的 clip 写成 sublevel set。</strong> 若你在用 DAPO 的非对称 clip，可以直接视为 KL-MC；想试 GPPO，最小改动是把 clip 上下界改成 µ 的函数（Atomic：解 µ·f(r)=δ），µ 就是 rollout 时记录的旧策略 token 概率，几乎零额外开销。</li>
+      <li><strong>一定保留全局比率护栏。</strong> KL-Atomic 在稀有 token 上近乎不 clip，没有 dual-clip（论文 0.5 / 10）时 off-policy 程度高的 mini-batch 可能放大梯度；多次更新（论文每轮 8 次）时尤其要看 grad norm。</li>
+      <li><strong>盯熵曲线比盯 reward 更早发现问题。</strong> 论文最一致的观察是 MC 系列熵快速塌缩；换估计器后若熵反而爆涨，说明低 µ 放得太开，可以把 δ 调小或换 χ² 这类放宽更慢（1/√µ）的组合。</li>
+      <li><strong>与训推失配一起考虑。</strong> µ 若来自推理引擎（vLLM / SGLang）的 logprob，而 π 来自训练框架，低概率 token 的比率本就噪声大；Atomic 放宽低 µ 的 clip 会让这部分噪声更容易进梯度，配合 TIS / MIS 一类截断修正更稳。</li>
+      <li><strong>MoE 场景另算。</strong> 论文只做 dense 8B。MoE 上 token 级比率还受路由变化影响（参见站内 <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 与 <a href="daily-2026-09-14-t1.html">T1 的 R3 routing replay</a>），放宽 clip 前先确认路由一致性。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说 PPO-Clip 是在约束「单样本 MC 估计的 TV 散度」？这个视角下它的两个缺陷分别是什么？</summary>
+      <p>D_TV(π‖µ)=½·E_{a∼µ}|r−1|，所以 |r−1| 是 TV 的单样本无偏估计（差常数），clip 到 [1−ε,1+ε] 就是要求该估计 ≤ε。缺陷一是几何：TV 生成函数零曲率、对称，阻力与偏移大小无关、上下对等；缺陷二是估计：只看采到的那个 token 的比率，约束对采样噪声敏感，也不区分高概率与低概率 token。</p>
+    </details>
+    <details>
+      <summary>2. 所有 f''(1)&gt;0 的 f-散度在 r≈1 处等价，那为什么换 f 还会改变训练结果？</summary>
+      <p>局部等价只在 r→1 的二阶近似下成立；clip 恰恰发生在有限位移区（r≈0.8 或 1.25 及以外），这里高阶项与非对称项决定区间形状。比如 KL 在 r→0 一侧更硬、r 增大一侧更软，导致上界比下界宽；再叠加 Atomic 的 1/µ 放宽，差异在稀有 token 上会被成倍放大。</p>
+    </details>
+    <details>
+      <summary>3. Atomic 估计 µ·f(r) 的期望是 Σµ²f，不等于 D_f。为什么它仍然有效？该怎样理解它？</summary>
+      <p>它不是在追求无偏点估计，而是把约束从「这个 token 的比率偏了多少」改成「这个 token 对整体散度贡献了多少」。低概率 token 即使比率偏离很大，对分布级散度的贡献也小，因此不该被提前 clip。解出 sublevel set 后，它等价于 clip 宽度随 1/µ 放宽；附录的二阶矩分析（v_Atom=µ²·v_MC）说明它压掉了稀有 token 的长尾方差。</p>
+    </details>
+    <details>
+      <summary>4. 按论文标定 δ_TV=0.2，请推出 TV-Binary 的区间，并说明它为什么与 DPPO 一致。</summary>
+      <p>以 f=|r−1| 为例，Binary 估计为 µ|r−1| + (1−µ)|(1−µr)/(1−µ) − 1| = µ|r−1| + µ|r−1| = 2µ|r−1|，令其 ≤δ 得 |r−1| ≤ δ/(2µ)；若按论文 ½|r−1| 的 TV 定义则得 |r−1|≤δ/µ，即 |π−µ| = µ|r−1| ≤ δ，正是 DPPO 的约束。两种写法只差常数缩放，本质都是约束绝对概率质量变化。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把 GPPO 搬到多轮 Agent RL（工具调用、长 observation、token 数极不均衡）时，估计器的选择会有什么新问题？</summary>
+      <p>可讨论方向：(a) Agent 轨迹里大量格式 / 工具名 token 的 µ 接近 1，Atomic 与 MC 差别很小，真正受影响的是推理中的分叉 token，收益可能集中在少数位置；(b) 环境返回的 token 不参与损失，但会改变后续 token 的 µ 分布；(c) 多轮下 off-policy 更重（异步 rollout、partial rollout），低 µ 放宽 clip 叠加 staleness 可能放大方差，需要配合序列级（GSPO 式）或轮次级的比率护栏；(d) 可以考虑按轮次或按 token 类型选择不同的 (f, T)。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.13015" target="_blank" rel="noopener">arXiv:2610.13015 · Generalized Proximal Policy Optimization（Cai et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">arXiv:1502.05477 · Trust Region Policy Optimization（Schulman et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347 · Proximal Policy Optimization Algorithms（Schulman et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">arXiv:2503.14476 · DAPO（Yu et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2507.18071" target="_blank" rel="noopener">arXiv:2507.18071 · Group Sequence Policy Optimization（Zheng et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-11-algo-trpo.html">TRPO</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Entropy</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

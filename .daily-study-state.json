@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 0,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -711,6 +711,27 @@
       "source": "algo",
       "topic": "RoPE：二维旋转分块对角、qᵀR_{n−m}k 相对性、θ_i=10000^(−2(i−1)/d)、波长/频谱视角、long-term decay、线性注意力兼容；PI（m·L/L′）/ NTK-aware（b′=b·s^{|D|/(|D|−2)}）/ NTK-by-parts（α=1, β=32）/ YaRN 温度 √(1/t)=0.1 ln s+1 / Dynamic Scaling；DeepSeek-V2 decoupled RoPE + YaRN s=40（arXiv:2104.09864 / 2306.15595 / 2309.00071 / 2405.04434）",
       "file": "posts/daily-2026-10-13-algo-rope.html"
+    },
+    {
+      "date": "2026-10-14",
+      "domain": "rl",
+      "source": "frontline",
+      "topic": "GPPO：PPO-Clip=单样本 MC 的 TV 约束；Vajda 紧下界推广 f-散度信赖域（C_f^Vajda）；TV/χ²/Hellinger/KL × MC/Atomic/Binary 4×3 设计空间，GRPO=(TV,MC)、DAPO=(KL,MC)、DPPO=(TV,Bin)、RIPO=(χ²,Atom)；Atomic 等价 clip 宽度随 1/µ 放宽；Qwen3-8B-Base KL-Atomic 数学 41.5（+49.8% vs GRPO 27.7）、代码 59.7（+13.9%）（Cai et al. 清华 AIR / ByteDance Seed arXiv:2610.13015）",
+      "file": "posts/daily-2026-10-14-gppo.html"
+    },
+    {
+      "date": "2026-10-14",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "LongHarness：S_t=(EvidenceBank, Conclusion State, 完整历史)；Evidence–Conclusion Coevolution（open gaps 引导检索）+ Evidence Lifecycle（upsert/revise、不可变 id、superseded/retracted 不可引用）；OfficeQA Pro V1/V2（~1 亿 token）GLM-5.3-Flash 60.2/61.1 vs Codex 46.6/42.2、Claude Code 48.1/35.6；消融 append-only V2 −10.0；r₁/r₂/r₃ 分阶段（Huang et al. 复旦/上海 AI Lab arXiv:2610.13075）",
+      "file": "posts/daily-2026-10-14-harness-longharness.html"
+    },
+    {
+      "date": "2026-10-14",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "MoE 路由与负载均衡：Noisy Top-k Gating + CV(Importance)²/CV(Load)²；Switch α·N·Σf·P（α=1e-2）与 capacity factor；ST-MoE router z-loss（c_z=1e-3）；DeepSeek-V3 sigmoid 亲和度 + 选择偏置 b（γ=1e-3）+ 序列级 α=1e-4，batch 级 vs 序列级均衡；numpy 玩具实验；RL 下的 routing replay（arXiv:1701.06538 / 2101.03961 / 2202.08906 / 2412.19437）",
+      "file": "posts/daily-2026-10-14-algo-moe-routing.html"
     }
   ]
 }

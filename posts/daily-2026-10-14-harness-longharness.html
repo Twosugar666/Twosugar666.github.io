@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜LongHarness：把「证据」和「结论」拆成两块持久状态——1 亿 token 语料上 EvidenceBank 的生命周期管理，OfficeQA Pro V2 比 Codex 高 18.9 点 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜LongHarness：把「证据」和「结论」拆成两块持久状态——1 亿 token 语料上 EvidenceBank 的生命周期管理，OfficeQA Pro V2 比 Codex 高 18.9 点</h1>
+    <p class="post-meta">2026-10-14 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Songtao Huang、Zhijie Zhong、Xiaohan He、Shuaiyu Zhang、Zhiyin Yu、Li Kang、Heng Zhou、Yutao Fan、Xiangchao Yan、Bo Zhang、Shiyang Feng（复旦、上海人工智能实验室、北大、上交、中科大、哈工大） ·
+      <em>LongHarness: Advancing Agentic Reasoning over 100M-Token Corpora via Stateful Evidence Management</em>
+      · <a href="https://arxiv.org/abs/2610.13075" target="_blank" rel="noopener">arXiv:2610.13075</a>（cs.AI，v1，2026-10-09 提交）。
+      文中数字均为<strong>论文自报</strong>；主表每个 harness 每个设置只跑一次，三次重复只在附录对 GLM-5.3-Flash 做了。
+      交叉：
+      <a href="daily-2026-09-07-harness-compaction.html">上下文压缩</a>、
+      <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a>、
+      <a href="daily-2026-10-08-harness-refold.html">ReFold</a>、
+      <a href="daily-2026-09-24-harness-anatomy.html">Harness 源码解剖</a>、
+      <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      语料级长上下文推理（corpus-level long-context reasoning）的典型场景：几百份财政报表、总量远超任何上下文窗口，问题需要从多份文档里各取一个数再组合计算。直接把 BM25 检索结果塞进 256K 窗口，主表里十个前沿模型在 OfficeQA Pro V1 上最高 23.2% exact match（Kimi-K3），V2 最高 5.6%（GPT-5.6-Sol）。
+    </p>
+    <p>
+      于是大家转向 agent harness：Claude Code、Codex、RLM 这类框架让模型自己搜、自己读、多轮累积。论文指出它们的共同问题是<strong>证据和结论都埋在不断增长的交互历史里</strong>，由此产生两种互相强化的失败：
+    </p>
+    <ul>
+      <li><strong>Unbounded exploration</strong>：检索一直在扩历史，却没有在填真正影响答案的信息缺口，直到预算耗尽；</li>
+      <li><strong>Evidence-state drift</strong>：早先读到的证据或后来的更正，与当前推理脱节，最终答案建立在过时或不完整的证据上。</li>
+    </ul>
+    <p>
+      漂移让 agent 搞不清哪些问题已经解决，于是再去搜；再搜又把历史撑得更长，相关证据更难找回。这和站内 <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a>、<a href="daily-2026-09-07-harness-compaction.html">上下文压缩</a> 讨论的是同一类问题，但 LongHarness 的切法不同：<strong>不删、不压历史</strong>，而是在历史之外再维护两块显式、结构化的状态。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 状态定义：S_t = (E_t, C_t, H_t)</h3>
+    <pre><code># 论文 §2.1
+S_t = (E_t, C_t, H_t)
+  E_t : EvidenceBank 中的 active 证据（带来源引用的陈述）
+  C_t : Conclusion State —— established claims / supported hypotheses / unresolved gaps
+  H_t : 完整交互历史（推理、动作、观测；不截断、不摘要）
+
+(a_t, Ĉ_t) ∼ π_θ(· | q, M_D, S_t, B_t)     # 动作 + 可选的结论更新
+(x_{t+1}, o_{t+1}) ∼ P_D(· | x_t, a_t)       # 环境：已登记的来源片段、证据及其生命周期、资源计数
+# M_D = 文档地图（id / 标题 / 章节结构），B_t = 剩余预算</code></pre>
+    <p>
+      关键选择：<strong>证据与推断分开存</strong>。EvidenceBank 只放「从已读段落里抽出来、能指回原文」的陈述；Conclusion State 放 agent 对这些证据的当前解释，每条 claim 显式引用支持它的证据 id。open gaps 则写明「还缺什么信息会改变结论」。
+    </p>
+
+    <h3>② Evidence–Conclusion Coevolution：两步互相驱动</h3>
+    <pre><code>E⁺ = A_θ(q, D, E, C)    # 结论引导的探索：按 claim 需要什么来证实/限定/否定，组织 query 与阅读范围
+C⁺ = R_θ(q, E⁺, C)      # 证据驱动的修订：用 active 证据重审每条 claim，更新引用与 open gaps
+# 同一个 policy 完成两步，可在多轮中自适应交错</code></pre>
+    <p>
+      这里的价值不在公式，而在于<strong>把「接下来该搜什么」从隐式推理变成显式的 open gaps 列表</strong>。竞争假设驱动能区分它们的搜索；缺口没解决就改写 query 或扩大阅读范围，但始终绑在「推进结论所需的信息」上。提交前还要检查剩余缺口是否可能改变答案。
+    </p>
+
+    <h3>③ Evidence Lifecycle Management：证据也有生老病死</h3>
+    <table>
+      <thead><tr><th>操作</th><th>输入</th><th>效果（附录 B）</th></tr></thead>
+      <tbody>
+        <tr><td><code>upsert</code></td><td>一条或多条带来源引用的陈述</td><td>逐条校验来源是否由之前的 read 登记过；合格的成为 active 条目，批次可部分接受</td></tr>
+        <tr><td><code>revise</code></td><td>一个 active 证据 id + 替换陈述（或 null）</td><td>非 null：新建更正条目、旧条目标记 superseded；null：撤回（retract），不留替代</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>不可变 id，不做原地修改。</strong> superseded / retracted 条目保留在修订记录里，但不能被 compute 或 final 引用。</li>
+      <li><strong>结论不自动改写。</strong> 证据失效后，转换日志会标记受影响的结论引用，但 runtime 不会自动删或改 claim，也不阻止继续搜读——修订仍是 policy 的责任。</li>
+      <li><strong>校验边界写得很清楚：</strong>controller 只检查引用是否已登记、compute / final 声明的证据 id 是否 active；「陈述是否忠实于原文」「compute 的字面操作数是否与来源数值一致」都由 policy 自己负责。</li>
+    </ul>
+
+    <h3>④ 动作空间与一轮的执行顺序</h3>
+    <pre><code># 动作：Search | Read（返回文本并登记来源引用）| upsert | revise | Compute（校验声明的证据 id）| Final
+# Algorithm 1 精简
+loop while 预算允许:
+    (a_t, Ĉ_t) ← π_θ(...)
+    if a_t 违反协议 / 来源引用 / 预算:      # 非法动作：持久状态不变，返回校验反馈
+        o ← validation feedback
+    else:
+        if a_t ∉ {upsert, revise}: C ← Merge(C, Ĉ_t)   # 结论更新先合并
+        (x, o) ← 执行 a_t                              # 证据变更先被观测，下一轮再修结论
+    E ← ActiveEvidence(x); H ← H + 本轮; B ← 剩余预算
+    if o 确认 Final 被接受: return 答案 + 已解析的来源引用
+# Merge：只替换本次给出的列表（established / hypotheses / open），省略的保持；显式空列表=清空</code></pre>
+    <p>
+      「EvidenceBank 变更后推迟结论更新」这条顺序约束很实用：保证每条 claim 引用的都是<strong>已经被接受</strong>的证据，而不是 agent 以为会被接受的证据。
+    </p>
+    <table>
+      <thead><tr><th>运行限制（附录 Table 7）</th><th>值</th></tr></thead>
+      <tbody>
+        <tr><td>最大步数</td><td>200</td></tr>
+        <tr><td>最大 search 调用</td><td>60</td></tr>
+        <tr><td>累计 read 预算</td><td>1,000,000 token（只计 read 返回的原文）</td></tr>
+        <tr><td>单次 read 上限</td><td>16,384 token</td></tr>
+      </tbody>
+    </table>
+    <p>
+      对照组 Codex / Claude Code 各允许 200 轮、200 次工具调用，RLM 30 次迭代。值得注意：LongHarness <strong>保留完整历史、不做压缩</strong>，客户端也不自动截断——它的收益来自「历史之外多了一份有组织的状态」，而不是「历史更短」。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>基准：</strong>OfficeQA Pro V1（697 份美国财政部文档，约 1 亿 token）与 V2（扩到 1,435 份，新增需多源组合的统计题）；AA-LCR（100 题，给定上下文）；LongBench v2 Long 子集。backbone：GLM-5.3-Flash 与 Qwen3.8-Flash，temperature 1、top-p 0.95、最大推理强度。</li>
+      <li><strong>主结果（GLM-5.3-Flash，exact match）：</strong>直接推理 15.8 / 4.4（V1 / V2）；Codex 46.6 / 42.2；Claude Code 48.1 / 35.6；RLM 45.1 / 38.9；<strong>LongHarness 60.2 / 61.1</strong>。AA-LCR 84.0、LongBench v2 Long 75.9，四项平均 70.3（次优 Codex 58.8）。</li>
+      <li><strong>换 backbone 收益收窄：</strong>Qwen3.8-Flash 下 LongHarness 61.7 / 51.1，V1 领先 Claude Code 8.3 点，V2 只领先 Codex 1.1 点（Codex 50.0）。</li>
+      <li><strong>三次重复（附录 Table 9，GLM-5.3-Flash）：</strong>V1 均值 59.90±0.43，V2 59.63±1.28；对照 Codex V2 41.11±4.00、Claude Code 32.59±4.21。LongHarness 方差明显更小。</li>
+      <li><strong>消融（GLM，V1 / V2 掉点）：</strong>去掉两块持久状态 −4.5 / −7.8；去掉 Conclusion State 及其检索反馈 −5.3 / −9.4；EvidenceBank 只允许追加（不能 revise）−3.8 / −10.0；保留状态但删掉「用缺口引导检索」的指令 −4.5 / −7.8；把结构化结论换成可编辑自由文本笔记 −6.8 / −7.8。所有消融在 V2 掉得更多。</li>
+      <li><strong>分阶段成功率（V2）：</strong>检索覆盖 r₁ 87.8%、证据采纳 r₂ 87.3%、转换为正确答案 r₃ 79.7%；Claude Code 为 72.2 / 84.6 / 58.2，Codex 为 76.7 / 78.3 / 70.4。r₂、r₃ 是条件概率，且由 GPT-5.6-Luna 审计错误轨迹得出。</li>
+      <li><strong>交互长度：</strong>V1→V2 中位轮数 LongHarness 22→30，Claude Code 21→116，Codex 19→43；Codex 在 V2 有 21.1% 的题耗尽轮数预算。</li>
+    </ul>
+
+    <h2>放进 harness 设计的坐标系</h2>
+    <table>
+      <thead><tr><th>路线</th><th>对历史做什么</th><th>代表（站内）</th><th>LongHarness 的位置</th></tr></thead>
+      <tbody>
+        <tr><td>压缩 / 摘要</td><td>替换旧历史</td><td><a href="daily-2026-09-07-harness-compaction.html">Compaction</a>、<a href="daily-2026-10-08-harness-refold.html">ReFold</a></td><td>不压缩；历史全量保留</td></tr>
+        <tr><td>主动遗忘</td><td>agent 决定删什么</td><td><a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a></td><td>不删历史；只让证据条目失效（superseded / retracted）</td></tr>
+        <tr><td>外置记忆 / 笔记</td><td>旁路自由文本</td><td>各类 scratchpad / memory 工具</td><td>结构化 + 来源可追溯；消融显示比自由笔记好 6.8 / 7.8 点</td></tr>
+        <tr><td>预算 / 停止控制</td><td>限制交互长度</td><td><a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a>、<a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a></td><td>靠 open gaps 让探索自然收敛，硬预算只兜底</td></tr>
+      </tbody>
+    </table>
+    <p>
+      一句话概括：<strong>LongHarness 把「agent 当前相信什么、凭什么相信、还缺什么」从隐式推理里提出来，变成 runtime 管理的数据结构</strong>。这和数据库里「事实表 + 视图」的分离类似：证据是带溯源的事实，结论是基于事实的派生视图，事实更正时视图被标脏、由 policy 刷新。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>证据条目要能指回原文且由 runtime 校验。</strong> 最便宜的一步是：read 工具返回时登记 span id，任何「事实」写入都必须引用已登记的 span，否则拒收。这一条就能拦掉大量凭记忆编的数。</li>
+      <li><strong>更正用 supersede，不要原地改。</strong> 不可变 id + 修订记录让你能审计「答案用的是哪个版本的数」；论文 Figure 4 的案例正是 Codex 看到了更正却在最终计算里用了旧值。</li>
+      <li><strong>把 open gaps 当一等公民。</strong> 消融里「状态都在、只删掉用缺口引导检索的指令」也掉 4.5 / 7.8 点：光给状态不够，要在 system prompt 里明确要求按缺口组织下一步搜索。</li>
+      <li><strong>Compute 是独立工具，但别以为它校验了数值。</strong> 论文明确 compute 只检查声明的证据 id，不检查字面操作数与来源是否一致；自己实现时可以加一步「操作数必须从证据条目里按字段取」。</li>
+      <li><strong>评估要看分阶段，不只看 exact match。</strong> r₁ / r₂ / r₃ 三段拆分能告诉你瓶颈在搜不到、留不住还是算不对，比单一准确率更能指导改 harness。</li>
+      <li><strong>注意它没解决的成本：</strong>全量历史不截断意味着每轮请求仍随轮数增长；在更长任务上需要与压缩路线组合，而 EvidenceBank 恰好提供了「压缩时哪些信息必须保住」的清单。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. Unbounded exploration 与 evidence-state drift 为什么会互相强化？LongHarness 分别用哪块状态去切断？</summary>
+      <p>漂移使 agent 不确定哪些信息需求已经解决，于是重复搜索；重复搜索扩大历史，让已有证据更难被找回，进一步加重漂移。Conclusion State 的 open gaps 显式记录「还缺什么」，切断盲目探索；EvidenceBank 的 active 集合与 supersede 机制让最新证据始终可见、可引用，切断漂移。</p>
+    </details>
+    <details>
+      <summary>2. 为什么 EvidenceBank 变更之后，结论更新要推迟到下一轮？如果同一轮内同时提交 upsert 和 claim 会出什么问题？</summary>
+      <p>upsert 是逐条校验的，批次可能被部分拒收（来源未登记等）。若同一轮直接写 claim，claim 可能引用了实际上没被接受的证据，造成「结论引用了不存在的 active 证据」。推迟到观测到更新结果之后再修订，保证每条 claim 只引用已接受的条目。</p>
+    </details>
+    <details>
+      <summary>3. 「Naive Evidence Accumulation」（只能追加）在 V1 只掉 3.8 点，在 V2 掉 10.0 点。怎么解释这个差距？</summary>
+      <p>V2 语料翻倍且题目需要从多个来源组合数值，读到被后续文档更正的数（修订版报表、口径变化）的概率更高。只追加时旧值与新值并存，最终计算更容易用错版本；能 revise / retract 时旧值退出 active 集合，无法再被 compute / final 引用。题越依赖多源对账，这一机制越重要。</p>
+    </details>
+    <details>
+      <summary>4. 论文保留完整交互历史、不做压缩。这和站内「压缩 / 主动遗忘」路线冲突吗？如何组合？</summary>
+      <p>不冲突，它们解决不同问题：LongHarness 解决「历史里的信息没被组织好」，压缩解决「历史太长放不下或太贵」。组合方式是把 EvidenceBank 与 Conclusion State 作为压缩时的不可丢弃部分（pinned state），对其余原始观测做摘要或遗忘；因为证据都带来源 span，必要时还能按 id 重新 read 原文。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果要把 LongHarness 的状态协议用于 RL 训练（而不只是推理时 harness），奖励和信用分配可以怎么设计？</summary>
+      <p>可讨论方向：(a) 用 r₁ / r₂ / r₃ 分阶段信号做过程奖励，例如所需证据首次被 upsert 时给检索奖励；(b) 对 revise 动作做反事实信用：被更正的证据是否改变了最终答案；(c) 惩罚 compute / final 引用 superseded 证据的尝试（runtime 已能检测）；(d) 注意 open gaps 是 policy 自写的，奖励它「关闭缺口」可能诱导写容易关闭的假缺口，需要以最终正确性为主、过程信号为辅。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.13075" target="_blank" rel="noopener">arXiv:2610.13075 · LongHarness（Huang et al.）</a></li>
+      <li><a href="https://github.com/openai/codex" target="_blank" rel="noopener">openai/codex</a> · <a href="https://github.com/anthropics/claude-code" target="_blank" rel="noopener">anthropics/claude-code</a>（论文对照 harness）</li>
+      <li><a href="https://arxiv.org/abs/2308.14508" target="_blank" rel="noopener">arXiv:2308.14508 · LongBench</a>（LongBench v2 见 <a href="https://arxiv.org/abs/2412.15204" target="_blank" rel="noopener">arXiv:2412.15204</a>）</li>
+      <li>站内：
+        <a href="daily-2026-09-07-harness-compaction.html">上下文压缩</a> ·
+        <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> ·
+        <a href="daily-2026-10-08-harness-refold.html">ReFold</a> ·
+        <a href="daily-2026-09-24-harness-anatomy.html">Harness 源码解剖</a> ·
+        <a href="daily-2026-09-28-harness-hard-stop.html">Hard Stop</a> ·
+        <a href="daily-2026-09-15-harness-elastic-horizon.html">Elastic Horizon</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
