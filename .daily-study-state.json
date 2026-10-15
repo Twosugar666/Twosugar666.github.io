@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 1,
+  "next": 2,
   "daily_streams": [
     "frontline",
     "harness",
@@ -732,6 +732,27 @@
       "source": "algo",
       "topic": "MoE 路由与负载均衡：Noisy Top-k Gating + CV(Importance)²/CV(Load)²；Switch α·N·Σf·P（α=1e-2）与 capacity factor；ST-MoE router z-loss（c_z=1e-3）；DeepSeek-V3 sigmoid 亲和度 + 选择偏置 b（γ=1e-3）+ 序列级 α=1e-4，batch 级 vs 序列级均衡；numpy 玩具实验；RL 下的 routing replay（arXiv:1701.06538 / 2101.03961 / 2202.08906 / 2412.19437）",
       "file": "posts/daily-2026-10-14-algo-moe-routing.html"
+    },
+    {
+      "date": "2026-10-15",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "VH-GPO：GRPO 全失败零信号组 → 冻结 teacher 从学生到达的最深可恢复状态接管、环境验证成功才保留 → 有界搜索（指数回跳+线性细化，2 条发现续写 / 4 条独立确认）找最早可独立确认的 handoff → student prefix–teacher bridge–student resume relay 整条重放；pair（DPO 式，β=0.1）/ bridge / resume 三辅助损失 λ=(0.5,0.25,0.1)；Qwen2.5-1.5B ALFWorld 59.38→94.79、WebShop 71.62→77.34，7B 78.12→95.57 / 71.61→79.69，额外生成 1.77% / 2.61%；消融 bridge −14.32、Terminal Teacher −7.81；7B 仅 18 / 10 条 relay（Li et al. 北航 / Luxi Tech arXiv:2610.14000）",
+      "file": "posts/daily-2026-10-15-vh-gpo.html"
+    },
+    {
+      "date": "2026-10-15",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "ClawLoop：harness-native、无外部 teacher 的闭环（Task Synthesis → SFT/GRPO → Diagnosis & Feedback，K=3、每轮 1,024 候选）；capability-driven（LLM 写 build(seed)→(s₀,y,C) generator + answer contract）+ domain-grounded（工具三部图聚 skills、抽象任务图）；multi-hop / dirtiness 难度增长；agent-free（oracle + leakage audit）+ agent-based（N=8，band [1,5]，自算入选概率不对称）；8 条 rollout 三用；Qwen3.6-27B SkillsBench 46.3→57.2、Claw-Eval-Live 69.3→76.9、ClawGym-Bench 67.6→68.4（ClawGym 61.9）；迁移 4B/9B；每轮 2,375 GPU·h（Yang et al. 美团 / 北大 arXiv:2610.14118）",
+      "file": "posts/daily-2026-10-15-harness-clawloop.html"
+    },
+    {
+      "date": "2026-10-15",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "RMSNorm：BatchNorm vs LayerNorm 统计轴；RMSNorm 去掉 mean-centering 只留 re-scaling（Table 1 不变性，只失去权重矩阵整体平移）；pRMSNorm p=6.25%；Jacobian 投影掉径向、scale invariance ⇒ ‖W‖ 增长与有效学习率；Post-LN vs Pre-LN（Xiong et al. Theorem 1：O(d√ln d) vs O(d√(ln d/L))，Lemma 2 残差流线性增长）；T5 / LLaMA / Gemma (1+w) / QK-Norm / MLA；HF cast 顺序与训推一致性；numpy 玩具实验（arXiv:1910.07467 / 1607.06450 / 1502.03167 / 2002.04745）",
+      "file": "posts/daily-2026-10-15-algo-rmsnorm.html"
     }
   ]
 }

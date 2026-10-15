@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜RMSNorm：去掉 mean-centering、只留 re-scaling——从 BatchNorm / LayerNorm 的不变性、Post-LN 与 Pre-LN 的梯度尺度，到现代 LLM 为什么默认用它 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜RMSNorm：去掉 mean-centering、只留 re-scaling——从 BatchNorm / LayerNorm 的不变性、Post-LN 与 Pre-LN 的梯度尺度，到现代 LLM 为什么默认用它</h1>
+    <p class="post-meta">2026-10-15 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Biao Zhang、Rico Sennrich · <em>Root Mean Square Layer Normalization</em>（NeurIPS 2019）
+      · <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener">arXiv:1910.07467</a>；
+      Jimmy Lei Ba、Jamie Ryan Kiros、Geoffrey Hinton · <em>Layer Normalization</em>
+      · <a href="https://arxiv.org/abs/1607.06450" target="_blank" rel="noopener">arXiv:1607.06450</a>；
+      Sergey Ioffe、Christian Szegedy · <em>Batch Normalization</em>
+      · <a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">arXiv:1502.03167</a>；
+      Ruibin Xiong et al. · <em>On Layer Normalization in the Transformer Architecture</em>（ICML 2020）
+      · <a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">arXiv:2002.04745</a>。
+      结论与数字均引自原论文；「玩具实验」一节为本文用 numpy 自跑的示意，不代表任何真实模型或 GPU kernel 的性能。
+      交叉：
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-13-algo-rope.html">RoPE</a>、
+      <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a>、
+      <a href="daily-2026-10-07-algo-muon.html">Muon</a>、
+      <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      打开任何一个 2023 年之后的开源 LLM 代码，Transformer block 的第一行几乎都是 <code>h = x + Attn(RMSNorm(x))</code>。这个看似最不起眼的算子，背后串着三件事：<strong>归一化在统计哪个维度</strong>（BatchNorm → LayerNorm）、<strong>归一化放在残差的哪一侧</strong>（Post-LN → Pre-LN）、以及<strong>归一化到底需要哪些统计量</strong>（LayerNorm → RMSNorm）。
+    </p>
+    <p>
+      Zhang &amp; Sennrich 2019 的出发点很朴素：LayerNorm 在 RNN 上能显著加速收敛，但它本身很贵——论文报告 TensorFlow 版 RNNSearch 里加 LayerNorm 后比不加还慢约 67%。他们的假设是：<strong>LayerNorm 起作用的是 re-scaling 不变性，而不是 re-centering 不变性</strong>。如果假设成立，均值那一项可以整个拿掉。这篇笔记沿着这条线把三代归一化串起来，并讨论它在 LLM 训练与推理里的实际后果。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① BatchNorm 与 LayerNorm：统计的轴不同</h3>
+    <pre><code># 记一层的 summed inputs 为 a = W·x ∈ Rⁿ（n 为隐藏维度），g / b 为可学习的逐维 gain / bias
+
+# BatchNorm（Ioffe &amp; Szegedy 2015）：沿 batch 维统计，每个特征一组 μ / σ
+μ_i = mean_{batch}(a_i),   σ_i² = var_{batch}(a_i)
+ā_i = g_i · (a_i − μ_i) / sqrt(σ_i² + ε) + b_i
+# 训练用 batch 统计，推理用滑动平均 → 训推行为不同；依赖 batch 大小；对变长序列 / RNN 不友好
+
+# LayerNorm（Ba et al. 2016）：沿特征维统计，每个样本（每个 token）一组 μ / σ
+μ = (1/n) Σ_i a_i,   σ = sqrt( (1/n) Σ_i (a_i − μ)² )
+ā_i = g_i · (a_i − μ) / σ + b_i
+# 与 batch 无关；训练与推理完全一致；天然适合逐 token 计算</code></pre>
+    <p>
+      对语言模型来说，LayerNorm 的决定性优势是「每个 token 独立」：batch 里混着不同长度、不同 padding 的序列，KV cache 推理时 batch 每一步都在变，按 batch 统计根本无法定义稳定的行为。
+    </p>
+
+    <h3>② RMSNorm：只保留二阶矩</h3>
+    <pre><code># Zhang &amp; Sennrich 2019，式 (4)
+RMS(a) = sqrt( (1/n) Σ_i a_i² )
+ā_i    = a_i / RMS(a) · g_i                # 原论文的一般形式还可加 bias b，现代 LLM 基本不用
+
+# 与 LayerNorm 的关系：当 μ = 0 时，σ = RMS(a)，两者完全相等
+# 几何：输出被压到半径 √n 的球面上（再逐维乘 g）
+
+# pRMSNorm：只用前 p% 的维度估计 RMS（论文用 p = 6.25%）
+RMS_p(a) = sqrt( (1/k) Σ_{i≤k} a_i² ),   k = ⌈n·p⌉</code></pre>
+    <ul>
+      <li><strong>为什么要除以 √n（用 RMS 而不是 L2 范数）：</strong>论文实验里直接用 L2 范数归一化不起作用；作者的解释是球面半径随向量维度缩放，能让归一化在不同宽度的层之间保持一致的数值尺度。</li>
+      <li><strong>省了什么：</strong>LayerNorm 需要先算 μ、再算 (a − μ)² 的均值（或用 Welford 合并成一遍），反向也要对两个统计量求导；RMSNorm 前向只有一次 Σa² 归约，反向少一条均值分支。</li>
+      <li><strong>pRMSNorm 的教训：</strong>理论上计算更少，但论文发现它有时反而更慢，原因是框架的张量切片实现不够好——「少算」不等于「更快」，访存模式更关键（这一点在 <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> 里已经见过）。</li>
+    </ul>
+
+    <h3>③ 不变性：到底丢掉了什么（论文 Table 1）</h3>
+    <table>
+      <thead><tr><th>方法</th><th>权重矩阵整体缩放</th><th>权重矩阵整体平移</th><th>单个权重向量缩放</th><th>数据集缩放</th><th>数据集平移</th><th>单样本缩放</th></tr></thead>
+      <tbody>
+        <tr><td>BatchNorm</td><td>✓</td><td>✗</td><td>✓</td><td>✓</td><td>✓</td><td>✗</td></tr>
+        <tr><td>WeightNorm</td><td>✓</td><td>✗</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td></tr>
+        <tr><td>LayerNorm</td><td>✓</td><td>✓</td><td>✗</td><td>✓</td><td>✗</td><td>✓</td></tr>
+        <tr><td>RMSNorm</td><td>✓</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td><td>✓</td></tr>
+        <tr><td>pRMSNorm</td><td>✓</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td><td>✓</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与 LayerNorm 相比，RMSNorm 只少了一格：<strong>权重矩阵整体平移</strong>（给 W 每一行加同一个向量，等价于给 a 的每一维加同一个偏移）。来源是 RMS 的线性性 RMS(α·a) = α·RMS(a)：任何对 a 的整体缩放都被分子分母抵消，但平移不行。论文的实验结论是：去掉这一格对 BLEU / 收敛几乎没有影响——这就是「re-scaling 才是关键」的经验证据。
+    </p>
+
+    <h3>④ 梯度视角：Jacobian 把「径向」投影掉</h3>
+    <pre><code># 忽略 ε 与 g，令 r = RMS(x)，y = x / r
+∂y/∂x = (1/r) · ( I − x·xᵀ / (n·r²) )          # RMSNorm
+∂y/∂x = (1/σ) · ( I − 1·1ᵀ/n − ŷ·ŷᵀ/n )          # LayerNorm，ŷ 为归一化后的输出
+
+# 推论 1：(∂y/∂x)·x = 0 —— 沿 x 自身方向的扰动对输出无影响（scale invariance 的微分形式）
+# 推论 2：回传到 x 的梯度 ∇_x L 与 x 正交
+# 推论 3：若 W 位于 norm 之前，L(c·W) = L(W) ⇒ ∇_W L ⊥ W，
+#        纯 SGD 下 ‖W‖ 只增不减（勾股定理），有效学习率 ∝ lr / ‖W‖²
+# gain 的梯度：∂L/∂g = ∂L/∂v ⊙ (a / RMS(a))，与输入、权重的整体尺度无关（论文 §4.2）</code></pre>
+    <p>
+      推论 3 是一个常被忽略的联系：<strong>归一化层让上游权重的「范数」变成无关自由度</strong>，于是 weight decay 实际上在控制有效学习率，而不是在做传统意义的正则化（van Laarhoven 2017 的分析）。这正是站内 <a href="daily-2026-09-08-algo-adam.html">AdamW</a> 解耦权重衰减、以及 <a href="daily-2026-10-07-algo-muon.html">Muon</a> 讨论「更新 RMS 对齐」时背后的同一件事。
+    </p>
+
+    <h3>⑤ 放在哪里：Post-LN vs Pre-LN</h3>
+    <pre><code># Post-LN（原始 Transformer）
+x_{l+1} = Norm( x_l + F(x_l) )
+# Pre-LN（GPT-2 之后的主流）
+x_{l+1} = x_l + F( Norm(x_l) )          # 输出层前还需一个 final Norm
+
+# Xiong et al. 2020，Theorem 1（初始化时，最后一个 FFN 的 W² 的梯度）
+Post-LN :  ‖∂L/∂W²_L‖_F ≤ O( d · sqrt(ln d) )          # 与层数 L 无关
+Pre-LN  :  ‖∂L/∂W²_L‖_F ≤ O( d · sqrt(ln d / L) )      # 随层数按 1/√L 缩小
+# Lemma 2：Post-LN 中进入 LN 之前的隐状态 E‖x‖² 各层都保持 (3/2)d；
+#          Pre-LN 满足 (1 + l/2)·d ≤ E‖x_l‖² ≤ (1 + 3l/2)·d，随深度线性增长</code></pre>
+    <p>
+      直观解释：Norm 会把梯度按输入尺度缩小（Lemma 3：LN 的 Jacobian 范数是 O(√d / ‖x‖)）。Post-LN 每层输入尺度固定，靠近输出的参数梯度很大，大学习率一上来就不稳，所以必须 warm-up；Pre-LN 的残差流随深度变长，梯度被自动按 √L 缩小，论文实验显示去掉 warm-up 也能训到可比结果、调参更少。一个常被讨论的代价是：残差流越来越长，深层子层的输出相对残差流的占比越来越小，深层的有效贡献可能被稀释，这是后来 DeepNorm（<a href="https://arxiv.org/abs/2203.00555" target="_blank" rel="noopener">arXiv:2203.00555</a>，带 α 放大残差的 Post-LN）、sandwich norm 等变体试图找回的东西。
+    </p>
+
+    <h3>⑥ 现代 LLM 里的 RMSNorm</h3>
+    <table>
+      <thead><tr><th>模型 / 组件</th><th>做法</th><th>来源</th></tr></thead>
+      <tbody>
+        <tr><td>T5</td><td>只缩放、无 bias、不减均值的简化 LayerNorm（HF 代码注释称 LlamaRMSNorm 与 T5LayerNorm 等价）</td><td><a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">arXiv:1910.10683</a></td></tr>
+        <tr><td>LLaMA 系</td><td>Pre-normalization + RMSNorm；Llama 2 的 HF config <code>rms_norm_eps = 1e-5</code></td><td><a href="https://arxiv.org/abs/2302.13971" target="_blank" rel="noopener">arXiv:2302.13971</a></td></tr>
+        <tr><td>Gemma</td><td>gain 参数化为 (1 + w)，w 初始化为 0；乘 gain 在 fp32 下完成后再 cast</td><td>HF <code>GemmaRMSNorm</code></td></tr>
+        <tr><td>QK-Norm</td><td>对 q、k 分别做 RMSNorm 再算点积，抑制 attention logit 增长；Qwen3、OLMo 2 等采用</td><td><a href="https://arxiv.org/abs/2302.05442" target="_blank" rel="noopener">arXiv:2302.05442</a>（ViT-22B）</td></tr>
+        <tr><td>DeepSeek MLA</td><td>在压缩后的 latent 向量之后额外加 RMSNorm</td><td><a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">arXiv:2405.04434</a></td></tr>
+      </tbody>
+    </table>
+    <pre><code># HF LlamaRMSNorm.forward（节选，注意精度路径）
+input_dtype = hidden_states.dtype
+hidden_states = hidden_states.to(torch.float32)                 # 统计量一律 fp32
+variance = hidden_states.pow(2).mean(-1, keepdim=True)
+hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+return self.weight * hidden_states.to(input_dtype)              # Llama：先 cast 再乘 gain
+# Gemma：output * (1.0 + self.weight.float()) 之后再 .type_as(x) —— 先乘再 cast</code></pre>
+    <p>
+      Gemma 源码里专门写了一行注释对比两者的 cast 顺序。这个差别在 bf16 下会让同一份权重得到逐比特不同的输出——对推理无伤大雅，对 RL 的训推一致性则是需要注意的细节（见下文）。QK-Norm 与 <a href="daily-2026-10-13-algo-rope.html">RoPE</a> 的顺序通常是先 norm、再旋转；与 <a href="daily-2026-10-14-algo-moe-routing.html">MoE router z-loss</a> 一样，它们都是在给 softmax 的输入尺度加约束（参见 <a href="daily-2026-09-09-algo-attention.html">Attention</a> 里的温度讨论）。
+    </p>
+
+    <h3>⑦ 玩具实验（本文自跑，numpy，示意）</h3>
+    <pre><code>import numpy as np
+rng = np.random.default_rng(0)
+ln  = lambda x, e=1e-6: (x - x.mean(-1, keepdims=True)) / np.sqrt(x.var(-1, keepdims=True) + e)
+rms = lambda x, e=1e-6: x / np.sqrt((x**2).mean(-1, keepdims=True) + e)
+x = rng.normal(size=(8, 4096))
+# (a) 不变性：f(3x) vs f(x)，f(x+2) vs f(x)
+# (b) Jacobian：J = (I − x xᵀ/(n r²)) / r，检查 ‖J x‖
+# (c) Pre-norm 残差流：h ← h + W₂·ReLU(W₁·rms(h))，d=1024，48 层，随机初始化，记录 E‖h‖²/d</code></pre>
+    <table>
+      <thead><tr><th>检查项</th><th>LayerNorm</th><th>RMSNorm</th></tr></thead>
+      <tbody>
+        <tr><td>max|f(3x) − f(x)|</td><td>2.0e-6（仅来自 ε）</td><td>2.0e-6（仅来自 ε）</td></tr>
+        <tr><td>max|f(x+2) − f(x)|</td><td>8.9e-16</td><td>3.37；平均余弦相似度仅 0.45</td></tr>
+        <tr><td>‖J·x‖</td><td>—</td><td>5.0e-14（数值上为 0）</td></tr>
+        <tr><td>CPU 前向耗时，4096×4096 fp32，中位数</td><td>103 ms</td><td>45 ms</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Pre-norm 残差流的 E‖h‖²/d 在第 1 / 12 / 24 / 48 层分别为 1.50 / 6.97 / 12.96 / 24.73，几乎贴着 Xiong et al. Lemma 2 的下界 1 + l/2（1.5 / 7 / 13 / 25）。CPU 耗时只说明「少一次归约 + 少一次减法」的量级，numpy 未融合，与 GPU kernel 的实际差距（论文报告 Transformer 上 7%–9%）不可直接比较。
+    </p>
+
+    <h2>和 LLM 训练 / RL / 推理的交叉</h2>
+    <ul>
+      <li><strong>训推不一致的来源之一。</strong> 训练框架与推理引擎的 RMSNorm 实现可能在归约顺序、是否 fp32 upcast、gain 乘法与 cast 的先后上不同，导致 token logprob 的细微差异。RL 里 π/µ 比率对这种差异敏感（站内 <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a>、<a href="daily-2026-10-14-gppo.html">GPPO</a> 都讨论过低概率 token 的比率噪声），对齐 norm kernel 是排查顺序里很靠前的一项。</li>
+      <li><strong>融合算子。</strong> 推理侧通常把「残差相加 + RMSNorm」融合成一个 kernel（如 vLLM 的 <code>fused_add_rms_norm</code>），省掉一次读写残差流；它是 memory-bound 算子，收益来自少一次 HBM 往返，而非少算几次乘法。</li>
+      <li><strong>量化友好性。</strong> RMSNorm 的 gain 是逐通道缩放，可以被合并进下一层线性层的权重（SmoothQuant 一类方法常利用这一点做逐通道平衡）；没有 bias 也让这类合并更干净。</li>
+      <li><strong>激活尺度监控。</strong> Pre-LN 残差流随深度增长，深层 RMSNorm 的输入可以很大；监控每层 norm 输入的 RMS、以及 gain 的分布，是发现训练异常（如个别通道激活爆涨）的低成本手段。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>新模型默认 Pre-norm + RMSNorm，无 bias。</strong> 这是目前开源 LLM 的事实标准，省一次归约、少一组参数，效果与 LayerNorm 持平（Zhang &amp; Sennrich 的 MT / 语言建模实验与后续大量模型的实践）。</li>
+      <li><strong>统计量一律 fp32。</strong> Σx² 在 bf16 下误差很大；参照 HF 的写法先 upcast 再 rsqrt，ε 放在根号内（常见 1e-5 / 1e-6），并在训练与推理两侧保持同一 ε。</li>
+      <li><strong>gain 不做 weight decay。</strong> 由推论 3，norm 之前的权重范数是「冗余自由度」；norm 自身的 gain 则直接决定输出尺度，衰减它会把各层输出向 0 拉，常见配置都会把 norm 参数排除在 decay 之外。</li>
+      <li><strong>深层 / 大学习率时加 QK-Norm。</strong> 它的成本是两次小 RMSNorm，换来 attention logit 的尺度上限；与 RoPE 组合时注意先 norm 后旋转。</li>
+      <li><strong>做 RL 时核对 norm 实现。</strong> rollout 引擎与训练框架的 RMSNorm（cast 顺序、ε、是否融合残差）要逐项对齐；发现 π/µ 比率在 μ≈1 的 token 上也有系统偏差时，norm 和 RoPE 是最先该查的两个算子。</li>
+      <li><strong>Post-LN 不是不能用，但要配套。</strong> 若出于表示能力考虑用 Post-LN 或 sandwich norm，必须配 warm-up 和更保守的初始化（DeepNorm 的 α / β 缩放是可参考的现成方案）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 BatchNorm 不适合 LLM，而 LayerNorm / RMSNorm 适合？请从训练与推理两侧说明。</summary>
+      <p>BatchNorm 沿 batch 统计，训练时依赖 batch 组成与大小，推理时改用滑动平均，训推行为不一致；变长序列与 padding 会污染统计量；自回归解码时 batch 每步都在变，甚至 batch=1，统计量无法稳定定义。LayerNorm / RMSNorm 对每个 token 独立统计，训练与推理计算完全相同，也与 KV cache、continuous batching 等推理机制兼容。</p>
+    </details>
+    <details>
+      <summary>2. RMSNorm 相对 LayerNorm 只失去了「权重矩阵整体平移」不变性。请用 RMS 的线性性解释它为什么保留了缩放不变性，又为什么失去了平移不变性。</summary>
+      <p>RMS(α·a) = α·RMS(a)，所以 a/RMS(a) 对 a 的任意正数整体缩放不变：权重矩阵整体缩放、输入整体缩放、单样本缩放都会在分子分母同时出现并抵消。平移 a → a + c·1 时，RMS(a + c·1) 不等于 RMS(a) 的任何简单函数，输出方向也随之改变（玩具实验里余弦相似度降到 0.45）；LayerNorm 先减均值，恰好把 c·1 消掉。</p>
+    </details>
+    <details>
+      <summary>3. 若某层权重 W 位于 RMSNorm 之前，为什么纯 SGD 训练下 ‖W‖ 会单调增长？这和 weight decay 的作用有什么关系？</summary>
+      <p>W 整体缩放不改变损失，即 L(c·W) = L(W)，对 c 求导得 ⟨∇_W L, W⟩ = 0，梯度与 W 正交。SGD 一步后 ‖W − η∇‖² = ‖W‖² + η²‖∇‖² ≥ ‖W‖²，范数只增不减。而梯度大小又与 ‖W‖ 成反比，有效学习率约为 η/‖W‖²，会随训练自然衰减。weight decay 把 ‖W‖ 拉回来，实际作用是维持有效学习率，而不是限制模型容量。</p>
+    </details>
+    <details>
+      <summary>4. Xiong et al. 证明 Post-LN 最后一层梯度 O(d·√(ln d)) 与层数无关，Pre-LN 则按 1/√L 缩小。这为什么解释了「Post-LN 需要 warm-up」？</summary>
+      <p>Norm 会把回传梯度按其输入尺度缩小。Post-LN 每一层的输入都被归一化到固定尺度，靠近输出的参数梯度在初始化时就很大，若一开始就用大学习率，更新步长过大导致训练不稳，warm-up 用小学习率熬过这段时期。Pre-LN 的残差流按 (1 + l/2)·d 量级随深度增长，final Norm 的输入尺度正比于 L，梯度自然被缩小到 1/√L，初始化附近梯度良态，因此可以去掉或缩短 warm-up。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）在 RL 后训练中，你会如何系统地排查「训练框架与推理引擎 logprob 不一致」里 RMSNorm 的贡献？</summary>
+      <p>可讨论方向：(a) 固定一批输入，逐层 dump 两侧 norm 的输入与输出，计算最大绝对误差与相对误差，定位第一处显著分叉的层；(b) 分别对齐 ε、fp32 upcast、gain 乘法与 cast 顺序、是否与残差融合，观察 logprob 差异的变化；(c) 区分 norm 与其他算子（RoPE、attention kernel、matmul 的归约顺序）的贡献，可逐个把推理侧算子替换为训练侧参考实现；(d) 关注深层：Pre-LN 残差流尺度更大，同样的相对误差在深层对应更大的绝对误差；(e) 若无法完全对齐，配合 TIS / MIS 一类截断重要性采样修正，并监控比率分布的尾部。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener">arXiv:1910.07467 · Root Mean Square Layer Normalization（Zhang &amp; Sennrich）</a></li>
+      <li><a href="https://arxiv.org/abs/1607.06450" target="_blank" rel="noopener">arXiv:1607.06450 · Layer Normalization（Ba, Kiros, Hinton）</a></li>
+      <li><a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">arXiv:1502.03167 · Batch Normalization（Ioffe &amp; Szegedy）</a></li>
+      <li><a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">arXiv:2002.04745 · On Layer Normalization in the Transformer Architecture（Xiong et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/1706.05350" target="_blank" rel="noopener">arXiv:1706.05350 · L2 Regularization versus Batch and Weight Normalization（van Laarhoven）</a></li>
+      <li><a href="https://arxiv.org/abs/2203.00555" target="_blank" rel="noopener">arXiv:2203.00555 · DeepNet / DeepNorm（Wang et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2302.13971" target="_blank" rel="noopener">arXiv:2302.13971 · LLaMA（Touvron et al.）</a></li>
+      <li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py" target="_blank" rel="noopener">transformers · modeling_llama.py（LlamaRMSNorm）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-09-algo-attention.html">Attention</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-10-13-algo-rope.html">RoPE</a> ·
+        <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a> ·
+        <a href="daily-2026-10-07-algo-muon.html">Muon</a> ·
+        <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache</a> ·
+        <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

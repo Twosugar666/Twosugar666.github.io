@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜VH-GPO：全失败组里让冻结 teacher「只扶一段」——在最早可独立确认的 handoff 点把控制权还给学生，1.5B ALFWorld 59.38%→94.79%，7B 额外生成仅 1.77% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜VH-GPO：全失败组里让冻结 teacher「只扶一段」——在最早可独立确认的 handoff 点把控制权还给学生，1.5B ALFWorld 59.38%→94.79%，7B 额外生成仅 1.77%</h1>
+    <p class="post-meta">2026-10-15 · 收藏夹：Agent / RL · 一线追踪<br />
+      论文：Haoze Li（北航）、Peng Zhou（通讯）、Peiyuan Wu、Weijie Zhao、Yinan Xin（深圳 Luxi Tech） ·
+      <em>VH-GPO: Verified Handoff for LLM Agent Reinforcement Learning</em>
+      · <a href="https://arxiv.org/abs/2610.14000" target="_blank" rel="noopener">arXiv:2610.14000</a>（cs.LG，v1）。
+      文中实验数字均为<strong>论文自报</strong>（Qwen2.5-1.5B / 7B-Instruct 学生，ALFWorld、WebShop，三 seed 均值±标准差）；「相对最强基线的差距」「增益 / 标准差」等派生数是本文按论文表格自行计算。
+      交叉：
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-10-14-gppo.html">GPPO</a>、
+      <a href="daily-2026-10-06-depgpo.html">DepGPO</a>、
+      <a href="daily-2026-09-04-pgpo.html">PGPO</a>、
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a>、
+      <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Full Sandbox Snapshots</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 的优势来自组内对比：同一任务采 G 条 rollout，用 (r − mean)/std 给每条打分。长程 Agent 任务的奖励极稀疏，训练早期经常出现<strong>整组全失败</strong>——R₁ = … = R_G，于是 A₁ = … = A_G ≈ 0，这一组除了耗掉 rollout 算力，什么梯度都不贡献。论文把它叫 <strong>all-failure, zero-signal group</strong>。
+    </p>
+    <p>
+      已有的几条路各管一段：<a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 的 dynamic sampling 直接丢掉全对 / 全错组再补采，batch 是满了，但被丢掉的失败本身没有得到任何「该怎么改」的目标；GiGPO、GraphGPO、HGPO 一类细粒度信用分配（站内 <a href="daily-2026-10-06-depgpo.html">DepGPO</a>、<a href="daily-2026-09-07-tigpo.html">TIGPO</a> 也属这条线）能把功劳分得更准，但前提是组里已经有成功轨迹——<strong>没有成功样本时，再精细的归因也无从谈起</strong>。
+    </p>
+    <p>
+      自然的补救是请一个冻结的 teacher：从学生已经走到的失败状态出发让 teacher 接管，环境验证成功才保留（OVCSD，<a href="https://arxiv.org/abs/2607.27937" target="_blank" rel="noopener">arXiv:2607.27937</a>）。问题在于 teacher 接管得越久，被保留的成功后缀就越是 teacher 的状态–动作分布，RL 退化成 off-policy 模仿，丢掉了「在学生自己诱导的状态分布上学习」这个 RL 的核心好处。VH-GPO 的问题因此被问得很具体：<strong>teacher 修好之后，什么时候把控制权还给学生？</strong>答案是：只扶过学生暂时过不去的那一段，然后在<strong>最早一个「学生能独立完成」被环境确认的状态</strong>交还。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 触发条件与整体结构：student prefix → teacher bridge → student resume</h3>
+    <pre><code># 每次更新：冻结 π_old，每个任务 x 采 G 条轨迹 G_x = {τ_1..τ_G}
+if G_x 有奖励对比:        走标准 GRPO（完全不改）
+elif G_x 全失败 且 A≈0:   进入 VH-GPO 干预（每次更新最多 M=2 组）
+    1. 选 backbone：在失败轨迹中挑「满足剩余预算 b_t ≥ b_min 的最深候选状态」那条
+    2. 从深到浅排 anchor（固定回退步长，最后兜底到初始状态）
+    3. 在 anchor 处恢复环境 → 冻结 teacher π_T 尝试接管 → 环境验证成功才保留（多次成功取最短）
+    4. 在 teacher 恢复路径 s_0..s_L 上搜索 handoff：
+         j* = min { j ∈ J_test : 从 s_j 出发学生成功被独立确认 },  要求 j* &lt; L
+    5. 组装 relay = 原学生前缀 + teacher 前 j* 步 + 学生续写；从初始状态整条重放验证
+    6. 任一步失败 → 该组不产生任何 teacher 相关梯度
+# 推理期：teacher / 状态恢复 / verifier / handoff 全部移除，只剩学生</code></pre>
+    <p>
+      两个设计取向值得注意。其一，<strong>anchor 从最深处开始</strong>：失败轨迹也可能已经完成了大半任务，从晚的状态起修，teacher 只需处理「学生自己造成的局面」，不必把前半段重演一遍。其二，<strong>handoff 必须被独立确认</strong>：搜索时找到一个学生能成功的状态还不够，要再用新 seed 采样续写重新验证，最后整条 relay 从初始状态重放一遍——防止靠运气或状态恢复误差混进假阳性。
+    </p>
+
+    <h3>② 有界搜索：anchor 预算与 handoff 搜索（附录 A / D）</h3>
+    <table>
+      <thead><tr><th>参数（1.5B / 7B 共用）</th><th>ALFWorld</th><th>WebShop</th></tr></thead>
+      <tbody>
+        <tr><td>最小剩余交互预算 b_min（步）</td><td>16</td><td>6</td></tr>
+        <tr><td>anchor 回退步长（步）</td><td>8</td><td>2</td></tr>
+        <tr><td>最大回退次数</td><td>4</td><td>4</td></tr>
+        <tr><td>每组最多 anchor 数（含根）</td><td>6</td><td>6</td></tr>
+        <tr><td>每个 anchor 的 teacher 尝试次数</td><td>2</td><td>2</td></tr>
+        <tr><td>交互上限 H（训练 = 评测）</td><td>50</td><td>15</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 每组 teacher 恢复尝试上限 = 6 anchor × 2 = 12（不含学生搜索与确认 rollout）
+# handoff 发现（discovery）：
+#   从 teacher 恢复的末尾向前，以指数增长的步长跳；
+#   第一次测到失败后，在「该失败状态 → 最早的已发现成功状态」之间按递增顺序逐个测，遇到成功即停
+#   每个被测非终止状态给 2 条学生续写，至少 1 条成功即进入发现成功集合 S；每条 teacher 恢复最多 8 条发现 rollout
+# 独立确认（confirmation）：对 min S 再用新 seed 采 4 条续写，至少 1 条成功
+# 最后：整条 prefix–bridge–resume 动作序列从初始状态重放成功，才进入辅助训练</code></pre>
+    <p>
+      「最早」是<strong>有限预算内测到的最早</strong>，不是全局最短的干预——论文在附录 E 明确了这一点。指数回跳 + 局部线性细化本质上是在单调假设（越晚的状态越容易让学生接手）下做的近似二分，代价是可能漏掉更早的可行点。
+    </p>
+
+    <h3>③ 三个辅助损失：pair / bridge / resume</h3>
+    <pre><code># s_θ(y | h)：学生在可见上下文 h 下对目标文本 y 的「平均 token 对数概率」
+# ① 状态对齐的动作偏好（DPO 式，只在最早的动作分叉点 h_d）
+p_θ    = s_θ(a_chosen | h_d) − s_θ(a_rejected | h_d)    # chosen = teacher 动作，rejected = 失败学生动作
+ℓ_pair = −log σ( β · (p_θ − p_ref) ),   β = 0.1          # p_ref 来自学生初始 checkpoint
+# ② teacher bridge：对 bridge 中每一轮 (h, y) 做 NLL
+L_bridge = −(1/|B|) Σ_{(h,y)∈B} s_θ(y | h)
+# ③ student resume：对独立确认过的学生续写做 NLL（outcome-filtered，非无偏 PG 估计）
+L_resume = −(1/|C|) Σ_{(h,y)∈C} s_θ(y | h)
+
+L_aux = 0.5·L_pair + 0.25·L_bridge + 0.1·L_resume
+L     = L_GRPO + η·L_KL + L_aux       # GRPO 项与辅助项分别归一化后再合并
+# η = 0（ALFWorld）/ 0.01（WebShop）；同一条失败轨迹不会同时被当作 GRPO 样本和 teacher 正例</code></pre>
+    <p>
+      三个信号各有分工：<strong>pair</strong> 是局部纠错——在同一状态下告诉学生「这一步不该选你原来那个动作」，和 <a href="daily-2026-09-10-algo-dpo.html">DPO</a> 的 reference-anchored 形式一致，只是对象从整段回复换成了单步可执行动作；<strong>bridge</strong> 是最小纠正序列的模仿；<strong>resume</strong> 则把学生自己在 teacher 帮助后走通的那段续写强化掉，作用接近 self-imitation learning，但样本经过了独立确认。注意 resume 的权重最小（0.1），且论文自己承认它不是无偏的 policy gradient——这是有意识地用一点偏差换「成功经验一定是学生生成的」。
+    </p>
+
+    <h3>④ 放进已有方法的坐标系</h3>
+    <table>
+      <thead><tr><th>方法</th><th>全失败组怎么处理</th><th>成功样本是谁生成的</th><th>需要什么额外条件</th></tr></thead>
+      <tbody>
+        <tr><td>GRPO</td><td>A≈0，白跑</td><td>—</td><td>—</td></tr>
+        <tr><td>DAPO dynamic sampling</td><td>丢弃并补采</td><td>学生（靠多采碰运气）</td><td>额外 rollout</td></tr>
+        <tr><td>GiGPO / GraphGPO / HGPO</td><td>无法凭空造成功</td><td>学生</td><td>组里得有成功</td></tr>
+        <tr><td>OVCSD</td><td>teacher 从学生状态接管，验证成功后蒸馏<strong>完整后缀</strong></td><td>后缀全是 teacher</td><td>可恢复状态 + teacher</td></tr>
+        <tr><td>DAgger 系</td><td>学生状态上查询专家标签</td><td>专家标注</td><td>可随时查询的专家</td></tr>
+        <tr><td><strong>VH-GPO</strong></td><td>teacher 只修一段，最早确认点交还</td><td>bridge 是 teacher，resume 是学生</td><td>可恢复状态 + 可验证结局 + 冻结 teacher</td></tr>
+      </tbody>
+    </table>
+    <p>
+      和站内 <a href="daily-2026-09-04-pgpo.html">PGPO</a>（给失败轨迹里的好动作正名）相比，VH-GPO 不在失败轨迹内部找功劳，而是<strong>外接一条被验证过的替代路线</strong>；和 <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Full Sandbox Snapshots</a>、<a href="daily-2026-09-18-rir.html">RIR</a> 一样，它的地基是「环境状态可以恢复」——这在 ALFWorld / WebShop 这种文本环境里便宜，在真实沙箱里就是快照基础设施的问题。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>设置：</strong>Qwen2.5-1.5B / 7B-Instruct 学生，150 次更新，AdamW lr 1e-6、weight decay 0.01；每次更新 16 个任务 × 8 条 root rollout；GRPO clip 0.2；回复上限 512 token。teacher 是<strong>冻结的、经 GRPO 训练过的 Qwen2.5-1.5B-Instruct</strong>，仅训练期使用。奖励：ALFWorld 成功 10 分否则 0；WebShop 只有 s=1 的完整购买得 10 分；格式错误每次 −0.1。</li>
+      <li><strong>主结果（Table 1，All / WebShop Succ.）：</strong>1.5B：GRPO 59.38 / 71.62，GiGPO 90.63 / 71.09，GraphGPO 92.71 / 75.52，HGPO 86.98 / 75.52，<strong>VH-GPO 94.79 / 77.34</strong>。7B：GRPO 78.12 / 71.61，GraphGPO 94.53 / 78.38，HGPO 94.27 / 78.12，<strong>VH-GPO 95.57 / 79.69</strong>。</li>
+      <li><strong>和最强基线的差距（自算）：</strong>相对 GRPO 是 +35.41pp（1.5B ALFWorld），相对最强基线 GraphGPO 只有 +2.08pp（1.5B ALFWorld）、+1.04pp（7B ALFWorld）；WebShop Succ. 领先 1.82pp（1.5B）/ 1.31pp（7B），而这两列的三 seed 标准差在 2.4–3.4 之间。另外 7B 的 Pick2 子项 VH-GPO 84.26，低于 GiGPO / HGPO 的 94.01。</li>
+      <li><strong>训练目标消融（1.5B ALFWorld）：</strong>去掉 bridge loss 80.47（<strong>−14.32</strong>），去掉 action preference 88.28（−6.51），去掉 resume loss 90.62（−4.17）。</li>
+      <li><strong>恢复 / handoff 消融：</strong>Random Failure Anchor（打乱非根 anchor 顺序）90.89（−3.90）；Random Verified Handoff（排除最早成功点后随机选）90.10（−4.69）；<strong>Terminal Teacher</strong>（监督完整 teacher 后缀、不交还）86.98（−7.81）。</li>
+      <li><strong>同预算多采：</strong>给每个被选中的零信号组多采 4 条完整学生轨迹（4 × 50 步 × 512 token = 102,400 token，对齐 4 条确认续写的 token 预留）走普通 GRPO：64.32，只比 GRPO 高 4.94pp，比 VH-GPO 低 30.47pp。</li>
+      <li><strong>额外生成（7B，150 次更新累计，占 root rollout 输出 token）：</strong>ALFWorld 1.77%（teacher 恢复 1.04 + 搜索 0.47 + 确认 0.26），WebShop 2.61%（2.07 + 0.41 + 0.13），含失败与被丢弃的尝试。</li>
+      <li><strong>relay 产出（7B，Table 8）：</strong>ALFWorld 50 个合格组 → 25 次 teacher 恢复成功（50.0%）→ 18 条保留 relay（72.0%）；WebShop 150 → 29（19.3%）→ 10（34.5%）。<strong>teacher 能修好不等于学生能接手</strong>：7 条 ALFWorld、19 条 WebShop 的恢复因找不到确认的 handoff 被弃用。</li>
+      <li><strong>干预长度（7B，Table 9）：</strong>ALFWorld 完整 teacher 恢复均值 14.78 步、保留 bridge 9.39 步、学生续写 4.33 步；WebShop 5.20 / 1.80 / 4.10。按 teacher 动作加权，handoff 从 bridge 监督中去掉了 36.47%（97/266）与 65.38%（34/52）的 teacher 动作。</li>
+      <li><strong>OVCSD 复现对比（附录 C，作者复现，非原文数字）：</strong>ALFWorld All 1.5B 71.36 vs 94.79，7B 88.54 vs 95.57。</li>
+    </ul>
+
+    <h2>怎么看这篇</h2>
+    <p>
+      <strong>值得拿走的：</strong>一个很干净的原则——<strong>teacher 的价值不在于替学生做完，而在于把学生送回「它自己能走完」的区域</strong>。Terminal Teacher 消融（−7.81）和 OVCSD 复现对比都指向同一件事：完整后缀蒸馏会把学生本来能做的部分也换成 teacher 的分布。bridge loss 掉点最多（−14.32）说明真正稀缺的是「如何从这个具体失败局面里脱身」的那几步，而 resume 的存在保证了成功经验的主体仍是 on-policy 的。另一个值得记住的细节：7B 学生由 1.5B teacher 辅助，最终成功率远高于同规模 GRPO——验证机制让「较弱 teacher 的局部正确片段」也能被安全利用。
+    </p>
+    <p>
+      <strong>需要打折的：</strong>(1) 相对强基线（GraphGPO / HGPO）的优势只有 1–2pp，WebShop 上落在一个标准差内；大幅提升主要是相对 vanilla GRPO。(2) teacher 是「GRPO 训练过的 1.5B」，大概率在同一环境上训练过——它带来的环境知识是一份隐性资源，1.77% 的开销统计不含 teacher 自身的训练成本。(3) 7B 全程只保留了 18 / 10 条 relay，辅助信号非常稀疏却对应大幅增益，说明单条 relay 的杠杆极高，也意味着对超参（λ、β、每次最多 2 组）和随机性可能敏感，论文只有三 seed。(4) 「独立确认」的门槛是 4 条新续写里至少 1 条成功，偏宽松；整条重放能挡掉状态恢复错误，挡不住「学生在该状态下成功率其实很低」。(5) 前提是可恢复状态 + 可验证终局；两个基准都是文本环境，状态恢复几乎免费。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先统计零信号组占比。</strong> 每次更新记录全对 / 全错组比例；论文图 2(b) 显示合格组比例随训练下降——如果你的任务里全错组长期 &gt;10%，再考虑 teacher 介入，否则 dynamic sampling 或细粒度信用分配已经够用。</li>
+      <li><strong>把「状态可恢复」当成环境 API 的一等能力。</strong> VH-GPO、RIR、Go-Explore 式方法都依赖 restore(state)；在 Docker / 沙箱环境里提前做快照与回放校验（论文要求整条 relay 从初始状态重放成功），否则辅助样本会混进环境不一致带来的噪声。</li>
+      <li><strong>teacher 不必更大，但最好经过同环境训练。</strong> 论文用 1.5B 辅助 7B；实际落地时可以拿上一阶段 checkpoint 或同环境的 RL 小模型当 teacher，成本远低于调用大模型 API。</li>
+      <li><strong>handoff 搜索先做粗再做细。</strong> 从恢复末尾指数回跳、遇失败后线性细化，配合每点 2 条续写的发现预算和 4 条确认，是一个可直接照搬的默认值；预算紧时宁可减少 anchor 数，也别省掉独立确认与整条重放。</li>
+      <li><strong>辅助项与 GRPO 分开归一化。</strong> 辅助样本极少（每次更新最多 2 组），如果和 GRPO token 混在一起做 token-mean，信号会被稀释到看不见；论文的做法是各自归一化再按 λ = (0.5, 0.25, 0.1) 合并。</li>
+      <li><strong>与 clip / 比率设计正交。</strong> bridge 是 teacher token，不应进入 GRPO 的重要性比率（站内 <a href="daily-2026-10-14-gppo.html">GPPO</a> 讨论的 clip 区间只针对学生采样）；实现上把 bridge / resume 当成独立的 SFT 式 batch 最不容易出错。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 全失败组为什么在 GRPO 下几乎不产生梯度？DAPO 的 dynamic sampling 解决了什么、没解决什么？</summary>
+      <p>组内奖励全相等时，(r − mean) 全为 0，所有 token 的优势为 0，policy gradient 项消失（只剩可能的 KL 项）。dynamic sampling 把这类组丢掉、补采到 batch 填满，解决了「有效样本数不足导致的梯度方差」，但被丢掉的失败任务仍没有任何纠正目标；如果某类任务学生一直全错，它会被反复丢掉，能力缺口持续存在，且补采本身也增加 rollout 成本。</p>
+    </details>
+    <details>
+      <summary>2. 为什么不直接让 teacher 做完剩下的任务（Terminal Teacher）？论文给了哪些证据？</summary>
+      <p>teacher 做完的后缀完全落在 teacher 的状态–动作分布上，训练变成 off-policy 模仿，且会把学生本来能独立完成的部分也替换掉。证据：Terminal Teacher 消融比完整方法低 7.81pp；按 OVCSD 思路的完整后缀蒸馏复现在 1.5B ALFWorld 只有 71.36%；附录 E 显示 handoff 从监督里去掉了 36.47%（ALFWorld）/ 65.38%（WebShop）的 teacher 动作，这些正是「学生自己能做」的部分。</p>
+    </details>
+    <details>
+      <summary>3. bridge loss 消融掉 14.32pp，是三项中最大的。结合「全失败组」的性质解释原因。</summary>
+      <p>全失败组里所有轨迹奖励相等，学生无从知道哪一步是脱困的关键。bridge 把一条被验证的恢复路径拆成逐轮的监督，直接提高「从这种失败局面走向学生可解状态」那几步的概率；pair 只在第一个分叉点给一次对比，resume 强化的是学生已经能做的部分。真正缺失的能力恰在 bridge 段，所以去掉它损失最大。</p>
+    </details>
+    <details>
+      <summary>4. 7B 训练中 teacher 恢复成功 25 次、但只保留 18 条 relay；WebShop 是 29 次保留 10 条。这个差异说明了什么？</summary>
+      <p>teacher 成功只证明「从 anchor 出发任务可解」，不证明「存在一个早于终点的状态让学生能独立接手」。WebShop 的 teacher 恢复很短（均值 5.20 步），可供交还的中间状态少，且购买动作接近终局、学生续写失败率高，因此保留率只有 34.5%。这也说明 handoff 的确认步骤在过滤：不满足条件的恢复宁可丢掉，也不退化成完整后缀蒸馏。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把 VH-GPO 搬到真实 coding / 终端 Agent（Docker 沙箱、几十到几百轮）时，哪些假设会变得昂贵或失效？可以怎么改？</summary>
+      <p>可讨论方向：(a) 状态恢复：需要容器级快照或可重放的命令日志，快照体积与恢复时延成为主要成本，可只在 anchor 候选点打快照；(b) 验证：单测通过并不总等于成功，独立确认要用更严格的 verifier 或多次确认；(c) handoff 搜索：轨迹长、每次学生续写很贵，可用 value / PRM 估计先筛候选状态，再做少量真实确认；(d) teacher 选择：可用更强 API 模型做 bridge，但要注意 tokenizer / 格式不一致，bridge 文本最好重新按学生模板渲染（参见站内 TITO 讨论）；(e) 信用：bridge 很长时可以把 pair 损失扩展到多个分叉点，而不只是第一个。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.14000" target="_blank" rel="noopener">arXiv:2610.14000 · VH-GPO: Verified Handoff for LLM Agent RL（Li et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2607.27937" target="_blank" rel="noopener">arXiv:2607.27937 · OVCSD: Outcome-Verified Comparative Self-Distillation（Xia et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300 · DeepSeekMath / GRPO（Shao et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">arXiv:2503.14476 · DAPO（Yu et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2505.10978" target="_blank" rel="noopener">arXiv:2505.10978 · GiGPO（Feng et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/1011.0686" target="_blank" rel="noopener">arXiv:1011.0686 · DAgger（Ross, Gordon, Bagnell）</a></li>
+      <li><a href="https://arxiv.org/abs/1806.05635" target="_blank" rel="noopener">arXiv:1806.05635 · Self-Imitation Learning（Oh et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="daily-2026-10-14-gppo.html">GPPO</a> ·
+        <a href="daily-2026-10-06-depgpo.html">DepGPO</a> ·
+        <a href="daily-2026-09-07-tigpo.html">TIGPO</a> ·
+        <a href="daily-2026-09-04-pgpo.html">PGPO</a> ·
+        <a href="daily-2026-09-18-rir.html">RIR</a> ·
+        <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Full Sandbox Snapshots</a> ·
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

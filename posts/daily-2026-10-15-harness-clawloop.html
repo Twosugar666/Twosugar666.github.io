@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜ClawLoop：不靠外部 teacher 的 harness 原生训练闭环——自己出题（可执行 generator + answer contract）、自己做、自己诊断，Qwen3.6-27B SkillsBench 46.3→57.2 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜ClawLoop：不靠外部 teacher 的 harness 原生训练闭环——自己出题（可执行 generator + answer contract）、自己做、自己诊断，Qwen3.6-27B SkillsBench 46.3→57.2</h1>
+    <p class="post-meta">2026-10-15 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Hansi Yang、Linji Hao（共同一作）、Hongyan Hao、An Wang、Han Wu、Qi Gu、Xunliang Cai（美团、北京大学） ·
+      <em>ClawLoop: Self-Improving Agents via Harness-Native Training Loops</em>
+      · <a href="https://arxiv.org/abs/2610.14118" target="_blank" rel="noopener">arXiv:2610.14118</a>（cs.AI，v1，2026-10-09 提交）。
+      文中数字均为<strong>论文自报</strong>；主表为单次结果，未报告多 seed 方差。「入选概率」一表与各项增量是本文按论文设定自行计算。
+      交叉：
+      <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a>、
+      <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a>、
+      <a href="daily-2026-10-07-harness-hear.html">HEAR</a>、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、
+      <a href="daily-2026-09-11-neohorse-1.html">NeoHorse-1</a>、
+      <a href="daily-2026-09-22-codemidas.html">CodeMidas</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      站内过去一个多月的 harness 系列大多在讨论「运行时怎么设计」：<a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> 的极简 bash、<a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> 的 Workspace 工厂、<a href="daily-2026-10-14-harness-longharness.html">LongHarness</a> 的证据状态。另一条线是「harness 自己演化」：<a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、<a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、<a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a> 改的是脚手架，模型权重不动。
+    </p>
+    <p>
+      ClawLoop 切的是第三个方向：<strong>harness 不变，在 harness 里训模型本身，而且训练数据也由被训的模型在 harness 里自己造</strong>。论文对现有 harness 后训练管线（代表是 ClawGym，<a href="https://arxiv.org/abs/2604.26904" target="_blank" rel="noopener">arXiv:2604.26904</a>）的两点批评很直接：
+    </p>
+    <ul>
+      <li><strong>依赖外部更强模型</strong>：ClawGym 用 MiniMax-M2.5 / GLM-5.1 出题、收轨迹，被训模型的上限天然被外部模型的能力封顶；</li>
+      <li><strong>一次性</strong>：题目按人类先验合成一次、模型训练一次，评测结果给研究员看，而不是回流驱动下一轮。</li>
+    </ul>
+    <p>
+      论文的观察是：一个 harness（Docker + shell + 文件系统 + 包管理）本身已经具备闭环所需的全部原料——能实例化任意 workspace、能跑轨迹、能用代码或 rubric 验证结果。缺的不是基础设施，而是「agent 识别自己弱点 → 生成针对性练习 → 迭代」的机制。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 任务的形式化：τ = ⟨p, s₀, A, F, V_τ⟩</h3>
+    <pre><code>p   : 自然语言指令（作为初始 user prompt）
+s₀  : 初始 workspace 状态（文件、环境变量、已装工具 / skills）
+A   : 动作空间（shell 命令、文件编辑、工具调用）
+F   : S × A → S，由 harness 沙箱实现的确定性转移
+V_τ : S → {0, 1}，只看终态的 verifier
+
+# 一次迭代 k（共 K=3 轮），起点是 π_{k−1}
+Phase 1  Task Synthesis &amp; Selection : 生成任务池 P_k → 切分 T_k（训练）/ E_k = P_k \ T_k（留出诊断）
+Phase 2  Train                      : SFT（成功轨迹）→ GRPO（满足阈值的任务）得 π_k
+Phase 3  Diagnosis &amp; Feedback       : π_k 在 E_k 上跑 → 失败轨迹自我总结 → 聚合成能力报告 F_k → 喂给下一轮出题</code></pre>
+    <p>
+      与通用 tool-use 任务的区别在于 s₀ 与 A 都更开放：workspace 里有文件系统和 skills，动作可以是任意 shell 脚本。这也是为什么「预定义工具 + schema」式的任务合成管线（ASTRA、EnvScaler、ScaleEnv 等）不能直接搬进 harness。
+    </p>
+
+    <h3>② Phase 1a：两条互补的出题路线</h3>
+    <table>
+      <thead><tr><th></th><th>Capability-driven</th><th>Domain-grounded</th></tr></thead>
+      <tbody>
+        <tr><td>起点</td><td>能力目录：工作流模式 × 目标能力（对账、跨源审计、多文档合并、领域计算）</td><td>可执行领域：一组带 schema 的工具 + 一个能完整描述领域状态的数据库（可来自 MCP server）</td></tr>
+        <tr><td>表面多样性</td><td>同一能力骨架套到大量长尾领域（养蜂蜂箱台账、步道维护记录、业余无线电通联日志）</td><td>AST 检查 + LLM 分析抽出「工具—原子参数/返回字段—数据库表」三部图，按亲和度聚成 skills</td></tr>
+        <tr><td>关键设计</td><td>LLM <strong>不直接写任务数据</strong>，而是写可运行的 generator：<code>build(seed) → (s₀, y, C)</code>，由 TaskForge 在沙箱里执行</td><td>先采样<strong>不含业务内容与工具名</strong>的抽象任务图（长程依赖、分支、汇合、错误恢复、多子目标），再落到具体领域</td></tr>
+        <tr><td>可验证性</td><td>答案 y 由代码在合成数据上算出，而非模型断言；C（answer contract）显式声明过滤条件、舍入规则、tie-break、join key 和输出 schema，但不含答案值</td><td>终态写成对最终数据库状态的结构化谓词并编译成测试；按业务语义 key 而非硬编码 id 定位记录</td></tr>
+        <tr><td>防泄漏</td><td>generator 必须带 seed、至少生成两个需交叉引用的数据源</td><td>指令在信息屏障下生成：只给初始参数、不复述背景记录、不给步骤与分支条件</td></tr>
+      </tbody>
+    </table>
+    <p>
+      最值得抄的是 <strong>answer contract</strong>。单有答案键并不能唯一确定一个任务：四舍五入在哪一步做、同值怎么排序、空分组要不要输出，这些「隐藏决策」从 workspace 里看不出来；不声明的话，verifier 会因为一个指令从未约束过的选择判 agent 错。附录 E 的案例里，这些决策被写进 workspace 提供的 skill 文件，例如「中位数恰好落在阈值上归高档」「分档基于未舍入的中位数、只在输出时舍入」。
+    </p>
+
+    <h3>③ Phase 1b：难度增长与两段式校验</h3>
+    <pre><code># 难度增长（diagnosis-conditioned，只对已熟练的类别加难，每轮最多升一级）
+multi-hop draw : 索引文件（只有 id 和文件名、没有答案所需数值）
+               + 若干实体明细文件（任何单个都不够）
+               + 至少一个横切参照源（费率表 / 阈值表）
+               → 结构由构造保证，而非靠 prompt 描述
+dirtiness draw : 注入干扰项、缺字段、schema 不一致、单位不一致（保证标准解仍良定义）
+交付格式轮换   : JSON / CSV / 多文件 / 自由文本报告（后者配机器可读的 sidecar 评分文件）
+
+# 校验
+agent-free : oracle 解必须通过自己写的 verifier；
+             leakage audit —— 在初始状态下测试就能通过的任务直接丢弃（否则 agent 什么都不做也拿奖励）
+agent-based: 当前 π_{k−1} 对每个任务跑 N=8 次，只保留通过次数 ∈ [N_l, N_h] = [1, 5] 的任务</code></pre>
+    <p>
+      [1, 5] 这个 admission band 有一个容易被忽略的性质：它<strong>不对称</strong>。把任务的真实成功率记作 p、通过次数 X ~ Binomial(8, p)，入选概率 P(1 ≤ X ≤ 5) 如下（自算）：
+    </p>
+    <table>
+      <thead><tr><th>p</th><th>0.05</th><th>0.1</th><th>0.2</th><th>0.3</th><th>0.5</th><th>0.7</th><th>0.8</th><th>0.9</th></tr></thead>
+      <tbody>
+        <tr><td>P(入选)</td><td>0.337</td><td>0.570</td><td>0.831</td><td>0.931</td><td>0.852</td><td>0.448</td><td>0.203</td><td>0.038</td></tr>
+      </tbody>
+    </table>
+    <p>
+      也就是说，p=0.1 的难题有 57% 的机会入选，p=0.8 的偏易题只有 20%——筛选器整体偏向「当前还不太会」的区域。这与论文附录 E 的观察一致：被选中的难题轨迹里，验证阶段占了 40% 的轮次（15 轮里 6 轮），推理 token 是易题的近 17 倍（67,994 vs 4,067）。<strong>admission band 实际上在挑「需要自我检查」的轨迹</strong>。
+    </p>
+
+    <h3>④ Phase 2：同一批 8 条 rollout 用三次</h3>
+    <pre><code># 自蒸馏 SFT：只用 r=1 的轨迹，屏蔽 observation token（工具输出、文件内容）
+L_SFT = − Σ_{i: r_i=1} Σ_t m_t · log π_θ(a_t | p, s₀, a_{1:t−1}, s_{1:t−1})
+#   harness 里一次大文件读或构建日志可达数千 token，不 mask 会主导损失
+#   轨迹打包到最大长度而非截断——截断会砍掉最后的验证轮，恰恰是想学的行为
+
+# GRPO：直接复用 agent-based validation 的 N=8 条 rollout 作为一组
+Â_j = (r_j − mean(r)) / (std(r) + ε)
+# 因为已按 [1,5] 过滤，每组都保证有对比，不会出现全对 / 全错的零优势组
+
+# 超参（附录 Table 5）
+#            SFT      GRPO
+# lr         2e-5     5e-7
+# batch      128      64
+# epochs     3        1
+# KL β       —        0.04
+# max seq    65,536（两者）  · 温度 1.0 · 32×H800</code></pre>
+    <p>
+      「一份 rollout 三用」（校验信号、SFT 正例、GRPO 组）是论文控制成本的关键；admission band 也因此等价于<strong>任务级的 dynamic sampling</strong>——和 <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 丢掉全对 / 全错组是同一个思路，只是提前到了选题阶段。附录 C 解释了为什么小模型的收益主要来自 RL：4B / 9B 在同一任务池上成功率低，SFT 只能看到很少的正例且偏向最容易的题；GRPO 在 8 次里成功 1 次时仍能给出可用的优势，而 SFT 会扔掉那 7 条有信息量的失败。
+    </p>
+
+    <h3>⑤ Phase 3：诊断与反馈</h3>
+    <ul>
+      <li><strong>轨迹总结：</strong>对 E_k 上每条失败轨迹，让 agent 自己写结构化总结——失败点（哪个动作偏离了成功路径）、根因（误解任务 / 选错工具 / 编辑错误 / 过早终止）、缺失能力。论文的论点是事后分析一条具体执行轨迹比从头解题容易得多。</li>
+      <li><strong>模式聚合：</strong>按 skill 类别归类、类内按根因聚类，把高频失败模式输出为诊断报告；例：「multi-file refactoring」下反复出现「改了目标文件，却没更新依赖模块的 import」。</li>
+      <li><strong>回流：</strong>报告作为下一轮出题的条件，引导生成专门打这些弱点的任务。</li>
+    </ul>
+    <p>
+      这一层和站内 <a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a> 的「跨任务失败聚合」几乎同构，区别在于 Ecdysis 把聚合结果变成 harness 补丁，ClawLoop 把它变成下一轮训练数据。
+    </p>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>设置：</strong>OpenClaw 作为 harness；Qwen3.6-27B 作为闭环模型，K=3 轮，每轮合成 1,024 个候选任务。容器：Python 3.11、断网（依赖预装或写进 workspace）、单条轨迹 24 小时 / 300 轮上限，超限记为失败；32 个容器并发。评测温度 0.7、top-p 0.95，三个基准都不参与训练、选题或难度调度。</li>
+      <li><strong>主结果（Table 1，Base / ClawGym / ClawLoop）：</strong>SkillsBench（86 题、11 个领域，Avg@5）46.3 / 52.6 / <strong>57.2</strong>；Claw-Eval-Live（105 题）69.3 / 74.6 / <strong>76.9</strong>；ClawGym-Bench（200 题）67.6 / 61.9 / <strong>68.4</strong>。</li>
+      <li><strong>增量（自算）：</strong>相对 Base 分别 +10.9 / +7.6 / +0.8。论文正文称 ClawGym-Bench 的增益与另两个基准「comparable」，但按表中数字只有 +0.8；同一张表里 ClawGym 在<strong>自家基准上反而比 Base 低 5.7</strong>，这说明对 Qwen3.6-27B 来说，ClawGym-Bench 更像一个「不掉点」检查。</li>
+      <li><strong>迁移到小模型（Table 2）：</strong>用 27B 闭环产出的任务训 Qwen3.5-4B / 9B（RL）。4B：Base 5.8 / 32.4 / 33.0 → ClawLoop 8.4 / 48.0 / 44.1（ClawGym 6.2 / 36.8 / 34.6）；9B：6.4 / 58.3 / 32.0 → 10.8 / 71.7 / 43.6（ClawGym 6.7 / 64.3 / 35.3）。注意对照组 ClawGym 用的是 SFT、ClawLoop 用的是 RL，算法差异与数据差异混在一起。</li>
+      <li><strong>出题路线消融（Table 3）：</strong>只保留 capability 路线 54.5 / 73.2 / 67.2；只保留 domain 路线 55.9 / 70.1 / 67.8。去掉 capability 路线 Claw-Eval-Live 掉得最多（−6.8），去掉 domain 路线主要伤 SkillsBench（−2.7）。</li>
+      <li><strong>闭环内部状态（Table 6）：</strong>agent-free 通过 897 / 910 / 913（约 89%）；agent-based 通过 672 / 469 / 567，即入选率 65.6% / 45.8% / 55.4%；保留的 SFT 轨迹 1,978 / 892 / 1,694；平均轮数 5.6 / 11.4 / 8.7。第 2 轮难度加得过猛、入选率骤降，第 3 轮回调——论文称为「从两侧逼近合适难度」。</li>
+      <li><strong>迭代数：</strong>SkillsBench 随 K 继续上涨，Claw-Eval-Live 与 ClawGym-Bench 在 K≈3 饱和；论文把瓶颈归于「落进 admission band 的任务比例」，而不是候选数量。</li>
+      <li><strong>算力（Table 4，每轮，32×H800）：</strong>出题 15.98 h / 511 GPU·h；校验 rollout 30.76 h / 984 GPU·h；SFT 8.03 h / 257；GRPO 18.52 h / 593；诊断 0.94 h / 30；合计 74.23 h / 2,375 GPU·h。校验 rollout 约占 41%，超过 SFT + GRPO 之和。按 K=3 推算全程约 7,125 GPU·h、约 9.3 天墙钟（自算）。</li>
+    </ul>
+
+    <h2>放进 harness × 训练的坐标系</h2>
+    <table>
+      <thead><tr><th>路线</th><th>优化对象</th><th>信号来源</th><th>代表（站内）</th></tr></thead>
+      <tbody>
+        <tr><td>harness 自演化</td><td>脚手架代码 / prompt / 工具</td><td>失败轨迹 + 回归测试</td><td><a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、<a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、<a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a></td></tr>
+        <tr><td>可学的 harness 策略</td><td>harness 中的协调层</td><td>RL</td><td><a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a>、<a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a></td></tr>
+        <tr><td>harness 进训练环</td><td>模型权重</td><td>固定任务集 + RL</td><td><a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a>、<a href="daily-2026-09-03-harness-lego-rl.html">Lego-RL</a>、<a href="daily-2026-09-16-harnessbandit.html">HarnessBandit</a></td></tr>
+        <tr><td>环境 / 任务合成</td><td>训练数据</td><td>源码 / 外部模型</td><td><a href="daily-2026-09-22-codemidas.html">CodeMidas</a>、ClawGym</td></tr>
+        <tr><td><strong>ClawLoop</strong></td><td>模型权重 + 自己的任务分布</td><td>自出题、自验证、自诊断</td><td>与 <a href="daily-2026-09-11-neohorse-1.html">NeoHorse-1</a> 的「能力反馈写进下一轮后训练」最接近</td></tr>
+      </tbody>
+    </table>
+
+    <h2>怎么看这篇</h2>
+    <p>
+      <strong>值得拿走的：</strong>(1) 「LLM 写 generator、而不是写数据」——答案由代码算出，seed 保证可复现，sandbox 报错还能回喂修复；(2) answer contract 把 verifier 的隐式假设显式化，这是自动合成任务能不能「公平评分」的关键；(3) leakage audit 里「初始状态就能过测试的任务丢弃」是一条成本极低、收益很高的检查；(4) admission band + rollout 复用，让「选题」和「零优势组过滤」合二为一。
+    </p>
+    <p>
+      <strong>需要打折的：</strong>(1) 「teacher-free」指没有外部更强模型，但 27B 闭环模型本身就是 4B / 9B 的数据生产者，小模型实验更准确的说法是「用 27B 自产数据做 RL」；论文附录也承认小模型并未运行自己的诊断，不算闭环意义上的自我改进。(2) 主表单次运行、无方差，SkillsBench 只有 86 题。(3) 从算法 1 看，GRPO 复用的是 π_{k−1} 在校验阶段采的 rollout，而更新起点是 SFT 之后的 θ′——这批样本对 θ′ 已经是 off-policy，重要性比率用哪个策略的 logprob、clip 是否足以兜住，论文没有展开。(4) 作者自己指出 K 的上限来自「能否把候选打进 band」，第 2 轮的过冲说明难度控制器还很粗。(5) ClawGym-Bench 上的提升几乎为零，与正文表述不符。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>合成任务时让模型写 generator，不写答案。</strong> 最低配置是：带 seed 的数据生成脚本 + 由脚本算出的答案 + 一个只看终态的测试；任何「模型直接给答案」的任务都先打上低置信标签。</li>
+      <li><strong>每个任务配一份 answer contract。</strong> 列出舍入、tie-break、空集处理、join key、数值容差；写不清楚的任务宁可不要。这一步同样适用于手写评测集。</li>
+      <li><strong>上线三条廉价校验：</strong>oracle 必须通过 verifier；初始状态必须<strong>不</strong>通过 verifier；指令文本里不能出现答案键（字符串匹配即可）。</li>
+      <li><strong>用 admission band 代替 dynamic sampling。</strong> 若你本来就要用 N 条 rollout 估计难度，直接把它们当作 GRPO 组；但要意识到 [1, 5]/8 偏向难题（见上表），想要更对称就把 N_h 调到 6–7。</li>
+      <li><strong>SFT 时 mask observation、打包不截断。</strong> harness 的工具输出动辄数千 token；截断会恰好砍掉结尾的验证轮。</li>
+      <li><strong>预算按 rollout 规划，不按训练规划。</strong> 校验 rollout 单项就占每轮 41% 的 GPU·h；容器并发数、单轨迹墙钟上限（论文 24 h / 300 轮）对总成本的影响大于训练超参。站内 <a href="daily-2026-10-07-harness-hear.html">HEAR</a> 讨论的 harness–推理引擎协同在这里能直接省钱。</li>
+      <li><strong>诊断报告留给人看一眼。</strong> 自我诊断会把「agent 能说清楚的失败」放大，而说不清楚的失败（如环境不一致）可能被系统性忽略；把聚合后的高频根因定期人工抽查。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么让 LLM 写 <code>build(seed) → (s₀, y, C)</code> 比让它直接写「题目 + 答案」更可靠？还需要 C 的原因是什么？</summary>
+      <p>直接写答案时，答案正确性依赖模型的推理，错误会变成错误奖励；写 generator 时答案由代码在合成数据上计算，正确性来自执行而非模型信念，seed 还保证可复现，报错可回喂修复。但答案键本身欠定任务：舍入时机、tie-break、过滤条件、join key 等无法从 workspace 推断，不声明的话多种合理输出都会被判错，所以需要不含答案值、只声明隐藏决策与输出 schema 的 contract。</p>
+    </details>
+    <details>
+      <summary>2. admission band [1, 5]/8 为什么 N_l 必须 &gt;0、N_h 必须 &lt;N？它和 DAPO 的 dynamic sampling 有什么关系？</summary>
+      <p>通过 0 次的任务可能太难或本身有矛盾，通过 8 次的任务太容易；两者在 GRPO 下组内奖励全相等、优势为 0，只耗算力。band 在选题阶段就排除了这两类，而且校验用的 8 条 rollout 直接作为 GRPO 组，相当于把 DAPO 的「丢弃零优势组」提前到任务级。由于 band 相对当前策略定义，任务会随模型变强自动移出，不需要外部课程表。</p>
+    </details>
+    <details>
+      <summary>3. 第 2 轮入选率从 65.6% 跌到 45.8%、平均轮数从 5.6 涨到 11.4，第 3 轮又回到 55.4% / 8.7。用控制系统的语言解释，并给出一个改进思路。</summary>
+      <p>难度增长是一个开环较强的控制器：依据上一轮能力报告加难，但加难幅度没有用「预期入选率」做反馈，第 2 轮过冲，大量候选被推出 band 之外而被拒，留下的任务也明显更长；第 3 轮诊断反映出问题后回调。改进可以是闭环控制：先对少量候选做小 N 预跑，估计入选率，再按目标入选率（如 60%）调节难度级别或 multi-hop / dirtiness 的强度，类似带积分项的比例控制。</p>
+    </details>
+    <details>
+      <summary>4. 4B / 9B 的收益被论文归因于 RL 而非 SFT。为什么在同一任务池上，小模型做自蒸馏 SFT 会「又少又偏」？</summary>
+      <p>小模型在 27B 校准过难度的任务池上成功率低，r=1 的轨迹很少，且集中在最容易的那部分任务上，SFT 梯度既噪声大又偏向简单题。GRPO 只需要组内有对比：8 次成功 1 次也能给出正的优势给那条成功轨迹、负的优势给失败轨迹，失败轨迹的信息也被利用。这也解释了为什么 Table 2 里 ClawLoop（RL）对 ClawGym（SFT）的比较不能完全归功于数据。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）ClawLoop 的闭环里，哪些环节可能产生「自我强化的盲区」？如何设计外部锚点而不重新引入 teacher？</summary>
+      <p>可讨论方向：(a) 出题与诊断都由同一模型完成，模型意识不到的能力维度可能永远不被出题覆盖，可固定一份人工维护的能力目录并统计覆盖率；(b) verifier 也由模型生成，系统性偏差（如总是只检查格式）会被训练放大，可抽样人工审计或用不同 seed / 不同模型交叉生成 verifier；(c) admission band 选出的是「当前不太会」的题，可能偏离真实任务分布，可用留出的真实任务（不参与训练）做分布漂移监控；(d) 每轮保留少量固定「锚题」，观察它们的通过率是否单调，作为闭环是否健康的信号。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.14118" target="_blank" rel="noopener">arXiv:2610.14118 · ClawLoop（Yang et al.，美团 / 北大）</a></li>
+      <li><a href="https://arxiv.org/abs/2604.26904" target="_blank" rel="noopener">arXiv:2604.26904 · ClawGym: A Scalable Framework for Building Effective Claw Agents（Bai et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2602.12670" target="_blank" rel="noopener">arXiv:2602.12670 · SkillsBench</a> · <a href="https://arxiv.org/abs/2604.28139" target="_blank" rel="noopener">arXiv:2604.28139 · Claw-Eval-Live</a></li>
+      <li><a href="https://arxiv.org/abs/2511.16043" target="_blank" rel="noopener">arXiv:2511.16043 · Agent0</a>（同为自生成课程，但面向 tool-integrated reasoning）</li>
+      <li><a href="https://github.com/openclaw/openclaw" target="_blank" rel="noopener">openclaw/openclaw</a>（论文使用的 harness）</li>
+      <li>站内：
+        <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a> ·
+        <a href="daily-2026-10-07-harness-hear.html">HEAR</a> ·
+        <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a> ·
+        <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> ·
+        <a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a> ·
+        <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> ·
+        <a href="daily-2026-09-11-neohorse-1.html">NeoHorse-1</a> ·
+        <a href="daily-2026-09-22-codemidas.html">CodeMidas</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
