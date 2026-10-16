@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Spectral-MoE：dense-to-MoE 转换里学会「按层不均」分配 expert utilization——25% 预算下动态分配把 Llama-3-8B WikiText-2 PPL 相对均匀降 2.96 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Spectral-MoE：dense-to-MoE 转换里学会「按层不均」分配 expert utilization——25% 预算下动态分配把 Llama-3-8B WikiText-2 PPL 相对均匀降 2.96</h1>
+    <p class="post-meta">2026-10-16 · 收藏夹：Infra · 一线追踪<br />
+      论文：Zachary Broveak、Christian Kubicka、Thierry Tambe（Stanford） ·
+      <em>Spectral-MoE: Heterogeneous Per-Layer Expert Utilization in Dense-to-MoE Conversion</em>
+      · <a href="https://arxiv.org/abs/2610.19232" target="_blank" rel="noopener">arXiv:2610.19232</a>（cs.LG，v1）
+      · 代码 <a href="https://github.com/ZacharyBroveak/Spectral-MoE" target="_blank" rel="noopener">ZacharyBroveak/Spectral-MoE</a>。
+      文中实验数字均为<strong>论文自报</strong>（Llama-2-7B / Llama-3-8B / Qwen2.5-7B；WikiText-2 PPL 与六任务 mean accuracy）；「相对均匀的降幅」「三模型平均百分点」等派生数按论文表格自行核对。
+      交叉：
+      <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a>、
+      <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Dense FFN 对每个 token 算完全部神经元；dense-to-MoE 转换把这些神经元划成 experts，每 token 只激活一部分，在保留预训练权重的同时砍掉激活算力。站内 <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由</a>讨论的是「原生 MoE 怎么训」；这条线反过来问：已经训好的 dense 模型，怎么<strong>事后</strong>改成稀疏激活。
+    </p>
+    <p>
+      现有转换方法大致两派：<strong>analytic</strong>（CMoE 等）用启发式快速划 expert / 造 router；<strong>learning</strong>（DOT-MoE 等）用梯度联合学 partition 与 router。两边有一个共同默认——<strong>每一层用同一 utilization</strong>（或只让总预算在 token 间浮动）。量化与剪枝里「不同层对压缩敏感度不同」早已是常识；Spectral-MoE 把这条轴搬进 dense-to-MoE：在固定总 routed budget <code>B</code> 下，学会<strong>按层不均</strong>的 expert 数分配。
+    </p>
+    <p>
+      名字里的 Spectral 是个比喻：把 dense FFN 拆成 experts，像把一束光拆成光谱——不同层拿到不同「带宽」。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 预算怎么定：名义 utilization → 整数 routed budget</h3>
+    <pre><code># L 层 FFN；每层 E_r 个 routed experts + E_s 个 always-on shared（论文取 E_s = E_min = 1）
+# 用户给名义 FFN utilization u_target
+Ē = round(u_target · (E_r + E_s) − E_s)     # 均匀时每层 routed 数
+B = L · Ē                                    # 每 token 的总 routed budget，必须守恒
+# 例：Llama-2-7B，L=32，E_t=86，u=25% → Ē=21，B=672，实现利用率 22/86 ≈ 25.58%
+# 每层自由量 f_l = E_l − E_min；可再分配总量 = L · (Ē − E_min)</code></pre>
+    <p>
+      关键点：比较 static / dynamic / uniform 时，<strong>同一个 B</strong>——差别只在「这 B 个 expert 激活槽位怎么分到各层」，而不是偷偷多开算力。
+    </p>
+
+    <h3>② Static allocator：每层一个共享标量 ε_l</h3>
+    <pre><code># 连续计数 ε ∈ R^L，初始化为全 Ē；优化后投影回 Σ ε_l = B，且 1/2 ≤ ε_l ≤ E_r−1/2
+E = Γ_B(ε)     # largest-remainder：先 floor，再把余数分给小数部分最大的层；越界再 repair
+# 前向：每层 hard top-E_l 选 expert
+# 反向：把 rank 当常量，用 soft inclusion 过 STE
+R̃_te = σ( (ε_l − rank_l(t,e) − 1/2) / T )     # T：inclusion temperature（static 常用 1.5）
+R_STE = R + (P − sg[P]) + (R̃ − sg[R̃])         # 继承 router STE，再加 count 梯度项</code></pre>
+    <ul>
+      <li><strong>Γ_B</strong> 保证整数 schedule 精确吃满预算；连续 ε 在步间持久化，亚整数更新可以攒到下一次 hard 翻转。</li>
+      <li>soft inclusion 对边界附近的 expert 最敏感——调大 ε_l 时，主要推动「刚好卡在 top-E 边缘」的那些 expert 进选出。</li>
+    </ul>
+
+    <h3>③ Dynamic allocator：hidden state 驱动初始 schedule + 逐层 revision</h3>
+    <pre><code># 共享投影 W_in，初始头 W_0，以及层 1..L−2 的 revision 头（末层没有 revision，直接吃完剩余）
+x_l = h_l / rms(h_l)                          # 与站内 RMSNorm 同构的尺度归一
+z_l = gelu(W_in [x_l ; log rms(h_l)])         # 额外接回 log-RMS，补上被归一化掉的尺度
+v⁽⁰⁾ = W_0 z_0                                # 整条剩余 schedule 的初始 logits
+# 逐层：
+r_l = tanh(W_l [z_l ; v⁽ˡ⁻¹⁾_{1:}])           # 提议修正
+Δ_l = tanh(Δ_{l−1,1:} + r_l)                  # 相对初始 schedule 的累积偏差也有界
+v⁽ˡ⁾ = v⁽⁰⁾_{l:} + Δ_l
+# 承诺当前层预算（守恒）：
+π_l = softmax(v⁽ˡ⁾)_0
+ε_l = E_min + max(R_l − q_l·E_min, 0) · π_l   # R_l = 剩余 routed，q_l = 未承诺层数
+E_l = clip_[a_l, b_l](round(ε_l))             # a_l/b_l 保证后面层仍可行
+# 末层：q=1 → E_{L−1} = R_{L−1} ⇒ Σ E_l = B 对每个 token 精确成立
+# 对早先承诺的 STE：Ŝ_l = Σ_{j&lt;l}(E_j + ε_j − sg[ε_j])，让「后面选多了」能回传改前面</code></pre>
+    <p>
+      参数量很小：L=32、d_model=4096 时 allocator 约 <strong>15.9 万</strong>参数（含 bias），相对 7B 级模型可忽略。图 3 显示：层均值会形成稳定的异质 profile（晚层往往分到更多），同时同 token ID 在不同上下文下仍可走出不同 schedule——稳定层偏好 + 上下文相关微调。
+    </p>
+
+    <h3>④ 挂在哪种 base 上</h3>
+    <table>
+      <thead><tr><th></th><th>Analytic base（CMoE）</th><th>Learned base（DOT-MoE 自实现）</th></tr></thead>
+      <tbody>
+        <tr><td>先做什么</td><td>balanced k-means 划 expert + 代表神经元造 router；LoRA 恢复权重</td><td>联合学 partition affinities 与 router（论文当时无公开 DOT-MoE 代码，作者自实现并加 shared expert）</td></tr>
+        <tr><td>训 allocator 时</td><td>冻权重 / partition / router，只训 allocator</td><td>partition + router + allocator 同训，预训练 FFN 权重冻结</td></tr>
+        <tr><td>目标</td><td>LM CE + dense-teacher 蒸馏</td><td>同上，外加 router 正则与 load balancing</td></tr>
+      </tbody>
+    </table>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>设置：</strong>每 expert 128 neurons；Llama-2-7B / Llama-3-8B / Qwen2.5-7B 每层分别 86 / 112 / 148 experts。Learned base：4×H100，3,500 steps / ~458.8M Dolmino tokens；analytic base：1×GPU，LoRA 恢复后再 1,024 steps 训 allocator。</li>
+      <li><strong>25% utilization，learned base，dynamic vs uniform PPL（↓）：</strong>Llama-2-7B 11.61→10.57（<strong>−1.04</strong>）；Llama-3-8B 19.40→16.44（<strong>−2.96</strong>）；Qwen2.5-7B 16.92→14.21（<strong>−2.71</strong>）。</li>
+      <li><strong>同设定 analytic base：</strong>相对 uniform 降 2.45 / <strong>6.26</strong> / 2.17（Llama-2 / Llama-3 / Qwen）。</li>
+      <li><strong>六任务 mean accuracy（learned，dynamic vs uniform，三模型平均）：</strong>12.5% / 25% / 50% utilization 上平均提升约 <strong>1.5 / 4.2 / 3.6</strong> 百分点。25% 时单模型：Llama-2 59.9→62.8；Llama-3 58.5→62.3；Qwen 57.6→63.3。</li>
+      <li><strong>Static 的位置：</strong>Llama-2-7B learned@25% 上 static 终局 PPL 约 11.50，只略好于 uniform 11.61，明显落后 dynamic 10.57——「固定异质 schedule」有收益，但 token 条件 revision 才是大头。</li>
+      <li><strong>训练动态：</strong>joint 训练末期 neuron-to-expert turnover 仍均值 ~8.9%/step，学习率衰减后骤降至 0.33%；ridge 回归 refit router 提升 overlap/coverage，但六任务均值 ±1pp 量级、种子间符号不一。</li>
+    </ul>
+
+    <h2>怎么看这篇</h2>
+    <p>
+      <strong>值得拿走的：</strong>(1) dense-to-MoE 的第三轴——partition、routing 之外还有 <strong>per-layer utilization</strong>；(2) 「预算守恒 + STE 过 hard top-k」这套可直接挂到别的转换管线；(3) dynamic 用 RMS 归一 + log-RMS 特征，和现代 Pre-LN LLM 的数值习惯一致（参见 <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a>）。
+    </p>
+    <p>
+      <strong>需要打折的：</strong>(1) learned base 的 uniform 是作者自实现的 DOT-MoE，论文承认低于公开数字，和「published DOT-MoE」比时要分清；(2) seed 方差不小（Llama-2 dynamic 三 seed 六任务均值 61.7–62.8），主表用 seed-matched 对照；(3) analytic 上 accuracy 增益远小于 PPL 增益；(4) partition 持续翻动可能让 router 追不上——作者自己标成 open question。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先保证 Σ E_l = B，再谈学分配。</strong> 没有守恒约束，「异质」很容易退化成偷偷提高总利用率。</li>
+      <li><strong>从 static 冒烟，再上 dynamic。</strong> static 只有 L 个标量，调参面小；若 static 已经无明显收益，再投入 revision 头。</li>
+      <li><strong>Inclusion temperature 要扫。</strong> 附录在 Ē=10 时 T=0.25/1/1.5 终局 PPL 差到 0.7；边界过窄则 count 梯度几乎只碰两三个 rank。</li>
+      <li><strong>Allocator 单独一组优化器、零 weight decay。</strong> 衰减会把 ε 往 0 routed 推。</li>
+      <li><strong>部署时可以冻 schedule 均值。</strong> 若动态头带来的 PPL 收益主要来自层均值而非 token 方差，推理可换成 static profile 降延迟。</li>
+      <li><strong>与原生 MoE 负载均衡正交。</strong> 这里优化的是「每层开几个」，不是「专家之间是否均匀」；两者可以叠（站内 MoE 路由文的 aux loss / bias）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么比较 static / dynamic / uniform 时必须固定总 routed budget B？若不固定会发生什么？</summary>
+      <p>固定 B 保证三种方法激活的 FFN 神经元总数相同，差异只来自跨层分配。若不固定，dynamic 可能通过抬高平均 utilization「作弊」——PPL 下降无法归因于异质分配。论文用整数 B 与末层吃剩的构造，让每个 token 的 Σ E_l 精确相等。</p>
+    </details>
+    <details>
+      <summary>2. Static 里 soft inclusion R̃ = σ((ε − rank − 1/2)/T) 为什么对「边界 expert」最敏感？T 过小会怎样？</summary>
+      <p>sigmoid 的导数在 0 附近最大；当 rank ≈ ε−1/2 时，ε 的微小变化最能改变 soft inclusion。T 过小（如 0.25）时敏感区间只覆盖边界两侧不到 1 个 rank，深处 / 远处 expert 的 count 梯度几乎为 0，分配难以移动，附录里 PPL 甚至差于 uniform。</p>
+    </details>
+    <details>
+      <summary>3. Dynamic 为什么要在 RMS 归一化后再拼接 log rms(h)？只归一化会丢什么信息？</summary>
+      <p>x = h/rms(h) 去掉了整体尺度，而 Pre-LN 残差流的 RMS 随深度与 token 变化，本身可能编码「这一层还需要多少容量」。拼回 log-RMS 让 allocator 既能看方向（归一化 hidden），又能看尺度，避免所有 token 在尺度维上被压成同一点。</p>
+    </details>
+    <details>
+      <summary>4. 末层「吃完剩余」如何保证 Σ E_l = B？中间层的 clip 上下界 a_l、b_l 在守恒里起什么作用？</summary>
+      <p>每层承诺后更新剩余 R；到末层未承诺层数 q=1，可行区间退化成单点 R，故 E_last = R。中间层的 a_l、b_l 保证：无论当前怎么 round，后面层仍能在 [E_min, E_r] 内吃完剩余——否则会出现「前面选太多、后面不够最小 expert 数」的不可行预算。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）若要把 Spectral-MoE 的 per-layer budget 思想用到「原生预训练 MoE」的推理侧（而不是 dense-to-MoE），会碰到哪些新问题？</summary>
+      <p>可讨论方向：(a) 预训练 MoE 的 router 与 capacity factor 已假设近似均匀 top-k，突然改 E_l 会破坏 load balance 与 expert 特化；(b) 动态 schedule 增加一步依赖，影响 continuous batching / PD 分离的调度；(c) 需要重新定义「预算」——是 token 级 FLOPs、还是 expert 并行度；(d) 可先用离线 profile 得到 static 异质 E_l，再在 serving 里做查表，避免在线 revision 头；(e) 与站内 FlashAttention 类 IO 优化正交，但会改变各层算子时长，影响 pipeline bubble。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.19232" target="_blank" rel="noopener">arXiv:2610.19232 · Spectral-MoE（Broveak, Kubicka, Tambe）</a></li>
+      <li><a href="https://github.com/ZacharyBroveak/Spectral-MoE" target="_blank" rel="noopener">GitHub · ZacharyBroveak/Spectral-MoE</a></li>
+      <li><a href="https://arxiv.org/abs/2502.04416" target="_blank" rel="noopener">arXiv:2502.04416 · CMoE（Pei et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2606.01666" target="_blank" rel="noopener">arXiv:2606.01666 · DOT-MoE（Bamba et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2110.01786" target="_blank" rel="noopener">arXiv:2110.01786 · MoEfication（Zhang et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a> ·
+        <a href="special-2026-08-27-new-models-arch.html">新模型架构全景</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜DeLoop：把「重复同类 tool call + 相同 observation」当成自监督——压缩上下文后 loop 率飙升，用本回合后续恢复动作做 DPO，Qwen3-8B CodeGym 57.3%→6.1% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜DeLoop：把「重复同类 tool call + 相同 observation」当成自监督——压缩上下文后 loop 率飙升，用本回合后续恢复动作做 DPO，Qwen3-8B CodeGym 57.3%→6.1%</h1>
+    <p class="post-meta">2026-10-16 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Tianle Chen 等（Google / Boston University / University of Washington / USC / Google DeepMind） ·
+      <em>DeLoop: Repeated Actions as Self-Supervision for Long-Horizon Agents</em>
+      · <a href="https://arxiv.org/abs/2610.19376" target="_blank" rel="noopener">arXiv:2610.19376</a>（cs.AI，v1）。
+      文中数字均为<strong>论文自报</strong>（主表 CodeGym、summarization@4096；部分行多 run 平均）。「9.4×」「steps 约 1/3」等派生表述按表中数字核对。
+      交叉：
+      <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a>、
+      <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a>、
+      <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a>、
+      <a href="daily-2026-10-08-harness-refold.html">ReFold</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-10-algo-dpo.html">DPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 Agent 的一个常见浪费：同一 tool call（规范化后相同）再发一次，环境返回<strong>完全相同</strong>的 observation——这一步没有新信息。论文把这种步叫 <strong>looping action</strong>；轨迹里至少出现一次，整条 run 就算 <strong>looping run</strong>，其占比记为 loop rate。
+    </p>
+    <p>
+      站内最近的 harness 文多在管「历史怎么压」：<a href="daily-2026-10-08-harness-refold.html">ReFold</a> 的折叠、<a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> 的归档、<a href="daily-2026-10-14-harness-longharness.html">LongHarness</a> 的证据库。DeLoop 问的是互补问题：<strong>压完之后，策略会不会用「已经做过」这条记录去避免重复？</strong>答案往往是：不会。
+    </p>
+    <ul>
+      <li>Qwen3-8B @ CodeGym：full history loop <strong>29.0%</strong> → summarization@4096 升到 <strong>57.3%</strong>；阈值再压到 2048 到 64.7%。</li>
+      <li>更好摘要 / ledger / ACON / LLMLingua-2 仍约 <strong>46–63%</strong>，明显高于 full history。</li>
+      <li>六模型上 looping runs 平均失败率 <strong>59.5%</strong> vs loop-free <strong>33.4%</strong>；Qwen3-8B 压缩设定下 85% vs 68%。</li>
+    </ul>
+    <p>
+      探测实验更直白：删掉「最近一次已完成 call + observation」后，重发该 call 的概率从 3.3% 跳到 <strong>48.8%</strong>——记录有用；但 full history 仍有 29% 在 loop，压缩后还有 25.2% 的 run 在<strong>原文仍在上下文里</strong>时重复。问题不全在压缩器，而在策略。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① Loop 的形式化</h3>
+    <pre><code># κ：规范化 tool call（空白、参数顺序），避免格式差异误判
+x_t = (κ(a_t), o_t)                    # 步签名
+s_t = 1  iff  ∃ i &lt; t : x_t = x_i      # 同 call + 同 observation → looping action
+# 注意：同 call 但 observation 变了 = informative repeat，不算 loop
+# 轨迹 loops ⇔ 存在某个 s_t = 1
+# OpenHands 的 stuck 检测（同 action+obs 连续 ≥4 次）是近亲，但阈值更严</code></pre>
+
+    <h3>② 自监督挖 pair：同 rollout 内的 y⁻ / y⁺</h3>
+    <pre><code># 对每个 looping action a_t：
+x   = h_&lt;t                                 # loop 发生前的可见历史（含当时的压缩结果）
+y⁻  = a_t                                  # rejected：这次无信息的重复
+y⁺  = a_{t′},  t′ = min{u &gt; t : s_u = 0 且 κ(a_u) ≠ κ(a_t)}
+# 若到轨迹结束都没恢复 → 该 loop 不进训练集
+# 一条 rollout 可贡献多对；无需任务奖励 / 金标 / LLM judge
+# 论文：8,000 CodeGym pairs 里 82.6% 来自最终失败的轨迹</code></pre>
+    <p>
+      例子（附录 B）：Agent 反复 <code>FindUnvisitedOnlineServer(3,0)</code> 拿到同一坐标，后来自己发出 <code>MarkVisited(3,0)</code>——前者是 y⁻，后者是 y⁺。和 hindsight experience replay 一样，<strong>失败轨迹里的局部恢复</strong>仍然有用。
+    </p>
+
+    <h3>③ 训练：标准 DPO，推理期整段用训好的策略</h3>
+    <pre><code>L = −log σ( β · (log π_θ(y⁺|x)/π_ref(y⁺|x) − log π_θ(y⁻|x)/π_ref(y⁻|x)) )
+# Qwen3-8B：LoRA DPO，β=0.05，1 epoch，8k pairs；r=32, α=64, lr=8e−6
+# 14B / 32B：各自从自己的 compressed rollout 挖 pair，同 β，2 epochs
+# 推理：同一模型既写 summary（温度 0）又继续行动；压缩阈值默认 4096 token</code></pre>
+
+    <h3>④ 放进「压上下文 × 改策略」坐标系</h3>
+    <table>
+      <thead><tr><th>路线</th><th>改什么</th><th>loop 能否从根上消</th><th>代表（站内 / 论文）</th></tr></thead>
+      <tbody>
+        <tr><td>更好压缩 / 外存</td><td>保留什么历史</td><td>降低但不清零（仍 46%+）</td><td>ReFold、Forgetting、ACON</td></tr>
+        <tr><td>推理期 blocker / Reflexion</td><td>拦截或口头反思</td><td>Agent 仍<strong>提议</strong>重复（blocker 下 71.3% 任务仍提案）</td><td>OpenHands stuck、Reflexion</td></tr>
+        <tr><td>outcome / gold DPO、SFT</td><td>策略，但要标签</td><td>可降，弱于自挖 loop pair</td><td>ETO、Agent-R 类</td></tr>
+        <tr><td><strong>DeLoop</strong></td><td>策略；标签=结构规则</td><td>8B：57.3%→6.1%</td><td>本篇；与 <a href="daily-2026-09-10-algo-dpo.html">DPO</a> 同损失</td></tr>
+      </tbody>
+    </table>
+
+    <h2>实验要点（均为论文自报）</h2>
+    <ul>
+      <li><strong>主结果 Qwen3-8B @ CodeGym，summ@4096（Table 1）：</strong>compressed baseline loop 57.3% / success 25.1% / steps 15.00；<strong>DeLoop 6.1% / 25.9% / 4.67</strong>（tokens/task 23.9k→12.7k）。DeLoop-Mix（+跨域 pairs）10.1% / <strong>30.3%</strong> / 5.94。</li>
+      <li><strong>对照（同表）：</strong>exact duplicate blocker 46.7%；Reflexion 55.3%；ACON 46.3%；chosen-only SFT（只要 y⁺）<strong>37.7%</strong>；gold-label DPO 22.3%；looping-action penalty GRPO 15.0%。DPO 在同信号目标里最低 loop、最高 success。</li>
+      <li><strong>缩放（Figure 5 / Table 6）：</strong>14B：42.9%→12.3%，success 45.1%→<strong>52.3%</strong>；32B：38.5%→12.9%，success 37.7%→<strong>44.8%</strong>。大模型上修 loop 会带回成功率。</li>
+      <li><strong>数据规模：</strong>1k→8k pairs，loop 45.1%→6.1%；8k 后边际变平。82.6% pairs 来自失败轨迹——不必等成功示范。</li>
+      <li><strong>选择性：</strong>训练后「有信息的重复 / 全部重复」从 29.9% 升到 69.8%——模型仍会复查状态变化，只是少发「答案已在手里」的空转。</li>
+      <li><strong>迁移：</strong>DeLoop-Mix 在 ALFWorld / AppWorld 等降 loop；BrowseComp-Plus 上 Mix 把 loop 22.4%→1.2%；32B 仅 CodeGym pairs 零样本到 ALFWorld：loop 64.9%→54.5%，success 33.6%→42.5%。</li>
+    </ul>
+
+    <h2>怎么看这篇</h2>
+    <p>
+      <strong>值得拿走的：</strong>(1) loop 是<strong>轨迹级、零成本可检</strong>的事件，比「哪一步该背锅」的归因简单一个数量级；(2) y⁺ 取「同 rollout 里稍后的恢复」，把失败跑成了偏好数据；(3) 两边都要——chosen-only SFT 只到 37.7%，说明压制 y⁻ 和模仿 y⁺ 一样关键；(4) 与更好压缩正交：DeLoop-Mix 在七种 memory policy 下 loop 全降。
+    </p>
+    <p>
+      <strong>需要打折的：</strong>(1) 8B 上 success 几乎持平（+0.8pp），主收益是成本和稳定性；success 跃迁更明显在 14B/32B 与 Mix；(2) 定义只覆盖「完全相同 obs」——近重复 / 参数抖动不算，附录显示压缩最放大的是 exact loop；(3) DPO 后 summary 也共用新权重，但没有单独的摘要目标；(4) 过强的 β / lr 可以把 loop 压到 &lt;2% 同时伤 success——需要筛集盯双指标。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先在日志里打 loop 仪表盘。</strong> 按 κ(call)+obs 哈希计数；同时报 looping runs%、空转步占比、与失败率的列联。</li>
+      <li><strong>压缩与策略一起抓。</strong> 只升级摘要 prompt（ledger / action-trace）往往不够；在不动压缩器的前提下挖 pair 训策略，成本通常低于再训一个 compressor。</li>
+      <li><strong>挖 pair 时强制 κ(y⁺) ≠ κ(y⁻)。</strong> 否则「后来同 call 但 obs 变了」会混进 chosen，两边文本相同，DPO 无效。</li>
+      <li><strong>blocker 只能当护栏，不能当老师。</strong> 论文里 blocker 下 Agent 仍高频提案重复 call；要改提议分布，还得更新权重。</li>
+      <li><strong>优先 DPO，慎用「chosen NLL 锚」。</strong> 附录显示加 likelihood anchor（RPO）会把 loop 从 6.1% 拉回 27%——锚把对比稀释成模仿。</li>
+      <li><strong>与站内遗忘 / 折叠工具链兼容。</strong> Forgetting 删 tool-result 时若留下「已执行断言」，DeLoop 探测表明断言几乎等同原文记录；删得干干净净则要靠训好的策略兜底（删记录后 DeLoop 重发率 15% vs baseline 43%）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「同 tool call + 不同 observation」不算 looping action？若把这类也当负例会有什么风险？</summary>
+      <p>环境状态可能已变，重发同一 call 是合理的再观测（informative repeat）。若一律打成负例，Agent 会学到「永远不要复查」，在需要确认副作用或轮询的任务上受损。论文用选择性指标显示：DeLoop 主要砍掉同 obs 的空转，信息性重复仍保留。</p>
+    </details>
+    <details>
+      <summary>2. 压缩为什么抬高 loop rate？记录删除探测与「原文仍在上下文却仍重复」分别说明了什么？</summary>
+      <p>删除最近 completed call 使重发率 3.3%→48.8%，说明摘要丢掉动作记录会直接诱使重复。但压缩后仍有约四分之一 run 在记录 verbatim 可见时重复，且 full history 也有 29% loop——说明还有「有记录却不会用」的策略缺陷，单靠更好压缩无法清零。</p>
+    </details>
+    <details>
+      <summary>3. 为什么 chosen-only SFT（只要 y⁺）远弱于完整 DPO pair？结合 DPO 梯度直觉说明。</summary>
+      <p>DPO 梯度一项抬高 log π(y⁺|x)，一项压低 log π(y⁻|x)。SFT 只有第一项，等价于模仿恢复动作，但在相同上下文下 looping action 的概率未必被压下去，Agent 仍会采样到空转。完整 pair 显式拉大两者的相对对数概率，所以 loop 从 37.7% 降到 6.1%。</p>
+    </details>
+    <details>
+      <summary>4. 82.6% 的训练对来自失败轨迹。这对「只保留成功示范」的 Agent SFT 管线意味着什么？</summary>
+      <p>失败跑里只要出现「先 loop、后恢复」的局部结构，就能提供偏好对；丢掉失败轨迹等于丢掉大部分可挖的 loop 监督。这与「outcome-only 过滤」相反：结构事件（exact repeat）比终局成功更密集，也更早可检。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）若在线 RL（GRPO）里把「是否 looping action」做成逐步惩罚，和离线 DeLoop 相比各适合什么阶段？</summary>
+      <p>可讨论方向：(a) 论文 GRPO 惩罚把 loop 降到 15.0%，弱于 DPO 6.1%，但能跟着 offline 分布外的新状态；(b) 冷启动宜先 DeLoop 快速压空转，再上任务奖励 RL，避免早期算力耗在重复 call；(c) 逐步惩罚要防「少做事少 loop」的活动天花板（附录命题：模糊上下文下降 loop 可能靠少行动）；(d) 与站内 ClawLoop 的自造题闭环可叠加——用 loop 仪表盘当诊断信号，而不是唯一奖励。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.19376" target="_blank" rel="noopener">arXiv:2610.19376 · DeLoop（Chen et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2509.17325" target="_blank" rel="noopener">arXiv:2509.17325 · CodeGym（Du et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">arXiv:2305.18290 · DPO（Rafailov et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2303.11366" target="_blank" rel="noopener">arXiv:2303.11366 · Reflexion（Shinn et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a> ·
+        <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> ·
+        <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a> ·
+        <a href="daily-2026-10-08-harness-refold.html">ReFold</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-10-algo-dpo.html">DPO</a> ·
+        <a href="daily-2026-09-10-harness-ralph-loop.html">Ralph Loop</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

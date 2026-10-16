@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜GAE：用 λ 在高偏差 TD(0) 与高方差 MC 之间插值——PPO / GRPO 时代仍在用的优势估计骨架 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜GAE：用 λ 在高偏差 TD(0) 与高方差 MC 之间插值——PPO / GRPO 时代仍在用的优势估计骨架</h1>
+    <p class="post-meta">2026-10-16 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典来源：John Schulman、Philipp Moritz、Sergey Levine、Michael Jordan、Pieter Abbeel ·
+      <em>High-Dimensional Continuous Control Using Generalized Advantage Estimation</em>（ICLR 2016）
+      · <a href="https://arxiv.org/abs/1506.02438" target="_blank" rel="noopener">arXiv:1506.02438</a>。
+      公式与极限情形按原文；与 PPO / GRPO / 长程 Agent 的对照为本笔记在 2026 语境下的解读，不代表原论文实验。
+      交叉：
+      <a href="daily-2026-09-02-algo-gae.html">站内旧版 GAE 笔记</a>、
+      <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-10-14-gppo.html">GPPO</a>、
+      <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a>、
+      <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a>、
+      <a href="daily-2026-10-06-algo-dqn.html">DQN</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      策略梯度把回报当权重：∇J ≈ E[ Σ_t ∇log π(a_t|s_t) · Ψ_t ]。Ψ 可以是原始回报 G_t（高方差）、也可以是 advantage A_t = Q(s_t,a_t) − V(s_t)（减 baseline 后通常更稳）。问题变成：<strong>没有真 V 时，Â 从哪来？</strong>
+    </p>
+    <p>
+      2015–2016 的连续控制里，Schulman et al. 给出的答案是 <strong>Generalized Advantage Estimation（GAE）</strong>：用一轮 TD residual 的指数加权，把「短视但低方差」的 TD(0) 和「无偏但高方差」的 Monte Carlo 拧在同一个旋钮 λ 上。十年后，机器人 PPO 仍在默认开 GAE；LLM 后训练里 GRPO 一类方法常常<strong>不用 critic</strong>，改用组内相对奖励——这反而让「什么时候还需要 GAE」变成一个更清楚的工程问题。本篇按同行课节奏重讲骨架，并接到 2026 的 Agent RL。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① TD residual 与多步 advantage</h3>
+    <pre><code># 折扣回报与优势（真值）
+G_t = Σ_{k≥0} γ^k r_{t+k}
+A_t = Q(s_t, a_t) − V(s_t) = E[G_t | s_t, a_t] − V(s_t)
+
+# 一步 TD residual（V 为当前 value 估计）
+δ_t = r_t + γ V(s_{t+1}) − V(s_t)          # 终止态约定 V(s_{T+1})=0
+
+# n-step advantage（把 n 步奖励展开，再用 V(s_{t+n}) bootstrapping）
+Â_t^{(n)} = Σ_{l=0}^{n−1} γ^l δ_{t+l}
+# n=1 → δ_t（TD）；n→∞ → Σ γ^l δ ≈ G_t − V(s_t)（MC 残差）</code></pre>
+
+    <h3>② GAE(γ, λ)：对 n-step 估计做指数平均</h3>
+    <pre><code># Schulman et al. 式 (16)–(18) 的常用写法
+Â_t^{GAE(γ,λ)} = Σ_{l=0}^{∞} (γλ)^l δ_{t+l}
+
+# 等价递推（实现里从后往前扫一遍轨迹）
+Â_T = δ_T
+Â_t = δ_t + γλ Â_{t+1}
+
+# 两个端点
+λ = 0  ⇒  Â_t = δ_t                         # 纯 1-step TD；偏差来自 V，方差最低
+λ = 1  ⇒  Â_t = Σ_{l≥0} γ^l δ_{t+l}         # ≈ G_t − V(s_t)；V 准则近乎无偏，方差最大
+λ ∈ (0,1) ：在偏差–方差之间插值（经验上 0.9–0.97 常见，机器人 PPO 默认常 0.95）</code></pre>
+    <p>
+      直观：每个 δ 是「相对当前 V 的瞬时惊喜」。λ 控制惊喜向后传多远——λ 小则只信近处，λ 大则把整条轨迹的残差累起来。这与 <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a> 的 λ-return 是同一家族；GAE 明确把对象定成 <strong>advantage</strong>，并强调与信任域策略梯度（TRPO → PPO）配套。
+    </p>
+
+    <h3>③ 和 PPO clip、value 损失怎么拼</h3>
+    <table>
+      <thead><tr><th>组件</th><th>角色</th><th>和 GAE 的关系</th></tr></thead>
+      <tbody>
+        <tr><td>GAE Â</td><td>给 policy 梯度的方向与幅度</td><td>依赖 V_φ；V 偏了，Â 整段平移 / 扭曲</td></tr>
+        <tr><td>PPO clip</td><td>限制 π_new/π_old 比率</td><td>不产生 Â；只限制「沿 Â 走多远」（见 <a href="daily-2026-10-14-gppo.html">GPPO</a>）</td></tr>
+        <tr><td>Value loss</td><td>拟合 V，常回归 GAE 目标或 MC 回报</td><td>训不好 V → GAE 再漂亮也是噪声放大器</td></tr>
+        <tr><td>γ</td><td>任务有效视野</td><td>与 λ 耦合：长 horizon 常同时抬 γ、略降 λ，以免方差爆炸</td></tr>
+      </tbody>
+    </table>
+    <pre><code># 伪代码：一段有限轨迹 t=0..T−1
+for t = T−1 .. 0:
+    δ = r_t + γ * (0 if done else V(s_{t+1})) − V(s_t)
+    adv = δ + γ * λ * (0 if done else adv)
+    store Â_t = adv
+# 可选：整条轨迹对 Â 做标准化（batch 内 mean/std），再进 PPO surrogate</code></pre>
+
+    <h3>④ 2026：GRPO 不用 GAE 时，缺的是什么</h3>
+    <pre><code># GRPO 一类（站内 GRPO 笔记）：同题采 G 条完整回答，用组内相对奖励
+Â_i = (r_i − mean(r)) / (std(r) + ε)       # 轨迹级 / outcome 级，通常无逐步 critic
+
+# 对比
+# GAE  : 需要 V；给 step-level 信用；适合稠密 / 逐步奖励，或中间态可定义 value 的 MDP
+# GRPO : 不需要 V；信用在整条样本间对比；适合「终局可验证、中间难打分」的 LLM RL
+# 混用 : 过程奖励 / PRM / 逐步环境反馈回来时，GAE 或 TD(λ) 会重新变得有用</code></pre>
+    <p>
+      长程 Agent 里两者张力更明显：奖励极稀疏时，纯 outcome GRPO 会遇到全失败零信号组（昨天 <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a>）；若环境给逐步反馈（命令是否改对文件、单测是否变绿），step-level advantage——GAE 或其离散变体——又能把功劳分到中间动作。站内 <a href="daily-2026-10-06-depgpo.html">DepGPO</a> 用依赖图重分配 GRPO 优势，本质也是在补「只有终局分」的信用缺口，和 GAE 要解决的问题同构、手法不同。
+    </p>
+
+    <h3>⑤ 偏差从哪里来（实践里最常踩的坑）</h3>
+    <ul>
+      <li><strong>V 本身有偏：</strong>函数近似、分布偏移、过早 bootstrapping → δ 系统性偏，λ 越大越把偏差传远。</li>
+      <li><strong>γ 与任务不匹配：</strong>γ 过低 → 长程信用消失；过高 + λ≈1 → 方差回到 MC。</li>
+      <li><strong>轨迹截断：</strong>未 done 就截断时，必须用 V(s_T) bootstrap，否则 λ 靠近 1 会系统性低估尾部。</li>
+      <li><strong>与 off-policy 混用：</strong>经典 GAE 假设 on-policy 轨迹；像 <a href="daily-2026-09-25-algo-vtrace.html">V-trace</a> 那样截断 IS 才是 IMPALA 路线。Experience Replay（<a href="daily-2026-10-12-algo-experience-replay.html">笔记</a>）更常配 DQN 系，而不是裸 GAE。</li>
+    </ul>
+
+    <h2>怎么看这个工具</h2>
+    <p>
+      <strong>仍该掌握的原因：</strong>只要训练栈里还有 critic——机器人 PPO、部分 process-reward RL、带逐步环境分的 Agent——GAE 就是默认的优势估计器。λ 是少数几个「一把拧偏差–方差」且实现成本极低的旋钮。
+    </p>
+    <p>
+      <strong>不必教条使用的原因：</strong>纯 outcome、可验证终局、组采样便宜时，GRPO / RLOO 用组统计量代替 V，少维护一个网络、少一种训推不一致来源。此时硬上 GAE 等于先要训好一个逐步 value——在语言动作空间里往往比策略本身还难。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>默认 λ=0.95，γ 跟 horizon 走。</strong> 先固定这两项把 PPO 跑通，再扫 λ∈{0.9, 0.95, 0.99}；观察是方差炸（抬 λ）还是学不动长程依赖（降 λ 过狠）。</li>
+      <li><strong>Value 与 policy 的学习率解耦。</strong> V 欠拟合时，把 λ 调低只能掩盖问题；先看 value loss 与 explained variance。</li>
+      <li><strong>截断轨迹一定 bootstrap。</strong> done=False 的最后一步用 V(s_T)，与 λ=1 的 MC 残差定义一致。</li>
+      <li><strong>LLM RL 选型清单：</strong>只有终局分 → 先 GRPO/RLOO；有逐步可验证信号 → 考虑 GAE 或分步加权；全失败组多 → 先解决零信号（VH-GPO / dynamic sampling），再谈 GAE 细节。</li>
+      <li><strong>标准化 Â 要声明范围。</strong> 按 micro-batch、按整条轨迹、还是按任务组，会影响有效学习率；换并行度时同步改。</li>
+      <li><strong>记录 (γ, λ, V 结构) 与 clip 区间。</strong> 复现 PPO 结果时这三项比「用了Adam」更关键；GPPO 说明 clip 形状也是设计空间的一部分。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 证明（直观即可）：λ=0 时 GAE 退化为 δ_t；λ=1 时等于 Σ_l γ^l δ_{t+l}。后者在 V 为真值时为什么等于 A_t？</summary>
+      <p>把 Â = Σ_l (γλ)^l δ_{t+l} 代入 λ=0，只剩 l=0 项即 δ_t。λ=1 时 Â = Σ_l γ^l δ_{t+l}。将 δ 展开成望远镜级数：Σ_l γ^l (r_{t+l}+γV_{t+l+1}−V_{t+l}) = Σ_l γ^l r_{t+l} − V(s_t)（中间 V 项抵消）。若 V=V^π，则 G_t−V(s_t) 的期望正是 A_t。</p>
+    </details>
+    <details>
+      <summary>2. 为什么说「V 的偏差会注入 GAE」？λ 较大时为什么往往更危险？</summary>
+      <p>每个 δ 显式含 V(s_t)、V(s_{t+1})。若 V 系统性高估某些状态，δ 与 Â 会系统性偏移。λ 大时远处 residual 衰减慢，局部 V 误差被累加进早期时间步的 Â，策略在错误优势上更新；λ 小则误差更局部，但信用分配变短视。</p>
+    </details>
+    <details>
+      <summary>3. GRPO 用组内相对奖励代替 Â，相当于丢掉了 GAE 的哪两部分假设？换来了什么？</summary>
+      <p>丢掉：(1) 需要维护 V_φ；(2) 需要逐步/轨迹内的时间结构来聚合 δ。换来：实现简单、无 critic 训推不一致、天然适合「同 prompt 多条样本可对比」的 LLM 设定。代价是：组内无对比时零信号，以及缺少细粒度时间信用（除非额外设计过程奖励或依赖图重分配）。</p>
+    </details>
+    <details>
+      <summary>4. 一段 100 步、中途无稠密奖励、只有终局 r_T∈{0,1} 的 Agent 轨迹，λ=0 与 λ=1 的 GAE 会各自把学习信号主要放在哪里？</summary>
+      <p>λ=0：只有靠近终局、且 V 能区分的状态能通过 δ 获得明显信号；早期步 δ≈0（若 V 平坦）。λ=1：终局惊喜会沿 γ^l 回传到整条轨迹，早期动作也能分到优势，但方差大，且严重依赖 V 对中间态的校准。稀疏奖励下二者都吃力，这正是过程奖励 / 组采样方法兴起的原因。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）若要在「终端 Agent + 逐步单测反馈」上把 GAE 与 GRPO 拼起来，你会把什么当 r_t、什么当轨迹级奖励？</summary>
+      <p>可讨论方向：(a) r_t = 单测增量 / 文件差分启发式，轨迹级再加终局通过分，GAE 管逐步、GRPO 管同题多条对比；(b) 仅用终局分做 GRPO，把 GAE 只用在「有环境增量」的子段；(c) 用 PRM 当稠密 r_t，但要注意与真环境分的校准；(d) 全失败组仍按 VH-GPO 补桥，GAE 只在有非零回报的段上计算；(e) 报告时分开消融：逐步 r、λ、组大小 G。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1506.02438" target="_blank" rel="noopener">arXiv:1506.02438 · GAE（Schulman et al., ICLR 2016）</a></li>
+      <li><a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347 · PPO（Schulman et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/1502.05477" target="_blank" rel="noopener">arXiv:1502.05477 · TRPO（Schulman et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300 · DeepSeekMath / GRPO</a></li>
+      <li>站内：
+        <a href="daily-2026-09-02-algo-gae.html">旧版 GAE</a> ·
+        <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-11-algo-trpo.html">TRPO</a> ·
+        <a href="daily-2026-10-14-gppo.html">GPPO</a> ·
+        <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> ·
+        <a href="daily-2026-10-06-depgpo.html">DepGPO</a> ·
+        <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a> ·
+        <a href="daily-2026-10-06-algo-dqn.html">DQN</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

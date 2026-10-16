@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 2,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -753,6 +753,27 @@
       "source": "algo",
       "topic": "RMSNorm：BatchNorm vs LayerNorm 统计轴；RMSNorm 去掉 mean-centering 只留 re-scaling（Table 1 不变性，只失去权重矩阵整体平移）；pRMSNorm p=6.25%；Jacobian 投影掉径向、scale invariance ⇒ ‖W‖ 增长与有效学习率；Post-LN vs Pre-LN（Xiong et al. Theorem 1：O(d√ln d) vs O(d√(ln d/L))，Lemma 2 残差流线性增长）；T5 / LLaMA / Gemma (1+w) / QK-Norm / MLA；HF cast 顺序与训推一致性；numpy 玩具实验（arXiv:1910.07467 / 1607.06450 / 1502.03167 / 2002.04745）",
       "file": "posts/daily-2026-10-15-algo-rmsnorm.html"
+    },
+    {
+      "date": "2026-10-16",
+      "domain": "infra",
+      "source": "frontline",
+      "topic": "Spectral-MoE：dense-to-MoE 下学 per-layer heterogeneous utilization；static ε_l+Γ_B+STE / dynamic hidden→schedule+逐层 revision 守恒 ΣE_l=B；25% 时 learned dynamic 相对 uniform WikiText-2 PPL −1.04/−2.96/−2.71（Llama-2/3/Qwen），analytic −2.45/−6.26/−2.17；六任务均值 12.5%/25%/50% 平均 +1.5/+4.2/+3.6pp（Broveak et al. arXiv:2610.19232）",
+      "file": "posts/daily-2026-10-16-spectral-moe.html"
+    },
+    {
+      "date": "2026-10-16",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "DeLoop：loop=规范化同 tool call+同 observation；压缩后 Qwen3-8B CodeGym 29.0%→57.3%；同 rollout y⁻/y⁺ 挖 pair 做 DPO（82.6% 自失败轨迹），loop 57.3%→6.1%、steps 15→4.67、success≈25.9%；32B success 37.7%→44.8%；DeLoop-Mix→30.3%（Chen et al. arXiv:2610.19376）",
+      "file": "posts/daily-2026-10-16-harness-deloop.html"
+    },
+    {
+      "date": "2026-10-16",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "GAE：Â=Σ(γλ)^l δ_t；λ=0→TD、λ=1→MC 残差；与 PPO clip / GRPO outcome 无 critic / 长程 Agent step-level credit 对照；实践 λ≈0.95（Schulman et al. ICLR 2016 arXiv:1506.02438）",
+      "file": "posts/daily-2026-10-16-algo-gae.html"
     }
   ]
 }
