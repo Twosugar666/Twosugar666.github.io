@@ -80,6 +80,27 @@
           <button class="chip" data-filter="pc">配件</button>
         </div>
         <ul class="post-list">
+          <li data-cat="infra gpu">
+            <a href="posts/daily-2026-10-19-kv-tier-pcp.html">一线追踪｜远端 KV cache 比 GPU 还慢：B300 上一次 L2 命中 0.88 s 输给重算 0.31 s——B*=sR 断点模型 + 按 PCP rank 分片 MLA KV，hit-heavy p99 83.32 s→0.67 s</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span><span class="post-cat">显卡</span>
+              <span class="post-date">2026-10-19</span>
+            </span>
+          </li>
+          <li data-cat="harness agent">
+            <a href="posts/daily-2026-10-19-harness-specagent.html">学习笔记｜SpecAgent：让强模型从「写每一步」变成「审一段草稿」——弱模型带真实只读 tool call 起草、停在第一个写操作前，强模型一次 prefill 判最长语义有效前缀；τ²-Airline 86.0 持平 Strong-only、wall time 41%</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-10-19</span>
+            </span>
+          </li>
+          <li data-cat="algo infra">
+            <a href="posts/daily-2026-10-19-algo-mqa-gqa-mla.html">学习笔记｜MQA → GQA → MLA：KV cache 压缩的三代注意力——从「删掉 K/V 的 head 维」到「低秩 latent + 矩阵吸收 + decoupled RoPE」</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-19</span>
+            </span>
+          </li>
           <li data-cat="infra">
             <a href="posts/daily-2026-10-16-spectral-moe.html">一线追踪｜Spectral-MoE：dense-to-MoE 转换里学会「按层不均」分配 expert utilization——25% 预算下动态分配把 Llama-3-8B WikiText-2 PPL 相对均匀降 2.96</a>
             <span class="post-side">

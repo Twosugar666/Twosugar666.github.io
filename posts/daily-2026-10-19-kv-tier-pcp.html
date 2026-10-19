@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜远端 KV cache 比 GPU 还慢：B300 上一次 L2 命中 0.88 s 输给重算 0.31 s——B*=sR 断点模型 + 按 PCP rank 分片 MLA KV，hit-heavy p99 83.32 s→0.67 s · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜远端 KV cache 比 GPU 还慢：B300 上一次 L2 命中 0.88 s 输给重算 0.31 s——B*=sR 断点模型 + 按 PCP rank 分片 MLA KV，hit-heavy p99 83.32 s→0.67 s</h1>
+    <p class="post-meta">2026-10-19 · 收藏夹：Infra / 显卡 · 一线追踪<br />
+      论文：Muhammad Ibrahim（Multiverse Computing） ·
+      <em>When the KV Cache Is Slower Than the GPU: Scaling Remote KV Tiers for Context-Parallel Prefill</em>
+      · <a href="https://arxiv.org/abs/2610.21500" target="_blank" rel="noopener">arXiv:2610.21500</a>（cs.DC，v1，2026-10-15 提交，10-16 列表）。
+      部署：GLM-5.3（FP8 MoE + MLA）、8×B300 prefill 节点、vLLM 0.31.0 + LMCache 0.5.5 + Valkey 8.1。
+      文中数字均为<strong>论文自报</strong>，且作者明确说明<strong>每个条件只跑了一次</strong>（&lt;10% 的差异不构成结论）；「B* ≈ 2.53 GB/s」「17k token 门槛」等派生量已按文中 s、R、T0 代入复核。
+      交叉：
+      <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a>、
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">今日算法篇 MQA → GQA → MLA</a>、
+      <a href="daily-2026-10-07-harness-hear.html">HEAR（Mooncake 负载相关）</a>、
+      <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a>、
+      <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3</a>、
+      <a href="daily-2026-10-08-nemo-dcr.html">NeMo-DCR</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长 prompt 的 TTFT 基本由 prefill 决定。生产系统的常见做法是两级 KV 复用：每个 engine 本机 host memory 里一层（L1），再挂一个所有 engine 共享、重启不丢的远端层（L2）。L2 的隐含前提只有一句话——<strong>把 KV 读回来比重新算一遍便宜</strong>。
+    </p>
+    <p>
+      这篇论文报告的是这个前提在生产里失效的一次事故：一个企业 SLA 负载（9k–200k token prompt）打开 L2（LMCache + Valkey）后，<strong>中位 TTFT 不变，尾延迟爆炸</strong>——16k 档 p99 从 3.96 s 涨到 17.3 s，32k 档从 6.06 s 涨到 25.0 s，最终整体回滚到只开 L1。作者没有停在「Redis 太慢」，而是用 trace replay + Nsight + py-spy 把账算清，给出一个两参数的成本模型，再据此改了 LMCache 的存储布局、远端拓扑、加载路径并修了三个客户端 bug。值得细读的原因是：它把「cache tier 是否值得」从网络延迟问题，改写成了<strong>相对 GPU prefill 速率的带宽问题</strong>——而后者每代 GPU 都在变难。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 部署形态：为什么「lockstep」放大一切</h3>
+    <table>
+      <thead><tr><th>组件</th><th>配置（论文自报）</th><th>对 cache 路径的含义</th></tr></thead>
+      <tbody>
+        <tr><td>模型</td><td>GLM-5.3，FP8，MoE + DeepSeek 式 MLA</td><td>每 token 只存一个低秩 latent，<strong>与 head 数无关</strong>；TP 切 head 不缩小这份状态</td></tr>
+        <tr><td>Prefill 并行</td><td>一节点 8×B300，PCP8（prefill context parallelism）+ EP8</td><td>序列按 rank 切，AllGather 交换 KV 后<strong>每个 rank 都持有整段 latent</strong>；每步都有 NCCL collective，8 个 rank 锁步</td></tr>
+        <tr><td>PD 分离</td><td>prefill / decode 分节点，KV 经 NIXL 送 decode</td><td>本文只测 prefill 腿</td></tr>
+        <tr><td>LMCache</td><td>256-token chunk，键为 token 前缀 hash；L1 host memory，L2 Valkey（RESP 协议）</td><td>lookup 返回「所有 chunk 都在」的最长前缀；中间缺一块，后面全部重算</td></tr>
+        <tr><td>MLA 的旧策略</td><td><code>save_only_first_rank</code>：只在 worker 0 存取</td><td>TP 下合理（各 rank latent 相同）；PCP 下变成<strong>单 rank 包揽全部 I/O</strong></td></tr>
+        <tr><td>Valkey</td><td>与 Redis 一样单主线程执行命令，I/O 线程只并行 socket 读写</td><td>单实例命令吞吐被一个核封顶，加客户端没用</td></tr>
+      </tbody>
+    </table>
+    <p>
+      MLA 的数字：GLM-5.3 FP8 一个覆盖全部层的 256-token chunk 是 12.4 MB，即 <strong>s ≈ 48.4 KB/token</strong>。一条 16k prompt 约 0.79 GB。为什么 MLA 的 KV 这么小、又为什么 TP 不能再切小它，见今天的<a href="daily-2026-10-19-algo-mqa-gqa-mla.html">算法篇</a>。
+    </p>
+
+    <h3>② 两参数成本模型：B* = sR 与 T0</h3>
+    <pre><code># 记号：n = 命中的 prompt token 数；s = 每 token KV 字节；R = engine prefill 速率 (token/s)
+#       B = cache tier 交付给这一个 prompt 的带宽；T0 = 命中仍要付、且不随带宽缩小的固定成本
+T_recompute = n / R
+T_load      = T0 + n·s / B                      # 论文式 (1)
+
+# 忽略 T0：命中划算 ⇔ B > B* = s·R            # prompt 长度 n 被消掉了！
+GLM-5.3 FP8 @ 1×B300 节点：s = 48.4 KB/token，R = 52.2k token/s（冷 miss 中位速率）
+  ⇒ B* ≈ 48.4e3 × 52.2e3 ≈ 2.53 GB/s
+单个 Valkey 实例服务 8 个 PCP rank：最好 1.71 GB/s &lt; B*  ⇒ 每次 L2 命中都比重算慢
+
+# 计入 T0：需要 n/R &gt; T0 + n·s/B，必要条件 n &gt; R·T0
+T0 拟合（只用最快配置 H5b 的中位数，8 实例 B=10.76 GB/s）：
+  T0 = 0.40 − 0.79/10.76 ≈ 0.33 s
+  ⇒ R·T0 ≈ 52.2k × 0.33 ≈ 17k token：短于此的 prompt，带宽无穷大也赢不了重算
+样本外校验：预测单实例 16k 命中 0.33 + 0.79/1.71 ≈ 0.79 s，实测三次 0.83–0.88 s</code></pre>
+    <p>
+      两个结论都很「反直觉但正确」。第一，<strong>断点带宽与 prompt 长度无关</strong>，只取决于模型 KV 足迹 s 和硬件 prefill 速率 R——所以 GPU 每快一代，cache tier 的门槛就水涨船高。第二，T0 里装的是调度、lookup 往返、未命中尾巴的前向、逐 chunk 的元数据交换与 broadcast——这些不吃带宽，因此「换更快的存储」救不了短 prompt。
+    </p>
+
+    <h3>③ 为什么中位数不变而 p99 爆炸：一个 ρ&gt;1 的排队</h3>
+    <pre><code># 同步加载：load 在 engine step 内执行，PCP 下一停全停 → 等价于单服务台队列
+每次命中服务时间 ≥ n·s / B；到达率 λ ⇒ 利用率 ρ = λ · n·s / B
+hit-heavy 回放：λ = 1.21 req/s，中位 prompt 0.79 GB
+  单实例负载下服务端实测仅 0.78–0.89 GB/s ⇒ ρ ≈ 1.13 &gt; 1 ⇒ 无稳态，队列只增不减
+  8 实例 ⇒ ρ ≈ 0.09</code></pre>
+    <p>
+      实测与之吻合：单实例同步（H1b）跑 6 分钟内，中位延迟按三分位从 3.52 s → 9.02 s → 52.30 s，engine 内最多同时压 59 个请求，<strong>GPU 利用率只有 7%</strong>。这就是 SRE 最怕的那种曲线：卡很闲，延迟却在爬。
+    </p>
+
+    <h3>④ 设计一：把 MLA KV store 按 PCP rank 分片</h3>
+    <p>
+      病灶先用 Nsight 定位：两条并发 ~200k prompt 的窗口里，rank 0 往 host 写了 19.1 GB，忙碌 82%；其他七个 rank 98% 忙且在 9.5 s 窗口里各累计 ~1.55 s AllGather 等待——它们在等 rank 0 搬完 KV 再进下一个 collective。
+    </p>
+    <table>
+      <thead><tr><th>环节</th><th>分片后的规则</th><th>为什么正确 / 不死锁</th></tr></thead>
+      <tbody>
+        <tr><td>Ownership</td><td>chunk c（起点 token 256c）归 rank o(c) = c mod W；各 rank 的 L1 是总预算的 1/W</td><td>AllGather 后每个 rank 都有整段 KV，谁存都行；总内存不变</td></tr>
+        <tr><td>Lookup</td><td>rank r 回答 a_r = min{c : o(c)=r 且 c 缺失}（全在则 N）；调度器照旧取各 rank 最小值</td><td><strong>Proposition 1</strong>：min_r a_r = m（第一个缺失 chunk）。c&lt;m 都在 ⇒ 所有 a_r ≥ m；chunk m 的 owner 在 m 之前的块都在 ⇒ a_{o(m)} = m。不需要新消息；W∈{2,3,4,8}、≤10 chunk 穷举 + 800 chunk 随机验证</td></tr>
+        <tr><td>Load（Algorithm 1）</td><td>每个 rank：取回并暂存自己的 chunk → 按固定顺序对每个 q 做一次 BroadcastObject(指纹, 首个失败, 元数据) → 由 W 份消息算出一致前缀 P → chunk c&lt;P 从 owner broadcast</td><td>所有 rank 无论本地结果如何都发<strong>同样序列</strong>的 collective；本地失败（驱逐、GET 失败、staging 错误）只体现为更短的一致前缀；输入不一致 ⇒ 指纹不同 ⇒ P=0</td></tr>
+        <tr><td>远端键名</td><td>各 rank 仍以 worker-0 的名字写自己的 chunk</td><td>键与写入 rank 无关 ⇒ 跨 engine 复用不受影响</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 设计二：按 rank 拆远端，零协调扩容</h3>
+    <p>
+      要抬 B 就需要更多 Valkey 主线程，即更多实例；通常这意味着 cluster 协议或客户端一致性哈希。但分片已经给了一个<strong>静态分区</strong>：rank r 只碰 c mod W = r 的 chunk，且<strong>每个 engine 的 rank r 拥有同一组 chunk 下标</strong>。于是实例 r 只存 rank r 的块——没有路由逻辑、实例间零流量、跨 engine 复用不丢。客户端改动就是远端 URL 里的 <code>{rank}</code> 占位：<code>resp://valkey-{rank}:6379</code>。
+    </p>
+    <table>
+      <thead><tr><th>聚合 GET 带宽（12.4 MB chunk，8-chunk 批 ≈ 99 MB/rank）</th><th>论文自报</th></tr></thead>
+      <tbody>
+        <tr><td>1 客户端 / 1 实例</td><td>1.51 GB/s</td></tr>
+        <tr><td>8 客户端 / 1 实例</td><td>1.71 GB/s（只多 13%，都排在同一主线程上；单 rank 批 p50 440 ms vs 65 ms）</td></tr>
+        <tr><td>8 客户端 / 8 实例</td><td><strong>10.76 GB/s（6.3×）</strong>，批 70 ms；分片平均 8.9 ms 服务端时间 / GET</td></tr>
+      </tbody>
+    </table>
+    <p>单实例 hit-heavy 期间，Valkey 主线程 73–74% 的墙钟时间在执行 GET（最忙那一分钟 89–91%）。</p>
+
+    <h3>⑥ 设计三、四：异步加载 + 三个「GPU 时间线全空」的 bug</h3>
+    <ul>
+      <li><strong>异步加载扩展到 shard 模式：</strong>LMCache 原异步路径假设 rank 0 做全部 lookup。改为各 rank 只预取自己的 chunk，并给存储层传一个自定义累计长度向量（第 k 项为第 k 个自有 chunk 的起始 token），存储层的「连续命中」答案恰好就是 a_r，调度器取最小即得同一前缀；3,000 个随机存在模式的 property test 验证等价。一个边界被修正：某 rank 零命中原先报 0 token，分片下是错的（rank 1 首个自有 chunk 缺失时正确答案是 256，因为 chunk 0 属于 rank 0）。</li>
+      <li><strong>Lost completion：</strong>原生客户端先提交请求、再注册接收结果的 future，而 completion 在另一个事件循环线程 drain——两步之间 drain 掉的结果被丢弃，调用者永久阻塞。分片让每次 lookup 发往每个 rank，暴露面 ×W；一次丢失是永久的，之后每次 lookup 都等满 3 s 超时（生产日志：某一时刻起每分钟 16/16 个路由请求超时）。修法：一把锁同时罩住 submit-and-register 与 drain。</li>
+      <li><strong>GET 缺失 key 永不返回：</strong>RESP 用 5 字节 <code>$-1\r\n</code> 表示空值，而连接器按 chunk 固定读 11 字节头 → 读不完、连接永久丢失。LRU 下 EXISTS 与 GET 之间 chunk 被驱逐是常态，同步加载于是让所有 rank 卡满 10 s 阻塞超时。修后：4-chunk GET 删一个 key，69 ms 返回 [T,T,F,T]，下一次 GET 40 ms；修前 12 s 无完成。</li>
+      <li><strong>异步 GET 用错 key：</strong>没把 key 改写成 worker-0 名字，非 0 rank 查到了却去取不存在的 key（顺带牵出上一个 bug）。上游从没走到过，因为 MLA 只有 rank 0 做异步 lookup。</li>
+    </ul>
+
+    <h3>⑦ 结果：hit-heavy 子集（450 请求，~16k token，98.5% token 来自 L2）</h3>
+    <table>
+      <thead><tr><th>Run</th><th>L2 / 加载</th><th>p50</th><th>p99</th><th>max</th><th>来自 L2</th><th>GPU util</th></tr></thead>
+      <tbody>
+        <tr><td>H1b</td><td>1 实例，同步</td><td>9.70</td><td>83.32</td><td>86.72</td><td>98.5%</td><td>7%</td></tr>
+        <tr><td>H2b</td><td>1 实例，异步（rank-0 store）</td><td>3.20</td><td>3.82</td><td>4.04</td><td>50.6%</td><td>28%</td></tr>
+        <tr><td>H3</td><td>8 实例，同步，分片</td><td>0.41</td><td>0.80</td><td>1.25</td><td>98.5%</td><td>21%</td></tr>
+        <tr><td>H4</td><td>8 实例，异步，分片</td><td>0.41</td><td>0.73</td><td>1.07</td><td>98.5%</td><td>20%</td></tr>
+        <tr><td>H5b</td><td>8 实例，异步，分片，全部修复</td><td>0.40</td><td><strong>0.67</strong></td><td>0.86</td><td>98.5%</td><td>22%</td></tr>
+        <tr><td>B1</td><td>同请求，重算</td><td>0.31</td><td>1.28</td><td>2.76</td><td>0.8%</td><td>—</td></tr>
+        <tr><td>生产 engine</td><td>同请求</td><td>0.35</td><td>1.14</td><td>4.86</td><td>—</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <p>
+      单位秒，论文 Table 2。几处要读对：H2b 的 3.2 s 是「靠放弃换来的有界」——49% 请求撞 3 s 异步 lookup 超时转重算，所以只有 50.6% token 来自 L2。H5b 的 p99 相对 H1b 降 124×，但<strong>中位数仍比重算慢 0.09 s</strong>：10.76 GB/s 下传输只占 0.074 s，其余是 T0；无限带宽下 16k 命中也要 ~0.33 s。L2 在这个长度上赢的是<strong>尾延迟</strong>（0.67 vs 1.28 s）和<strong>算力</strong>（命中不消耗 GPU），而不是中位 TTFT。
+    </p>
+    <table>
+      <thead><tr><th>吞吐（1 节点，8 条并发 ~200k prompt，3 轮）</th><th>k token/s</th></tr></thead>
+      <tbody>
+        <tr><td>rank-0 store（基线）</td><td>43.2</td></tr>
+        <tr><td>分片 store</td><td>49.4（+14%）</td></tr>
+        <tr><td>rank-0 store + kernel fix</td><td>49.8</td></tr>
+        <tr><td>分片 store + kernel fix</td><td>57.3–58.0（+34%）</td></tr>
+        <tr><td>LMCache 关闭 / 关闭 + kernel fix</td><td>51.4 / 60.6</td></tr>
+      </tbody>
+    </table>
+    <p>
+      kernel fix 是顺带发现的第二个瓶颈：FlashInfer 的 fused SwiGLU + FP8 re-quantization kernel 每次 1.57 ms、占 prefill GPU 时间 17%，原因是 EP8 下大部分 thread block 在处理路由到别的 GPU 的 slot；上游 PR #3969 的重写（作者为 SM103 编译验证）降到 0.23 ms。同一 Nsight 窗口里，AllGather 总时间 15.8 s → 5.8 s，rank 0 的 D2H 流量 19.1 GB → 2.4 GB。正确性用 6 个 12.8k–166.7k token 的 needle-in-a-haystack（冷 / L1 / L2 重启后 / 冷对照，贪心解码），24/24 找到 needle。端到端 4P+1D（5 节点）在 200k SLA 基准上 100% 成功、TTFT P90 30.5 s / P50 18.0 s，每节点 2.55M TPM；作者明确说这与 11 节点聚合部署（0.70M/节点）的对比混入了并行与放置差异，只作部署背景，不算消融。
+    </p>
+
+    <h2>怎么看这项工作</h2>
+    <p>
+      <strong>真正可迁移的是 B* = sR 这把尺子。</strong>它把三个经常分开讨论的东西拧到一起：模型架构（s——MLA/GQA/量化/压缩在压它）、硬件（R——B300 这类新卡在抬它）、存储系统（B——实例数、RDMA、并行度在抬它）。架构越省 KV、GPU 越快，cache 越难回本；反过来，s 再小一倍，同一个 Valkey 就从「拖后腿」变成「刚过线」。读 <a href="daily-2026-10-07-harness-hear.html">HEAR</a> 时我们看到 Mooncake 的收益和负载强相关，这篇给了一个可以直接代入的解释框架。
+    </p>
+    <p>
+      <strong>第二个教训是 lockstep 放大器。</strong>PCP / TP / EP 下任何「一个 rank 多干一点」——包揽 I/O、一次慢 GET、一次丢失的 completion——都会被 collective 同步成全体停顿。论文的分片方案妙在没有引入新协议：Proposition 1 证明调度器早就在算的「各 rank 取 min」恰好就是最长有效前缀；Algorithm 1 用「所有 rank 发同样的 collective 序列、把本地失败折叠进一致前缀」保证不会有 rank 跳过 collective。这和 <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a> 里「collective 序必须对齐」的通信安全思路同源。
+    </p>
+    <p>
+      <strong>局限也要照单全收：</strong>每个条件单次运行；只测 prefill、单 engine 作为唯一 Valkey 客户端（多 engine 争用是估算：~0.45 req/s/engine × 0.79 GB，六个 engine 约 2 GB/s）；延迟结论只覆盖 14.7k–17.9k token 档，17k 门槛是模型预测、未直接测；hit-heavy 子集是挑来装得下私有实例的，生产实例的驱逐与 EXISTS→GET 竞态会更多。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>上 L2 之前先算 B*。</strong> 用自己的 s（每 token 全层 KV 字节，含量化）和 R（冷 miss 的 prefill token/s 中位数）算 sR，再实测 cache tier 交付给<em>单个 prompt</em> 的带宽（不是聚合带宽）。B &lt; B* 就别指望它降 TTFT。</li>
+      <li><strong>单独拟合 T0 并给出长度门槛 R·T0。</strong> 做一个按请求的 load-or-recompute 策略：预测 T0 + ns/B 与 n/R，短 prompt 直接重算（论文 §7 也把它列为下一步）。</li>
+      <li><strong>同步 load 不能放在 lockstep 的 step 里。</strong> 只要有一个操作可能无界阻塞（GET、lookup、远端 RPC），就要异步化或加硬超时，并监控「GPU util 低 + 队列深度涨」这一对信号。</li>
+      <li><strong>Redis 系存储按「主线程数」而不是「客户端数」扩容。</strong> 静态分区（按 rank、按 chunk mod W）可以免掉 cluster 协议；需要扩到多于 rank 数时，再在每个 rank 分区内做二级 hash。</li>
+      <li><strong>MLA + CP 场景检查「谁在搬 KV」。</strong> 继承自 TP 的「只在 rank 0 存」假设在 PCP 下会把 I/O 集中到一张卡；用 Nsight 看各 rank D2H 字节与 AllGather wait 是否对称。</li>
+      <li><strong>给 RESP / 原生客户端写「缺 key」与「先 drain 后注册」的回归测试。</strong> 这类 bug 不出现在 GPU 时间线上，只能靠 py-spy 栈和 fake client 复现。</li>
+      <li><strong>报告 cache 收益时拆开中位与尾部、延迟与算力。</strong> 本文 H5b 中位输给重算、尾部与 GPU 占用赢——只报一个数会误导容量规划。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 B* = sR 与 prompt 长度 n 无关？如果把 KV 从 FP8 再量化到平均 6 bit，B* 怎么变？</summary>
+      <p>T_recompute = n/R 与 T_load 的带宽项 ns/B 都与 n 成正比，比较 n/R &gt; ns/B 时 n 约掉，只剩 B &gt; sR。s 与每元素位宽成正比：8 bit → 6 bit 时 s 变为 3/4，B* 也降到约 0.75×（≈1.9 GB/s，按本文 s、R 代入的推算，非论文数字），单 Valkey 实例 1.71 GB/s 仍不过线，但差距显著缩小。代价是解量化开销可能进入 T0 或降低 R 的「等效」基准。</p>
+    </details>
+    <details>
+      <summary>2. 证明 Proposition 1，并说明为什么旧实现里「零命中 rank 报 0 token」在分片下是错的。</summary>
+      <p>设 m 为第一个缺失 chunk。所有 c&lt;m 都在，故任一 rank 的首个缺失自有 chunk ≥ m，a_r ≥ m；chunk m 的 owner o(m) 在 m 之前的自有块都在，所以 a_{o(m)} = m，于是 min = m（m=N 时所有 a_r=N）。旧实现把「本 rank 自有块一个都没命中」报为 0，但如果 rank 1 的首个自有块（chunk 1）缺失，正确的 a_1 是 256 token（chunk 0 属于 rank 0，与 rank 1 无关）；报 0 会把全局 min 错拉到 0，白白丢掉 rank 0 命中的 chunk 0。修正后报累计长度向量的第一项。</p>
+    </details>
+    <details>
+      <summary>3. H2b（单实例 + 异步）的 p99 只有 3.82 s，远好于 H1b 的 83.32 s，为什么论文不把它当解法？</summary>
+      <p>因为它的「有界」来自放弃：49% 请求撞 3 s 异步 lookup 超时后转去重算，而后台预取还在继续占用 Valkey，结果只有 50.6% token 来自 L2、GET 数与 H1b 相同。它避免了 ρ&gt;1 的排队爆炸，却没解决 B &lt; B* 的根因；延迟也仍是重算的 10 倍量级。真正的解是抬 B（8 实例 10.76 GB/s 使 ρ≈0.09），异步只作为去掉失效模式的保险。</p>
+    </details>
+    <details>
+      <summary>4. 为什么 Algorithm 1 要求每个 rank 「无论本地找到什么」都执行同样的 collective 序列？如果让命中失败的 rank 直接跳过 broadcast 会怎样？</summary>
+      <p>NCCL collective 要求所有参与者以相同顺序进入相同操作；某个 rank 因本地失败跳过一次 broadcast，其余 rank 会永远阻塞在该 collective（或更糟，错配到下一次 collective，数据错位）。Algorithm 1 把所有本地差异（失败位置、指纹）先通过一轮固定顺序的小消息交换，得到在每个 rank 上完全相同的一致前缀 P，之后的 broadcast 次数由 P 决定、全体一致，从结构上排除了 desync。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把这套分析搬到 RL rollout 引擎：多轮 Agent RL 里同一 prompt 前缀被 G 条 rollout、跨 step 反复复用，远端 KV 层何时值得？你会监控哪些量？</summary>
+      <p>可讨论方向：(a) rollout 引擎以 decode 为主，但长工具输出回填是 prefill，按 B*=sR 判断远端层对「回填 prefill」是否划算；(b) 组内 G 条共享前缀更适合 engine 内 prefix cache（RadixAttention），远端层主要服务跨 step / 跨 engine 复用；(c) 权重每 step 更新后 KV 失效——远端层命中率受 refit 频率约束（对照 <a href="daily-2026-10-08-nemo-dcr.html">NeMo-DCR</a>），旧权重 KV 若被复用还会带来训推不一致；(d) 监控：单 prompt 交付带宽 B、T0、ρ=λns/B、GPU util 与队列深度、EXISTS→GET 驱逐竞态次数；(e) PCP/TP/EP 锁步下所有 I/O 是否对称分摊。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.21500" target="_blank" rel="noopener">arXiv:2610.21500 · When the KV Cache Is Slower Than the GPU（Ibrahim, Multiverse Computing）</a></li>
+      <li><a href="https://arxiv.org/abs/2510.09665" target="_blank" rel="noopener">arXiv:2510.09665 · LMCache（Liu et al.）</a></li>
+      <li><a href="https://github.com/LMCache/LMCache/pull/5545" target="_blank" rel="noopener">LMCache PR #5545 · 按 PCP rank 分片 MLA KV store</a>（另见 #5547 / #5548 / #5550 / #5551 / #5553）</li>
+      <li><a href="https://github.com/flashinfer-ai/flashinfer/pull/3969" target="_blank" rel="noopener">FlashInfer PR #3969 · DeepSeek FP8 activation kernel 优化</a></li>
+      <li><a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">arXiv:2405.04434 · DeepSeek-V2（MLA）</a></li>
+      <li><a href="https://arxiv.org/abs/2410.03065" target="_blank" rel="noopener">arXiv:2410.03065 · Compute or Load KV Cache? Why Not Both?（Cake）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a> ·
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA → GQA → MLA</a> ·
+        <a href="daily-2026-10-07-harness-hear.html">HEAR</a> ·
+        <a href="daily-2026-09-08-ainfer-pd.html">AInfer-PD</a> ·
+        <a href="daily-2026-08-28-glm-5-3.html">GLM-5.3</a> ·
+        <a href="daily-2026-10-08-nemo-dcr.html">NeMo-DCR</a> ·
+        <a href="daily-2026-08-31-gpu-rubin.html">NVIDIA Rubin</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

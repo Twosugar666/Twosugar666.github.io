@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜SpecAgent：让强模型从「写每一步」变成「审一段草稿」——弱模型带真实只读 tool call 起草、停在第一个写操作前，强模型一次 prefill 判最长语义有效前缀；τ²-Airline 86.0 持平 Strong-only、wall time 41% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜SpecAgent：让强模型从「写每一步」变成「审一段草稿」——弱模型带真实只读 tool call 起草、停在第一个写操作前，强模型一次 prefill 判最长语义有效前缀；τ²-Airline 86.0 持平 Strong-only、wall time 41%</h1>
+    <p class="post-meta">2026-10-19 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Zilin Wang、Yinhong Liu、Chao Chen、Qun Liu、Zhijiang Guo（HKUST(GZ) LARK / Yinwang / Cambridge / HKUST） ·
+      <em>Trajectory-Level Speculation with Semantic Verification for Tool-Using Agents</em>
+      · <a href="https://arxiv.org/abs/2610.21463" target="_blank" rel="noopener">arXiv:2610.21463</a>（cs.CL，v1）
+      · 代码 <a href="https://github.com/LARK-AI-Lab/SpecAgent" target="_blank" rel="noopener">LARK-AI-Lab/SpecAgent</a>。
+      文中数字均为<strong>论文自报</strong>（Weak = Qwen3.5-4B，Strong = Qwen3.5-397B-A17B，H20 部署；HBM-read 与 FLOPs 为按 token 数与架构<strong>估算</strong>，MoE 的 HBM-read 为区间）。成本模型的数值示例为本文代入假设参数，非论文数据。
+      交叉：
+      <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>、
+      <a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM</a>、
+      <a href="daily-2026-10-13-s3r.html">S³R</a>、
+      <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a>、
+      <a href="daily-2026-10-07-harness-hear.html">HEAR</a>、
+      <a href="daily-2026-10-19-kv-tier-pcp.html">今日一线：远端 KV tier</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      主流 Agent harness 的循环是「一个强模型写每一步」：查用户、查订单、查政策、改订单、回复……论文 Table 1 给的典型轨迹长度是 MCP-Atlas 20–30 轮、τ²-Bench 30–80 轮、AutomationBench 40–60 轮、VitaBench 50–100 轮。成本随轨迹线性增长，而且大头是强模型<strong>逐 token decode</strong>——每个 token 都要把激活权重从 HBM 读一遍。
+    </p>
+    <p>
+      已有的分工方案都让强模型继续当<strong>作者</strong>：router 按 query 选模型；AgentCollab 一类按 step 决定谁出手；Speculative Actions 一类把 <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> 搬到动作层，但通常要求草稿与强模型自己的动作<strong>完全匹配</strong>才保留，于是强模型仍需生成每个参考步，工作只是被重叠而非被移除。SpecAgent 的问题设定换了一个角色：<strong>强模型能不能只当审稿人</strong>——一次读完弱模型起草的若干步，保留有效的部分？
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 核心原则：可逆性边界决定在哪里审</h3>
+    <table>
+      <thead><tr><th>动作类型</th><th>例子</th><th>出错代价</th><th>SpecAgent 怎么处理</th></tr></thead>
+      <tbody>
+        <tr><td>Read（只读）</td><td>search、lookup、读记录</td><td>可撤回：从 history 删掉即可，环境状态没变</td><td>弱模型<strong>立即真实执行</strong>，后续步骤基于真实 observation 起草</td></tr>
+        <tr><td>State-changing（写）</td><td>改订单、退款、提交最终答案</td><td>不可撤回：编辑 history 撤不回已改的数据库</td><td>弱模型遇到第一个写就<strong>挂起（held）</strong>，chunk 结束，交强模型审</td></tr>
+        <tr><td>K 步全是 read</td><td>连续查询</td><td>同上可撤回</td><td>chunk 满 K 步直接提交，<strong>不审</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      论文的论证很干净：审得更早，是把强模型花在还能撤销的步上；审得更晚，就来不及了。所以验证点恰好放在「错误即将变得不可逆」的边界。读过 <a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM</a> 的同学会认出这是 harness 版的「乱序执行、按序提交」：只读动作可以投机执行，写动作是提交点。附录 D 也老实地划了边界：被拒的 read 只是<em>逻辑上</em>撤回，外部服务的访问日志等痕迹仍在——保证的是「被分类为写的动作在审之前一定不执行」，不是物理回滚一切。
+    </p>
+
+    <h3>② 协议：Draft → Verify → Repair（Algorithm 1）</h3>
+    <pre><code># 记号：H 已提交历史；π_W 弱策略；V_S 强模型验证器；π_S 强策略；K chunk 上限；E benchmark adapter
+while 任务未完成:
+    τ̂ = []
+    loop:                                   # —— Draft ——
+        â = π_W(H ⊕ τ̂)
+        if E.StateChanging(â):  τ̂.append((â, ⊥)); break       # 写：挂起，不执行
+        ô = E.Execute(â); τ̂.append((â, ô))                     # 读：真实执行
+        if |τ̂| == K:  H = H ⊕ τ̂; τ̂ = []                        # 满 K 步纯读：直接提交
+    (j, r, ã) = V_S(H, τ̂)                   # —— Verify：一次 prefill，输出短 verdict ——
+    if j == |τ̂|:                            # 全部接受
+        H = H ⊕ Prefix_{j−1}(τ̂); 执行挂起的写，结果并入 H
+    else:                                   # —— Repair ——
+        H = H ⊕ Prefix_j(τ̂)                 # 保留最长有效前缀，丢弃被拒后缀（含挂起写）
+        c = ã if E.Valid(ã) else π_S(H, r)  # 优先用 verdict 里“顺手”给的替换动作
+        执行 c，(c, o_c) 并入 H              # 强模型自己的步，不再二审</code></pre>
+    <ul>
+      <li><strong>为什么是「前缀」：</strong>每个草稿步都条件于前面步的 observation；一旦某步错了，后面的步建立在错误前提上，即便看起来合理也不能信。</li>
+      <li><strong>为什么是「语义」接受：</strong>验证器问的是「这一步是不是朝任务前进的合法一步」，而不是「是不是我会写的那一步」。工具任务有大量等价解（查询顺序、参数选择不同），精确匹配会把有效进展当废品扔掉。</li>
+      <li><strong>Fused replacement：</strong>很多被拒步只是一个 tool call 参数或目标错了，验证器解释拒因时顺手给出替换 ã；ã 通过 adapter 的 schema 校验且能在环境里执行，就不额外调用强模型。只有修复跨多次调用或 ã 不合法时，强模型才多做一轮修复。</li>
+      <li><strong>验证器看什么：</strong>已提交动作与 observation，<strong>看不到弱模型的 reasoning</strong>；MCP-Atlas / VitaBench 的长工具输出在验证视图里截断。</li>
+    </ul>
+
+    <h3>③ 成本模型：用 prefill 换 decode</h3>
+    <pre><code># 假设 1（decode-bound serving）：强模型 batch 足够小、仍受显存带宽约束时，
+#   一次调用的时间与 HBM 流量 ∝ 权重扫描次数（每个 decode token 一次 + prefill 一次）
+# 假设 2：任务 u 的逐步接受率 p_u，chunk 内各步独立接受
+# d = Strong-only 一步的权重扫描数；v = 一个 verdict 的扫描数；ρ = 被拒后需要单独修复轮的概率
+
+Proposition 1（强模型每提交一步的相对成本）
+  R_u = (1 − p_u)/(1 − p_u^n) · v/d  +  ρ·(1 − p_u)
+  p_u→0 ：R_u → v/d + ρ        p_u→1 ：R_u → v/(n·d)     # 一个 verdict 被 n 步摊薄
+
+Proposition 2（端到端相对延迟，忽略工具延迟；κ = 弱模型一步耗时 / 强模型一步耗时）
+  L_u = R_u + κ · n(1 − p_u)/(1 − p_u^n)                  # 第二项 = 每提交一步要起草几步，p→1 时趋于 1</code></pre>
+    <p>代入一组<strong>假设</strong>参数（v/d=0.5，ρ=0.3，κ=0.15，非论文数字）感受一下形状：</p>
+    <table>
+      <thead><tr><th>p_u</th><th>n</th><th>R_u（强模型相对成本）</th><th>L_u（相对延迟）</th></tr></thead>
+      <tbody>
+        <tr><td>0.5</td><td>3 / 6</td><td>0.436 / 0.404</td><td>0.693 / 0.861</td></tr>
+        <tr><td>0.7</td><td>3 / 6</td><td>0.318 / 0.260</td><td>0.524 / 0.566</td></tr>
+        <tr><td>0.85</td><td>3 / 6</td><td>0.239 / 0.165</td><td>0.414 / 0.382</td></tr>
+        <tr><td>0.95</td><td>3 / 6</td><td>0.190 / 0.109</td><td>0.348 / 0.279</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：接受率低时，加长 chunk 反而让延迟变差（弱模型白起草的步更多）；接受率高时，长 chunk 同时压低强模型成本与延迟。这就是为什么 chunk 大小 K 要按 benchmark 定（τ² / VitaBench / MCP-Atlas 取 6，AutomationBench 取 8）。论文 §5 用日志里的 token 数直接验证了式 (6)（Proposition 1 的经验版）：预测的强模型 HBM 份额与观测值在每个 benchmark 上误差在 0.01 内。
+    </p>
+
+    <h3>④ 主结果（论文 Table 2，每轨迹均值）</h3>
+    <table>
+      <thead><tr><th>Benchmark</th><th>方法</th><th>Pass@1</th><th>HBM-read (TB)</th><th>Wall (s)</th><th>PFLOP</th><th>Calls W/S</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="5">τ² Airline</td><td>Weak-only 4B</td><td>80.0</td><td>83.8</td><td>69.7</td><td>0.18</td><td>14.1/0</td></tr>
+        <tr><td>Strong-only 397B</td><td>86.0</td><td>[333.2, 341.6]</td><td>305.2</td><td>0.78</td><td>0/13.8</td></tr>
+        <tr><td>AgentCollab</td><td>85.3</td><td>[276.6, 289.4]</td><td>385.2</td><td>1.12</td><td>9.0/18.5</td></tr>
+        <tr><td>Speculative Actions</td><td>72.0</td><td>[429.5, 438.2]</td><td>665.6</td><td>0.89</td><td>4.5/17.4</td></tr>
+        <tr><td><strong>SpecAgent</strong></td><td><strong>86.0</strong></td><td>[147.6, 150.1]</td><td>126.2</td><td>1.01</td><td>15.5/3.1</td></tr>
+        <tr><td rowspan="2">τ² Retail</td><td>Strong-only</td><td>88.6</td><td>[192.8, 201.8]</td><td>162.4</td><td>0.58</td><td>0/13.1</td></tr>
+        <tr><td>SpecAgent</td><td>87.7</td><td>[107.3, 109.7]</td><td>87.5</td><td>0.81</td><td>13.8/3.1</td></tr>
+        <tr><td rowspan="2">AutomationBench</td><td>Strong-only（Weak 6.8）</td><td>15.2</td><td>[324.0, 337.3]</td><td>307.4</td><td>1.10</td><td>0/17.4</td></tr>
+        <tr><td>SpecAgent</td><td>10.5</td><td>[264.5, 273.6]</td><td>174.9</td><td>1.52</td><td>24.4/11.8</td></tr>
+        <tr><td rowspan="2">VitaBench Delivery</td><td>Strong-only（Weak 34.0）</td><td>48.0</td><td>[249.6, 262.0]</td><td>197.3</td><td>0.72</td><td>0/21.9</td></tr>
+        <tr><td>SpecAgent</td><td>44.5</td><td>[154.9, 161.1]</td><td>135.2</td><td>1.34</td><td>25.5/8.2</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>质量：</strong>Airline 与 Strong-only 同为 86.0（paired bootstrap 差 0.0，95% CI [−5.3, +5.3]）；Retail 87.7 vs 88.6（−0.9，CI [−4.7, +2.9]），收回 Weak–Strong 差距的 89%；AutomationBench 收回 44%，VitaBench 75%。</li>
+      <li><strong>资源：</strong>HBM-read 降到 Strong-only 的 43–45%（Airline）/ 53–57%（Retail）/ 78–84%（AutomationBench）/ 59–65%（VitaBench）；wall time 41% / 54% / 57% / 69%。<strong>但 FLOPs 上升</strong> 30% / 38% / 38% / 87%。</li>
+      <li><strong>为什么 FLOPs 涨而时间降：</strong>强模型验证 + 修复占 SpecAgent 81–85% 的 FLOPs，却只占 39–66% 的 HBM-read；弱模型起草占 15–19% FLOPs、34–61% HBM-read。VitaBench FLOPs 近乎翻倍，是因为验证器与修复 prompt 各有模板、彼此和 actor 都不共享前缀：每任务强模型 prefill 约 28.4k 未缓存 token（Strong-only 12.5k），这 1.03 PFLOP 本身就超过 Strong-only 的 0.72 PFLOP，而省掉的 decode 只有约 0.21 PFLOP。</li>
+      <li><strong>基线对照：</strong>两个协作基线的强模型调用都比 Strong-only 多；SpecAgent 在 τ² 上质量不低于 AgentCollab，HBM-read 低 1.6–1.9×、wall time 低 2.6–3.1×，且是唯一在 Table 2 所有 benchmark 上 HBM-read 与 wall time 都低于 Strong-only 的协作方法。Speculative Actions 的低分要看附录 E：移植的官方实现让后台 tool call 在真实环境里执行、无只读过滤、也不对照真实用户消息校验猜测，作者明确说这刻画的是 released implementation 而非原论文的受保护设计。</li>
+    </ul>
+
+    <h3>⑤ 边–云部署：MCP-Atlas（101 个公开任务，真实 MCP server）</h3>
+    <table>
+      <thead><tr><th>Strong（云 API）</th><th>Strong-only Pass@1</th><th>SpecAgent Pass@1</th><th>Strong 输出 token</th><th>API cost ($)</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3.5-397B-A17B</td><td>72.3</td><td>59.4</td><td>3.6k → 1.8k</td><td>1.39 → 1.12</td></tr>
+        <tr><td>GLM-5</td><td>76.2</td><td>67.3</td><td>4.6k → 2.1k</td><td>8.91 → 5.54</td></tr>
+        <tr><td>DeepSeek-V4-Flash-0731</td><td>84.2</td><td>74.3</td><td>10.6k → 3.8k</td><td>1.37 → 0.81</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Weak-only（本地单张 RTX 5090 上的 Qwen3.5-4B）为 44.6。三组收回 53–75% 的差距，强模型只 decode Strong-only 的 36–50% 输出 token，API 费用降到 59–81%——费用降得比 token 少，是因为每次审稿都要把上下文作为 input 重发（prefill 一侧的代价）。这里 <strong>wall time 不降</strong>：本地弱模型每任务 109 s，与云端强模型 105–151 s 相当，Proposition 2 的 κ 不再小，收益只体现为远端用量与费用。
+    </p>
+
+    <h3>⑥ 消融（τ² Retail，Figure 4）</h3>
+    <table>
+      <thead><tr><th>变体</th><th>Pass@1</th><th>PFLOP</th><th>HBM (TB)</th><th>Wall (s)</th></tr></thead>
+      <tbody>
+        <tr><td>SpecAgent</td><td>87.7</td><td>0.81</td><td>108</td><td>88</td></tr>
+        <tr><td>+ 回复也挂起审</td><td>84.2</td><td>1.08</td><td>176</td><td>223</td></tr>
+        <tr><td>每个 chunk 都审（含纯读）</td><td>84.2</td><td>1.12</td><td>194</td><td>259</td></tr>
+        <tr><td>去掉 fused replacement</td><td>82.5</td><td>0.86</td><td>111</td><td>114</td></tr>
+        <tr><td>去掉语义验证（只接受精确匹配）</td><td>82.5</td><td>1.37</td><td>125</td><td>84</td></tr>
+      </tbody>
+    </table>
+    <p>
+      「审得更多」不仅更贵（强模型调用超过原来的 3 倍，HBM-read +63–79%，wall time 2.5–3.0×，越过 Strong-only），而且<strong>质量更低</strong>；精确匹配让 FLOPs 涨 70%，因为有效的弱模型步被拒后重写。τ² 的回复对用户不可撤回但不改数据库，所以默认不挂起；AutomationBench / MCP-Atlas 的最终消息就是被评分的答案，因此按写处理。
+    </p>
+
+    <h2>怎么看这个 harness 设计</h2>
+    <p>
+      <strong>它把推测解码的三个要素整体上移了一层：</strong>草稿（弱模型）、并行验证（一次 prefill 读完整段）、最长接受前缀 + 首个拒绝位修复。不同之处在于 token 级推测解码靠拒绝采样保证<strong>分布无损</strong>，SpecAgent 的接受准则是<strong>语义有效</strong>——它主动放弃了「和强模型输出同分布」，换取对等价解的容忍。这在 Agent 任务上是对的取舍，但意味着最终质量上限由强模型「当审稿人」的能力决定：MCP-Atlas 上 SpecAgent 的分数跟着强模型自身走（59.4 / 67.3 / 74.3 对 72.3 / 76.2 / 84.2）。
+    </p>
+    <p>
+      <strong>它的收益前提是 decode 受显存带宽约束。</strong>论文给了失效边界：H20 上强模型 decode batch 超过约 37 条序列就进入算力瓶颈，此时 30–87% 的额外 FLOPs 会开始吃时间。这和今天<a href="daily-2026-10-19-kv-tier-pcp.html">一线篇</a>的 B*=sR 是同一类思维——先确认你在 roofline 的哪一侧，再决定拿哪种资源换哪种资源。高并发的 RL rollout 集群通常 batch 很大，直接照搬未必赚；低并发、长轨迹、强模型昂贵的在线服务和边–云场景才是甜区。
+    </p>
+    <p>
+      <strong>和 <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a> 对照：</strong>快照路线是把「写」也变成可回滚（整机 fork），从而可以大胆分支；SpecAgent 路线承认写不可回滚，于是只在写之前设卡。若环境能便宜地快照，SpecAgent 的挂起点可以后移——这是两条线自然的交汇点。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先给工具打 read / write 标签。</strong> 这是 adapter 唯一真正需要人工判断的部分；拿不准的一律当写。论文按文档 + 观察到的环境效果分类，VitaBench 直接用其自带标签。</li>
+      <li><strong>把验证 prompt 与 actor 共享前缀。</strong> VitaBench 的 FLOPs 翻倍就是模板不共享前缀导致的；verdict / repair 尽量复用同一 system prompt + history 排布，吃满 prefix cache。</li>
+      <li><strong>verdict 要短、结构化、带替换动作。</strong> 输出 (accepted_steps, reason, replacement_action)；fused replacement 去掉后 Pass@1 从 87.7 掉到 82.5。</li>
+      <li><strong>验证器不看弱模型的思维链。</strong> 只看已提交的动作与真实 observation，避免被弱模型的「理由」说服。</li>
+      <li><strong>按接受率调 K。</strong> 记录每个 chunk 的接受长度 j，估计 p_u；接受率低的任务族用短 chunk，甚至退回 Strong-only。</li>
+      <li><strong>上线前测 decode batch 是否仍 memory-bound。</strong> 强模型副本并发高时，SpecAgent 的额外 prefill FLOPs 会变成真实延迟。</li>
+      <li><strong>只读的外部副作用要单独审计。</strong> 「读」也可能触发计费、限流、访问日志；涉及隐私或配额的 read 应当提升为需审动作。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 verdict 必须是「最长有效前缀」而不能是「有效步的任意子集」？</summary>
+      <p>草稿步 t 的动作是在步 1..t−1 的 observation 之上选出来的。若步 k 被判无效，步 k+1.. 的选择建立在一个本不应该发生（或参数错误）的读结果上；即使单独看合理，它们的「理由」来自错误上下文。只保留前缀，保证提交的 history 中每一步都条件于已被接受的历史，因果链完整。</p>
+    </details>
+    <details>
+      <summary>2. 由 Proposition 1 解释：为什么 AutomationBench 上节省最少？</summary>
+      <p>R_u = (1−p)/(1−p^n)·v/d + ρ(1−p)。AutomationBench 上弱模型（Weak-only 只有 6.8）草稿被拒得多，p 低，第二项 ρ(1−p) 主导；且每次单独修复约 1.5 倍 Strong-only 一步的 token（Table 4：c_r=0.204，d̄_r/d̄=1.52），强模型 decode 份额预测 0.53、观测 HBM 0.54，远高于 τ² Airline 的 0.17。弱模型越不胜任，越多步落回强模型自己写，收益越小。</p>
+    </details>
+    <details>
+      <summary>3. 「审得更多」为什么会让质量下降，而不只是变贵？</summary>
+      <p>消融里把回复也挂起、或每个 chunk 都审，Pass@1 都从 87.7 降到 84.2。一种解释：每次审稿都是一次拒绝机会，强模型作为审稿人会拒掉一些其实有效的步（语义判定也有误判），之后由强模型修复或弱模型重新起草，轨迹变长、上下文更杂；同时 τ² 的回复不改数据库、用户下一轮回应本身就是 observation，提前审它不增加安全性，只增加干预。论文只报告了现象，原因是本文推断。</p>
+    </details>
+    <details>
+      <summary>4. SpecAgent 与 token 级推测解码都叫「speculation」，二者在正确性保证上有什么本质区别？能叠加吗？</summary>
+      <p>token 级推测解码（站内<a href="daily-2026-09-07-speculative-decoding.html">笔记</a>）用修正拒绝采样保证输出分布与目标模型完全一致，是无损的；SpecAgent 用语义判定，输出轨迹分布与 Strong-only 不同，只保证「被接受的步是强模型认为合法的」，是有损但容忍等价解的。二者正交可叠加：弱模型与强模型各自的 decode（verdict、repair）内部仍可用 token 级推测解码加速，论文也把它列为互补技术。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果把 SpecAgent 用在 Agent RL 的 rollout 阶段（弱模型是正在训练的 policy，强模型是 teacher），会遇到哪些训推问题？</summary>
+      <p>可讨论方向：(a) 提交的轨迹混合了 policy 与 teacher 的步，变成 off-policy 数据，需要 IS 校正或只对 policy 自己写的步算 loss（对照 <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> 的 relay 设计）；(b) 被拒的草稿是天然的负样本 / DPO pair（对照 <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a>）；(c) rollout 集群 batch 大，decode 可能已 compute-bound，Proposition 2 的收益前提不成立；(d) 只读工具真实执行意味着环境调用量增加，需和 sandbox 成本一起算；(e) teacher 的语义判定若有系统偏好，会通过接受率塑形 policy，需要单独监控接受率随训练的变化。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.21463" target="_blank" rel="noopener">arXiv:2610.21463 · SpecAgent（Wang et al.）</a></li>
+      <li><a href="https://github.com/LARK-AI-Lab/SpecAgent" target="_blank" rel="noopener">GitHub · LARK-AI-Lab/SpecAgent</a></li>
+      <li><a href="https://arxiv.org/abs/2506.07982" target="_blank" rel="noopener">arXiv:2506.07982 · τ²-Bench（Barres et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2602.00933" target="_blank" rel="noopener">arXiv:2602.00933 · MCP-Atlas（Bandi et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2302.01318" target="_blank" rel="noopener">arXiv:2302.01318 · Speculative Sampling（Chen et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM</a> ·
+        <a href="daily-2026-10-13-s3r.html">S³R</a> ·
+        <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a> ·
+        <a href="daily-2026-10-07-harness-hear.html">HEAR</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> ·
+        <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> ·
+        <a href="daily-2026-10-19-kv-tier-pcp.html">远端 KV tier</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

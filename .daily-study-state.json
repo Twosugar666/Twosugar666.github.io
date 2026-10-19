@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 3,
+  "next": 4,
   "daily_streams": [
     "frontline",
     "harness",
@@ -774,6 +774,27 @@
       "source": "algo",
       "topic": "GAE：Â=Σ(γλ)^l δ_t；λ=0→TD、λ=1→MC 残差；与 PPO clip / GRPO outcome 无 critic / 长程 Agent step-level credit 对照；实践 λ≈0.95（Schulman et al. ICLR 2016 arXiv:1506.02438）",
       "file": "posts/daily-2026-10-16-algo-gae.html"
+    },
+    {
+      "date": "2026-10-19",
+      "domain": "infra gpu",
+      "source": "frontline",
+      "topic": "When the KV Cache Is Slower Than the GPU：GLM-5.3 FP8 MLA on 8×B300 PCP8+EP8；LMCache+Valkey L2 命中 0.88 s vs 重算 0.31 s；B*=sR≈2.53 GB/s（s=48.4 KB/token，R=52.2k tok/s）、T0≈0.33 s ⇒ <17k token 永远不如重算；同步加载 ρ≈1.13 排队（p99 83.32 s、GPU 7%）；chunk c mod W 分片 + min-over-ranks 前缀证明 + 一致 collective 序列；每 rank 一个 Valkey 实例 GET 1.71→10.76 GB/s（6.3×）；异步加载 + 三个客户端 bug；p99 0.67 s（124×），prefill 吞吐 +14% / +34%（含 FlashInfer #3969）（Ibrahim, Multiverse Computing arXiv:2610.21500）",
+      "file": "posts/daily-2026-10-19-kv-tier-pcp.html"
+    },
+    {
+      "date": "2026-10-19",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "SpecAgent：弱模型（Qwen3.5-4B）真实执行只读 tool call 起草、挂起第一个写；强模型（Qwen3.5-397B-A17B）一次 prefill 判最长语义有效前缀 + fused replacement 修复；R_u=(1−p)/(1−p^n)·v/d+ρ(1−p)、L_u=R_u+κ·n(1−p)/(1−p^n)；τ² Airline 86.0=Strong-only、HBM 43–45%、wall 41%，Retail 87.7 vs 88.6；AutomationBench 收回 44%、VitaBench 75%；FLOPs +30–87%；MCP-Atlas 边–云收回 53–75%、Strong token 36–50%、API 59–81%（Wang et al. HKUST(GZ) arXiv:2610.21463）",
+      "file": "posts/daily-2026-10-19-harness-specagent.html"
+    },
+    {
+      "date": "2026-10-19",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "MQA → GQA → MLA：Shazeer 访存/计算比 Θ(n/d+1/b)→Θ(1/d+n/(dh)+1/b)，WMT14 decoder 46→3.8 µs/token；GQA-G 插值、mean-pool uptrain α=0.05，T5-XXL GQA-8 0.28 s/47.1 vs MHA 1.51 s/47.2；MLA c^KV 低秩联合压缩、W^UK→W^Q / W^UV→W^O 吸收（numpy 等价 ~1e-17）、decoupled RoPE（d_c=512、d_h^R=64 ⇒ GQA-2.25 组）；DeepSeek-V2 消融与 KV −93.3%、5.76×；TP/CP 交互（arXiv:1911.02150 / 2305.13245 / 2405.04434）",
+      "file": "posts/daily-2026-10-19-algo-mqa-gqa-mla.html"
     }
   ]
 }
