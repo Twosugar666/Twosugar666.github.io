@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜GR-OPD：把 OPD 的逐 token teacher 反馈汇成「序列级信用」再广播——raw sum 广播是 reverse-KL 的无偏梯度，γ=0.99 折扣 + 组内只留 λ 份 collective teacher pressure，Qwen3-1.7B 学生 macro Avg@K 34.1→45.1、think→Base 不再崩 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜GR-OPD：把 OPD 的逐 token teacher 反馈汇成「序列级信用」再广播——raw sum 广播是 reverse-KL 的无偏梯度，γ=0.99 折扣 + 组内只留 λ 份 collective teacher pressure，Qwen3-1.7B 学生 macro Avg@K 34.1→45.1、think→Base 不再崩</h1>
+    <p class="post-meta">2026-10-20 · 收藏夹：RL · 一线追踪<br />
+      论文：Yushu Wang、Renkai Yang、Jingcao Xu、Zili Geng、Haihong Tang、Yaohui Jin、Hao He（上海交通大学 / 阿里巴巴） ·
+      <em>GR-OPD: Group-Relative Sequence Credit for On-Policy Distillation</em>
+      · <a href="https://arxiv.org/abs/2610.23042" target="_blank" rel="noopener">arXiv:2610.23042</a>（cs.LG，v1，出现在 arXiv 2026-10-19 的 /new 列表）。
+      文中实验数字均为<strong>论文自报</strong>（Qwen3 系列、ROLL + Megatron + vLLM、8×H20）；「玩具实验」一节为本文在 box 上用 numpy 实跑的验证，γ 尾部权重等数值为本文按论文公式自行计算。
+      交叉：
+      <a href="daily-2026-10-20-algo-knowledge-distillation.html">今日算法：知识蒸馏</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL 散度</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-24-algo-rloo.html">RLOO</a>、
+      <a href="daily-2026-10-14-gppo.html">GPPO</a>、
+      <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      On-policy distillation（OPD）已经是 2026 年后训练的常规件：论文引言列举 DeepSeek-V4、MiMo-V2-Flash、Kimi K3 都用 OPD 迁移或整合推理能力。做法是让<strong>学生自己采样</strong>，再让 teacher 在学生走出来的前缀上打分。工程上最流行的是「sampled-token」轻量版：不保存整张词表分布，只对学生采到的那个 token 计算
+    </p>
+    <pre><code>r_t = log q(y_t | h_t) − log p_θ(y_t | h_t)        # teacher–student log-ratio，h_t = (x, y_&lt;t)
+token 级 advantage := r_t  →  PPO 式 clipped 更新</code></pre>
+    <p>
+      这等于把 <a href="daily-2026-09-17-algo-kl.html">reverse KL</a> 拆成逐 token 的即时奖励，而且<strong>只把第 t 个 token 的反馈记给第 t 个 token</strong>。问题有两个：
+    </p>
+    <ul>
+      <li><strong>信用是局部的。</strong>早期动作不仅决定自己那一位的 teacher 认同度，还决定学生后面会走到哪些前缀；后面的 teacher 反馈本该回流给早期动作，sampled-token 更新把这部分直接扔了。论文 Figure 1(a) 的例子：局部反馈偏好错误的首动作 B，把后续反馈加进来后偏好反转为通向正确答案的 A。</li>
+      <li><strong>跨「思考模式」蒸馏会崩。</strong>teacher 用 Instruct think 模式、学生是 Base 默认推理协议时，vanilla OPD 训练到最后 response 长度冲向上限、verifier reward 掉到近零（论文标为 Collapse）。</li>
+    </ul>
+    <p>
+      已有证据表明「整段平均」的 teacher 反馈信息量其实不差：Rethinking OPD（Li et al., arXiv:2604.13016）报告，在 cross-pattern 设置下，序列均值 teacher 反馈区分对/错回答的 AUROC 为 .75，与 matched 设置的 .73 相当。GR-OPD 的核心主张因此很直接：<strong>「在哪个粒度算反馈」与「在哪个粒度分信用」是两个独立的设计选择</strong>——反馈照样逐 token 算，信用改到序列级。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① reverse-KL 梯度的两项分解</h3>
+    <p>
+      记学生 p_θ、固定 teacher q、序列级目标 K(θ) = KL(p_θ(·|x) ‖ q(·|x))，z_t = ∇_θ log p_θ(y_t | h_t)。论文沿 MiniLLM / Distributional DAgger 的思路写出：
+    </p>
+    <pre><code>−∇_θ K = E[ Σ_t z_t · r_t ]                 # 局部动作匹配（local action matching）
+       + E[ Σ_t z_t · Σ_{u&gt;t} r_u ]          # 未来状态访问信用（future state-visitation credit）</code></pre>
+    <table>
+      <thead><tr><th>估计器</th><th>给 token t 的信用</th><th>是否为 −∇K 的无偏估计</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr><td>sampled-token OPD（vanilla）</td><td>r_t</td><td>否，只保留第一项</td><td>方差小；信用不回流</td></tr>
+        <tr><td>return-to-go</td><td>R_t = Σ_{u≥t} r_u</td><td>是（附录 A.1）</td><td>经典 REINFORCE 的「因果」写法</td></tr>
+        <tr><td>trajectory broadcast（Proposition 1）</td><td>R = Σ_u r_u（整段和，广播给每个 token）</td><td>是（理想 on-policy 下）</td><td>多出的「过去反馈」项期望为 0</td></tr>
+        <tr><td>GR-OPD（实用版）</td><td>A_i^{γ,λ}（折扣均值 + 组内校准）</td><td>否（附录 B 明说）</td><td>换稳定性；用 PPO clip</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② Proposition 1：为什么整段和广播是无偏的</h3>
+    <pre><code>R = Σ_t r_t = log q(y|x) − log p_θ(y|x)            # 自回归分解，逐 token log-ratio 之和 = 序列 log-ratio
+K = −E_{p_θ}[R]                                     # reverse KL 的定义
+−∇K = ∇E_{p_θ}[R] = E[ R · Σ_t z_t ] + E[ ∇_θ R ]   # 分布项（score function）+ 被积函数项
+     ∇_θ R = −Σ_t z_t（teacher 固定），而 E[Σ_t z_t] = ∇ Σ_y p_θ(y) = ∇1 = 0
+⇒  −∇K = E[ R · Σ_t z_t ]                           # 把同一个 R 乘到每个 token 的 z_t 上即可</code></pre>
+    <p>
+      附录 A.2 的另一条证明更直观：把 R 拆成「过去 P_t + 未来 R_t」，P_t 由 h_t 决定，而 E[z_t | h_t] = 0，所以过去反馈对 token t 的贡献期望为零——和 <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> 里「reward-to-go 与整段回报给出同一期望梯度」是同一个论证。区别只在这里的 reward 是 teacher–student log-ratio，而非环境回报。
+    </p>
+
+    <h3>③ 玩具实验：局部估计有偏、广播无偏但更吵</h3>
+    <p>
+      在 box 上搭了一个可穷举的小环境验证这件事：词表 V=3、长度 L=3，学生与 teacher 都是「每个历史一张 logits 表」的表格策略；用有限差分算精确 −∇K，再各采 20 万条学生轨迹做 Monte Carlo 估计（脚本为本文自写，非论文代码）：
+    </p>
+    <table>
+      <thead><tr><th>估计器</th><th>相对误差 ‖ĝ − g‖/‖g‖</th><th>与真梯度余弦</th><th>单样本 MSE</th></tr></thead>
+      <tbody>
+        <tr><td>local（vanilla OPD）</td><td>0.219</td><td>0.979</td><td>1.78</td></tr>
+        <tr><td>broadcast（整段和 R）</td><td>0.008</td><td>1.000</td><td>8.96</td></tr>
+        <tr><td>return-to-go</td><td>0.006</td><td>1.000</td><td>6.27</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：vanilla OPD 的期望方向偏了约 22%（余弦 0.979，在高维参数上偏差会更难察觉）；broadcast 与 return-to-go 都收敛到真梯度，但<strong>单样本方差是局部估计的 3.5–5 倍</strong>，broadcast 又比 return-to-go 更吵（多带了期望为零但有方差的「过去反馈」项）。这正是 GR-OPD 后半部分要解决的事：无偏只是起点，真正上训练需要基线和归一化——而 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> / <a href="daily-2026-09-24-algo-rloo.html">RLOO</a> 的同 prompt 组恰好提供了现成的基线。
+    </p>
+
+    <h3>④ 为什么 raw 序列信用直接用会崩</h3>
+    <ul>
+      <li><strong>teacher 反馈越往后越不可靠。</strong>作者在固定 rollout bank 上用前 H 个 token 重打分，统计组内「分数 vs 正确性」的标准化协方差 J_H(H)（512 个 prompt、每个 32 条回答、每组 8 条）：随 H 增长先升，在 pairing 相关的约 1,500–3,000 token 处见顶后回落。与已有观察一致：早停 rollout 更稳、前 30% token 就能匹配完整 OPD 而后 30% 单独几乎学不到东西（论文引 Zhou et al. / Xie et al.）。</li>
+      <li><strong>信息量够 ≠ 能直接当 advantage。</strong>直接拿折扣后的轨迹分数训练，五个 pairing 全部出现同一失败形态：训练 verifier 分数短暂上升后下降，平均 response 长度逼近生成上限（Figure 1(c,d)）。</li>
+    </ul>
+
+    <h3>⑤ GR-OPD 估计器：折扣 → 组内校准 → 广播 → PPO clip</h3>
+    <pre><code># 对 prompt g，旧策略采 G 条回答 y_1..y_G；r_{i,t} 为 token 级 log-ratio（先 clip 到 [−5, 5]）
+
+S_i^γ = Σ_t γ^(t−1) · r_{i,t}  /  Σ_t γ^(t−1)                 # 折扣「均值」：除以权重和，避免分数随长度增长；默认 γ = 0.99
+
+S̄_g = mean_i S_i^γ ,  s_g = pop_std_i S_i^γ
+
+A_i^{γ,λ} = [ (S_i^γ − S̄_g)   +   λ · S̄_g ] / (s_g + ε)       # 相对偏好 + 保留 λ 份 collective teacher pressure
+            ───────────────     ─────────
+            relative preference   retained shared component      # A 再 clip 到 [−5, 5]
+
+ℓ_{i,t}(θ) = min( ρ_{i,t} A_i ,  clip(ρ_{i,t}, 1−δ, 1+δ) A_i )  # ρ = p_θ / p_old，δ = 0.2；先在回答内平均再跨回答平均</code></pre>
+    <table>
+      <thead><tr><th>旋钮</th><th>取值</th><th>退化情形</th><th>控制的是什么</th></tr></thead>
+      <tbody>
+        <tr><td>γ（反馈地平线）</td><td>0.99（默认）</td><td>γ=1 → 全回答均值</td><td>后段 teacher 反馈的影响</td></tr>
+        <tr><td>λ（压力保留比例）</td><td>matched Instruct：0.25；base→base 与 cross-pattern：0</td><td>λ=0 → GRPO 式纯相对更新；λ=1 → 全量轨迹分数</td><td>「整组一起被推」的共享分量有多少进梯度</td></tr>
+      </tbody>
+    </table>
+    <p>
+      附录 A.5 把 λ 的作用说得很干净：把组内分数向量拆成 C = S − S̄·1（相对偏好）与 P = S̄·1（collective teacher pressure），二者正交。于是
+    </p>
+    <pre><code>mean_i A_i      = λ · S̄_g / (s_g + ε)          # λ 只改整组的共同平移（可正可负）
+A_i − A_j       = (S_i − S_j) / (s_g + ε)        # 两两差与排序完全不受 λ 影响</code></pre>
+    <p>
+      直观理解：S̄_g 是「teacher 对这道题上学生整体的平均态度」。如果 teacher 普遍更偏好更长、更像它自己风格的回答，S̄_g 就会持续给整组一个同向推力——这股推力既可能是有用的知识，也可能是学生吃不下的风格差异。λ 就是决定「信它多少」的阀门。
+    </p>
+    <p>
+      <strong>γ=0.99 的实际地平线有多长？</strong>附录 A.3 给了尾部权重 α_{γ,H,L} = (γ^H − γ^L)/(1 − γ^L) ≤ min{γ^H, (L−H)/L}。代入 γ=0.99（本文计算）：第 100 个 token 之后的总权重 ≤ 0.366，200 之后 ≤ 0.134，300 之后 ≤ 0.049，500 之后 ≤ 0.0066。也就是说，在最长 28,672 token 的回答里，<strong>序列分数实际由前几百个 token 主导</strong>——远短于 J_H 见顶的 1,500–3,000 token。论文没有讨论这个落差；一种读法是，γ 在这里更多起的是「切断后段 length shortcut」的作用，而不是精确匹配「最有信息量的地平线」。附录 A.4 还说明：若权重固定、不随实际长度归一化，加权目标等于前缀 KL 的几何混合 Σ_n (w_n − w_{n+1}) K_n；但实用版按每条回答的实际权重和归一化，又叠了组统计与 clip，作者在附录 B 明确承认无偏结论不再严格成立。
+    </p>
+
+    <h3>⑥ 实验设置（论文 §5.1 与附录 C）</h3>
+    <table>
+      <thead><tr><th>项</th><th>设置</th></tr></thead>
+      <tbody>
+        <tr><td>Pairing（teacher → student）</td><td>matched：Qwen3-4B-Base→1.7B-Base；4B / 32B-Instruct（nothink）→1.7B-Instruct（nothink）。cross-pattern：4B / 32B-Instruct（think）→1.7B-Base</td></tr>
+        <tr><td>训练数据</td><td>DAPO-Math-17k-Processed 英文配置，训练 split 14,116 题，不做难度 / 正确性过滤</td></tr>
+        <tr><td>Rollout</td><td>每步 64 prompt × G=8 = 512 条回答；切 8 个 minibatch，1 个 PPO epoch ⇒ 每个 rollout step 8 次 optimizer 更新；共 221 step</td></tr>
+        <tr><td>长度</td><td>prompt ≤ 4,096，response ≤ 28,672 token（训练与评测相同）</td></tr>
+        <tr><td>优化</td><td>Adam（Megatron），lr 5×10⁻⁷，weight decay 0.1，warmup 20 步后线性衰减到 0；bf16；采样 temperature 1.0、top-p 1.0</td></tr>
+        <tr><td>评测</td><td>AIME24 / AIME25 / AMC23（K=32）、MATH-500 / Minerva / OlympiadBench 数学子集（K=8），共 1,042 题；temperature 0.6、top-p 0.9；报六套 Avg@K 的 macro 平均</td></tr>
+        <tr><td>工程细节</td><td>Base 与 Instruct 的 EOS 不同：Base 学生 + Instruct teacher 时把学生 EOS（151643）映射到 teacher EOS（151645）再算 teacher log-prob</td></tr>
+      </tbody>
+    </table>
+    <p>
+      对照组 vanilla OPD 用相同 prompt、teacher、rollout batch、步数与 clipped 目标，<strong>唯一差别是信用规则</strong>：token 级 advantage 直接取 r_{i,t}，无轨迹聚合、无组归一化。
+    </p>
+
+    <h3>⑦ 主结果（论文 Table 1，macro Avg@K %）</h3>
+    <table>
+      <thead><tr><th>Teacher → Student</th><th>Vanilla OPD</th><th>GR-OPD</th><th>AIME25（vanilla → GR-OPD）</th><th>Δ macro</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3-4B-Base → 1.7B-Base（λ=0）</td><td>23.333</td><td>27.800</td><td>3.229 → 3.958</td><td>+4.5</td></tr>
+        <tr><td>4B-Instruct nothink → 1.7B-Instruct nothink（λ=.25）</td><td>34.118</td><td><strong>45.066</strong></td><td>12.708 → 26.563</td><td>+10.9</td></tr>
+        <tr><td>4B-Instruct think → 1.7B-Base（λ=0）</td><td>8.449（Collapse）</td><td>29.571</td><td>1.354 → 5.833</td><td>+21.1</td></tr>
+        <tr><td>32B-Instruct think → 1.7B-Base（λ=0）</td><td>10.066（Collapse）</td><td>24.463</td><td>3.333 → 3.333</td><td>+14.4</td></tr>
+        <tr><td>32B-Instruct nothink → 1.7B-Instruct nothink（λ=.25）</td><td>30.320</td><td>41.774</td><td>11.667 → 25.000</td><td>+11.5</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>全面领先：</strong>五个 pairing 的 macro 全部更高，且每个 suite 上都不低于 vanilla（32B think→Base 的 AIME25 持平）。</li>
+      <li><strong>cross-pattern 不再崩：</strong>vanilla 两组都 Collapse，GR-OPD 仍可训练到 29.571 / 24.463。参考附录 Table 6，学生 Qwen3-1.7B-Base 训练前 macro 为 23.099——vanilla 在这两组里是把学生训<strong>坏</strong>了。</li>
+      <li><strong>更大的 teacher 不一定更好：</strong>teacher 从 4B 换成 32B，think→Base 从 29.571 降到 24.463，nothink→Instruct 从 45.066 降到 41.774；作者指出 vanilla OPD 也有这种非单调现象，teacher 尺寸不是教学价值的可靠代理。</li>
+      <li><strong>一个值得留意的数字：</strong>Table 6 里 Qwen3-4B-Instruct nothink 作为 teacher 的 macro 为 42.970，而 GR-OPD 学生到了 45.066。论文提醒 Table 6 各行生成上限不同、不作为匹配对比，所以只能说「学生在这套评测下没有被 teacher 上限卡住」，不宜直接读成「学生超过老师」。</li>
+    </ul>
+
+    <h3>⑧ 消融：λ 与 γ 各管一种失败</h3>
+    <table>
+      <thead><tr><th>Pairing</th><th>设置</th><th>训练动态（Figure 3）</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="3">matched Instruct（4B / 32B nothink → 1.7B nothink）</td><td>λ=0</td><td>长度稳定，但 verifier reward 涨得有限</td></tr>
+        <tr><td>λ=.2 / .25</td><td>reward 持续上升、长度随之温和增长；.25 回答更长、最终 reward 更高</td></tr>
+        <tr><td>λ=.5 / 1</td><td>λ=1 长度迅速膨胀后 reward 崩；λ=.5 恶化更慢但最终仍崩，峰值 checkpoint 的评测也不如 λ=.25 终点</td></tr>
+        <tr><td rowspan="2">cross-pattern（4B think → 1.7B-Base）</td><td>λ=.15</td><td>reward 下降、长度快速增长</td></tr>
+        <tr><td>λ=.05 / 0</td><td>.05 稳定但最终 reward 低于 λ=0；需要彻底去掉共享分量</td></tr>
+        <tr><td>matched Instruct</td><td>γ=1 vs .99（λ=.25）</td><td>γ=1 先涨后跌、长度一路上涨；γ=.99 持续改善</td></tr>
+        <tr><td>cross-pattern</td><td>γ=1 vs .99（λ=0）</td><td>即使不保留任何共享压力，γ=1 仍走向 reward 下降 + 长度触顶</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Table 2 的压力幅度代理（|批均值轨迹分数| / 批均组内标准差，取训练中位数）：matched 两组 3.16–3.61，cross-pattern 两组 6.08 / 7.23，约为两倍。λ=.25 时实际保留的代理值为 0.79（4B）/ 0.90（32B）；λ=.5 保留 1.60 并最终崩掉。作者的解释是 cross-pattern 下共享分量里装了更多「推理模式不兼容」的差异，所以必须清零。
+    </p>
+    <p>
+      γ 的作用则对应一个<strong>长度捷径</strong>：轨迹分数是均值，单纯变长并不能抬分；但 γ=1 让后段反馈与前段同权，而后段恰恰处在 teacher 不可靠的前缀上，重复或绕圈的续写可能拿到高于前文均值的 log-ratio——加上它们就能抬分，广播后又反过来强化产生这些续写的行为。附录 Figure 4 的诊断（32B nothink→1.7B nothink，λ=0）：γ=1 时分数与长度的 Pearson 相关越来越强、与 verifier reward 的 Spearman 相关转负；γ=.99 时前者更弱、后者保持为正。
+    </p>
+
+    <h2>怎么看这项工作</h2>
+    <p>
+      <strong>λ=0 的 GR-OPD 本质上是「拿 teacher 当序列级 reward model 的 GRPO」。</strong>每条回答的 reward 是折扣平均 log-ratio，组内中心化 + 标准差归一化，然后 PPO clip——和 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 只差 reward 的来源。这解释了它为什么在 cross-pattern 下稳：相对排序只要求 teacher「哪条更像我」的判断大致可靠，不要求逐 token 的绝对 log-ratio 有意义。λ&gt;0 再把一部分绝对信号加回来，相当于在「纯排序」与「真正拉近 KL」之间插值。
+    </p>
+    <p>
+      <strong>它与这几周的几条线可以放在一张图上：</strong><a href="daily-2026-10-14-gppo.html">GPPO</a> 把 PPO / DAPO 等放进「Divergence × Estimator」表，GR-OPD 则在 OPD 内部只动 estimator 一维；<a href="daily-2026-08-31-algo-gspo.html">GSPO</a> 把重要性比率做到序列级，GR-OPD 是 advantage 序列级、ratio 仍是 token 级；<a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> 让 teacher 在全失败组里直接接管一段，GR-OPD 只让 teacher 打分、动作全由学生出。同 prompt 组的结构也天然允许把 verifier reward 与 teacher 信用并到一起，作者在结论里把它列为下一步。
+    </p>
+    <p>
+      <strong>需要打折扣的地方：</strong>(1) 只在数学推理 + Qwen3 家族上验证；(2) 主表只和 vanilla OPD 比，没有与 TOPD、G-OPD、CompassOPD、GC-OPD 等同期 OPD 变体正面对照；(3) λ 依赖 pairing，目前靠扫参，没有选择准则；(4) 一条回答只有一个广播信用，token 之间不再区分，论文自己也说未来要和 token 级信用结合；(5) γ=0.99 的有效地平线只有数百 token，和「后段反馈不可靠」的叙事一致，但也意味着长推理后半段的错误几乎拿不到 teacher 信号，主要靠 KL 之外的东西兜底。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先确认你的 OPD 是哪种 estimator。</strong>很多实现把 r_t 直接当 token advantage，这只对应 reverse-KL 梯度的局部项；若要信用回流，至少改成 return-to-go 或序列广播，并配同 prompt 组基线。</li>
+      <li><strong>先上 λ=0。</strong>teacher 与学生的思考模式、模板、家族不一致时，只用组内相对偏好最稳；确认稳定后再小步加 λ（0.05–0.25 区间扫），盯 response 长度。</li>
+      <li><strong>γ 不要取 1。</strong>γ=0.99 在 28k 回答上的有效权重集中在前几百 token；想让更长前缀参与，可以尝试按 J_H 曲线定制分段权重，而不是放开到全长。</li>
+      <li><strong>把「长度 ↔ 分数」相关性做成常驻监控。</strong>论文的崩溃前兆都是：分数与长度相关上升、分数与 verifier 的秩相关下降、平均长度逼近上限。三条曲线比训练 reward 本身更早报警。</li>
+      <li><strong>两道 clip 分开看。</strong>token log-ratio clip 到 [−5, 5]、组校准后 advantage 再 clip 到 [−5, 5]，这两道值域 clip 与 PPO 的 ratio clip δ=0.2 是三件事，别合并成一个超参。</li>
+      <li><strong>对齐 EOS / 模板。</strong>Base 与 Instruct 混用时，终止 token 不一致会让 teacher 对「结束」给出系统性低概率，直接污染序列分数；论文的 151643→151645 映射是必要的工程细节。</li>
+      <li><strong>teacher 选型用小实验定。</strong>4B teacher 优于 32B teacher 的结果说明，教学价值取决于兼容性；先在小步数上比较 J_H 曲线与 Table 2 式的压力幅度，再决定用谁。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 既然 broadcast 和 return-to-go 都无偏，为什么 Proposition 1 选「整段和」而不是 return-to-go？实践中哪个更好？</summary>
+      <p>二者期望相同，差别在方差：broadcast 额外乘了「过去反馈」P_t，它期望为零但贡献方差（本文玩具实验单样本 MSE 8.96 vs 6.27）。论文选整段和是为了得到「每条回答一个标量」的形式，便于接 GRPO 式的组内归一化与 PPO 更新，也便于做「序列分数区分对错」这类诊断。若只追求低方差，return-to-go（再配基线）通常更好；GR-OPD 实际上用组均值做基线、用 γ 折扣压后段，部分抵消了这份额外方差。</p>
+    </details>
+    <details>
+      <summary>2. 证明：在 GR-OPD 的式 (5) 中，λ 不改变组内任意两条回答 advantage 的差。那 λ 为什么还会显著影响训练？</summary>
+      <p>A_i − A_j = (S_i − S_j)/(s_g + ε)，λ 项 λS̄_g/(s_g+ε) 对组内所有回答相同，相减抵消。但 PPO 的梯度是 Σ_i A_i Σ_t ∇ρ_{i,t}，共同平移 c 会贡献 c·Σ_i Σ_t ∇ρ_{i,t}：当 S̄_g 为正，它整体抬高本组所有采到的 token 的概率（更像 teacher 的方向），且这个效果按 token 数累积——长回答被推得更多。此外 clip 是非线性的，平移会改变哪些 token 落在 clip 区间内。附录 A.5 也强调代数性质不意味着 PPO 梯度或训练轨迹不变。</p>
+    </details>
+    <details>
+      <summary>3. 为什么「均值型」的轨迹分数仍会产生长度捷径？给出一个具体机制。</summary>
+      <p>均值意味着加 token 本身不抬分，但如果新增 token 的 log-ratio 高于当前均值，均值就会上升。在学生自己走出来的长前缀上，teacher 已处在分布外，对重复、复述、绕圈的续写可能给出接近学生自己的概率甚至更高（log-ratio 接近 0 或为正），而前文里那些「学生与 teacher 分歧大」的 token log-ratio 是负的。于是继续写「无害废话」就能把均值往上拉。γ&lt;1 让这些后段 token 的权重指数下降，切断了这条路。</p>
+    </details>
+    <details>
+      <summary>4. γ=0.99 时，前 300 个 token 之外的权重不到 5%。这与 J_H 在 1,500–3,000 token 见顶的观察是否矛盾？如何改进？</summary>
+      <p>不完全矛盾：J_H 衡量的是「用前 H 个 token 的均值打分能否区分对错」，是诊断量；而训练中最需要的是「对学生动作给出可靠且不可被利用的信号」。后段虽然仍含区分信息，但也是 length shortcut 的来源。改进方向：(a) 用固定窗口 w_t = 1{t≤H}/H（附录 A.4 给出它对应 K_H/H），H 取 J_H 峰值附近；(b) 用更大的 γ（如 0.999）配合长度–分数相关监控；(c) 后段只保留组内相对分量、前段才保留 λ 压力，即「分段 λ」。这些都是本文提出的可试方案，论文未验证。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把 GR-OPD 用到多轮 Agent RL（teacher 是更强的模型，环境有工具调用）时，序列级广播会遇到什么新问题？</summary>
+      <p>可讨论：(a) observation token 不是学生产生的，不应算 r_t，也不应进入 S_i 的分母，否则工具输出长短会扭曲分数；(b) 不同回答的工具轨迹不同，同 prompt 组内的「相对偏好」可能主要反映走了哪条工具路径而非推理质量，可考虑按 turn 做折扣（对照 <a href="daily-2026-10-06-depgpo.html">DepGPO</a> 沿依赖分信用）；(c) teacher 在学生走出的环境状态上可能从未见过类似观测，后段可靠性衰减更快，γ 应按 turn 而非 token 计；(d) 可与 verifier / 环境 reward 在同一组内合并，λ 控 teacher 共享压力、另一系数控环境回报；(e) 上下文压缩会改变 teacher 看到的历史，打分前必须保证 teacher 与学生条件于同一份可见历史（对照 <a href="daily-2026-08-31-harness-tito.html">TITO</a>）。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.23042" target="_blank" rel="noopener">arXiv:2610.23042 · GR-OPD（Wang et al.，上海交通大学 / 阿里巴巴）</a></li>
+      <li><a href="https://arxiv.org/abs/2306.08543" target="_blank" rel="noopener">arXiv:2306.08543 · MiniLLM（Gu et al.，ICLR 2024）</a></li>
+      <li><a href="https://arxiv.org/abs/2306.13649" target="_blank" rel="noopener">arXiv:2306.13649 · GKD：On-Policy Distillation of Language Models（Agarwal et al.，ICLR 2024）</a></li>
+      <li><a href="https://arxiv.org/abs/2604.13016" target="_blank" rel="noopener">arXiv:2604.13016 · Rethinking On-Policy Distillation of LLMs（Li et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2606.05152" target="_blank" rel="noopener">arXiv:2606.05152 · Distributional DAgger（Agrawal et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">arXiv:2402.03300 · DeepSeekMath / GRPO</a> · <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">arXiv:1707.06347 · PPO</a></li>
+      <li>站内：
+        <a href="daily-2026-10-20-algo-knowledge-distillation.html">知识蒸馏</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-24-algo-rloo.html">RLOO</a> ·
+        <a href="daily-2026-08-31-algo-gspo.html">GSPO</a> ·
+        <a href="daily-2026-10-14-gppo.html">GPPO</a> ·
+        <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> ·
+        <a href="daily-2026-10-06-depgpo.html">DepGPO</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

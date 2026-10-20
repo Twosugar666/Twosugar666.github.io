@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Harness-Delta Attribution：harness 演化涨的分，多少是过拟合、多少是多花的推理算力？——compute-matched 基线 + 中和捷径的三分账，21 个显著设置里 O / T 平均占 54% / 14%，ALFWorld 演化出零 LLM 调用的控制器 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Harness-Delta Attribution：harness 演化涨的分，多少是过拟合、多少是多花的推理算力？——compute-matched 基线 + 中和捷径的三分账，21 个显著设置里 O / T 平均占 54% / 14%，ALFWorld 演化出零 LLM 调用的控制器</h1>
+    <p class="post-meta">2026-10-20 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Wenxuan Ding、Qin Lu、Changlong Yu、Sha Li、Shuowei Jin、Xin Liu、Zhenyu Shi、Greg Durrett（Amazon / New York University） ·
+      <em>Harness-Delta Attribution: Dissecting Gains From Harness Evolution</em>
+      · <a href="https://arxiv.org/abs/2610.22466" target="_blank" rel="noopener">arXiv:2610.22466</a>（cs.AI，v1，出现在 arXiv 2026-10-19 的 /new 列表）
+      · 代码 <a href="https://github.com/Wenwen-D/HarnessDeltaAttribution" target="_blank" rel="noopener">Wenwen-D/HarnessDeltaAttribution</a>。
+      文中数字均为<strong>论文自报</strong>（proposer 为 Claude Opus 4.8；executor 为 Qwen3 / 3.5 / 3.6 系列与 Claude Haiku 4.5 / Opus 4.8）。「小样本噪声」一节的标准误为本文按二项分布自行估算。
+      交叉：
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、
+      <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、
+      <a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a>、
+      <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a>、
+      <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a>、
+      <a href="daily-2026-10-20-gr-opd.html">今日一线：GR-OPD</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      过去两个月本站写了一长串「harness 自演化」：<a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> 修自演化的信用分配，<a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> 拆五模块并强调 benchmark-disjoint，<a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a> 聚合跨任务失败，<a href="daily-2026-09-25-harness-growing.html">Growing Harness</a> 从无策略脚手架长出控制代码，<a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a> 把 Belief / Progress / Experience 当成可学的协调层。它们共享同一个循环：固定权重的 executor 用当前 harness 跑一遍 search set，proposer 读轨迹与分数后改 prompt / skill / tool / 编排代码，再跑、再改，最后挑 search set 上分最高的那个。
+    </p>
+    <p>
+      这类工作报的是「演化后比基线高 X 分」。HDA 问了一个评测上一直被跳过的问题：<strong>这 X 分里，有多少来自对 benchmark 人工痕迹的过拟合、有多少只是演化后的 harness 多调了几次模型（test-time scaling）、剩下多少才可能是能迁移的改进？</strong>held-out 测试也不够：search 与 test 如果共享同一套出题方式与数据痕迹，held-out 只测出「benchmark 内迁移」。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 先把演化循环形式化（附录 A，Algorithm 1）</h3>
+    <pre><code># M：固定权重 executor；H：harness（prompt / skill / tool / memory / 编排代码）；P：proposer agent
+F_0 = {Evaluate(H_0, M, X_search, X_val)}           # 文件系统式历史：harness 版本、轨迹、分数、日志
+for t in 1..N:
+    𝓗_t = Propose(P, F_{t−1})                       # 一次提 k 个候选
+    for H in Valid(𝓗_t):
+        F_t ∪= { Evaluate(H, M, X_search, X_val) }
+Ĥ = argmax_{H ∈ 𝓗_eval} S_search(H)                 # 或按验证集选 Ĥ_val
+S_X(H) = (1/|X|) Σ_x r(x, τ_{H,x}),   τ_{H,x} ~ M(· | x; H)</code></pre>
+    <p>
+      关键点在最后一行的 argmax：Ĥ 是在<strong>同一个小 search set</strong> 上从几十上百个候选里挑出来的。即使每个候选都没有作弊，挑最大值本身就是一次带偏的选择。
+    </p>
+
+    <h3>② 三分账：T / O / G</h3>
+    <table>
+      <thead><tr><th>分量</th><th>定义</th><th>怎么构造对照</th><th>解释</th></tr></thead>
+      <tbody>
+        <tr><td>ΔS</td><td>S(Ĥ) − S(H_0)</td><td>先做 paired bootstrap 显著性检验；不显著则报「噪声内」，不做归因</td><td>观测到的演化收益</td></tr>
+        <tr><td>T（Test-Time Scaling）</td><td>S(H_0^scale) − S(H_0)</td><td>保持 H_0 不变，把推理预算抬到 Ĥ 的平均水平（如 Ĥ 每题 10 次 executor 调用 → H_0 跑 10 次再用 majority vote / pass@10 / 任务特定聚合）；Ĥ 不比 H_0 贵时 H_0^scale = H_0</td><td>不演化、直接多花算力就能拿到的部分</td></tr>
+        <tr><td>O（Overfitting）</td><td>S(Ĥ) − S(Ĥ^neutral)</td><td>找出 Ĥ 里利用 benchmark 痕迹的机制，用<strong>最小干预</strong>关掉，其余演化成分保留</td><td><strong>下界</strong>：隐式、纠缠的捷径关不掉</td></tr>
+        <tr><td>G（Generalizable，残差）</td><td>S(Ĥ^neutral) − S(H_0^scale) = ΔS − O − T</td><td>由前两者推出</td><td><strong>上界</strong>：Ĥ^neutral 里可能还残留没发现的过拟合</td></tr>
+      </tbody>
+    </table>
+    <p>
+      报告时各分量按 ΔS 归一化，O 截到 [0%, 100%]，T 截到剩余比例，余下记给 G；原始带符号分量仍满足 ΔS = O + T + G。过拟合分两类审计：
+    </p>
+    <ul>
+      <li><strong>Direct shortcuts：</strong>绕过或预先决定 executor 行为——去掉 LLM 调用、常量答案、按题目的 gate、硬编码查找表、字符串匹配规则。</li>
+      <li><strong>Benchmark-derived heuristics：</strong>利用 benchmark 的构造方式而非任务本身的性质——按 benchmark 统计拟合的阈值、逆向出来的出题规则、数据集特定先验、硬编码解题配方。</li>
+    </ul>
+
+    <h3>③ HDA 本身是一个 skill：agent 执行、人在两处签字</h3>
+    <pre><code>HDA Skill（附录 C，Figure 6 摘要）
+输入：H_0、Ĥ、一个评测集
+1. 计算 ΔS = S(Ĥ) − S(H_0)
+2. 写清任务目标、分数聚合方式、推理成本度量（LLM 调用数 / token 数）、任务特定评测 hook
+3. paired 显著性检验；不显著 → 报噪声内，停止
+4. 构造 H_0^scale，算 T                         ← 人工检查点 1：成本度量与匹配方式
+5. 检测并中和有证据支持的过拟合机制，得 Ĥ^neutral，算 O   ← 人工检查点 2：证据与中和方式
+6. G = ΔS − O − T；报原始分量、归一化比例、证据与局限
+解释：O 是检测到的过拟合下界，G 是可泛化改进的上界；held-out 迁移另行评估</code></pre>
+    <p>
+      这个设计和 harness 演化本身是对称的：演化用 agent 改 harness，HDA 用 agent 审 harness；人只在两个任务相关、最容易被做歪的决策点上把关。作者引用已有工作说明前沿 agent 能识别 benchmark 缺陷与 reward hacking 机会，但仍保留人工复核。
+    </p>
+
+    <h3>④ 实验矩阵</h3>
+    <table>
+      <thead><tr><th>维度</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>演化框架</td><td><strong>Meta-Harness</strong>（搜索 harness 代码，proposer 通过文件系统读源码、分数、轨迹）；<strong>SkillOpt</strong>（只改 skill 文档，优化器把打分 rollout 变成有界编辑）；<strong>AHE</strong>（Agentic Harness Engineering，改 prompt / tool / skill / memory，按原论文用 Opus 4.8 同时当 proposer 与 executor）</td></tr>
+        <tr><td>Executor</td><td>11 个：9 个 Qwen3 / 3.5 / 3.6 开源模型（0.8B–35B，含 coder），Claude Haiku 4.5、Claude Opus 4.8</td></tr>
+        <tr><td>设置数</td><td>25 个（Meta-Harness 16、SkillOpt 6、AHE 3），其中 21 个 search-set 收益显著</td></tr>
+        <tr><td>LiveMath</td><td>search / val / test = 35 / 18 / 124（沿用 SkillOpt 的切分）</td></tr>
+        <tr><td>ALFWorld</td><td>50 / 36 / 120；按任务类型 × 房间切：search 只含 3 类任务、厨房 / 客厅 / 浴室，test 含新实例、卧室、3 个未见任务类型；50 步内成功率</td></tr>
+        <tr><td>CREATE</td><td>120 / 80 / 561；按关系类型与领域切，test 含 263 条 held-out 传记 / 家庭 / 职业关系与 191 条科学 / 生物医学关系；指标 Creative Utility（CU）</td></tr>
+        <tr><td>SWE-bench Verified</td><td>48 / 24 / 50，seed 42，过滤为 1 小时内可解，保持仓库分布</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 主结果（论文 Table 1，O / T / G 为 ΔS 的百分比；⋆ = 演化后在 held-out 上反而不如基线）</h3>
+    <table>
+      <thead><tr><th>框架</th><th>Benchmark</th><th>Executor</th><th>ΔS</th><th>O ↓</th><th>T ↓</th><th>G ↑</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="16">Meta-Harness</td><td rowspan="5">ALFWorld</td><td>Qwen3.5-0.8B</td><td>+100.0%</td><td>100</td><td>0</td><td>0</td></tr>
+        <tr><td>Qwen3.5-2B</td><td>+100.0%</td><td>100</td><td>0</td><td>0</td></tr>
+        <tr><td>Qwen3.5-4B</td><td>+60.0%</td><td>93</td><td>0</td><td>7</td></tr>
+        <tr><td>Qwen3-8B</td><td>+64.0%</td><td>100</td><td>0</td><td>0</td></tr>
+        <tr><td>Qwen3.6-35B-A3B ⋆</td><td>+38.0%</td><td>95</td><td>0</td><td>5</td></tr>
+        <tr><td rowspan="5">LiveMath</td><td>Qwen3.5-0.8B</td><td>+77.1%</td><td>91</td><td>9</td><td>0</td></tr>
+        <tr><td>Qwen3.5-2B</td><td>+40.0%</td><td>64</td><td>0</td><td>36</td></tr>
+        <tr><td>Qwen3.5-4B</td><td>+51.4%</td><td>78</td><td>11</td><td>11</td></tr>
+        <tr><td>Qwen3-8B ⋆</td><td>+28.6%</td><td>100</td><td>0</td><td>0</td></tr>
+        <tr><td>Qwen3.6-35B-A3B ⋆</td><td>+20.0%</td><td>57</td><td>29</td><td>14</td></tr>
+        <tr><td rowspan="2">CREATE</td><td>Claude Haiku 4.5</td><td>+37.9 CU</td><td>0</td><td>49</td><td>51</td></tr>
+        <tr><td>Qwen3.6-35B-A3B</td><td>+7.5 CU</td><td>0</td><td>100</td><td>0</td></tr>
+        <tr><td rowspan="4">SWE-bench</td><td>Qwen3-4B-Instruct-2507</td><td>+27.1%</td><td>23</td><td>23</td><td>54</td></tr>
+        <tr><td>Qwen3-30B-A3B-Instruct-2507</td><td>+33.3%</td><td>0</td><td>6</td><td>94</td></tr>
+        <tr><td>Qwen3.6-27B ⋆</td><td>+8.3%</td><td>0</td><td>0</td><td>100</td></tr>
+        <tr><td>Qwen3-Coder-30B-A3B-Instruct ⋆</td><td>+12.5%</td><td>0</td><td>0</td><td>100</td></tr>
+        <tr><td rowspan="6">SkillOpt</td><td>ALFWorld</td><td>Qwen3.5-4B</td><td>+46.2%</td><td>44</td><td>0</td><td>56</td></tr>
+        <tr><td>LiveMath</td><td>Qwen3.5-4B</td><td>+45.7%</td><td>88</td><td>0</td><td>12</td></tr>
+        <tr><td rowspan="2">CREATE</td><td>Qwen3.6-35B-A3B</td><td>−0.3 CU（不显著）</td><td>–</td><td>–</td><td>–</td></tr>
+        <tr><td>Claude Haiku 4.5</td><td>+0.4 CU（不显著）</td><td>–</td><td>–</td><td>–</td></tr>
+        <tr><td rowspan="2">SWE-bench</td><td>Qwen3-4B-Instruct-2507</td><td>+10.4%</td><td>0</td><td>0</td><td>100</td></tr>
+        <tr><td>Qwen3.6-27B</td><td>0（不显著）</td><td>–</td><td>–</td><td>–</td></tr>
+        <tr><td rowspan="3">AHE</td><td>LiveMath</td><td>Claude Opus 4.8</td><td>+48.6%</td><td>100</td><td>0</td><td>0</td></tr>
+        <tr><td>CREATE</td><td>Claude Opus 4.8</td><td>+6.9 CU</td><td>0</td><td>75</td><td>25</td></tr>
+        <tr><td>SWE-bench</td><td>Claude Opus 4.8</td><td>0（不显著）</td><td>–</td><td>–</td><td>–</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>总账：</strong>21 个显著设置里，O 与 T 平均解释 54% 与 14% 的收益；O+T 超过一半的有 14 个。</li>
+      <li><strong>按 benchmark 分化：</strong>ALFWorld、LiveMath 由过拟合主导；CREATE 由 test-time scaling 主导；SWE-bench 的残差 G 最明显。</li>
+      <li><strong>按框架分化：</strong>能改编排代码的框架（Meta-Harness、AHE）收益更大，也更容易靠多调用拿分；SkillOpt 只改 skill 文档、控制流固定，所以 H_0^scale = H_0、T=0，但它在 CREATE 上两组都不显著。</li>
+    </ul>
+
+    <h3>⑥ 四个案例：捷径长什么样</h3>
+    <table>
+      <thead><tr><th>Benchmark</th><th>演化出的机制</th><th>证据（论文自报）</th><th>HDA 判定</th></tr></thead>
+      <tbody>
+        <tr><td>ALFWorld（Meta-Harness，Qwen3.5-0.8B）</td><td>harness 从 66 行增长到 503 行（非空非注释，7.6×），硬编码物体位置先验与任务配方，变成<strong>零 LLM 调用</strong>的确定性控制器</td><td>search set 100% 成功；这个零 LLM 控制器在 held-out 游戏上仍有 93.3%，因为模拟器本体与规则跨 split 不变</td><td>O=100</td></tr>
+        <tr><td>LiveMath（三框架）</td><td>选项「one of the remaining options is correct, but a stronger result can be proven」</td><td>search 35 题中 21 题出现、21 题全对；test 124 题中 53 题出现、仍全对；0.8B 的 Meta-Harness harness 在 test 上含该选项的题 53/53，其余题 22/71（31%）</td><td>Meta-Harness 字符串匹配 + 多次调用兜底：91/9/0；SkillOpt 写成默认决策规则：88/0/12；AHE 写进 system prompt：100/0/0</td></tr>
+        <tr><td>CREATE</td><td>Meta-Harness 每题 6 + 14 个「多样性 frame」共 20 次调用；AHE 用 hook 强制追加生成轮（目标 8+ 条、少于 5 条就 force_continue）</td><td>AHE 平均调用从 1.04 增至 2.46；按 k=3 做 compute match</td><td>Haiku 4.5：0/49/51；AHE：0/75/25；compute-matched 基线甚至<strong>超过</strong>演化后的 Qwen3.6-35B-A3B harness（T=100）</td></tr>
+        <tr><td>SWE-bench（Qwen3-4B）</td><td>通用守卫：编辑没生效时明确告诉模型「这条命令没改任何文件，不要假设成功」；外加按 search 轨迹拟合的 patch 大小阈值（新增 ≥12 行 / 删除 ≥8 行 / 重复 ≥3 即警告「已解决的修复几乎都只有几行」）</td><td>LLM 调用为基线 1.44×，compute match 把基线从 pass@2 提到 pass@3</td><td>只关掉 patch 阈值 → O=23；T=23；G=54</td></tr>
+        <tr><td>SWE-bench（Qwen3-30B-A3B）</td><td>发现 parser 只执行第一个 action block，于是在 observation 里报告「有 N 个 block 没执行，请重发并检查真实输出」</td><td>与题目内容无关</td><td>0/6/94</td></tr>
+      </tbody>
+    </table>
+    <p>
+      最后两行是全文最有用的对比：<strong>同样是 Meta-Harness 在 SWE-bench 上演化出来的改动，「让失败可见」类守卫几乎全部算进 G，「从 search 轨迹里拟合出的统计先验」算进 O。</strong>前者描述的是 harness 与模型交互的通道缺陷（编辑是否生效、动作是否被执行），后者描述的是这 48 道题的分布。
+    </p>
+
+    <h3>⑦ held-out 与验证集选择也挡不住</h3>
+    <ul>
+      <li><strong>迁移缩水：</strong>除 ALFWorld 外，15 个设置中 13 个的 held-out 收益小于 search 收益，8 个不到一半；4 个设置演化后在 test 上低于基线。</li>
+      <li><strong>验证集选择：</strong>给 Meta-Harness 额外提供验证集的<em>聚合</em>分（逐题结果与轨迹不给 proposer），保留 search 最优 Ĥ 与 val 最优 Ĥ_val。val 选择让 held-out 均值在 ALFWorld +8.0、LiveMath +0.8、SWE-bench Verified +8.5 个点，CREATE −0.4 CU；16 个设置里 10 个变好、6 个变差；但 14/16 的 Ĥ_val held-out 收益仍低于 Ĥ 的 search 收益。</li>
+      <li><strong>held-out 也会骗人：</strong>ALFWorld 的 test 收益大且接近 search 收益，看起来像强迁移，HDA 却把平均 89% 的收益归为过拟合——作者认为这里还有一个来源：强 proposer 把自己参数里关于这个知名 benchmark 的知识「蒸馏」进了 harness，生成的确定性规则覆盖了 search set 之外的实例。LiveMath 同理，meta-option 痕迹在 search / val / test 三个 split 里都有。</li>
+    </ul>
+
+    <h2>怎么看：小样本 + argmax + 强 proposer = 必然过拟合</h2>
+    <p>
+      <strong>统计层面：</strong>LiveMath search 只有 35 题、SWE-bench 48 题、ALFWorld 50 局。按二项分布粗算（本文估算），准确率在 50% 附近时单次评测的标准误约为 √(0.25/35) ≈ 8.5 个点（48 题约 7.2，50 题约 7.1）。从几十个候选里取 search 分最高者，光是「赢家诅咒」就足以制造可观的虚高——这正是论文先做 paired bootstrap、再做归因的原因，也是 val 选择只能部分缓解的原因（val 只有 18–36 题）。
+    </p>
+    <p>
+      <strong>能力层面：</strong>harness 是一个容量几乎无限的「策略」——代码可以写查找表、可以不调模型。RL 里我们熟悉 reward hacking；harness 演化里对应的是 <strong>benchmark hacking</strong>，而且 proposer 越强、越熟悉 benchmark，越容易把答案先验直接写进代码。<a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> 坚持 benchmark-disjoint、<a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a> 做 leakage audit，都是在补同一个洞；HDA 的贡献是把「补洞后还剩多少」变成一个可报告的数。
+    </p>
+    <p>
+      <strong>compute matching 的取舍（本文观点）：</strong>T 的大小依赖聚合器。用 pass@k（任一次对即算对）是对基线最慷慨的做法，接近「多花算力最多能补回多少」的上界；majority vote 更接近部署时真能拿到的。SWE-bench 案例里基线从 pass@2 提到 pass@3，说明作者按调用倍数取整对齐；不同任务的聚合规则由人工检查点 1 拍板，这一步值得在复现时单独报告。另外，T 只匹配了<em>平均</em>预算，演化 harness 若把预算集中花在难题上（自适应算力），H_0 均匀加采样未必能追平——这部分会被算进 G。
+    </p>
+    <p>
+      <strong>和本站「harness 运行时」系列的关系：</strong>HDA 里能活下来的 G 类改动，几乎都是运行时通道的修补——编辑生效反馈、action block 丢弃提示、失败可见化。这与 <a href="daily-2026-09-21-harness-design-study.html">Coding Agent Harness 组件消融</a>、<a href="daily-2026-09-24-harness-anatomy.html">十一套生产 harness 源码解剖</a> 里反复出现的模式一致：可迁移的 harness 价值主要在「让模型准确看到自己动作的后果」，而不是替模型做题。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>演化日志里强制记录每题 LLM 调用数与 token 数。</strong>没有成本列就无法做 compute matching；把「每题成本 ≤ 基线 × c」写进演化目标，比事后归因更省事。</li>
+      <li><strong>每次报演化收益都附一个 compute-matched 基线。</strong>至少给 majority vote 与 pass@k 两种聚合，让读者看到 T 的区间。</li>
+      <li><strong>对 Ĥ 做静态审计。</strong>grep 常量答案、题目字符串、硬编码表、跳过模型调用的分支、从轨迹统计来的阈值；每发现一个就做最小中和再跑一次，O 就有了。</li>
+      <li><strong>切 split 时沿「构造轴」切，而不是随机切。</strong>ALFWorld 按任务类型 × 房间、CREATE 按关系类型 × 领域是好的示范；但还要检查跨 split 共享的数据痕迹（LiveMath 的 meta-option）。</li>
+      <li><strong>优先选 proposer 不熟的 benchmark。</strong>知名 benchmark 的先验会被强 proposer 直接写进 harness；内部任务、新近构造的任务更能测出真改进。</li>
+      <li><strong>验证集只给聚合分仍不够。</strong>小验证集上的 argmax 一样会过拟合；可以只在最后一步用一次 val，或者用多个 val 子集取最差。</li>
+      <li><strong>给 harness 改动分类保留。</strong>「通道修补」类（反馈动作是否生效、解析器丢了什么、错误可见化）默认保留；「内容先验」类（答案模式、patch 大小、物体位置）默认拒绝，除非有跨 benchmark 证据。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 O 只能是下界、G 只能是上界？能不能反过来构造一个 O 的上界？</summary>
+      <p>O = S(Ĥ) − S(Ĥ^neutral) 只关掉了检测到、且能独立关掉的机制；隐式（写在 prompt 措辞里的先验）或与有用改动纠缠的捷径仍留在 Ĥ^neutral，于是真实过拟合 ≥ O，残差 G 相应偏大。O 的上界需要一个「保证不含任何 benchmark 痕迹」的参照，例如在完全不同构造方式、proposer 未见过的新任务上评测 Ĥ 与 H_0^scale，此时 Ĥ 相对 H_0^scale 的剩余收益才是可迁移改进的估计，ΔS 减去它即过拟合 + 其他的上界。这本质上就是「真正的分布外测试」，代价是要新造 benchmark。</p>
+    </details>
+    <details>
+      <summary>2. CREATE 上 compute-matched 基线甚至超过了演化后的 Qwen3.6-35B-A3B harness（T=100）。这说明了什么？</summary>
+      <p>说明演化找到的只是「多生成几轮」这一维度，而且找得不如直接 k 次采样 + 合并高效：CU 指标奖励更大、更多样的答案池，最便宜的拿分方式就是多采样。演化在此基础上加的那些 frame / 提示设计不仅没增益，反而比简单重复采样差。对实践的启示：如果你的指标本身对「多出答案」单调，先跑 compute-matched 基线，演化的价值要在预算约束下证明。</p>
+    </details>
+    <details>
+      <summary>3. ALFWorld 上零 LLM 调用的控制器在 held-out 上仍有 93.3%。从「harness 是策略」的角度，它算不算一个好 harness？</summary>
+      <p>就 ALFWorld 这个封闭模拟器而言，它是一个高效的手写策略；但它已经不是「让 executor 更好用」的 harness，而是替代了 executor——ΔS 不再反映模型 + harness 的协同，HDA 判 O=100 是对评测目的而言的。论文还指出，这类规则依赖字符串匹配与固定的 benchmark 模式，在 proposer 不熟悉的任务上稍有变化就可能失效。判断标准应回到目标：如果目标是「提升某模型在开放任务上的 agent 能力」，它不算；如果目标就是解这个模拟器，它当然算，但那就不该叫 harness 演化的收益。</p>
+    </details>
+    <details>
+      <summary>4. 用本文的二项分布估算：LiveMath search 35 题、从 30 个与基线等价（真实准确率都是 50%）的候选里挑最高分，期望虚高大约多少？</summary>
+      <p>单个候选的分数标准误约 8.5 个点。若 30 个候选近似独立，最大值的期望约为均值 + 2σ 左右（正态近似下 30 个样本最大值的期望约 2.04σ），即虚高约 17 个点。候选之间高度相关（同一 proposer、只改一点点）会降低这个值，但即使有效独立候选只有 5 个（约 1.16σ），也有近 10 个点。这就是为什么论文先做 paired bootstrap 判显著，也说明小 search set 上的「+20%」本身需要谨慎读。以上是本文的粗算，不是论文结果。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果把 HDA 的思路搬到 Agent RL（训练权重而非 harness），三个分量分别对应什么？</summary>
+      <p>可讨论：T 对应「推理时多采样 / 更长思维链」带来的提升——RL 后的模型若主要变得更啰嗦，应和基线加长 thinking budget 或 best-of-n 比较（对照 <a href="daily-2026-10-12-modebench-remax.html">ModeBench / Re:Max</a> 讨论的 pass@k 与 mode collapse）；O 对应 reward hacking 与 benchmark 痕迹利用，可以用中和后的环境（去掉可被利用的判分漏洞）重测；G 是剩余部分。不同点在于权重更新的捷径无法像代码那样 grep 出来，只能靠行为探针与反事实环境，这让 O 的下界更松。<a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a> 的 leakage audit、<a href="daily-2026-09-16-harnessbandit.html">HarnessBandit</a> 的可迁移性度量都可以看作这方向的部分实现。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.22466" target="_blank" rel="noopener">arXiv:2610.22466 · Harness-Delta Attribution（Ding et al.，Amazon / NYU）</a></li>
+      <li><a href="https://github.com/Wenwen-D/HarnessDeltaAttribution" target="_blank" rel="noopener">GitHub · Wenwen-D/HarnessDeltaAttribution</a> · <a href="https://wenwen-d.github.io/blog/harness-delta-attribution/" target="_blank" rel="noopener">作者博客</a></li>
+      <li><a href="https://arxiv.org/abs/2010.03768" target="_blank" rel="noopener">arXiv:2010.03768 · ALFWorld（Shridhar et al.）</a> · <a href="https://arxiv.org/abs/2310.06770" target="_blank" rel="noopener">arXiv:2310.06770 · SWE-bench（Jimenez et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> ·
+        <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> ·
+        <a href="daily-2026-09-17-harness-ecdysis.html">Ecdysis</a> ·
+        <a href="daily-2026-09-25-harness-growing.html">Growing Harness</a> ·
+        <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">Harness 组件消融</a> ·
+        <a href="daily-2026-09-24-harness-anatomy.html">十一套 harness 源码解剖</a> ·
+        <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a> ·
+        <a href="daily-2026-09-16-harnessbandit.html">HarnessBandit</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

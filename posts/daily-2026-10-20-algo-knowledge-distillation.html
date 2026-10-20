@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜知识蒸馏：从 Hinton 的温度软标签到 On-Policy 蒸馏——dark knowledge、T² 缩放与 logit matching、SeqKD 用 beam 输出当标签、forward vs reverse KL，再到 GKD / MiniLLM · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜知识蒸馏：从 Hinton 的温度软标签到 On-Policy 蒸馏——dark knowledge、T² 缩放与 logit matching、SeqKD 用 beam 输出当标签、forward vs reverse KL，再到 GKD / MiniLLM</h1>
+    <p class="post-meta">2026-10-20 · 收藏夹：算法 / RL · 学习笔记<br />
+      经典来源：Geoffrey Hinton、Oriol Vinyals、Jeff Dean · <em>Distilling the Knowledge in a Neural Network</em>（<a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">arXiv:1503.02531</a>，NIPS 2014 Deep Learning Workshop）；
+      Yoon Kim、Alexander M. Rush · <em>Sequence-Level Knowledge Distillation</em>（<a href="https://arxiv.org/abs/1606.07947" target="_blank" rel="noopener">arXiv:1606.07947</a>，EMNLP 2016）；
+      Rishabh Agarwal 等（Google DeepMind / Mila / Toronto）· <em>On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes</em>（GKD，<a href="https://arxiv.org/abs/2306.13649" target="_blank" rel="noopener">arXiv:2306.13649</a>，ICLR 2024）；
+      Yuxian Gu、Li Dong、Furu Wei、Minlie Huang（清华 / MSR）· <em>MiniLLM</em>（<a href="https://arxiv.org/abs/2306.08543" target="_blank" rel="noopener">arXiv:2306.08543</a>，ICLR 2024）。
+      公式与实验数字按原文；numpy 小实验为本文在 box 上实跑。
+      交叉：
+      <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Temperature / Entropy</a>、
+      <a href="daily-2026-09-17-algo-kl.html">KL 散度</a>、
+      <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a>、
+      <a href="daily-2026-08-28-algo-ppo.html">PPO</a>、
+      <a href="daily-2026-10-20-gr-opd.html">今日一线：GR-OPD</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      训练时我们愿意用大模型、大 ensemble、强正则去「从数据里榨出结构」，部署时却希望模型小、快、便宜。Hinton 等人 2015 年用一个比喻定下了知识蒸馏（KD）的基调：昆虫的幼虫形态擅长从环境吸收养分，成虫形态擅长迁徙与繁殖——训练和部署本来就该用不同的「形态」。Buciluǎ、Caruana 等人 2006 年已经证明可以把 ensemble 的知识压进单个模型；Hinton 的贡献是给出一个通用且好调的做法：<strong>提高 softmax 温度，让大模型的输出分布变软，再让小模型去匹配它</strong>。
+    </p>
+    <p>
+      为什么软分布有用？论文里的例子：一张宝马的图片，被误认成垃圾车的概率很小，但这个错误仍比误认成胡萝卜<strong>大很多倍</strong>。one-hot 标签把这些「错误类别之间的相对大小」全部抹掉，而它们恰恰编码了大模型学到的相似性结构——后来被称作 dark knowledge。
+    </p>
+    <p>
+      十年后，这条线在 LLM 后训练里换了一身衣服：SeqKD 用 teacher 生成的回答做 SFT，GKD / MiniLLM 让学生自己采样、teacher 逐 token 打分，也就是今天一线篇 <a href="daily-2026-10-20-gr-opd.html">GR-OPD</a> 所在的 on-policy distillation（OPD）。这篇把这条脉络从头串一遍。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 温度软化：把「暗知识」放大到可学习的量级</h3>
+    <pre><code>q_i = exp(z_i / T) / Σ_j exp(z_j / T)        # T=1 为普通 softmax；T 越大分布越平
+
+蒸馏目标（Hinton 的「两个目标加权平均」，常见实现写法）：
+L = α · T² · KL( p^T_teacher ‖ q^T_student )  +  (1 − α) · CE( y, q^{T=1}_student )
+    # 软目标：teacher 与 student 用同一个高温 T；硬目标：student 在 T=1 下对真标签
+    # 原文：硬目标项权重「明显更低」时效果通常最好；部署时 student 用 T=1</code></pre>
+    <p>本文用一个 teacher logit 向量 v = [9, 5, 4, 1, −2] 看温度的效果（box 实跑）：</p>
+    <table>
+      <thead><tr><th>T</th><th>softmax(v / T)</th><th>熵（nats，上限 ln5 ≈ 1.609）</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>[0.975, 0.018, 0.007, 0.0003, ≈0]</td><td>0.132</td></tr>
+        <tr><td>2</td><td>[0.807, 0.109, 0.066, 0.015, 0.003]</td><td>0.676</td></tr>
+        <tr><td>4</td><td>[0.540, 0.199, 0.155, 0.073, 0.035]</td><td>1.250</td></tr>
+        <tr><td>8</td><td>[0.362, 0.220, 0.194, 0.133, 0.092]</td><td>1.506</td></tr>
+        <tr><td>20</td><td>[0.260, 0.213, 0.203, 0.174, 0.150]</td><td>1.592</td></tr>
+      </tbody>
+    </table>
+    <p>
+      T=1 时第 2–5 类加起来不到 2.5%，对交叉熵几乎没有贡献；T=4 时它们占了近一半，「第 2 类比第 4 类像得多」这种信息才真正进入梯度。温度与熵的一般关系见站内 <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Temperature / Entropy</a>。
+    </p>
+
+    <h3>② 为什么要乘 T²：梯度推导与 logit matching</h3>
+    <pre><code>软目标交叉熵 C 对 student logit z_i 的梯度（teacher logit v_i，软目标 p_i）：
+∂C/∂z_i = (1/T) · (q_i − p_i)
+
+高温近似 exp(x/T) ≈ 1 + x/T（且 N 类 logits 各自零均值）：
+∂C/∂z_i ≈ (1/T) · [ (1 + z_i/T)/N − (1 + v_i/T)/N ] = (z_i − v_i) / (N · T²)
+
+⇒ 高温极限下蒸馏 ≡ 最小化 ½ (z_i − v_i)²，即 Caruana 等人的「logit matching」是特例
+⇒ 软目标梯度量级 ∝ 1/T²，所以要乘 T² 才能在调 T 时保持软 / 硬两项的相对贡献不变</code></pre>
+    <p>本文用随机 student logits 验证 1/T² 缩放（N=5，logits 零均值，box 实跑）：</p>
+    <table>
+      <thead><tr><th>T</th><th>‖∂C/∂z‖</th><th>T² · ‖∂C/∂z‖</th><th>近似式 T² · ‖(z − v)/(N T²)‖</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>0.881</td><td>0.881</td><td rowspan="6">1.586（与 T 无关）</td></tr>
+        <tr><td>2</td><td>0.340</td><td>1.360</td></tr>
+        <tr><td>4</td><td>0.0983</td><td>1.573</td></tr>
+        <tr><td>8</td><td>0.0251</td><td>1.605</td></tr>
+        <tr><td>20</td><td>0.00400</td><td>1.598</td></tr>
+        <tr><td>50</td><td>0.00064</td><td>1.592</td></tr>
+      </tbody>
+    </table>
+    <p>
+      不乘 T²，T=20 时软目标梯度比 T=1 小 200 多倍，基本被硬目标淹没。论文还指出低温有它的好处：低温蒸馏对「比平均值低很多的负 logit」几乎不关心，而这些 logit 基本不受 teacher 训练目标约束、噪声很大；当 student 很小时，中间温度最好——这也是下面 MNIST 结果里 30 单元小网络偏好 T=2.5–4 的原因。
+    </p>
+
+    <h3>③ Hinton 2015 的实验：软目标到底装了多少知识</h3>
+    <table>
+      <thead><tr><th>实验</th><th>设置</th><th>结果（论文自报）</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="3">MNIST</td><td>大网（2×1200 ReLU + dropout + 权重约束 + 输入抖动 ±2 像素）</td><td>67 个测试错误</td></tr>
+        <tr><td>小网（2×800，无正则）直接训</td><td>146 个错误</td></tr>
+        <tr><td>同一小网只加「匹配 T=20 的软目标」</td><td><strong>74 个错误</strong>；≥300 单元时 T&gt;8 差别不大，30 单元时 T=2.5–4 明显更好</td></tr>
+        <tr><td>MNIST 去掉数字 3</td><td>transfer set 里完全没有 3</td><td>206 个错误，其中 133 个在 1010 个 3 上；把 3 的 bias 加 3.5 后 109 个错误、3 上只错 14 个（98.6% 正确）</td></tr>
+        <tr><td rowspan="3">语音（~2000 小时，~700M 帧样本）</td><td>Baseline</td><td>帧准确率 58.9%，WER 10.9%</td></tr>
+        <tr><td>10× ensemble</td><td>61.1%，10.7%</td></tr>
+        <tr><td>蒸馏到单模型</td><td><strong>60.8%，10.7%</strong>（帧准确率提升的 80% 以上被保留）</td></tr>
+        <tr><td rowspan="2">只用 3% 语音数据（~20M）</td><td>硬目标训练</td><td>严重过拟合，early stop 时测试 44.5%</td></tr>
+        <tr><td>软目标（teacher 在全量数据上训）</td><td>测试 57.0%，无需 early stop（全量硬目标为 58.9%）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      「没见过 3 也能认 3」是最有说服力的一条：student 关于 3 的全部知识都来自其他数字图片上 teacher 给「3」这一类的那一点点概率。3% 数据实验则说明软目标还是强正则——每个样本携带的约束远多于一个 one-hot。论文后半部分还用 61 个「专家」模型（每个负责 300 类 + 一个 dustbin 类）在 JFT 上做 ensemble，整体测试准确率相对提升 4.4%。
+    </p>
+
+    <h3>④ 搬到序列模型：Word-KD、SeqKD 与 Seq-Inter</h3>
+    <pre><code>Word-KD（逐位置匹配 teacher 的下一词分布，前缀用真值 teacher forcing）：
+L_WORD-KD = − Σ_j Σ_k q(t_j = k | s, t_&lt;j) · log p(t_j = k | s, t_&lt;j)
+
+SeqKD（匹配整条序列分布；用 teacher 的 mode 近似，mode 又用 beam search 近似）：
+L_SEQ-KD = − Σ_t q(t | s) log p(t | s)  ≈  − log p(t = ŷ | s),   ŷ = teacher 的 beam search 输出
+# 实操：(1) 训 teacher (2) 在训练集上跑 beam search (3) student 在新数据上做普通交叉熵
+
+Seq-Inter：在 teacher 的 beam 里选与真值最接近（句级 BLEU 最高）的那条 ỹ 作为目标</code></pre>
+    <p>
+      用一个样本近似指数级的分布看起来很粗，但作者测得：teacher 的 beam=1 输出平均就占 q(t|s) 的 1.3%（德→英）/ 2.3%（泰→英），beam=5 的 K-best 合计 2.8% / 3.8%——NMT 的序列分布质量高度集中。结果：student 用 greedy 解码比 4×1000 teacher 用 beam search 快 10 倍且性能接近；比不蒸馏的同尺寸 baseline 高 4.2 BLEU（greedy）/ 1.7 BLEU（beam）；再叠加权重剪枝，参数比 teacher 少 13 倍、只掉 0.4 BLEU。还有一个当时令人意外的现象：SeqKD 训练后 beam search 几乎不再需要——student 直接学到了 teacher 的 mode。
+    </p>
+    <p>
+      <strong>LLM 时代的对应物：</strong>用强模型生成回答再 SFT 小模型（各种「蒸馏版」开源模型）本质就是 SeqKD；拒绝采样 + 过滤再 SFT 则接近 Seq-Inter。二者共同的问题是：<strong>训练数据全来自 teacher 的分布</strong>，学生推理时却在自己的分布上滚动。
+    </p>
+
+    <h3>⑤ Forward KL vs Reverse KL：容量不足时学生该「覆盖」还是「挑选」</h3>
+    <p>
+      上面所有方法都在最小化 forward KL：KL(p_teacher ‖ q_student)，期望取在 teacher 分布下，学生必须在 teacher 有质量的每个地方都放质量（mode-covering）。Reverse KL：KL(q_student ‖ p_teacher)，期望取在学生分布下，学生只需在自己放质量的地方让 teacher 也认可（mode-seeking）。站内 <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> 有更完整的讨论。本文在 box 上做了一个最小实验：teacher 是两个分离的高斯（±3，σ=0.7，各 0.5），student 只能是单个高斯，网格搜索最优 (μ, σ)：
+    </p>
+    <table>
+      <thead><tr><th>目标</th><th>最优 μ</th><th>最优 σ</th><th>最小 KL</th><th>行为</th></tr></thead>
+      <tbody>
+        <tr><td>forward KL(p ‖ q)</td><td>0.00</td><td>3.10</td><td>0.789</td><td>罩住两个峰，把大量质量放在两峰之间 teacher 几乎为 0 的谷里</td></tr>
+        <tr><td>reverse KL(q ‖ p)</td><td>3.00（或 −3.00）</td><td>0.70</td><td>0.693（= ln 2）</td><td>只选一个峰并完美贴合</td></tr>
+      </tbody>
+    </table>
+    <p>
+      对生成模型，forward KL 的「谷里放质量」意味着学生会生成 teacher 认为几乎不可能的样本——MiniLLM 的原话是避免学生<strong>高估 teacher 分布的低概率区域</strong>。小模型容量有限，与其「什么都会一点但样样不像」，不如「会的那部分都像 teacher」。代价是多样性下降，这与 RLVR 里讨论的 mode collapse 是同一个硬币（对照 <a href="daily-2026-10-12-modebench-remax.html">ModeBench / Re:Max</a>）。
+    </p>
+
+    <h3>⑥ GKD：把蒸馏改成「在学生自己的错误上请教 teacher」</h3>
+    <pre><code>L_GKD(θ) = (1 − λ) · E_{(x,y)~数据} [ D(p_T ‖ p_S^θ)(y|x) ]  +  λ · E_{x} E_{y~p_S(·|x)} [ D(p_T ‖ p_S^θ)(y|x) ]
+D(p_T ‖ p_S)(y|x) = (1/L_y) Σ_n D( p_T(·|y_&lt;n, x) ‖ p_S(·|y_&lt;n, x) )     # 逐位置、整张词表的散度再平均
+# λ = 学生自采样数据比例：λ=0 为 supervised KD，λ=1 为纯 on-policy；不对采样过程反传梯度
+
+广义 JSD(β) = β · KL(P ‖ βP + (1−β)Q) + (1−β) · KL(Q ‖ βP + (1−β)Q)
+# lim_{β→0} JSD(β)/β = KL(P‖Q)：β 小时梯度像 forward KL，β 接近 1 时像 reverse KL</code></pre>
+    <p>
+      GKD 的视角来自模仿学习：自回归生成是一个序贯决策问题，teacher 是可以随时询问的专家，所以应该像 DAgger（Ross et al. 2011）那样在<strong>学生实际访问的状态</strong>上收集专家标签。这直接对付 exposure bias——训练只见过 teacher / 真值前缀，推理时一旦走偏就进入没见过的状态。论文自报：以 T5-XL（约 3B）为 teacher、T5 Small/Base/Large 为 student，on-policy GKD 相对初始 student 的提升平均是基线 KD 方法的 2.1×（摘要）、1.7×（翻译）、1.9×（GSM8K 推理）；任务无关的指令蒸馏在 held-out BBH / MMLU 上 +2% / +1%。
+    </p>
+    <p>
+      GKD 还指出它能直接与 RL 合并，因为只需要学生样本：
+    </p>
+    <pre><code>max_θ  E_x [ (1 − α) · E_{y~p_S^θ}[ r(y) ]  −  α · E_{y~p_S}[ D(p_T ‖ p_S^θ)(y|x) ] ]
+# 作者建议：若在现有 RLHF 流水线上小改，用 reverse KL 或 JSD(0.9) 作为 D</code></pre>
+
+    <h3>⑦ MiniLLM：把 reverse KL 写成策略梯度</h3>
+    <pre><code># 记号按 MiniLLM 原文：p = teacher，q_θ = student
+L(θ) = KL(q_θ ‖ p)  （序列级 reverse KL）
+∇L(θ) = − E_{y~q_θ} Σ_t (R_t − 1) ∇ log q_θ(y_t | y_&lt;t, x),
+        R_t = Σ_{t'≥t} log [ p(y_t' | ·) / q_θ(y_t' | ·) ]            # 逐 token log-ratio 的 return-to-go
+
+三个稳定化技巧：
+1) Single-step decomposition：把 r_t 从 R_t 中拆出来，E_{y_t~q_θ}[r_t] 直接对整张词表求和（可微、无采样方差）
+2) Teacher-mixed sampling：p̃ = α·p + (1−α)·q_θ 采样（α = 0.2），抑制学生生成重复短语去骗 teacher 高分的 reward hacking；
+   用逐 token 的 q_θ/p̃ 近似重要性权重
+3) Length normalization：R_{t+1} 按剩余长度取平均，否则长序列 R 偏小，学生倾向输出极短 / 空回答
++ PPO 式 clip（ε = 0.2）；覆盖 120M–13B 多个模型族</code></pre>
+    <p>
+      把这一节和今天的一线篇放在一起看会很有意思：MiniLLM 的 R_t 正是 GR-OPD 附录里的 return-to-go 估计；今天工程上流行的 sampled-token OPD 把 advantage 直接取 r_t，相当于<strong>只保留了 MiniLLM 的 single-step 部分、而且还是单样本版</strong>；GR-OPD 则走到另一端，把整段反馈汇成序列分数再做组内归一化。MiniLLM 遇到的是「偏短」，GR-OPD 遇到的是「偏长」——同一个 log-ratio 回报，取和还是取均值、权重怎么分布，会把学生推向完全相反的长度捷径。
+    </p>
+
+    <h3>⑧ 一张表看演进</h3>
+    <table>
+      <thead><tr><th>方法</th><th>前缀 / 序列从哪来</th><th>散度</th><th>粒度</th><th>需要 teacher 什么</th></tr></thead>
+      <tbody>
+        <tr><td>Hinton KD</td><td>transfer set（输入）</td><td>forward KL（高温）+ 硬标签 CE</td><td>单步分类</td><td>完整 logits</td></tr>
+        <tr><td>Word-KD</td><td>真值前缀（teacher forcing）</td><td>forward KL</td><td>逐 token、整张词表</td><td>每位置完整分布</td></tr>
+        <tr><td>SeqKD / Seq-Inter</td><td>teacher beam 输出</td><td>forward KL 的 mode 近似</td><td>序列（硬标签）</td><td>只要生成文本（黑盒可用）</td></tr>
+        <tr><td>GKD</td><td>学生采样（比例 λ）+ 数据</td><td>forward / reverse / JSD(β) 可选</td><td>逐 token、整张词表</td><td>每位置完整分布</td></tr>
+        <tr><td>MiniLLM</td><td>学生 + teacher 混合采样</td><td>序列级 reverse KL</td><td>策略梯度（return-to-go）+ single-step 精确项</td><td>完整分布（single-step 项）</td></tr>
+        <tr><td>sampled-token OPD</td><td>学生采样</td><td>reverse KL 的单样本估计</td><td>逐 token，r_t 当 advantage</td><td>只要采到 token 的 log-prob</td></tr>
+        <tr><td><a href="daily-2026-10-20-gr-opd.html">GR-OPD</a></td><td>学生采样（同 prompt 组）</td><td>reverse KL 的序列信用</td><td>折扣均值 → 组内校准 → 广播</td><td>只要采到 token 的 log-prob</td></tr>
+      </tbody>
+    </table>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>分类 / 小词表任务：</strong>从 T∈{2, 4, 8} 起扫，软目标乘 T²，硬目标权重小（如 0.1–0.5）；student 越小，越倾向中等温度。</li>
+      <li><strong>LLM 先 SeqKD 再 OPD：</strong>先用 teacher 生成的数据做 SFT 把学生拉到 teacher 附近（off-policy、便宜、可黑盒），再用 on-policy 蒸馏修 exposure bias；直接从很远的初始点做 OPD，teacher 在学生的前缀上往往不可靠。</li>
+      <li><strong>存全分布还是只存采样 token：</strong>完整词表分布（Word-KD / GKD）信号更密但显存与通信贵；常见折中是存 teacher top-k logits；sampled-token OPD 最省，但要配好基线与归一化（见 <a href="daily-2026-10-20-gr-opd.html">GR-OPD</a> 的玩具实验：局部估计有偏、序列估计方差大）。</li>
+      <li><strong>tokenizer / 模板必须对齐：</strong>teacher 与 student 不同词表时 token 级 KL 无法直接计算；即使同族，Base / Instruct 的 EOS、chat template 不同也会系统性污染 log-ratio。</li>
+      <li><strong>reverse KL 要防 reward hacking：</strong>学生会找到 teacher 给高分的退化文本（重复短语、无限续写）；用 teacher-mixed 采样、log-ratio clip、长度监控兜底。</li>
+      <li><strong>看清「蒸馏的上限」：</strong>Hinton 的语音实验里单模型保留了 ensemble 80% 以上的增益，而不是 100%；LLM 蒸馏同样会遇到 teacher 更大反而教得更差的情况——兼容性比尺寸重要。</li>
+      <li><strong>与 RL 合并时统一散度方向：</strong>RLHF 里的 KL 惩罚本来就是 reverse KL（对 reference），蒸馏项用 reverse KL / JSD(0.9) 改动最小（GKD 的建议）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么软目标的梯度量级正比于 1/T²？如果不乘 T²，调大 T 时会发生什么？</summary>
+      <p>∂C/∂z_i = (q_i − p_i)/T，其中一个 1/T 来自 logit 被除以 T 的链式法则；高温时 q_i − p_i ≈ (z_i − v_i)/(N T)，又贡献一个 1/T，合计 1/T²。不乘 T² 时，调大 T 会让软目标梯度迅速变小（本文实验 T=20 时小两百多倍），总损失被硬目标主导，等于悄悄关掉了蒸馏；而且每换一个 T 都要重新调 α，超参互相纠缠。</p>
+    </details>
+    <details>
+      <summary>2. 「高温极限 = logit matching」需要 logits 零均值这个条件。为什么？低温时蒸馏与 logit matching 的关键区别是什么？</summary>
+      <p>softmax 对所有 logit 加同一个常数不变，所以 teacher 和 student 的 logit 只在「去掉均值」之后才可比；推导里 Σ_j exp(z_j/T) ≈ N + Σ_j z_j/T，只有 Σ z_j = 0 时分母才化为 N，得到 (z_i − v_i)/(N T²)。低温时，teacher 概率极小的那些类对梯度贡献几乎为零，蒸馏不再关心很负的 logit 匹配得如何；logit matching 则对每个 logit 一视同仁。前者在 student 小、teacher 负 logit 噪声大时更好，这也是 Hinton 说中间温度最佳的原因。</p>
+    </details>
+    <details>
+      <summary>3. SeqKD 只用 teacher 的一条 beam 输出当标签，为什么比 Word-KD 的整张分布还有效？</summary>
+      <p>(a) Word-KD 在真值前缀上匹配，学生学不到 teacher 在自己前缀上会怎么走，序列层面的决策（尤其早期词选择对后续的影响）没被传递；SeqKD 直接给出 teacher 完整走一遍的结果。(b) NMT 的序列分布高度集中（beam=1 就占 1.3–2.3% 质量，在指数级空间里非常大），mode 近似并不差。(c) teacher 的 beam 输出比带噪声的真值更「好学」——更规整、更符合模型可表达的分布，类似 Seq-Inter 论证中的「真值是噪声版本」。论文也发现二者可叠加。</p>
+    </details>
+    <details>
+      <summary>4. MiniLLM 发现 reverse KL 回报会导致「偏短」，GR-OPD 发现折扣均值分数会导致「偏长」。用 r_t = log p_teacher − log q_student 的符号解释两者。</summary>
+      <p>学生在自己的样本上 log q 通常高于 teacher 的 log p，所以 r_t 多为负。MiniLLM 的 R_t 是求和：序列越长，累加的负数越多，回报越低，策略被推向早停甚至空回答，所以要做长度归一化。GR-OPD 的 S 是加权<em>均值</em>：长度本身不再惩罚，但只要新续写的 r_t 高于当前均值（例如 teacher 在分布外前缀上对重复内容给出接近学生的概率，r_t 接近 0），均值就上升，于是出现「越写越长」的捷径。和与均值是同一信号的两种聚合，对应相反的长度偏置；γ 折扣与长度归一化分别是两边的补丁。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）在 Agent 场景里做蒸馏，Hinton 意义上的「dark knowledge」对应什么？哪些部分适合 SeqKD、哪些必须 on-policy？</summary>
+      <p>可讨论：dark knowledge 对应 teacher 对「次优但合理」动作的相对偏好——例如先查哪个工具、哪些参数也可以接受——这在只看 teacher 轨迹的 SeqKD 中会丢失，需要逐步分布或 teacher 打分才能传递。工具调用的格式、常见流程适合 SeqKD（低成本、teacher 轨迹即可）；从错误中恢复、长程信用分配必须 on-policy，因为学生犯的错 teacher 轨迹里不会出现（对照 <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> 只在学生卡住处让 teacher 接管、<a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> 用学生自己的恢复动作做 pair）。observation token 不应计入蒸馏损失，上下文压缩后 teacher 与学生必须看到同一份历史。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">arXiv:1503.02531 · Distilling the Knowledge in a Neural Network（Hinton, Vinyals, Dean）</a></li>
+      <li><a href="https://arxiv.org/abs/1606.07947" target="_blank" rel="noopener">arXiv:1606.07947 · Sequence-Level Knowledge Distillation（Kim &amp; Rush）</a></li>
+      <li><a href="https://arxiv.org/abs/2306.13649" target="_blank" rel="noopener">arXiv:2306.13649 · GKD：On-Policy Distillation of Language Models（Agarwal et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2306.08543" target="_blank" rel="noopener">arXiv:2306.08543 · MiniLLM（Gu et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/2610.23042" target="_blank" rel="noopener">arXiv:2610.23042 · GR-OPD（Wang et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-20-gr-opd.html">GR-OPD</a> ·
+        <a href="daily-2026-09-18-algo-softmax-entropy.html">Softmax / Temperature / Entropy</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> ·
+        <a href="daily-2026-09-03-algo-reinforce.html">REINFORCE</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">Importance Sampling</a> ·
+        <a href="daily-2026-10-12-modebench-remax.html">ModeBench / Re:Max</a> ·
+        <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> ·
+        <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -795,6 +795,27 @@
       "source": "algo",
       "topic": "MQA → GQA → MLA：Shazeer 访存/计算比 Θ(n/d+1/b)→Θ(1/d+n/(dh)+1/b)，WMT14 decoder 46→3.8 µs/token；GQA-G 插值、mean-pool uptrain α=0.05，T5-XXL GQA-8 0.28 s/47.1 vs MHA 1.51 s/47.2；MLA c^KV 低秩联合压缩、W^UK→W^Q / W^UV→W^O 吸收（numpy 等价 ~1e-17）、decoupled RoPE（d_c=512、d_h^R=64 ⇒ GQA-2.25 组）；DeepSeek-V2 消融与 KV −93.3%、5.76×；TP/CP 交互（arXiv:1911.02150 / 2305.13245 / 2405.04434）",
       "file": "posts/daily-2026-10-19-algo-mqa-gqa-mla.html"
+    },
+    {
+      "date": "2026-10-20",
+      "domain": "rl",
+      "source": "frontline",
+      "topic": "GR-OPD：sampled-token OPD 只保留 reverse-KL 梯度的局部项；Proposition 1 整段 log-ratio 和广播为无偏估计（box 玩具实验：local 相对误差 0.219，broadcast 0.008 但单样本 MSE 8.96 vs 1.78）；S^γ 折扣均值（γ=0.99，300 token 后尾部权重 ≤0.049）+ A=(S−S̄+λS̄)/(s+ε) 组内校准（λ 只改共同平移）+ 广播 + PPO clip δ=0.2；DAPO-Math 14,116 题、64×8 rollout、221 步、8×H20；macro Avg@K：B4→B1.7 23.333→27.800、I4 nothink→I1.7 34.118→45.066、I32 nothink→I1.7 30.320→41.774，think→Base vanilla Collapse 8.449/10.066 → 29.571/24.463；λ=1/.5 崩、cross-pattern 需 λ=0；γ=1 长度捷径；压力代理 matched 3.16–3.61 vs cross 6.08/7.23（Wang et al. 上海交通大学 / 阿里巴巴 arXiv:2610.23042）",
+      "file": "posts/daily-2026-10-20-gr-opd.html"
+    },
+    {
+      "date": "2026-10-20",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Harness-Delta Attribution：ΔS=O+T+G，T=compute-matched H_0^scale（majority / pass@k），O=中和检测到的捷径后的下降（下界），G 残差（上界）；paired bootstrap 先判显著；HDA skill 两个人工检查点；Meta-Harness / SkillOpt / AHE × 11 executor × LiveMath / ALFWorld / CREATE / SWE-bench Verified 共 25 设置，21 显著，O/T 平均 54%/14%，O+T>50% 有 14 个；ALFWorld 0.8B harness 66→503 行零 LLM 调用、held-out 93.3%；LiveMath meta-option 21/35 与 53/124 全对，三框架都学到；CREATE 20 次调用 0/49/51、AHE 1.04→2.46 次 0/75/25；SWE-bench 4B patch 阈值 23/23/54 vs 30B action-block 守卫 0/6/94；held-out 13/15 缩水，val 选择 10/16 变好但 14/16 仍低于 search 收益（Ding et al. Amazon / NYU arXiv:2610.22466）",
+      "file": "posts/daily-2026-10-20-harness-hda.html"
+    },
+    {
+      "date": "2026-10-20",
+      "domain": "algo rl",
+      "source": "algo",
+      "topic": "知识蒸馏：温度软化（box 实验 T=1→20 熵 0.132→1.592）；∂C/∂z=(q−p)/T，高温≈(z−v)/(NT²) ⇒ logit matching 特例、乘 T²（box 验证 T²‖g‖→1.586）；Hinton MNIST 67/146/74 错（T=20）、去掉 3 仍 98.6%、语音 58.9/61.1/60.8 帧准确率、3% 数据 44.5→57.0；Word-KD / SeqKD（beam=1 占 q 质量 1.3%/2.3%，greedy 快 10×，+4.2/+1.7 BLEU，剪枝 13× −0.4）/ Seq-Inter；forward vs reverse KL（box 双峰实验 μ=0 σ=3.10 vs μ=3 σ=0.70 KL=ln2）；GKD λ 学生数据比例 + JSD(β)、RL 合并；MiniLLM R_t return-to-go + single-step / teacher-mixed α=0.2 / 长度归一化；与 sampled-token OPD、GR-OPD 对照（arXiv:1503.02531 / 1606.07947 / 2306.13649 / 2306.08543）",
+      "file": "posts/daily-2026-10-20-algo-knowledge-distillation.html"
     }
   ]
 }
