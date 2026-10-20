@@ -306,8 +306,10 @@ section h2::before {
 .pubs a:hover { text-decoration: underline; }
 
 .post-list { list-style: none; margin: 0; padding: 0; }
+.paper-list { list-style: none; margin: 0; padding: 0; }
 
-.post-list li {
+.post-list li,
+.paper-list li {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
@@ -320,10 +322,13 @@ section h2::before {
   transition: border-color 0.2s, transform 0.2s;
 }
 
-.post-list li:hover { border-color: var(--accent); transform: translateX(4px); }
+.post-list li:hover,
+.paper-list li:hover { border-color: var(--accent); transform: translateX(4px); }
 
-.post-list a { text-decoration: none; color: var(--fg); font-weight: 500; }
-.post-list a:hover { color: var(--accent); }
+.post-list a,
+.paper-list a { text-decoration: none; color: var(--fg); font-weight: 500; }
+.post-list a:hover,
+.paper-list a:hover { color: var(--accent); }
 
 .post-date {
   color: var(--muted);
