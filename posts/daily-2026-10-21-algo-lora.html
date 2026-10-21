@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜LoRA：低秩适配为什么够用——ΔW = BA 的参数化、B=0 初始化与 α/r 缩放、可合并的零推理开销、r=1 就够的 intrinsic rank 证据，再到 QLoRA / rsLoRA / DoRA 与「学得少也忘得少」 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜LoRA：低秩适配为什么够用——ΔW = BA 的参数化、B=0 初始化与 α/r 缩放、可合并的零推理开销、r=1 就够的 intrinsic rank 证据，再到 QLoRA / rsLoRA / DoRA 与「学得少也忘得少」</h1>
+    <p class="post-meta">2026-10-21 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Edward J. Hu、Yelong Shen、Phillip Wallis、Zeyuan Allen-Zhu、Yuanzhi Li、Shean Wang、Lu Wang、Weizhu Chen（Microsoft）· <em>LoRA: Low-Rank Adaptation of Large Language Models</em>（<a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">arXiv:2106.09685</a>，ICLR 2022）；
+      Tim Dettmers、Artidoro Pagnoni、Ari Holtzman、Luke Zettlemoyer · <em>QLoRA</em>（<a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">arXiv:2305.14314</a>）；
+      Damjan Kalajdzievski · <em>rsLoRA</em>（<a href="https://arxiv.org/abs/2312.03732" target="_blank" rel="noopener">arXiv:2312.03732</a>）；
+      Shih-Yang Liu 等（NVIDIA / HKUST）· <em>DoRA</em>（<a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noopener">arXiv:2402.09353</a>）；
+      Dan Biderman 等（Columbia / Databricks）· <em>LoRA Learns Less and Forgets Less</em>（<a href="https://arxiv.org/abs/2405.09673" target="_blank" rel="noopener">arXiv:2405.09673</a>）。
+      公式与实验数字按原文；「box 小实验」一节为本文在 box 上用 numpy 实跑。
+      交叉：
+      <a href="daily-2026-09-08-algo-adam.html">Adam</a>、
+      <a href="daily-2026-10-07-algo-muon.html">Muon</a>、
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA → GQA → MLA</a>、
+      <a href="daily-2026-10-20-algo-knowledge-distillation.html">知识蒸馏</a>、
+      <a href="daily-2026-10-21-arctic-swe.html">今日一线：Arctic-SWE</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      全参数微调 GPT-3 175B 意味着每个下游任务都要存一份 175B 的副本，训练时还要为每个参数存 Adam 的两份状态（本站 <a href="daily-2026-09-08-algo-adam.html">Adam</a> 一文讲过 m / v 的显存账）。2021 年前的参数高效方案各有硬伤：Adapter 在层间插小 MLP，增加串行深度，小 batch 在线推理时延迟明显上升；prefix / prompt tuning 占用序列长度，而且难优化、对可训练参数量非单调。
+    </p>
+    <p>
+      LoRA 的出发点来自 Aghajanyan et al. 2020 的观察：预训练模型的「intrinsic dimension」很低，随机投影到小子空间里也能学。LoRA 把假设落到权重更新上：<strong>适配时的 ΔW 本身就是低秩的</strong>。于是不去改 W，而是学一个低秩的 ΔW，且训练完可以把它加回 W，推理零额外开销。今天几乎所有开源微调、很多 RL 后训练实验（包括多 adapter 的 population 训练）都建在这个结构上。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 参数化：冻结 W<sub>0</sub>，只学 B 和 A</h3>
+    <pre><code># W0 ∈ R^{d×k} 冻结；B ∈ R^{d×r}，A ∈ R^{r×k}，r ≪ min(d, k)
+h = W0·x + (α / r) · B·A·x
+
+# 初始化：A ~ 高斯随机，B = 0  ⇒  训练开始时 ΔW = BA = 0，模型与预训练完全相同
+# α：与 r 无关的常数。论文把 α 设成第一次尝试的 r，然后不再调
+#    （用 Adam 时，在初始化适当缩放的前提下，调 α ≈ 调学习率）
+
+# 推理前合并：W = W0 + (α/r)·B·A，之后和普通 dense 层一模一样
+# 切任务：W − (α/r)·B·A + (α/r)·B'·A'</code></pre>
+    <p>
+      几个设计点值得逐一想清楚：
+    </p>
+    <ul>
+      <li><strong>为什么 B=0 而不是 A=0？</strong>两者都能让 ΔW=0，但梯度不同：∂L/∂B = (∂L/∂h)·(Ax)<sup>T</sup>，A 随机时这项非零，B 第一步就能动；若 A=0、B 随机，则 ∂L/∂B=0，只有 A 先动。两种都能训，但 B=0 是原文默认，也是之后 rsLoRA 等分析的出发点。不能两个都为 0——那样两者梯度都是 0，永远不动。</li>
+      <li><strong>α/r 的意义</strong>：r 变大时 BA 的输出量级会变，除以 r 是希望换 r 时不必重新调学习率（原文引 Yang &amp; Hu 2021）。这个选择后来被 rsLoRA 证明在大 r 时过度抑制，见 ⑥。</li>
+      <li><strong>泛化全参微调</strong>：对所有权重矩阵用 LoRA 且令 r 等于原矩阵的秩，就近似恢复全参微调的表达力；而 Adapter 增参数会收敛到一个 MLP、prefix 方法收敛到不能吃长输入的模型。</li>
+    </ul>
+
+    <h3>② 放在 Transformer 的哪里</h3>
+    <p>
+      原文只适配 attention 的 W<sub>q</sub> / W<sub>k</sub> / W<sub>v</sub> / W<sub>o</sub>（每个当 d<sub>model</sub>×d<sub>model</sub> 处理），冻结 MLP、LayerNorm 和 bias。在 GPT-3 175B 上固定可训练参数预算 18M（FP16 约 35MB），96 层：
+    </p>
+    <table>
+      <thead><tr><th>适配的矩阵</th><th>W<sub>q</sub></th><th>W<sub>k</sub></th><th>W<sub>v</sub></th><th>W<sub>o</sub></th><th>W<sub>q</sub>,W<sub>k</sub></th><th>W<sub>q</sub>,W<sub>v</sub></th><th>全部四个</th></tr></thead>
+      <tbody>
+        <tr><td>r</td><td>8</td><td>8</td><td>8</td><td>8</td><td>4</td><td>4</td><td>2</td></tr>
+        <tr><td>WikiSQL（±0.5%）</td><td>70.4</td><td>70.0</td><td>73.0</td><td>73.2</td><td>71.4</td><td>73.7</td><td>73.7</td></tr>
+        <tr><td>MultiNLI（±0.1%）</td><td>91.0</td><td>90.8</td><td>91.0</td><td>91.3</td><td>91.3</td><td>91.3</td><td>91.7</td></tr>
+      </tbody>
+    </table>
+    <p>
+      结论：<strong>同样预算下，铺得广（多种矩阵、小 r）比堆得深（单一矩阵、大 r）好</strong>；只放在 W<sub>q</sub> 或 W<sub>k</sub> 上明显吃亏。今天的常见实践（所有线性层包括 MLP 都挂 LoRA）是这个结论的延伸——原文把 MLP 留给了 future work。
+    </p>
+
+    <h3>③ r 要多大：r=1 往往就够</h3>
+    <table>
+      <thead><tr><th>适配矩阵</th><th>指标</th><th>r=1</th><th>r=2</th><th>r=4</th><th>r=8</th><th>r=64</th></tr></thead>
+      <tbody>
+        <tr><td>W<sub>q</sub></td><td>WikiSQL</td><td>68.8</td><td>69.6</td><td>70.5</td><td>70.4</td><td>70.0</td></tr>
+        <tr><td>W<sub>q</sub>, W<sub>v</sub></td><td>WikiSQL</td><td>73.4</td><td>73.3</td><td>73.7</td><td>73.8</td><td>73.5</td></tr>
+        <tr><td>W<sub>q</sub>, W<sub>v</sub></td><td>MultiNLI</td><td>91.3</td><td>91.4</td><td>91.3</td><td>91.6</td><td>91.4</td></tr>
+      </tbody>
+    </table>
+    <p>
+      作者进一步比较 r=8 与 r=64 学到的 A 的右奇异向量子空间（基于 Grassmann 距离的归一化相似度）：top 方向高度重合，r=64 多出来的方向大多是噪声。原文脚注也提醒了反例：如果下游任务与预训练分布差得很远（例如换一种语言），小 r 不会够，r = d<sub>model</sub> 的全量更新当然更好。这一点三年后被 Biderman et al. 用更大规模的实验证实，见 ⑦。
+    </p>
+
+    <h3>④ ΔW 和 W 是什么关系：放大「已学到但没被强调」的方向</h3>
+    <p>
+      在 GPT-3 第 48 层，把 W<sub>q</sub> 投影到 ΔW<sub>q</sub>（r=4）的 top-r 奇异方向上：‖U<sup>T</sup>W<sub>q</sub>V<sup>T</sup>‖<sub>F</sub> = 0.32，而 ‖ΔW<sub>q</sub>‖<sub>F</sub> = 6.91、‖W<sub>q</sub>‖<sub>F</sub> = 61.95。三点结论：ΔW 与 W 的相关性强于随机矩阵；但 ΔW 放大的<strong>不是</strong> W 的 top 奇异方向；放大倍数很大，约 6.91 / 0.32 ≈ 21.5。r=64 时这个因子只有约 2，说明多出的秩大多没被「用力」放大。直觉：预训练已经学到了任务需要的特征，只是没给它们足够权重，LoRA 做的是重新加权。
+    </p>
+
+    <h3>⑤ 显存、存储与吞吐账（GPT-3 175B，原文自报）</h3>
+    <table>
+      <thead><tr><th>项目</th><th>全参微调</th><th>LoRA</th></tr></thead>
+      <tbody>
+        <tr><td>训练显存</td><td>1.2 TB</td><td>350 GB（冻结参数无需优化器状态，r ≪ d<sub>model</sub> 时最多省约 2/3）</td></tr>
+        <tr><td>单任务 checkpoint（r=4，只适配 W<sub>q</sub>,W<sub>v</sub>）</td><td>350 GB</td><td>35 MB（约 10,000×）</td></tr>
+        <tr><td>100 个任务的总存储</td><td>≈ 35 TB</td><td>350 GB + 35 MB × 100 ≈ 354 GB</td></tr>
+        <tr><td>训练吞吐（每张 V100，相同模型并行切分）</td><td>32.5 tokens/s</td><td>43.1 tokens/s（约 25% 加速）</td></tr>
+      </tbody>
+    </table>
+    <p>GPT-3 175B 上的质量对比（原文 Table 4）：</p>
+    <table>
+      <thead><tr><th>方法</th><th>可训练参数</th><th>WikiSQL</th><th>MNLI-m</th><th>SAMSum R1/R2/RL</th></tr></thead>
+      <tbody>
+        <tr><td>全参微调</td><td>175,255.8M</td><td>73.8</td><td>89.5</td><td>52.0/28.0/44.5</td></tr>
+        <tr><td>BitFit</td><td>14.2M</td><td>71.3</td><td>91.0</td><td>51.3/27.4/43.5</td></tr>
+        <tr><td>PreLayer</td><td>20.2M</td><td>70.1</td><td>89.5</td><td>50.8/27.3/43.5</td></tr>
+        <tr><td>Adapter<sup>H</sup></td><td>40.1M</td><td>73.2</td><td>91.5</td><td>53.2/29.0/45.1</td></tr>
+        <tr><td>LoRA</td><td>4.7M</td><td>73.4</td><td>91.7</td><td>53.8/29.8/45.9</td></tr>
+        <tr><td>LoRA</td><td>37.7M</td><td>74.0</td><td>91.6</td><td>53.4/29.2/45.1</td></tr>
+      </tbody>
+    </table>
+    <p>
+      原文也写了局限：如果为了零延迟把 A、B 合并进 W，就没法在一个 forward 里给不同任务的样本用不同的 A、B 做 batching；不合并、动态选 adapter 可以 batching，但有额外延迟。后来 S-LoRA / Punica 这类多 adapter serving 系统解决的正是这个 trade-off。
+    </p>
+
+    <h3>⑥ rsLoRA：α/r 在大 r 时把学习「压死」了</h3>
+    <p>
+      Kalajdzievski（arXiv:2312.03732）的论点：缩放因子 γ<sub>r</sub> = α/r 让 r 越大的 adapter 学得越慢、效果越差，这也是实践中 LoRA 长期只用很小 r 的原因之一；他证明 adapter 应除以 <strong>√r</strong>（rank-stabilized LoRA），这样增大 r 能稳定地「用训练算力换效果」，推理成本不变。
+    </p>
+    <p><strong>box 小实验</strong>（本文实跑，numpy）：d = k = 1024，n = 512 个样本，B 从 0 出发，模拟 Adam 第一步（≈ sign 更新，lr = 1e-3），看输出增量 Δh 的 RMS 随 r 的变化：</p>
+    <table>
+      <thead><tr><th>r</th><th>γ = α/r：rms(Δh)</th><th>γ = α/√r：rms(Δh)</th></tr></thead>
+      <tbody>
+        <tr><td>4</td><td>4.99e-4</td><td>1.03e-3</td></tr>
+        <tr><td>16</td><td>2.54e-4</td><td>1.01e-3</td></tr>
+        <tr><td>64</td><td>1.32e-4</td><td>1.06e-3</td></tr>
+        <tr><td>256</td><td>7.59e-5</td><td>1.22e-3</td></tr>
+      </tbody>
+    </table>
+    <p>
+      原因：Adam 让每个参数的步长约为 lr、与 γ 无关；Δh = γ·ΔB·Ax 对 r 个方向求和，近似随机符号叠加，量级 ∝ γ√r。于是 α/r 下 Δh ∝ 1/√r（r 每乘 4，增量约减半，与表中一致），α/√r 下大致恒定。这是一个只看第一步的玩具，不是 rsLoRA 的完整证明，但足以说明「换 r 必须重调 lr」在 α/r 下是常态。
+    </p>
+    <p>同一实验里的另外两个数：</p>
+    <ul>
+      <li>d = k = 4096 的方阵，LoRA 参数量 2dr：r=1 / 8 / 64 分别是 8,192 / 65,536 / 524,288，占原矩阵 0.049% / 0.39% / 3.1%。</li>
+      <li>合并等价性：FP64 下 W<sub>0</sub>x + γBAx 与 (W<sub>0</sub>+γBA)x 的最大误差 5.2e-15；但若把合并后的权重存回 FP16，最大误差约 2.4e-3（激活均值约 0.80）。<strong>合并进低精度权重是有损的</strong>——这在 QLoRA 的 4-bit 基座上更明显，部署时通常要先反量化再合并、或不合并直接挂 adapter。</li>
+    </ul>
+
+    <h3>⑦ 之后的三条主线</h3>
+    <table>
+      <thead><tr><th>工作</th><th>改了什么</th><th>论文自报要点</th></tr></thead>
+      <tbody>
+        <tr><td>QLoRA（Dettmers et al. 2023）</td><td>冻结的基座量化到 4-bit，梯度穿过量化基座流进 LoRA</td><td>单张 48GB GPU 微调 65B，保持 16-bit 微调的任务表现；三件套：NF4（对正态分布权重信息论最优的 4-bit 类型）、double quantization（把量化常数再量化）、paged optimizers（应对显存尖峰）；Guanaco 在 Vicuna benchmark 上达到 ChatGPT 的 99.3%，单 GPU 24 小时</td></tr>
+        <tr><td>rsLoRA（2023）</td><td>γ<sub>r</sub> = α/√r</td><td>大 r 不再学得慢，r 成为可以用训练算力换效果的旋钮</td></tr>
+        <tr><td>DoRA（Liu et al. 2024）</td><td>把预训练权重分解成 magnitude 与 direction，用 LoRA 只更新 direction，magnitude 单独学</td><td>动机来自对全参微调 vs LoRA 的权重分解分析；在 LLaMA、LLaVA、VL-BART 的多类任务上稳定超过 LoRA，可合并、无额外推理开销</td></tr>
+        <tr><td>LoRA Learns Less and Forgets Less（Biderman et al. 2024）</td><td>在代码与数学上系统对比 LoRA 与全参（指令微调约 100K 对、持续预训练 20B token）</td><td>标准低秩设置下 LoRA 明显不如全参；但更好地保住目标域之外的能力，抗遗忘强于 weight decay / dropout，生成更多样；全参学到的扰动秩是常见 LoRA 配置的 10–100 倍</td></tr>
+      </tbody>
+    </table>
+    <p>
+      最后一行和原文 ③ 的「r=1 就够」并不矛盾：GPT-3 上的 WikiSQL / MNLI 离预训练分布近，Biderman et al. 的代码 / 数学持续预训练要注入大量新知识，正好落在原文脚注说的「小 r 不够」的区域。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先决定任务离预训练分布多远。</strong>格式 / 风格 / 指令对齐类任务，小 r 足够；要注入大量新知识（新语言、新领域持续预训练），要么用大 r + rsLoRA，要么直接全参。</li>
+      <li><strong>铺广优于堆深。</strong>同预算下所有线性层（含 MLP）都挂 LoRA、用较小 r，通常比只挂 q/v 用大 r 更好。</li>
+      <li><strong>换 r 就重调 lr</strong>，或改用 α/√r 缩放；不要只改 r 然后比较结果。</li>
+      <li><strong>LoRA 的 lr 通常比全参大一个量级左右</strong>（经验值，依模型与 α 而定，务必 sweep）；B=0 初始化意味着前几步 ΔW 很小，warmup 不宜过长。</li>
+      <li><strong>部署时想清楚合并与否。</strong>单任务高 QPS：合并进 BF16 权重；多租户多 adapter：不合并，用多 adapter serving；4-bit 基座上合并前先反量化。</li>
+      <li><strong>RL / 后训练里用 LoRA 的一个隐性好处是「忘得少」</strong>——在意通用能力保持（以及 KL 约束本身较弱）时，LoRA 是一种结构性正则；但要接受它学得少。</li>
+      <li><strong>和蒸馏配合</strong>：<a href="daily-2026-10-20-algo-knowledge-distillation.html">知识蒸馏</a>得到的小模型再按任务挂 LoRA，是在多任务部署下性价比很高的组合。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 如果把 A 和 B 都初始化为小随机数（而不是 B=0），会有什么问题？</summary>
+      <p>训练第一步之前模型就已经偏离预训练权重：ΔW = γBA 是一个随机低秩扰动，会立刻改变输出分布，等于在一开始就注入噪声并损失部分预训练能力；在 α 较大或层数多时，这个扰动在残差流里累积，可能让初始 loss 明显升高。B=0 保证起点就是预训练模型，微调完全从零增量开始，这对「小数据、少步数」的微调尤其重要。另一方面不能两者都为 0，否则两边梯度都为 0。</p>
+    </details>
+    <details>
+      <summary>2. 为什么说「用 Adam 时调 α 约等于调学习率」？用 SGD 还成立吗？</summary>
+      <p>Adam 对每个参数做尺度归一化，步长约为 lr，与梯度的整体缩放无关。γ = α/r 对输出 Δh 的影响有两处：梯度 ∂L/∂B 里乘了一次 γ（被 Adam 归一化掉），前向 Δh = γΔB·Ax 又乘一次 γ（保留）。净效果是 Δh ∝ γ·lr，所以 α 和 lr 在一阶上可以互换（初始化缩放合适时）。SGD 不做归一化，两处 γ 都保留，Δh ∝ γ²·lr，此时 α 与 lr 不再等价，且大 r 下 α/r 的抑制更严重。</p>
+    </details>
+    <details>
+      <summary>3. 预算固定时，「W<sub>q</sub>,W<sub>v</sub> 各 r=4」优于「只 W<sub>q</sub> r=8」。从 intrinsic rank 的角度解释。</summary>
+      <p>如果每个矩阵的有效更新秩都很低（r=1~4 就覆盖主要方向），那么对单个矩阵从 r=4 加到 r=8 的边际收益接近零（多出来的是噪声方向，③ 的子空间分析也这样显示）；而把这部分预算拿去适配另一个原本完全没动的矩阵，能覆盖一个全新的、有用的更新方向。也就是说，收益来自「覆盖更多矩阵的 top 方向」，而不是「把一个矩阵的长尾方向学出来」。</p>
+    </details>
+    <details>
+      <summary>4. LoRA 在 RL 后训练中被广泛使用（如多 adapter population、低成本 rollout 引擎热切换）。从 <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a> 讨论的训推一致性角度看，LoRA 带来哪些新风险？</summary>
+      <p>（1）合并与否导致数值路径不同：训练端是 W<sub>0</sub>x + γBAx 分开算，推理引擎如果把 adapter 合并进 BF16 权重，舍入不同，importance ratio ω 偏离 1，mismatch KL 上升；（2）推理引擎的多 adapter kernel（分块 / 不同精度）与训练框架实现不同，同样制造 ω 噪声；（3）权重推送变便宜（只推 A、B）会鼓励更频繁的刷新，若缓存不重算，陈旧缓存问题更频繁。缓解：训练与推理用同一种「不合并」的计算路径，监控 mismatch KL，对超大 ratio 的 token 做 mask。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）「LoRA 学得少也忘得少」与 KL 正则（<a href="daily-2026-09-17-algo-kl.html">KL 散度</a>）都在限制模型偏离。两者限制的「距离」有什么本质区别？</summary>
+      <p>KL 正则限制的是<strong>输出分布</strong>的距离，在被采样到的状态上起作用，对没覆盖的输入几乎没有约束；LoRA 限制的是<strong>参数更新的结构</strong>（秩 ≤ r、只在选定矩阵上），对所有输入同时生效——它无法表达高秩的改变，所以未覆盖输入上的行为也很难被大幅改写，这可能是它「忘得少」的来源。代价是即便目标需要高秩更新，LoRA 也学不到。两者可以组合：RL 里用 LoRA 做结构约束、用 KL 做分布约束；值得讨论的是在 Agent RL 中去掉 reference KL（如 Arctic-SWE）后，LoRA 能否部分替代它的稳定作用。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">arXiv:2106.09685 · LoRA（Hu et al.，Microsoft）</a> · <a href="https://github.com/microsoft/LoRA" target="_blank" rel="noopener">microsoft/LoRA</a></li>
+      <li><a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">arXiv:2305.14314 · QLoRA</a> · <a href="https://arxiv.org/abs/2312.03732" target="_blank" rel="noopener">arXiv:2312.03732 · rsLoRA</a> · <a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noopener">arXiv:2402.09353 · DoRA</a> · <a href="https://arxiv.org/abs/2405.09673" target="_blank" rel="noopener">arXiv:2405.09673 · LoRA Learns Less and Forgets Less</a></li>
+      <li><a href="https://arxiv.org/abs/2012.13255" target="_blank" rel="noopener">arXiv:2012.13255 · Intrinsic Dimensionality Explains the Effectiveness of LM Fine-Tuning（Aghajanyan et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-08-algo-adam.html">Adam</a> ·
+        <a href="daily-2026-10-07-algo-muon.html">Muon</a> ·
+        <a href="daily-2026-09-17-algo-kl.html">KL 散度</a> ·
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA → GQA → MLA（同样是低秩思想）</a> ·
+        <a href="daily-2026-10-20-algo-knowledge-distillation.html">知识蒸馏</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

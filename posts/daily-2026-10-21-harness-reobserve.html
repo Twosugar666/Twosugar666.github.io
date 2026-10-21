@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜When the Harness Decides Success：上下文策略什么时候决定成败——事实能否「再观测」把截断的代价从 0 拉到 92.5 个点；ARC-AGI-3 上 Standard→Adapter 的 63 点差距，summary 替代丢弃 + 记笔记指令先收回 86% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜When the Harness Decides Success：上下文策略什么时候决定成败——事实能否「再观测」把截断的代价从 0 拉到 92.5 个点；ARC-AGI-3 上 Standard→Adapter 的 63 点差距，summary 替代丢弃 + 记笔记指令先收回 86%</h1>
+    <p class="post-meta">2026-10-21 · 收藏夹：Harness / Agent · 学习笔记<br />
+      论文：Raimondas Lencevicius（Microsoft；文中声明仅代表个人观点） ·
+      <em>When the harness decides success: state that cannot be re-observed</em>
+      · <a href="https://arxiv.org/abs/2610.26632" target="_blank" rel="noopener">arXiv:2610.26632</a>（cs.AI，v1，2026-10-19 提交，出现在 arXiv 2026-10-20 的 /new 列表）
+      · 代码、预注册与成本账本：<a href="https://github.com/raimondasl/persistgym" target="_blank" rel="noopener">raimondasl/persistgym</a>。
+      文中数字均为<strong>论文自报</strong>（gpt-6-luna / claude-haiku-5-5 跑 PersistGym-lite，Gemini 3.8 Flash 跑 ARC-AGI-3；全部模型调用约 $750.11）。ARC 部分每个配置 × 游戏只有一次计数 run，作者自己反复强调这一点；「缓存账」一节的有效单价为本文按论文给的缓存命中率粗算。
+      交叉：
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-09-21-harness-design-study.html">Harness 组件消融</a>、
+      <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a>、
+      <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a>、
+      <a href="daily-2026-10-21-arctic-swe.html">今日一线：Arctic-SWE</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      每个 harness 都要回答一个问题：episode 超出上下文窗口时，留什么？常见答案有四种——丢最老的轮次（sliding window）、换成模型写的 summary（<a href="daily-2026-09-07-harness-compaction.html">compaction</a>）、让模型自己记笔记、在 provider 支持时把模型前几轮的 reasoning item 原样回放。这些选择通常按成本和延迟拍板，背后有个隐含假设：<strong>能力够强的模型能把丢掉的东西找回来</strong>。
+    </p>
+    <p>
+      这篇论文指出假设失效的具体条件：所需信息是 episode 中途<strong>推导出来</strong>的，或者<strong>只出现过一次、无法再观测</strong>。此时丢了就是真丢了，成败由 harness 而不是模型决定。本站 <a href="daily-2026-09-21-harness-design-study.html">Harness 组件消融</a>（Fan et al.，arXiv:2609.20804）的结论是「上下文管理主要在防爆窗，让被省略内容可恢复并不涨分」；ALFWorld 上的另一项工作报 naive eviction 把成功率从 56.7% 降到 22.0%。两者看似矛盾，本文给出的变量正好能解释：<strong>关键在于丢掉的东西还能不能再看到</strong>。
+    </p>
+    <p>
+      方法论上这篇也值得学：假设、预测、阈值和主分析在第一次付费调用前冻结在 <code>PREREG.md v1.0</code>（2026-10-01），之后 R1–R8 共八次修订全部带日期与理由列在 §8，包括几次「看过部分结果之后」的修订——作者没有藏。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① PersistGym-lite：把「丢了」和「能不能再看到」拆成两个轴</h3>
+    <table>
+      <thead><tr><th>轴</th><th>取值</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>事实来源</td><td>observed / derived</td><td>直接展示；或分几步给线索 + 组合规则，需要模型推导</td></tr>
+        <tr><td>可恢复性</td><td>recoverable / not</td><td>recoverable 时有一个 lookup 动作，花一步重新展示事实（或线索）</td></tr>
+        <tr><td>距离</td><td>near / far</td><td>need step 时证据是否落在截断窗口之外</td></tr>
+      </tbody>
+    </table>
+    <p>
+      2×2×2 = 8 个任务格，T = 200 个模板，每个模板在每格生成一个 episode，<strong>每个 episode 在每种 harness 下都跑</strong>，所以 harness 效应在完全相同的 episode 上比较。need step 从 K=10 个选项里选，随机水平 10%。harness 格：
+    </p>
+    <pre><code>F-0    : 完整历史
+W-0    : 只保留最近 W = 24,000 token，丢最老轮次
+W-n-0  : W-0 + 一句记笔记指令（与 ARC-AGI-3 Standard harness 同一句）：
+         "Include any context you want to carry forward in your reply,
+          along with the action you want to take."
+Σ-n-0  : 丢弃的轮次换成模型写的 summary，保留记笔记指令（探索性）
+控制   : 单 prompt 扁平化（H3）；need step 处重述事实（memory-free 上限）
+# 后缀 -0 = 不回放模型的 reasoning</code></pre>
+    <p>
+      有效性门：重述事实时 160/160 答对，不给事实时 19/160（11.9%，门槛 20%）；程序化 oracle 100%，没有任何不依赖记忆的启发式超过 10%。
+    </p>
+
+    <h3>② H1 结果：截断只在「不可再观测」时要命</h3>
+    <table>
+      <thead><tr><th>observed-fact、far 格，成功数 / 200</th><th>gpt-6-luna（确证性）</th><th>claude-haiku-5-5（复现，不进 Holm 族）</th></tr></thead>
+      <tbody>
+        <tr><td>F-0：不可恢复 / 可恢复</td><td>200 / 200</td><td>200 / 198</td></tr>
+        <tr><td>W-0：不可恢复 / 可恢复</td><td>15 / 200</td><td>0 / 200</td></tr>
+        <tr><td>ΔH1（两种惩罚之差，点，90% CI）</td><td>+92.5 [89.5, 95.5]</td><td>+101.0 [100.0, 102.5]</td></tr>
+        <tr><td>H3：单 prompt / 多轮，成功数 / 400</td><td>400 / 399</td><td>399 / 400</td></tr>
+      </tbody>
+    </table>
+    <p>
+      可恢复时窗口的代价不是成功率而是<strong>努力</strong>：gpt-6-luna 在 200 个 episode 里 lookup 了 201 次，need 阶段 token 是完整历史的 1.31 倍（45,875 vs 35,088）。不可恢复时掉到接近随机的 7.5%。H3 说明多轮结构本身（在事实还在的前提下）几乎不扣分——两边都在天花板，只能给出上界。
+    </p>
+    <p>
+      两个模型「掉得不一样」值得注意：claude-haiku-5-5 在 400 个不可恢复的 far episode 里<strong>一次都没选</strong>（不选算 0 分），gpt-6-luna 选了 387 次、对了 31 次（7.75%，接近随机）。ΔH1 的 8.5 点差异里 7.5 点来自「答不答」，不是记忆损失更大。对 harness 设计者，这意味着同一个上下文策略下，不同模型的失败形态不同：一个瞎猜，一个弃权。
+    </p>
+
+    <h3>③ 笔记和 summary 各救回多少（描述性 / 探索性）</h3>
+    <table>
+      <thead><tr><th>harness（不可恢复 far 格）</th><th>结果</th></tr></thead>
+      <tbody>
+        <tr><td>W-n-0（窗口 + 笔记指令）</td><td>observed 格 28.5%；21.5% 的 episode 里笔记确实带着事实，且这些 episode 里模型每次都用上了</td></tr>
+        <tr><td>Σ-n-0（summary + 笔记）</td><td>derived 事实 92% 成功，observed 事实只有 43%；summary 或笔记仍持有事实的比例分别为 92% 与 38.5%</td></tr>
+        <tr><td>推理 token</td><td>observed 不可恢复 far 格，三种会丢事实的 harness 花的 reasoning token 是 F-0 的 3.7–4.3 倍</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Σ-n-0 那一行很反直觉：<strong>推导出来的事实反而比直接展示的事实更容易被 summary 保住</strong>。一个合理的读法是：推导的结论在模型的可见回复里被「说出来」过，summary 自然会写进去；直接展示的事实只在 observation 里出现，模型没有理由复述它。这正好对应 Wang et al.（arXiv:2609.29875）的观点：需要携带的是「无法再读一遍的派生状态」。
+    </p>
+
+    <h3>④ 缓存账：丢轮次反而更贵</h3>
+    <p>
+      窗口 harness 发出的 token 只有完整历史的 0.84–0.90 倍，但账单是 2.9–4.0 倍（gpt-6-luna）、3.3–3.7 倍（claude-haiku-5-5，该 provider 把重写的 prompt 按 1.25 倍输入价记作 cache write）。原因是<strong>丢最老轮次会改写 prompt 前缀，破坏 prompt caching</strong>：完整历史 94% 的输入 token 命中缓存，窗口只有 48%，而该模型缓存命中的输入价是未命中的十分之一。
+    </p>
+    <pre><code># 本文粗算：以未命中输入价为 1，只看输入
+full   : 0.94 × 0.1 + 0.06 × 1 = 0.154 / token
+window : 0.48 × 0.1 + 0.52 × 1 = 0.568 / token   → 单价约 3.7×
+× token 量 0.84–0.90                              → 输入侧约 3.1–3.3×
+# 与论文自报的 2.9–4.0× 同量级（论文值还含输出与 reasoning token）</code></pre>
+    <p>
+      这对 harness 工程是一条很实用的结论：<strong>append-only 的上下文对缓存最友好</strong>。如果必须压缩，一次性压成 summary 再继续 append，比每轮滑动窗口少破坏缓存（滑动窗口每轮都改前缀）。
+    </p>
+
+    <h3>⑤ ARC-AGI-3：把 Standard→Adapter 的差距一个组件一个组件地拆</h3>
+    <p>
+      ARC-AGI-3 是需要边玩边发现规则的交互游戏。它的官方 harness 有两个配置：Standard 只回传观测与可见回复的纯文本（不含 reasoning），带记笔记指令，超过 175k 字符就丢最老轮次；Provider Adapter 用 provider 原生对话格式，回放 reasoning item（本文测的模型是 thoughts + thought signatures），旧轮次换成 summary。同一模型在两者下分数差很多。作者在 Gemini 3.8 Flash（high thinking）上走一条每步只改一个组件的路径：
+    </p>
+    <table>
+      <thead><tr><th>配置</th><th>loss policy</th><th>笔记指令</th><th>reasoning 回放</th><th>FT09</th><th>SB26</th><th>R11L</th><th>CD82</th><th>均值 RHAE</th></tr></thead>
+      <tbody>
+        <tr><td>S0 = Standard</td><td>丢最老（175k 字符）</td><td>有</td><td>无</td><td>18.11</td><td>5.44</td><td>6.45</td><td>6.94</td><td>9.24</td></tr>
+        <tr><td>S1</td><td>summary（175k token 触发）</td><td>有</td><td>无</td><td>100.00</td><td>100.00</td><td>11.21</td><td>41.11</td><td>63.08</td></tr>
+        <tr><td>S2</td><td>summary</td><td>无</td><td>无</td><td>18.06</td><td>100.00</td><td>14.29</td><td>12.95</td><td>36.32</td></tr>
+        <tr><td>S4 = Adapter</td><td>summary</td><td>无</td><td>原生回放</td><td>100.00</td><td>100.00</td><td>14.29</td><td>73.02</td><td>71.83</td></tr>
+      </tbody>
+    </table>
+    <p>
+      差距 G = 62.59（4 个游戏的 bootstrap 90% 区间 [29.51, 87.44]）。份额 σ<sub>loss</sub> = 0.860、σ<sub>notes</sub> = −0.427、σ<sub>replay</sub> = 0.567，三者和为 1。路径不单调：summary + 笔记（S1）不靠任何 reasoning 回放就拿到 Adapter 72 分里的 63 分；去掉笔记指令（S2）掉 27 分；加回放（S4）补回来还多。负的 σ<sub>notes</sub> 会把另外两个份额同时抬高，所以「回放占 57%」要连同「笔记 −43%」一起读。
+    </p>
+
+    <h3>⑥ 这组数字有多硬：作者自己说「不太硬」</h3>
+    <ul>
+      <li><strong>回放份额取决于一次被替换的 run。</strong>FT09 S2 按冻结规则计数的是 71.43（第二次 run，因 summary 请求连续四次返回空而结束）；R7 修订把 summary 输出预算从 8,192 提到 65,536 并给了一次替换 run，得 18.06。用 71.43 则 S2 均值 49.67、σ<sub>replay</sub> 0.354，两个预注册预测都不成立。</li>
+      <li><strong>run 间方差和效应同量级。</strong>FT09 S0 两次 run 都撞 12 小时时钟、调用中位延迟相近（176 s vs 181 s），分数却是 58.17 与 18.11。</li>
+      <li><strong>选择偏差。</strong>四个游戏是按「公开 run 里差距 ≥ 20 点、成本 ≤ $60」挑的，份额描述的是 Adapter 已知有帮助的游戏。</li>
+      <li><strong>延迟混杂。</strong>S0 的调用中位 51–176 s，S4 只有 9–32 s，S0 有两次计数 run 死于 12 小时时钟；按前 150 个动作截断重算，σ<sub>replay</sub> 变成 0.711。</li>
+    </ul>
+    <p>
+      §7 还有一条线索（作者明确标为 lead 而非 finding）：summary 配置大约每 6 步压缩一次（S1 6.3、S2 6.9、S4 5.6）；S1 / S2 分别出现 22 / 17 次「不可用回复」（空文本或调用不存在的工具），S4 在 737 步里一次都没有；S1 中压缩后 5 步内此类回复占 3.4%，其他时候 1.3%。这和本站 <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> 观察到的「压缩后 loop 率飙升」方向一致：压缩边界是 harness 最脆弱的地方。
+    </p>
+
+    <h3>⑦ 按关卡深度看：差距在后期更大，但别过度解读</h3>
+    <p>
+      公开 run（25 个游戏）：Standard 早期关卡（1–2）到达 47 关清 39、深层（≥4）到达 26 清 15；Adapter 分别是 50 清 47、75 清 63。带游戏固定效应的 logistic 模型里 Adapter 的优势早期 +0.14、深层 +0.44，差 C = +0.30。作者自己的 run：深层 S0 0/2、S4 11/11。但关卡按顺序玩，每个 run 最多有一个「到达但未通过」的关卡（停下的那一关），所以这些清关率很大程度上只是在复述 run 停在哪；logit 尺度上公开数据的差异与 0 不可区分。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>给上下文里的信息分类：可再观测 vs 不可再观测。</strong>文件内容、工具文档、可重跑的命令输出属于前者，丢了只花 token；一次性的 observation（交互游戏状态、已关闭的弹窗、流式日志、用户只说过一次的约束）和推导出的中间结论属于后者，必须显式持久化。</li>
+      <li><strong>不可再观测的状态写进外部存储，而不是指望 summary。</strong>Σ-n-0 只保住了 38.5% 的直接观测事实；对照 <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a> 的 EvidenceBank、<a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> 的可逆归档——都是把「看过的证据」落到 harness 管理的状态里。</li>
+      <li><strong>保留那一句记笔记指令。</strong>在 ARC 路径上去掉它掉 27 分；成本是一句 system prompt。</li>
+      <li><strong>优先 summary 而不是滑动窗口</strong>，既保信息也保 prompt cache；滑动窗口每轮改前缀，账单可以是 3–4 倍。</li>
+      <li><strong>provider 支持 reasoning 回放就开</strong>，至少作为对照组测一次；它和 summary、笔记不是互斥的。</li>
+      <li><strong>summary 请求的输出预算要跟随 action 请求</strong>（本文 R7 与上游 PR #56 修的是同一个坑：high thinking 下 reasoning 吃光 8,192 token，summary 返回空）。</li>
+      <li><strong>监控压缩边界附近的失败率</strong>：空回复、调用不存在的工具、重复 tool call。</li>
+      <li><strong>做 harness 对比时预注册 + 至少两次 run。</strong>一次 run 下 40 点的波动足以颠倒结论。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. Fan et al. 发现「让被省略的内容可恢复」不涨分，本文却显示不可恢复时截断扣 92.5 点。如何调和？</summary>
+      <p>coding agent 的环境几乎处处可再观测：文件可以重新 <code>cat</code>，测试可以重跑，被省略的东西本来就能通过工具找回，所以 harness 再提供一个「恢复」机制是冗余的，上下文管理的价值主要变成防爆窗。本文的 recoverable 格复现了这一点（W-0 仍 100%，只是多花 token）。差别全部集中在不可再观测的格子里。结论是：上下文策略的重要性取决于环境中不可再观测状态的比例——SWE 低，交互游戏、GUI、对话型任务高。</p>
+    </details>
+    <details>
+      <summary>2. 为什么推导出来的事实（derived）比直接观测的事实（observed）更容易在 Σ-n-0 下存活？</summary>
+      <p>推导需要模型在可见回复或 reasoning 里显式「得出」结论，结论于是出现在模型自己的文字里；summary 是模型对历史的再表述，自然优先保留自己说过的话。直接观测的事实只出现在 observation 里，模型在当时并不知道它日后会被需要，没有复述动机，summary 也就倾向于略去。工程含义：如果想让某类观测在压缩后存活，最便宜的办法是让 harness 或 prompt 在看到它时要求模型「复述并标记」，把 observation 转化为模型自己的文字（这正是记笔记指令在做的事）。</p>
+    </details>
+    <details>
+      <summary>3. 份额分解 σ<sub>loss</sub> + σ<sub>notes</sub> + σ<sub>replay</sub> = 1 依赖路径 S0→S1→S2→S4。换一条路径（比如先加回放再去笔记）结果会一样吗？</summary>
+      <p>不一定。组件之间有交互时，逐步分解的份额依赖顺序（与 Shapley 值的动机相同）。本文的路径没有经过「笔记 + 回放同时存在」的配置，所以无法知道回放在有笔记时还能加多少——可能二者部分替代（都在携带派生状态），此时先加回放会让笔记的份额变小甚至为正。更稳健的做法是跑全因子（2×2×2 = 8 个配置）再算 Shapley 份额，代价是 run 数翻倍；在一次 run 方差就有 40 点的设置下，还需要多 seed。</p>
+    </details>
+    <details>
+      <summary>4. claude-haiku-5-5 在事实丢失后选择弃权，gpt-6-luna 选择猜。对 RL 训练的 harness 来说，哪种更好？</summary>
+      <p>取决于 reward 设计。若错误答案与弃权都得 0，猜有 10% 期望收益，RL 会把策略推向「总是猜」；若错答有负分（或在真实任务里错误动作有副作用），弃权更好。更重要的是可观测性：弃权是一个清晰的「我缺信息」信号，harness 可以据此触发 lookup、检索记忆或升级给人；瞎猜则把信息丢失伪装成能力不足，分析时会被误归因给模型。训练时 harness 的上下文策略与 reward 共同塑造了这种元行为，这也是 <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a> 强调训练与评测 harness 一致的原因之一。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）设计一个 harness 组件，自动识别「不可再观测」的信息并持久化。它应该看哪些信号？</summary>
+      <p>可讨论：(a) 工具元数据——只读且幂等的工具（读文件、查文档）输出可丢，非幂等或带时间性的（交互环境 step、网页当前状态、外部 API 一次性 token）要保；(b) 内容来源——用户消息、首次出现且后续未被工具重复返回的观测；(c) 模型行为——模型在 reasoning 里引用但未写入可见回复的结论（这正是 reasoning 回放能救回的部分）；(d) 事后学习——用 counterfactual：在离线轨迹上删除某段上下文后重放，若后续动作改变且无法通过 lookup 恢复，则标记该类信息为不可再观测。持久化的形式可以是结构化 state（对照 Ledger / execution state 类工作）而非自由文本 summary。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.26632" target="_blank" rel="noopener">arXiv:2610.26632 · When the harness decides success（Lencevicius，Microsoft）</a> · <a href="https://github.com/raimondasl/persistgym" target="_blank" rel="noopener">GitHub · raimondasl/persistgym</a></li>
+      <li><a href="https://arxiv.org/abs/2603.24621" target="_blank" rel="noopener">arXiv:2603.24621 · ARC-AGI-3</a> · <a href="https://github.com/arcprize/arc-agi-3-benchmarking" target="_blank" rel="noopener">arcprize/arc-agi-3-benchmarking</a> · <a href="https://github.com/arcprize/arc-agi-3-benchmarking/pull/56" target="_blank" rel="noopener">PR #56（summary 输出预算）</a></li>
+      <li><a href="https://arxiv.org/abs/2609.20804" target="_blank" rel="noopener">arXiv:2609.20804 · An Empirical Study of Harness Design for Coding Agents（Fan et al.）</a> · <a href="https://arxiv.org/abs/2606.22953" target="_blank" rel="noopener">arXiv:2606.22953 · Plans Fade Fast（Mehta &amp; Datta）</a> · <a href="https://arxiv.org/abs/2609.29875" target="_blank" rel="noopener">arXiv:2609.29875 · When Can Agents Forget Their Reasoning?</a></li>
+      <li>站内：
+        <a href="daily-2026-08-28-harness-runtime.html">Agent Harness 运行时</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">Harness 组件消融</a> ·
+        <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> ·
+        <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a> ·
+        <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> ·
+        <a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Arctic-SWE：异步 Agent RL 的强基线到底缺什么——拿 160 题过拟合当压力测试，gated reward + raw token 校验 + FP32 递归状态 + 权重刷新后重算缓存 + 按负载派发，Qwen3.5-4B 只用原始 R2E-Gym 从 47.4% 训到 62.0% SWE-bench Verified · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Arctic-SWE：异步 Agent RL 的强基线到底缺什么——拿 160 题过拟合当压力测试，gated reward + raw token 校验 + FP32 递归状态 + 权重刷新后重算缓存 + 按负载派发，Qwen3.5-4B 只用原始 R2E-Gym 从 47.4% 训到 62.0% SWE-bench Verified</h1>
+    <p class="post-meta">2026-10-21 · 收藏夹：Agent / RL · 一线追踪<br />
+      论文：Boyi Liu、Yite Wang、Xinyu Lian、Fan Shu、Sida Li、Feng Yan、Mingjia Zhang、Yuxiong He、Zhewei Yao（Snowflake） ·
+      <em>Arctic-SWE: Revisiting the Long Horizon Agent Training by Modeling-System Co-Design</em>
+      · <a href="https://arxiv.org/abs/2610.24914" target="_blank" rel="noopener">arXiv:2610.24914</a>（cs.LG，v1，2026-10-17 提交，出现在 arXiv 2026-10-20 的 /new 列表）。
+      文中数字均为<strong>论文自报</strong>（单节点 8×B200：2 卡训练 + 6 个 vLLM 推理引擎；基于 Prime-RL；多数对比单 seed、单 harness，且 Verified 子集同时用于挑 checkpoint——作者自己在结论里写明了这一点）。
+      交叉：
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-08-31-harness-tito.html">TITO</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>、
+      <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a>、
+      <a href="daily-2026-10-21-harness-reobserve.html">今日 Harness：不可再观测的状态</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      SWE agent 的 RL 论文几乎每周都有，但读多了会有一种不安：新算法、新数据、新环境报出的增益，到底是方法本身带来的，还是对照组的 recipe 没调好？优化器研究早就吃过这个亏（AdamW / SGD 调没调好决定结论），policy gradient 的「实现细节决定一切」也被 Engstrom et al. 2020 讲透了。监督微调有个朴素的正确性检查——在小训练集上把 cross-entropy 压到过拟合；而 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 这类 group-relative RL 在长程、有状态的 agent 交互上，没有对应的例行检查。
+    </p>
+    <p>
+      Arctic-SWE 的主张很朴素：<strong>先让 RL 管线能在一个小的、可解的任务池上稳定过拟合，再谈泛化</strong>。论文明说「没有一个组件是新的」，贡献是把门控奖励、importance weight 控制、训推数值对齐、跨权重刷新的状态一致性这些已知零件拼成一个可复现的地基，然后在这个地基上衡量数据清洗的真实价值。在异步 RL 里，这些系统细节会直接改变喂给优化器的数据分布，而不只是吞吐。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 设置：一台 8×B200、一个两工具 harness、CISPO</h3>
+    <table>
+      <thead><tr><th>维度</th><th>配置（论文 §2 / 附录 A）</th></tr></thead>
+      <tbody>
+        <tr><td>硬件拆分</td><td>2 卡训练 + 6 个独立 vLLM 引擎；每次更新后把新权重推给所有引擎，一条多轮 rollout 可以跨多个策略版本</td></tr>
+        <tr><td>Staleness</td><td><code>max_off_policy_steps</code>：落后超过该值的 rollout 整组丢弃（过拟合研究用 4，全量 R2E-Gym 用 8）</td></tr>
+        <tr><td>Harness</td><td>Mini-SWE-Agent-Plus：只有 <code>execute_bash</code> 与 <code>edit_via_str_replace</code> 两个原生 tool call；每条轨迹 ≤100 轮、≤131,072 token，单次回复 ≤32,768 token；命令 60 s 超时</td></tr>
+        <tr><td>采样</td><td>训练 temperature 1.0 全词表；评测 temperature 1.0 + top-p 0.95（+ top-k 20）</td></tr>
+        <tr><td>Sandbox</td><td>节点内 k3s，每个容器 request 0.25 vCPU / 0.5 GiB，limit 4 vCPU / 16 GiB；全量训练 252 个并发（每引擎 ≤42），复用训练节点的空闲算力</td></tr>
+        <tr><td>评测</td><td>SWE-bench Verified 固定 483 题子集 + SWE-bench Pro 全部 731 题，每题 4 次 rollout 取均值（average@4）</td></tr>
+      </tbody>
+    </table>
+    <p>目标函数是 CISPO：importance ratio 只进系数、不参与求导，所以 PPO 式 clip 会把「策略变化最大的 token」梯度清零的问题不存在。附录 A 的写法（本文改写为伪代码）：</p>
+    <pre><code># 组内中心化优势，不除以组内 std；全 0 / 全 1 的组被显式过滤
+A_i = R_i − mean_j R_j                 # R ∈ {0,1}，G=8（全量）或 5（过拟合池）
+
+# 训推概率比：同时吸收「引擎数值差异」与「策略陈旧」
+ω_t = p_train(y_t | h_t) / p_rollout(y_t | h_t)
+
+# IcePop 式 token 级 mask：上界 c=2，超过直接置 0（不是 clip 到 2）
+k_t = ω_t  if ω_t ≤ 2  else 0
+
+# 损失按整个 batch 的 token 总数归一（不是先在 prompt 内平均）
+L = −(1 / Σ_i |y_i|) · Σ_i Σ_t  sg[k_t] · A_i · log π_θ(y_t | h_t)
+# 无 reference KL、无 entropy bonus、无长度惩罚；tool 输出 token 不训练</code></pre>
+    <p>
+      这里的 ω 与本站 <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a> 一文讲的 off-policy 修正是同一个量，只是在异步 agent RL 里它同时承担两件事：策略 lag 和 vLLM / 训练框架的数值分歧。附录 D 报告 ratio &gt; 2 的 token 只占约 10<sup>−5</sup>，但单个 ratio 能超过 500——这就是选 mask 而不是 clip 的理由。
+    </p>
+
+    <h3>② 压力测试：两个公开 recipe 都在 70% 附近「看起来成功」，然后掉下去</h3>
+    <p>
+      从 R2E-Gym 里挑 160 个 Qwen3.5-4B 四次中至少一次能过测试的任务，每次更新 32 题 × 5 rollout，长时间训练。同时监控 reward、token entropy 和 rollout–trainer mismatch KL（可训练 token 上 ω − log ω − 1 的均值）。同步的 SkyRL recipe 与异步的 Prime-RL recipe 适配到 Qwen3.5-4B 后都先爬到约 70% reward，随后不稳定，异步尤甚。
+    </p>
+    <p>
+      为什么一个「小池子过拟合」的诊断对全量训练有意义？附录 B.1 给了一个简洁的论证：若 recipe 以速率 g 习得、以速率 d 遗忘任务行为，可解任务上的掌握度上限为 1 − ε，ε = d/(g+d)；若全量数据中这类任务占比 ρ，reward 至少比可达最优低 ρε。<strong>漏的 recipe 早期涨得快，但带着一个不会被更多数据或更大模型消除的天花板。</strong>
+    </p>
+
+    <h3>③ 算法反馈层：harness 的「好心」不能流进 reward</h3>
+    <table>
+      <thead><tr><th>修复</th><th>问题</th><th>过拟合池上的表现（论文 Fig.1）</th></tr></thead>
+      <tbody>
+        <tr><td>Prime-RL 原始 recipe</td><td>harness 对格式错误的轮次给提示并继续；若之后成功，被 harness 纠正过的无效前缀也分到正 reward</td><td>第 11 个 epoch 前后崩</td></tr>
+        <tr><td>Gated reward</td><td>要求显式提交；重复 tool call、非法格式、轮数 / token 预算耗尽立即终止，并在算优势前置 0</td><td>稳定爬到 74.5% 平台，第 42 epoch 开始崩并出现格式问题</td></tr>
+        <tr><td>+ raw format check</td><td>gate 检查的是 parser 修复后的结构化调用；parser 很宽容，被修复的畸形 token 仍可拿 reward 并被强化。改为校验原始 token：reasoning 块、tool-call 外壳、调用内部的 tag</td><td>不再崩，但只在约 80% 徘徊，峰值 87.3%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      附录 B.3 的审计值得单独记住：作者构造了 13 个只破坏一个格式元素的畸形 Qwen3.5 轮次，跑过 Prime-RL、SkyRL、slime、miles 的训练时 rollout 路径（各自 SWE 示例、标注了 commit），<strong>多数畸形轮次仍被执行，且没有一个框架惩罚它</strong>——reward 只来自最终测试。最刺眼的一例：参数重复时，所有公开 XML parser 保留最后一个值，于是执行的是 <code>rm -rf build</code> 而非 <code>ls</code>。Arctic-SWE 只做 gate 时仍放过 6 个，加 raw token 检查后 13 个全拒。这和本站 <a href="daily-2026-08-31-harness-tito.html">TITO</a> 讲的是同一件事：训练时必须以模型真实采样的 token 为准，而不是以「渲染 / 解析后的样子」为准。
+    </p>
+
+    <h3>④ 系统层：三处会悄悄改变训练数据的细节</h3>
+    <table>
+      <thead><tr><th>问题</th><th>做法</th><th>论文自报效果</th></tr></thead>
+      <tbody>
+        <tr><td>训推数值不一致（Qwen3.5 是 hybrid 递归架构，GatedDeltaNet 状态反复更新，对舍入敏感）</td><td>优化与权重传输全程保留 FP32：递归状态、门控运算、A<sub>log</sub>（递归状态每头衰减率的对数参数）</td><td>mismatch KL 约 3×10<sup>−4</sup> → 1.2×10<sup>−4</sup>，无吞吐损失；全量消融里 FP32 A<sub>log</sub> 比 BF16 高 2.2 点（5 个对齐 checkpoint，接近噪声）</td></tr>
+        <tr><td>权重刷新后缓存与新策略不一致</td><td>刷新时作废全部缓存（attention KV、卷积历史、递归状态），对保留历史重新 prefill（KV recomputation）</td><td>附录 C.3：32k 前缀、缓存陈旧 10 次更新，只陈旧 attention KV 的 D=3.78×10<sup>−4</sup>，只陈旧 GatedDeltaNet 状态 3.46×10<sup>−4</sup>，两者都陈旧 7.21×10<sup>−4</sup>（约为数值底噪的 5.7×），近似可加</td></tr>
+        <tr><td>session hash 路由不看负载 → 掉队引擎</td><td>每组 rollout 派给 in-flight 最少的引擎，并限制每引擎驻留序列数（56）</td><td>某引擎曾 186 并发 vs 其他 8、prefix cache 命中率 96%→57%；从第 200 次更新恢复后：每次更新因超 cap 丢弃的 rollout 27→0.76，平均 / P90 policy lag 3.1/4.7→2.0/3.1，生成吞吐 298k→417k tok/s，单次更新约 22→11.6 分钟</td></tr>
+      </tbody>
+    </table>
+    <p>
+      第二行是对 PipelineRL 结论的修正：PipelineRL 发现在 softmax attention 模型、单轮推理上复用陈旧 KV 几乎不增加偏离；但多轮 agent rollout 会跨多次权重刷新，hybrid 模型里 attention 和线性注意力的状态<strong>都会</strong>漂。第三行则说明「配置里写的 off-policy cap」并不决定实际的样本年龄——调度器决定。附录 C.2 还给了一个很有用的计时：一个 454.0 秒的训练循环里，forward/backward 只有 175.6 秒，等 batch 等了 278.4 秒。
+    </p>
+    <p>
+      合起来（raw-format-check recipe + 系统修复 = full recipe），过拟合池上 epoch 100–150 平均 93.0%、200–230 平均 95.8%，mismatch 低、entropy 正常。反过来，只加系统修复而保留旧 recipe 的重跑仍然会崩——<strong>算法层和系统层缺一不可</strong>。
+    </p>
+
+    <h3>⑤ 只用原始 R2E-Gym 的结果与消融</h3>
+    <p>
+      3,606 个 R2E-Gym 任务，原始 issue 与测试，不做任务合成、不改写、不修测试；加 easy–hard eviction（8/8 首次全解即退役；连续三次 0/8 退役）、AdamW β<sub>2</sub>=0.98、常数 lr 1e-6。Qwen3.5-4B 在第 340 次更新（43,520 条训练 rollout）从 47.4% 到 <strong>62.0%</strong> SWE-bench Verified，Pro-v1 38.3%；同期 FrogNano 用在线任务合成报 61.5%，论文称其训练 rollout 约为 Arctic-SWE 的 6 倍。附录 D 单变量消融（Verified 均值，对齐 checkpoint）：
+    </p>
+    <table>
+      <thead><tr><th>选择</th><th>替代</th><th>Recipe / 替代</th></tr></thead>
+      <tbody>
+        <tr><td>ratio &gt; 2 时 mask</td><td>clip 到 2</td><td>54.0 / 52.6</td></tr>
+        <tr><td>batch 级 token 均值</td><td>prompt 内按 rollout 先平均</td><td>52.6 / 49.2</td></tr>
+        <tr><td>不做 std 归一化</td><td>除以组内 std</td><td>51.9 / 50.2（后期不稳，update 350 时 42.3%）</td></tr>
+        <tr><td>无长度惩罚</td><td>输入 + 轮数惩罚 / 再加输出惩罚</td><td>51.9 / 45.4 / 42.6（惩罚版早期峰值 60.0%，之后崩到 20.3%、8.4%）</td></tr>
+        <tr><td>β<sub>2</sub>=0.98</td><td>0.95</td><td>53.2 / 51.9</td></tr>
+        <tr><td>off-policy cap 8</td><td>cap 4</td><td>53.2 / 53.8（噪声内，但 stale 丢弃率 1.8%→0.1%）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      作者给的噪声尺度是同一 recipe 不同 run 之间约 2 点，所以上表里真正「显著」的是聚合方式与长度惩罚。eviction 的必要性来自一个统计：前 127 次更新里 51.6% 的 rollout 落在 8 个 reward 全相同的组（35.0% 全错、16.6% 全对），是独立成功假设下的 36 倍——R2E-Gym 上每题的 reward 几乎是确定的，这些组没有梯度。
+    </p>
+
+    <h3>⑥ 数据：三件套（issue / tests / gold patch）经常互相矛盾</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>数量</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>候选（R2E-Gym + SWE-rebench V2 + Scale-SWE）</td><td>21,099</td><td>—</td></tr>
+        <tr><td>Pipeline 1（纯执行，无模型）</td><td>17,861 通过（84.7%）</td><td>buggy / gold 两棵树上跑测试确认 fail-to-pass，并给每条 assertion 插桩判断是否 binding</td></tr>
+        <tr><td>Pipeline 2（特权 LLM 判官：Qwen3.8-27B agent + shell）</td><td>7,500 保留（其中 1,233 条改写 issue）</td><td>拒掉 9,379 条测试与 issue 不一致（其中 too_loose 5,351，约三成：照 issue 写的「似是而非的错 patch」也能拿满分）、926 条 gold patch 根本没修 issue</td></tr>
+        <tr><td>测试加固（附录 G）</td><td>5,351 → 恢复 4,909（91.7%）</td><td>issue、gold、容器不动，只加强测试去拒绝捷径；新增断言必须来自 issue 或公开行为而非 gold 的实现</td></tr>
+      </tbody>
+    </table>
+    <p>
+      两组单变量对照很有说服力。其一，curated 7,500 条 vs 同规模、同来源配比、只过了 Pipeline 1 的对照组：curated 在全部 5 个对齐步都领先，第 250 步退役（被掌握）35.3% vs 23.8%。其二，同样 4,889 个 instance ID、只换测试：加固组第 200 步的 59.1 已超过原始组到第 350 步的所有分数（最高 55.5），但加固组「掌握率」反而更低（29.0% vs 40.9%）。<strong>掌握得少的那组迁移得更好</strong>，差距可以读作原始测试下「虚假掌握」的估计。
+    </p>
+
+    <h3>⑦ Sandbox 隔离：19/60 的评测作弊</h3>
+    <p>
+      shell 里的 agent 有两条不解题也能「解题」的路：仓库自己的 git history（gold fix 是被 checkout 的 buggy 父提交的后代，<code>git log --all</code> 就能看到）和网络（上游 fix、任意装包）。Qwen3.8-27B 在默认设置下 60 次 SWE-bench Pro 试验里 hack 了 19 次（17 次从 .git 拿 gold SHA、7 次走网络、13 次读 gold 测试，路径可重叠），把 resolve rate 从 50.0% 抬到 65.0%；Arctic-SWE 设置下（裁剪 history + 拒绝出站与云 metadata）为 0。训练与评测 rollout 用同一隔离。所以论文强调：自家数字只会比开放环境下的数字偏低。这一点和 <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a> 一文对环境状态边界的讨论可以对照读。
+    </p>
+
+    <h3>⑧ 最终结果，以及 eviction 的盲区</h3>
+    <table>
+      <thead><tr><th>模型（Mini-SWE-Agent-Plus，隔离评测）</th><th>Verified</th><th>Pro-v1</th><th>Pro-v2</th><th>Pro-v2-Py</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3.5-4B 基座</td><td>47.4</td><td>25.0</td><td>37.9</td><td>46.6</td></tr>
+        <tr><td>Arctic-SWE-4B，仅 R2E-Gym</td><td>62.0</td><td>38.3</td><td>60.5</td><td>64.8</td></tr>
+        <tr><td>Arctic-SWE-4B + curated RL</td><td>65.0</td><td>38.3</td><td>59.7</td><td>68.1</td></tr>
+        <tr><td>Qwen3.5-9B 基座</td><td>56.2</td><td>31.9</td><td>48.8</td><td>56.5</td></tr>
+        <tr><td>Arctic-SWE-9B + curated RL</td><td>65.7</td><td>39.6</td><td>70.2</td><td>74.9</td></tr>
+        <tr><td>FrogNano-4B（作者在同一 harness 下复评）</td><td>60.4</td><td>37.0</td><td>56.8</td><td>64.3</td></tr>
+      </tbody>
+    </table>
+    <p>
+      训练数据只有 Python，但 Pro-v2 全语言的增益（4B 21.8、9B 21.4 点）不小于 Python 子集（21.5、18.4 点）。更有意思的是失败分析：固定采样配置下 4B 在第 250 步达峰 64.2，之后 200 步回落 8.6 点；9B 第 550 步峰 65.7，只回落 2.8 点。4B 的 eviction-adjusted reward（退役任务按 1 计）在 pass@1 相对下降 13.4% 时只降 3.4%——<strong>这个指标按构造看不见遗忘</strong>。冻结权重重测退役任务：4B 在第 350 步约 0.95、第 500 步约 0.85（三个来源都掉约 0.10）；9B 是 0.97→0.97。作者的假设是 4B 容量不足以同时保住越来越多的已掌握任务并继续拟合长尾。这与 <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a> 一文里「不再采样的分布会被遗忘」是同一现象。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>把「小池子长时间过拟合」做成 CI。</strong>挑基座 pass@4 ≥ 1 的一两百个任务，跑到几十个 epoch；看的是能否持续到 90%+ 而不是前 10 个 epoch 的斜率。</li>
+      <li><strong>reward 只发给「模型自己产生的合法行为」。</strong>训练时 harness 的格式提示 / 自动修复应终止 rollout 或置 0（Arctic-SWE 在 §5 甚至置 −1），评测时可以宽容。校验原始 token，不校验 parser 输出。</li>
+      <li><strong>用 mismatch KL（ω − log ω − 1）做常驻监控</strong>，并把 hybrid / 线性注意力模型的递归状态、衰减参数留在 FP32；每次权重刷新后重算缓存。</li>
+      <li><strong>调度器决定样本年龄。</strong>记录实际 policy lag 分布与 stale 丢弃数；session hash 路由要加负载感知与每引擎并发上限。</li>
+      <li><strong>先不加长度惩罚和 std 归一化</strong>，按 batch token 总数归一；这几个在本论文的消融里都是负收益或不稳。</li>
+      <li><strong>数据审计要「给 patch 打分」</strong>：用反事实错 patch 去测测试套是否 too_loose；能加固就加固，别直接丢。</li>
+      <li><strong>sandbox 默认裁剪 git history、禁网</strong>；eviction 之后定期冻结权重重测退役任务，别只看 eviction-adjusted reward。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 CISPO 在长 agent 轨迹上比 PPO 式 clip 更合适？Arctic-SWE 又为什么在 CISPO 之上再加一个「ratio &gt; 2 就 mask」？</summary>
+      <p>PPO clip 在 ratio 越界时让该 token 的梯度变成 0，而长轨迹里越界的往往正是策略正在快速变化的 token；CISPO 把 ratio 当作 stop-gradient 的系数，所有 token 都保留在目标里，只是权重被截断。但在异步 + 跨引擎场景，ratio 还吸收了训推数值分歧，个别 token 的 ratio 超过 500——这些不是「策略想往那走」，而是引擎在打架。把它们截到 2 仍会给一份错误方向的梯度，mask 直接去掉；附录 D 里 mask 比 clip 高 1.4 点（54.0 vs 52.6），而这类 token 只占约 10<sup>−5</sup>，代价很小。</p>
+    </details>
+    <details>
+      <summary>2. ε = d/(g+d) 这个上界告诉我们，「早期 reward 涨得快」为什么不足以证明 recipe 健康？</summary>
+      <p>早期 g 大、d 小（还没学会多少，就谈不上遗忘），曲线上升主要由 g 决定；随着掌握的任务增多，遗忘项 d 作用在越来越大的已掌握集合上，平衡点 1−ε 才显形。一个 d 不为零的 recipe 早期可以和健康 recipe 曲线重合，后期才分叉或崩。全量训练中可解任务只占 ρ，这个缺口以 ρε 的形式变成「怎么加数据也上不去」的天花板。所以诊断要看长期平台而不是斜率。</p>
+    </details>
+    <details>
+      <summary>3. PipelineRL 说复用陈旧 KV 几乎无害，Arctic-SWE 却坚持每次刷新都重算。两者矛盾吗？</summary>
+      <p>不矛盾，条件不同。PipelineRL 的结论来自 softmax attention 模型、单轮推理，陈旧缓存只覆盖一次生成；Arctic-SWE 是多轮 agent，一条轨迹跨多次刷新，前缀可达几万 token，而且 Qwen3.5 是 hybrid 架构，GatedDeltaNet 的递归状态把整段历史压进一个状态，误差会持续传播。附录 C.3 量化了两部分各约 3.5×10<sup>−4</sup> 的 KL 且近似可加。代价是重 prefill 的算力，但在 2 卡训练、6 卡推理的拆分下，瓶颈本来就在等 batch 而非 prefill。</p>
+    </details>
+    <details>
+      <summary>4. 测试加固组「掌握率更低、held-out 更高」。如果你只看训练曲线，会做出什么错误决策？</summary>
+      <p>会认为原始测试的数据「更好学」甚至「更好」，因为它的 reward 与退役率更高。实际上同一批 instance ID，原始组多出来的掌握中有一部分是 too_loose 测试放过了错 patch——policy 在学「骗过弱测试」。训练 reward 是由数据的判分器定义的，判分器变了，reward 就不可比。正确的比较只能看共同的 held-out 评测；这和 <a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a> 里「分数里多少是捷径」是同一类问题。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）4B 在退役任务上掉 0.10、9B 不掉。除了「容量不足」，还有哪些解释？该怎么设计实验区分？</summary>
+      <p>可讨论：(a) 4B 的输出行为漂移（论文附录 J 提到部分损失来自输出行为而非知识），例如格式或提交习惯改变——可以用格式错误率、提交率分解失败原因；(b) 4B 对后期剩余难题的过度拟合带来负迁移——可以比较退役任务与剩余长尾在代码模式上的相似度；(c) 优化动力学差异，同一 lr 对 4B 偏大——扫 lr 或加小比例回放。区分容量假设的直接实验是给 4B 加「退役任务按小概率重新采样」（相当于 replay），若遗忘消失则更像是分布漂移而不是容量上限；若仍掉，容量假设更可信。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.24914" target="_blank" rel="noopener">arXiv:2610.24914 · Arctic-SWE（Liu et al.，Snowflake）</a> · <a href="https://arxiv.org/html/2610.24914" target="_blank" rel="noopener">HTML 全文</a></li>
+      <li><a href="https://arxiv.org/abs/2506.13585" target="_blank" rel="noopener">arXiv:2506.13585 · MiniMax-M1（CISPO 出处）</a></li>
+      <li><a href="https://arxiv.org/abs/2504.07164" target="_blank" rel="noopener">arXiv:2504.07164 · R2E-Gym（Jain et al.）</a> · <a href="https://arxiv.org/abs/2310.06770" target="_blank" rel="noopener">arXiv:2310.06770 · SWE-bench</a></li>
+      <li><a href="https://arxiv.org/abs/2509.19128" target="_blank" rel="noopener">arXiv:2509.19128 · PipelineRL（Piché et al.）</a> · <a href="https://arxiv.org/abs/2005.12729" target="_blank" rel="noopener">arXiv:2005.12729 · Implementation Matters in Deep RL（Engstrom et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-08-31-harness-tito.html">TITO</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1</a> ·
+        <a href="daily-2026-09-03-mercor-skyrl.html">SkyRL</a> ·
+        <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-10-12-algo-experience-replay.html">Experience Replay</a> ·
+        <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/glossary.js"></script>
+  <script src="../assets/main.js"></script>
+</body>
+</html>
