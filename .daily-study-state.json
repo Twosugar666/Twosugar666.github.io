@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 2,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -837,6 +837,27 @@
       "source": "algo",
       "topic": "LoRA：h=W0x+(α/r)BAx，A 高斯 B=0，α 设为首个 r 不调，可合并零推理开销；GPT-3 18M 预算 Wq,Wv r=4 最优（WikiSQL 73.7 / MNLI 91.3，全部四个 r=2 73.7/91.7）；r=1 即够（Wq,Wv 73.4/91.3）；ΔW 放大未被强调方向 6.91/0.32≈21.5；1.2TB→350GB、350GB→35MB、32.5→43.1 tok/s；Table 4 LoRA 4.7M 73.4/91.7/53.8；box 实验 α/r 下 Adam 首步 rms(Δh) 4.99e-4→7.59e-5（r=4→256），α/√r ≈1.0–1.2e-3；FP16 合并误差 2.4e-3；QLoRA NF4/双量化/paged、65B 单 48GB、Guanaco 99.3%；rsLoRA α/√r；DoRA magnitude/direction；LoRA Learns Less and Forgets Less 全参扰动秩 10–100×（arXiv:2106.09685 / 2305.14314 / 2312.03732 / 2402.09353 / 2405.09673）",
       "file": "posts/daily-2026-10-21-algo-lora.html"
+    },
+    {
+      "date": "2026-10-22",
+      "domain": "infra",
+      "source": "frontline",
+      "topic": "Don't Skip the Baseline：MoE 动态跳专家对照研究；NAEE/DiEP/MoDES/Ada-K vs 静态 top-k，同实测 K_eff 最多领先 ~2.6pp 且在已掉 50–65% 能力区间；Gemma4 K_eff≤2.5 不如 Gemma4-E4B；GSM8K 在 K_eff≈2 断崖；Qwen3-VL k_vision=2 掉<1.8%、=1 掉~4.1%（K_eff 1.08，-85% 专家）、=0 掉 19.1%；MoDES 校准 K_eff 1.20→实测视觉 0.58 / GSM8K 7.96；K_eff 8→1 吞吐 1.22×(bs1)/1.39×(bs256)；MVBench 69.95 vs 71.40；GLM-4.6V -4.2%（Steimle et al. TUM/Tensordyne arXiv:2610.28369）",
+      "file": "posts/daily-2026-10-22-moe-expert-skipping.html"
+    },
+    {
+      "date": "2026-10-22",
+      "domain": "harness agent infra",
+      "source": "harness",
+      "topic": "Cache Engineering for Agents：append/drop/repos 三操作，K←R(q)R(p)^-1K；历史依赖使前缀匹配失效；AKV 扩展 radix tree（drop/reposition 节点）、drop-aware eviction、segment-batch attention；tool-response rolling drop K=12；三模型四 benchmark 成本 -27.7%（vs Standard）/-21.9%（vs Text Eng）；GPT-OSS-120B 51.0/11.2→53.1/7.3；C=14 vs 12 平均/P95 延迟 1.36×/1.51×，吞吐 1.53×/1.18×；repos 55→62%；RSI -15.6%/-17.8%；KV 读占 API 成本 82.4%（Fu et al. 清华/CUHK arXiv:2610.28577）",
+      "file": "posts/daily-2026-10-22-harness-cache-engineering.html"
+    },
+    {
+      "date": "2026-10-22",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "混合精度训练：FP32 master weights（比值≥2048 更新被舍入；Mandarin 直接更新 FP16 相对损失 80%）、loss scaling（SSD 67% 梯度为 0，S=8 救回 77.1% vs 76.9%；bigLSTM S=128；S·max|g|<65504）、FP32 累加；动态 scaler 2^16/×0.5/2000 步×2；BF16 8 位指数免 loss scaling 但 7 位尾数阈值 256；box 实验：下溢 24.38%→0%（S=32768）、1e-4×10000 FP16/BF16 停在 1.0、FP16 累加 1e5×0.01=32（arXiv:1710.03740 / 1905.12322）",
+      "file": "posts/daily-2026-10-22-algo-mixed-precision.html"
     }
   ]
 }

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜混合精度训练：FP32 master weights、loss scaling 与 FP32 累加三件套——为什么 FP16 的梯度会下溢、更新会「加不上去」，动态 loss scale 怎么自适应，BF16 又为什么能省掉 loss scaling 却省不掉 master weights · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜混合精度训练：FP32 master weights、loss scaling 与 FP32 累加三件套——为什么 FP16 的梯度会下溢、更新会「加不上去」，动态 loss scale 怎么自适应，BF16 又为什么能省掉 loss scaling 却省不掉 master weights</h1>
+    <p class="post-meta">2026-10-22 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Paulius Micikevicius、Sharan Narang、Jonah Alben、Gregory Diamos、Erich Elsen、David Garcia、Boris Ginsburg、Michael Houston、Oleksii Kuchaiev、Ganesh Venkatesh、Hao Wu（NVIDIA / Baidu）· <em>Mixed Precision Training</em>（<a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arXiv:1710.03740</a>，ICLR 2018）；
+      Dhiraj Kalamkar 等（Intel / Facebook）· <em>A Study of BFLOAT16 for Deep Learning Training</em>（<a href="https://arxiv.org/abs/1905.12322" target="_blank" rel="noopener">arXiv:1905.12322</a>）。
+      论文数字按原文；「box 小实验」一节为本文在 box 上用 numpy 实跑（BF16 用 FP32 截位 + 就近偶数舍入模拟）。
+      交叉：
+      <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a>、
+      <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-21-algo-lora.html">LoRA</a>、
+      <a href="daily-2026-10-02-dsv41-nvfp4-gb300.html">DeepSeek V4.1 × NVFP4</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      今天几乎没人再用纯 FP32 训大模型：BF16 前后向 + FP32 优化器状态是默认配置，FP8 / FP4 训练也在把同一套思路往更低位宽推。但「混合精度」不是把 dtype 改成 half 这么简单——2017 年 Micikevicius 等人系统地拆出了三个会让 FP16 训练失败的数值问题，并给出三件套对策。后来所有低精度方案（BF16、FP8 的 per-tensor scale、MXFP / NVFP4 的 block scale）本质上都是在回答同样三个问题：<strong>小梯度会不会变成 0？小更新能不能加到大权重上？长求和会不会丢精度？</strong>
+    </p>
+    <p>
+      对后训练 / RL 的读者，这篇也有直接价值：训推数值不一致（本站多次讨论的 mismatch KL）很大一部分来自这里讲的舍入与累加路径差异。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 先看格式：范围和精度是两回事</h3>
+    <table>
+      <thead><tr><th>格式</th><th>符号 / 指数 / 尾数</th><th>最大值</th><th>最小正规数</th><th>最小次正规数</th><th>ε（1 的下一个数 − 1）</th></tr></thead>
+      <tbody>
+        <tr><td>FP32</td><td>1 / 8 / 23</td><td>≈3.4×10<sup>38</sup></td><td>2<sup>−126</sup></td><td>2<sup>−149</sup></td><td>2<sup>−23</sup>≈1.2×10<sup>−7</sup></td></tr>
+        <tr><td>FP16</td><td>1 / 5 / 10</td><td>65,504</td><td>2<sup>−14</sup>≈6.1×10<sup>−5</sup></td><td>2<sup>−24</sup>≈6.0×10<sup>−8</sup></td><td>2<sup>−10</sup>≈9.8×10<sup>−4</sup></td></tr>
+        <tr><td>BF16</td><td>1 / 8 / 7</td><td>≈3.4×10<sup>38</sup></td><td>2<sup>−126</sup></td><td>2<sup>−133</sup></td><td>2<sup>−7</sup>≈7.8×10<sup>−3</sup></td></tr>
+      </tbody>
+    </table>
+    <p>
+      FP16 的问题是<strong>范围窄</strong>（指数只有 5 位），BF16 的问题是<strong>精度粗</strong>（尾数只有 7 位）。三件套里 loss scaling 治的是范围，master weights 和 FP32 累加治的是精度——这就是标题里「BF16 能省掉前者、省不掉后者」的原因。
+    </p>
+
+    <h3>② 三件套</h3>
+    <pre><code># 每个 iteration（Micikevicius et al. 2018, Fig.1 的流程）
+W16  = fp16(W32)                    # FP32 master weights → 半精度副本用于前后向
+loss = forward(W16, x)              # 激活、权重以 FP16 存储
+loss_s = loss * S                   # (2) loss scaling：放大 S 倍再反传
+g16  = backward(loss_s)             #     链式法则使所有梯度同样放大 S 倍
+g32  = fp32(g16) / S                # 反缩放（在 FP32 里做）
+if not all_finite(g32): skip step   # 溢出检测（动态 S 时必需）
+W32  = optimizer_step(W32, g32)     # (1) 更新在 FP32 master 上做
+
+# (3) 矩阵乘 / 点积：FP16 输入相乘，部分和累加到 FP32，写回内存前再转 FP16
+#     规约类操作（BN 统计、softmax 的求和、LayerNorm / RMSNorm 的均方）用 FP32 计算
+#     逐元素操作受带宽限制，FP16 / FP32 计算差别不大</code></pre>
+
+    <h3>③ 为什么需要 FP32 master weights：「加不上去」</h3>
+    <p>
+      两个独立的原因。第一，更新量 lr·g 可能小于 2<sup>−24</sup>，在 FP16 里直接成 0；论文 Mandarin 语音模型里约 5% 的权重梯度指数小于 −24。第二个更隐蔽：即便更新量本身可表示，<strong>加法要把小数对齐到大数的指数</strong>，FP16 只有 10 位尾数，当权重与更新的比值 ≥ 2048 时，更新的隐含位要右移 11 位以上，可能被舍入成 0（&gt; 2048 时移 12 位以上则必然丢失）。权重 ~1、学习率 ~1e-4 时这几乎是常态。
+    </p>
+    <p>
+      论文的对照：Mandarin 语音模型（~800 小时数据、20 epoch），FP16 前后向 + 更新 FP32 master 可以对齐 FP32；直接更新 FP16 权重则<strong>相对精度损失 80%</strong>。master 副本让权重的显存多 50%，但训练显存主要是激活，激活也是 FP16，总显存大约减半。
+    </p>
+
+    <h3>④ 为什么需要 loss scaling：梯度落在 FP16 的下溢区</h3>
+    <p>
+      Multibox SSD 的激活梯度直方图里 67% 是 0，其余大量落在 FP16 表示不了的小数区间；作者实测小于 2<sup>−27</sup> 的值对训练无关紧要，但 [2<sup>−27</sup>, 2<sup>−24</sup>) 区间必须保住。而 FP16 能表示的范围上端绝大部分没被用到。放大 loss 等价于把整个梯度直方图右移 log<sub>2</sub>S 个 binade：
+    </p>
+    <table>
+      <thead><tr><th>模型（原文）</th><th>不做 loss scaling</th><th>做 loss scaling</th><th>FP32 baseline</th></tr></thead>
+      <tbody>
+        <tr><td>Multibox SSD（mAP）</td><td>发散</td><td>77.1%（S=8）</td><td>76.9%</td></tr>
+        <tr><td>Faster R-CNN（mAP）</td><td>68.6%</td><td>69.7%</td><td>69.1%</td></tr>
+        <tr><td>bigLSTM 1B Word（perplexity）</td><td>约 300K iter 后发散</td><td>S=128 对齐 baseline</td><td>—</td></tr>
+        <tr><td>ImageNet CNN（AlexNet → ResNet50，top-1）</td><td colspan="2">不需要 loss scaling；例如 ResNet50 76.04% vs 75.92%</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <p>
+      S 的选择：原文实验用 8 到 32K 的常数（不少网络不需要）；有梯度统计时选 S 使 S·max|g| &lt; 65,504。S 大没有坏处，<strong>只要不溢出</strong>——一旦出现 inf / NaN 并被更新进权重，损坏不可逆。原文结尾已经给出了动态方案的雏形：检测溢出就跳过本步并减小 S，否则逐步增大。这就是后来框架里的 dynamic loss scaler（如 PyTorch <code>GradScaler</code>：默认初始 2<sup>16</sup>，溢出时 ×0.5 并跳过，连续 2000 步无溢出 ×2）。
+    </p>
+
+    <h3>⑤ 为什么需要 FP32 累加</h3>
+    <p>
+      一个长度 n 的点积，部分和越来越大，后加进来的小项会遇到和 ③ 一样的对齐问题。FP16 累加的误差随 n 增长，最坏情况下部分和停在某个值再也加不动（见下面 box 实验）。Tensor Core 从 Volta 开始就是 FP16 乘、FP32 加；FP8 GEMM 的累加精度问题后来在 DeepSeek-V3 里又被重新提出（Hopper 上 FP8 Tensor Core 的累加位宽有限，需要定期提升到 CUDA core 的 FP32 寄存器），是同一个问题在更低位宽上的翻版。
+    </p>
+
+    <h3>⑥ BF16：用尾数换指数</h3>
+    <p>
+      BF16 就是 FP32 截掉低 16 位：指数 8 位与 FP32 相同，所以梯度几乎不会下溢，<strong>不需要 loss scaling</strong>，与 FP32 互转也只是截位 / 舍入。Kalamkar 等人在 CNN、语音、语言模型、GAN、推荐系统上验证 BF16 训练（激活和权重只以 16 位存在内存，点积 FP32 累加，例如 ResNet-50 ImageNet top-1 75.62%）无需调超参就能对齐 FP32。他们同时强调的仍然是：权重主副本与累加保持 FP32，FP32 → BF16 用就近偶数舍入（RNE）。BF16 尾数比 FP16 还少 3 位，「更新加不上去」只会更严重，所以 master weights 一个都不能少。
+    </p>
+
+    <h3>⑦ box 小实验（numpy，本文实跑）</h3>
+    <pre><code># 1) 合成梯度：|g| 对数正态，中位数 2^-22，log 标准差 3（10^6 个）
+#    转 FP16 后变成 0 的比例：
+scale 1      → 24.38%      scale 8    → 8.27%
+scale 128    →  1.04%      scale 1024 → 0.13%
+scale 32768  →  0.00%      （全程无 inf）
+BF16（scale 1）→ 0%
+
+# 2) w = 1.0，每步 +1e-4，共 10,000 步（期望 2.0）
+FP16 直接更新 → 1.0      # 每一步都被舍入掉
+BF16 直接更新 → 1.0
+FP32          → 2.0001657
+FP32 master → 转 FP16 副本 = 2.0
+
+# 3) 长度 4096 的 FP16 向量点积
+FP16 累加 → -47.875     FP32 累加 → -47.55667     float64 参考 → -47.55664
+#    FP16 逐个累加 100,000 个 0.01（期望 1000）→ 32.0（部分和到 32 后 0.01 再也加不上）
+
+# 4) 动态 loss scale 模拟：初始 2^16，max|g| 对数正态（中位数 2^-6）
+#    溢出 → S/2 并跳过；连续 2000 步无溢出 → S×2；20,000 步
+跳过 6 步（0.03%），S 在 2^16 ~ 2^18 之间振荡</code></pre>
+    <p>
+      实验 2 是最值得记住的：<strong>BF16 不需要 loss scaling，但纯 BF16 权重直接更新并不比 FP16 好，「加不上去」的比值阈值还更低（256 vs 2048）</strong>。很多「全 BF16 训练（连优化器状态和权重都 BF16）」的方案要额外引入 Kahan summation 或 stochastic rounding 才能稳定，原因就在这里。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>默认配置</strong>：BF16 autocast 前后向，FP32 master weights + FP32 Adam 的 m / v（参见 <a href="daily-2026-09-08-algo-adam.html">Adam</a> 一文的显存账：每参数 2 字节 BF16 权重 + 4 字节 master + 8 字节 m/v + 梯度）。不必开 loss scaling。</li>
+      <li><strong>必须用 FP16 时</strong>（老卡、某些推理一致性需求）：开动态 loss scaler，记录跳步率和 scale 曲线；跳步率突然升高通常是 loss spike 或 lr 过大的早期信号。</li>
+      <li><strong>哪些算子留在 FP32</strong>：softmax 的求和与 log-sum-exp、norm 层的统计量（<a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a> 的均方）、loss 计算、attention 的在线 softmax 统计（<a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> 里的 m、l 就是 FP32）。</li>
+      <li><strong>RL 训推一致性</strong>：rollout 引擎（BF16 / FP8 推理）与训练端（BF16 autocast）的舍入路径不同，logprob 差异会进 importance ratio。可以做的是：对齐 lm_head 与 logits 的精度（常见做法是 logits 用 FP32）、固定 GEMM 累加精度、监控 mismatch KL（见 <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a>）。</li>
+      <li><strong>往 FP8 / FP4 走</strong>：三件套的对应物分别是——per-tensor / per-block scale（治范围）、高精度 master 与优化器状态（治更新）、周期性提升累加精度（治求和）。读 <a href="daily-2026-10-02-dsv41-nvfp4-gb300.html">NVFP4</a> 之类的文章时，可以按这三问逐条对照。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. loss scaling 为什么对优化结果「无副作用」？在什么情况下它会改变训练结果？</summary>
+      <p>反传是线性的：放大 loss S 倍，所有梯度精确放大 S 倍（只要 S 是 2 的幂，放大和缩回在浮点里是精确的，只改指数）。在 FP32 里除以 S 后，梯度与无缩放时相同，只是原本会下溢的值被保住了。会改变结果的情况：（1）溢出产生 inf / NaN 而没被检测到（不跳步），权重被破坏；（2）S 不是 2 的幂，乘除各引入一次舍入；（3）梯度裁剪 / 梯度范数统计在反缩放之前做，阈值被放大 S 倍。所以框架都要求先 unscale 再 clip。</p>
+    </details>
+    <details>
+      <summary>2. 用 Adam 时，有人认为「Adam 对梯度尺度不敏感，所以不需要 master weights」。这个说法错在哪？</summary>
+      <p>Adam 的步长约为 lr（被 √v 归一化），与梯度尺度无关——这解决的是「梯度太小」，但不解决「步长相对权重太小」。lr=1e-4、权重 ~1 时，比值 1e4 远超 FP16 的 2048、BF16 的 256 阈值（7 位尾数对应 2<sup>8</sup>），更新照样被舍入成 0（见 box 实验 2）。另外 m、v 本身也需要高精度：v 是梯度平方的滑动平均，量级可能极小，ε 的相对作用也依赖精度。</p>
+    </details>
+    <details>
+      <summary>3. 动态 loss scaler 每 2000 步尝试把 S 翻倍、溢出就减半。为什么是「增慢减快」？若改成每 10 步翻倍会怎样？</summary>
+      <p>溢出的代价是跳过一步（浪费一次计算并引入噪声），而 S 偏小的代价只是少数极小梯度下溢，影响通常很小。增慢减快让 S 大部分时间停在「刚好不溢出」的下方，跳步率很低（box 模拟约 0.03%）。每 10 步翻倍会让 S 频繁撞上溢出上限，跳步率显著上升，有效 batch 数减少，且在 loss spike 附近可能连续跳步、训练停滞。</p>
+    </details>
+    <details>
+      <summary>4. BF16 的 ε 约 7.8×10<sup>−3</sup>。从这个角度解释为什么 LLM 的 logits / softmax 通常要在 FP32 里算，以及它和 RL 中 importance ratio 的关系。</summary>
+      <p>logits 的量级可能到几十，BF16 下相邻可表示值的间隔约为 |x|·2<sup>−7</sup> 量级，logit 落在 [16, 32) 时间隔是 0.125，舍入误差最多 0.0625；softmax 对 logit 差是指数敏感的，这对应概率最多约 6% 的相对误差。RL 的 importance ratio π<sub>θ</sub>/π<sub>old</sub> = exp(logp − logp<sub>old</sub>)，若训练端与推理端在 BF16 下各自舍入，即使参数完全相同，ratio 也会偏离 1，被 PPO clip 或 mask 误伤。因此 lm_head 输出用 FP32、两端统一 logits 精度，是降低 mismatch 的直接手段。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）LoRA + 量化基座（<a href="daily-2026-10-21-algo-lora.html">QLoRA</a>）里，基座权重是 4 bit、adapter 是 BF16。用本文的三个问题分析：哪一部分最可能出数值问题？</summary>
+      <p>（1）范围：NF4 基座靠 block-wise scale 解决，反量化成 BF16 参与计算，梯度只流向 adapter，下溢风险与普通 BF16 相同；（2）更新：adapter 参数从 B=0 起步、量级很小，BF16 下「加不上去」反而不严重（相对小权重的比值不大），但 A 的初值与 lr 比值仍需检查，常见做法是 adapter 与优化器状态保持 FP32；（3）累加：反量化后的 GEMM 若在 BF16 累加，长 K 维度误差累积；合并 adapter 进基座再量化时会引入一次额外舍入（LoRA 文中 box 实验测过 FP16 合并误差）。值得讨论的是：合并后推理与不合并训练之间的差异，在 RL 中是否会成为新的 mismatch 来源。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">arXiv:1710.03740 · Mixed Precision Training（Micikevicius et al.，NVIDIA / Baidu，ICLR 2018）</a></li>
+      <li><a href="https://arxiv.org/abs/1905.12322" target="_blank" rel="noopener">arXiv:1905.12322 · A Study of BFLOAT16 for Deep Learning Training（Kalamkar et al.）</a></li>
+      <li><a href="https://docs.pytorch.org/docs/stable/amp.html" target="_blank" rel="noopener">PyTorch AMP 文档（autocast / GradScaler）</a> · <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437 · DeepSeek-V3 技术报告（FP8 训练与累加精度）</a></li>
+      <li>站内：
+        <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a> ·
+        <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-10-21-algo-lora.html">LoRA</a> ·
+        <a href="daily-2026-10-02-dsv41-nvfp4-gb300.html">DeepSeek V4.1 × NVFP4</a> ·
+        <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

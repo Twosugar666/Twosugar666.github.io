@@ -93,6 +93,27 @@
           <button class="chip" data-filter="pc">配件</button>
         </div>
         <ul class="post-list">
+          <li data-cat="infra">
+            <a href="posts/daily-2026-10-22-moe-expert-skipping.html">一线追踪｜Don't Skip the Baseline：MoE 动态跳专家在同等实测算力下打不过「静态把 k 调小」——NAEE / DiEP / MoDES / Ada-K 最多领先 2.6 个点，校准出的 K<sub>eff</sub> 到测试时能偏 6 倍；k<sub>text</sub>=6、k<sub>vision</sub>=1 砍掉 85% 专家只掉 2%</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-22</span>
+            </span>
+          </li>
+          <li data-cat="harness agent infra">
+            <a href="posts/daily-2026-10-22-harness-cache-engineering.html">学习笔记｜Cache Engineering for Agents：不改上下文、直接改 KV——drop / repos 让 Agent 丢旧工具输出不必重 prefill；AKV 用带 drop 节点的 radix tree 与 segment-batch attention 做正确复用，成本降 27.7%、P95 延迟快 1.51×</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-22</span>
+            </span>
+          </li>
+          <li data-cat="algo infra">
+            <a href="posts/daily-2026-10-22-algo-mixed-precision.html">学习笔记｜混合精度训练：FP32 master weights、loss scaling 与 FP32 累加三件套——FP16 梯度为什么下溢、更新为什么「加不上去」，动态 loss scale 怎么自适应，BF16 为什么能省掉 loss scaling 却省不掉 master weights</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-22</span>
+            </span>
+          </li>
           <li data-cat="agent rl">
             <a href="posts/daily-2026-10-21-arctic-swe.html">一线追踪｜Arctic-SWE：异步 Agent RL 的强基线到底缺什么——拿 160 题过拟合当压力测试，gated reward + raw token 校验 + FP32 递归状态 + 权重刷新后重算缓存 + 按负载派发，Qwen3.5-4B 只用原始 R2E-Gym 从 47.4% 训到 62.0% SWE-bench Verified</a>
             <span class="post-side">

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Don't Skip the Baseline：MoE 动态跳专家在同等实测算力下打不过「静态把 k 调小」——Qwen3 / Gemma4 / Qwen3-VL 上 NAEE、DiEP、MoDES、Ada-K 最多领先 2.6 个点，校准出来的 K<sub>eff</sub> 到测试时能偏 6 倍 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Don't Skip the Baseline：MoE 动态跳专家在同等实测算力下打不过「静态把 k 调小」——Qwen3 / Gemma4 / Qwen3-VL 上 NAEE、DiEP、MoDES、Ada-K 最多领先 2.6 个点，校准出来的 K<sub>eff</sub> 到测试时能偏 6 倍</h1>
+    <p class="post-meta">2026-10-22 · 收藏夹：Infra · 一线追踪<br />
+      来源：Jakob Steimle、Thomas Elsken、Daniel Ehrhardt、Lukas Rinder、Daniel Cremers、Xi Wang（TUM / Tensordyne / ETH Zurich / Ulm）· <em>Don't Skip the Baseline: A Controlled Comparison of Dynamic Expert Skipping in MoEs</em>（<a href="https://arxiv.org/abs/2610.28369" target="_blank" rel="noopener">arXiv:2610.28369</a>，2026-10-20 提交）。
+      文中数字均为论文自报（单卡 A100 80GB、lm-eval / LMMS-Eval / vLLM + GuideLLM），作者称会开源全部重实现代码，本文写作时尚未看到仓库。
+      交叉：
+      <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a>、
+      <a href="daily-2026-10-16-spectral-moe.html">Spectral-MoE</a>、
+      <a href="daily-2026-09-01-kv-cache.html">KV Cache</a>、
+      <a href="daily-2026-10-22-harness-cache-engineering.html">今日 Harness：Cache Engineering</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      主流 MoE（Qwen3、DeepSeek、Gemma4）都是每 token 固定激活 k=8 个专家，总专家 128~512。这个 k 是训练时定的，推理时能不能再省？过去两年出了一串「dynamic expert skipping」方法：按路由分数的累计质量截断（NAEE）、加专家冗余度（DiEP）、加层重要性和模态阈值（MoDES）、用 PPO 训一个预测 k 的 allocator（Ada-K）。它们各自报告「砍掉 50%~80% 专家、质量几乎不掉」，但校准数据、操作点、评测集各不相同，彼此没法比。
+    </p>
+    <p>
+      这篇论文做的事情很朴素：把四种方法放到同一把尺子上——<strong>测试时实测的平均激活专家数 K<sub>eff</sub></strong>——然后和一个谁都想得到、但很少被认真当成对照组的 baseline 比：<strong>所有层、所有 token 统一把 top-k 的 k 调小</strong>。结论标题已经说了：这个 baseline 很难被稳定打败。对做推理系统的人来说，这是一篇「先别上复杂方案」的证据型文章，也顺带提醒了 MoE 推理加速的天花板在哪。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 四种方法放进同一张分类表</h3>
+    <table>
+      <thead><tr><th>方法</th><th>额外信号</th><th>决策规则</th><th>可调参数</th><th>单个操作点校准耗时（A100，自报）</th></tr></thead>
+      <tbody>
+        <tr><td>softmax top-k（baseline）</td><td>只用 gate 权重</td><td>保留 top-k</td><td>k</td><td>0</td></tr>
+        <tr><td>per-modality top-k（作者提议）</td><td>gate 权重 + 模态</td><td>文本 / 视觉各一个 k</td><td>k<sub>text</sub>、k<sub>vision</sub></td><td>0</td></tr>
+        <tr><td>NAEE（Lu et al. 2024）</td><td>gate 累计质量</td><td>尾部专家与 top1 分数差超过校准阈值就跳</td><td>β 分位数</td><td>0.5 h</td></tr>
+        <tr><td>DiEP（Bai et al. 2025）</td><td>gate + 专家间 CKA 冗余</td><td>冗余缩放后的比值阈值</td><td>γ<sub>1</sub> 分位数</td><td>0.5 h</td></tr>
+        <tr><td>MoDES（Huang et al. 2026）</td><td>gate 概率 × 层重要性 α(l)</td><td>每模态阈值 τ<sub>v,t</sub>，允许整层 MoE 被跳</td><td>目标跳过率</td><td>~20 h</td></tr>
+        <tr><td>Ada-K（Yue et al. 2025）</td><td>hidden state（学习）</td><td>PPO 训的线性 allocator 直接预测 k</td><td>代价系数 λ</td><td>2.5 h</td></tr>
+      </tbody>
+    </table>
+    <p>
+      注意两个实验设计上的「去混杂」：一是 NAEE、DiEP 原文都把跳专家和<strong>静态剪枝</strong>（永久删掉部分专家）绑在一起报告，这里只评跳专家本身；二是 NAEE / DiEP 原代码只支持 Mixtral 这种 k=2 的粗粒度 MoE，作者扩展到 k=8；Ada-K 没开源，作者按论文用 PPO 重训（γ=0.99、clip 0.2、2 个 PPO epoch、λ ∈ {0.0003…0.08} 每个值单独训一个 allocator）。每个方法原本只有一两个操作点，作者扫参数画出完整的「质量—算力」前沿，并在附录里复现了原文报告的操作点（MoDES 复现误差 ≤ 0.6 分）。
+    </p>
+
+    <h3>② 尺子：实测 K<sub>eff</sub>，而不是校准时的 K<sub>eff</sub></h3>
+    <pre><code># K_eff = 所有 token、所有层上实际激活专家数的平均
+K_eff = (1 / (T·L)) · Σ_t Σ_l k_{t,l}
+
+# 静态 top-k：K_eff ≡ k（构造上精确）
+# 动态方法：阈值只在校准集上「达标」，换数据分布 K_eff 会漂
+#   calibrated K_eff  —— 方法论文通常报这个
+#   measured  K_eff   —— 本文用这个（GSM8K / HumanEval 连 decode 步也算进去）</code></pre>
+    <p>
+      为什么 K<sub>eff</sub> 是合理代理：大 batch 时专家 FFN 是 compute-bound，matmul FLOPs 与 K<sub>eff</sub> 线性；但它<strong>不</strong>计路由决策开销、负载不均、通信，所以真实成本只会比 K<sub>eff</sub> 暗示的更高——这一项偏差天然对动态方法有利，作者明确说他们的比较是「偏向动态方法的」。
+    </p>
+
+    <h3>③ 文本结果：最多 2.6 pp，而且出现在模型已经坏掉一半的区间</h3>
+    <ul>
+      <li>Qwen3-30B-A3B、Gemma4-26B-A4B（都是 k=8），评测 HellaSwag、ARC-C、5-shot GSM8K、HumanEval；校准集是 C4 en/zh + open-web-math + python 代码的混合（模拟真实部署时校准与评测不一致）。</li>
+      <li>NAEE 基本贴着 baseline 前沿走，偶有微小领先；Allocator 在 Qwen3 的 K<sub>eff</sub>≈1 附近有改进。<strong>相对插值 baseline 的最大优势约 2.6 pp</strong>，但那时模型已经丢了 50%~65% 的原始能力。</li>
+      <li>DiEP 和 MoDES 多数点<strong>低于</strong> baseline。MoDES 唯一独占的是 K<sub>eff</sub>&lt;1 区间（某些 token 整个 MoE 块被跳过），baseline 构造上到不了。</li>
+      <li>K<sub>eff</sub> ≤ 2.5 时，Gemma4-26B-A4B 上最好的策略平均还不如 dense 的 Gemma4-E4B（有效参数少 85%）——作者的说法是：砍到 K<sub>eff</sub>≈3 以下，不如直接换小模型。</li>
+      <li>多选题随 k 下降平滑跌向随机猜测；GSM8K 在模型相关的阈值（Qwen3 约 K<sub>eff</sub>≈2）以下<strong>断崖式</strong>崩，HumanEval 类似。平均分在低 K<sub>eff</sub> 区间是被生成任务主导的，安全操作点应由生成类 benchmark 决定。</li>
+      <li>用 benchmark 自己的 train 集做「最佳情况」校准，DiEP 和 Allocator 明显变好，但仍然没有稳定超过 baseline。</li>
+    </ul>
+
+    <h3>④ 多模态：模态感知是真信号，但静态版就够了</h3>
+    <p>
+      Qwen3-VL-30B-A3B，六个 benchmark（ChartQA、TextVQA、MME、DocVQA、InfoVQA、OCRBench），MoDES 和 NAEE 都按 MoDES 原文的 GQA 协议校准（给 MoDES 最有利的条件）。
+    </p>
+    <table>
+      <thead><tr><th>设置</th><th>平均相对质量下降（自报）</th><th>备注</th></tr></thead>
+      <tbody>
+        <tr><td>k<sub>text</sub>=8，k<sub>vision</sub>=2</td><td>&lt; 1.8%</td><td>静态、零校准</td></tr>
+        <tr><td>k<sub>text</sub>=8，k<sub>vision</sub>=1</td><td>≈ 4.1%</td><td>实测 K<sub>eff</sub> 1.08，激活专家减少约 85%</td></tr>
+        <tr><td>k<sub>text</sub>=8，k<sub>vision</sub>=0</td><td>19.1%</td><td>视觉 token 完全不过专家，仍保留 80%+ 质量</td></tr>
+        <tr><td>两模态统一 k=1（模态无关 baseline）</td><td>&gt; 30%</td><td>说明「分模态」本身是主要增益</td></tr>
+      </tbody>
+    </table>
+    <p>
+      MoDES 大幅领先 NAEE 和模态无关 baseline，但<strong>追不上 per-modality 静态 baseline</strong>；把 MoDES 的专家分配按模态拆开看，它几乎就是在「文本保持 k=8、视觉狠砍」——和静态 per-modality 的形状一样。唯一例外是 MME-Cognition 子任务，MoDES 稳定领先。
+    </p>
+
+    <h3>⑤ 校准出的 K<sub>eff</sub> 不可信：最多偏 6 倍以上</h3>
+    <table>
+      <thead><tr><th>MoDES 目标跳过率</th><th>校准 K<sub>eff</sub>（GQA）</th><th>实测 K<sub>eff</sub>（视觉 benchmark）</th><th>实测 K<sub>eff</sub>（纯文本 GSM8K）</th></tr></thead>
+      <tbody>
+        <tr><td>0.85</td><td>1.20</td><td>0.58</td><td>7.96</td></tr>
+        <tr><td>0.73</td><td>1.99</td><td>1.50</td><td>—</td></tr>
+        <tr><td>0.60</td><td>3.17</td><td>2.81</td><td>—</td></tr>
+      </tbody>
+    </table>
+    <p>
+      两个漂移来源：工作负载里图像 / 文本 token 的比例；评测数据的路由分数分布和校准集不同。最极端的是 VL 模型跑纯文本 prompt（现实中很常见——多模态模型经常被当通用模型用）：校准时说 K<sub>eff</sub>=1.2，实际 7.96，跳专家等于失效，省算力的承诺全部蒸发。per-modality 静态方案也会随负载漂，但<strong>有上界</strong>：纯文本时就是 k<sub>text</sub>=6，用比 MoDES 实际少 25% 的专家换 2.7 pp（68.8% vs 71.5%）。
+    </p>
+
+    <h3>⑥ 天花板：K<sub>eff</sub> 从 8 砍到 1，端到端只快 1.2~1.4 倍</h3>
+    <table>
+      <thead><tr><th>场景（Qwen3-30B-A3B，vLLM，单卡 A100）</th><th>K<sub>eff</sub> 8 → 1 的变化（自报）</th></tr></thead>
+      <tbody>
+        <tr><td>同步 bs=1（带宽瓶颈）</td><td>TTFT / ITL 各降约 18%；输出吞吐 111 → 135 tok/s（1.22×）</td></tr>
+        <tr><td>吞吐 bs=256（算力瓶颈）</td><td>TTFT 降约 30%、ITL 降约 25%；输出吞吐 ~1.9k → ~2.65k tok/s（1.39×）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      这是<strong>静态</strong>把 k 改小测出来的，等于任何跳专家方法在该 K<sub>eff</sub> 下能拿到的速度上界（没有路由决策开销、没有参差不齐的 per-token 分配）。专家计算降 8 倍，端到端只有 1.2~1.4 倍，因为 attention、KV cache 读写、非专家权重都不受影响——这和 <a href="daily-2026-09-01-kv-cache.html">KV Cache</a> 一文里 decode 被 KV 读主导的账是一致的。几个 pp 的方法差异，在这个速度天花板下更不值钱。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>默认操作点</strong>：k=8 的模型，纯文本先试 k=6（作者称「可测的加速、轻微质量损失」）；多模态试 k<sub>text</sub>=6、k<sub>vision</sub>=1~2。作者在完全没参与选点的 MVBench（视频）上验证：k<sub>vision</sub>=1、k<sub>text</sub>=6 得 69.95 vs 全模型 71.40（相对 −2.0%，实测 K<sub>eff</sub> 1.19）；GLM-4.6V（带 shared expert）上平均 −4.2%，主要掉在 MME-Cognition。</li>
+      <li><strong>vLLM / SGLang 落地</strong>：静态 k 是一个 config 改动，不破坏 per-token 计算均匀性，EP 下的负载均衡和延迟保证都保住。动态方案要改 kernel 处理 ragged 分配，还要每次前向多一个决策。</li>
+      <li><strong>守住生成类 benchmark</strong>：调 k 时用 GSM8K / HumanEval 这类会断崖的任务确定下限，别看多选题平均分。</li>
+      <li><strong>审稿 / 自评自己的方法</strong>：对照组必须是「同等<em>实测</em> K<sub>eff</sub> 的静态 k」，并且对照组要用上你的方法利用的结构信号（比如模态）。只报校准 K<sub>eff</sub> 的结果直接打折。</li>
+      <li><strong>想再快</strong>：K<sub>eff</sub>≈3 以下与其跳专家，不如换小模型或在 attention / KV 侧下手（量化、MLA、<a href="daily-2026-10-19-kv-tier-pcp.html">KV 分层</a>）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说「按 K<sub>eff</sub> 对齐比较」本身就偏向动态方法？</summary>
+      <p>K<sub>eff</sub> 只数专家激活次数。动态方法另外付出：每层每 token 的跳过决策计算（Ada-K 还要跑一个 allocator）；ragged 的 per-token 专家数导致 grouped GEMM 填充不满、EP 下各卡负载不均、all-to-all 消息大小不可预测；这些都不进 K<sub>eff</sub>。静态 top-k 在同 K<sub>eff</sub> 下没有这些开销，所以同 K<sub>eff</sub> 打平其实意味着静态方案实际更快。</p>
+    </details>
+    <details>
+      <summary>2. Router 是用 top-8 训练的，直接改成 top-6 推理为什么损失不大，而降到 top-2 时 GSM8K 会崩？</summary>
+      <p>softmax 后的 gate 权重通常长尾：前几个专家拿走大部分质量，第 7、8 个专家的贡献（权重 × 输出）很小，去掉相当于对 FFN 输出做一个小扰动，残差流里能被吸收。降到 1~2 个时去掉的质量变大，且每层误差在几十层里累积；多选题只需比较几个候选的相对对数似然，误差下仍能保持排序，生成任务要自回归几百步、错一步后续全错（数学推理的链式依赖），所以呈断崖。可思考：是否该对去掉专家后的 gate 权重重新归一化？（这会改变输出尺度，是另一个需要对照实验的设计选择。）</p>
+    </details>
+    <details>
+      <summary>3. MoDES 在 VL 模型跑纯文本时 K<sub>eff</sub> 从 1.2 漂到 7.96，根因是什么？对线上服务意味着什么？</summary>
+      <p>阈值是在 GQA（图像 token 占大头）上校出来的，节省主要靠视觉 token；纯文本请求里没有视觉 token，而文本 token 的路由分数分布在阈值下几乎不触发跳过，于是回到全专家。线上影响：容量规划按校准 K<sub>eff</sub> 估算的吞吐会严重高估；流量构成（图文比）变化就能让集群算力需求翻数倍。静态 per-modality 的好处是算力上界可预测。</p>
+    </details>
+    <details>
+      <summary>4. 与 <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a> 一文联系：训练期的负载均衡损失 / bias 调整，会如何影响推理期跳专家的效果？</summary>
+      <p>负载均衡（aux loss 或 DeepSeek-V3 的 bias 法）推动 gate 分布更平、专家更「平等」，这会让 top-k 内部权重差距变小——尾部专家贡献不再可忽略，基于分数差/累计质量的跳过（NAEE 类）判据更难区分，静态砍 k 的损失也可能更大。反过来，如果模型训练时就用可变 k（论文背景提到的 MoD、动态 k 训练方法），推理期跳专家才与训练分布一致，这也是作者指出「训练期方案尚未被主流开源模型采用」的意义。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）Ada-K 用 PPO 训 allocator，奖励 = 质量 − λ·专家数。在这篇的结论下，RL 方法要在什么条件下才可能超过静态 baseline？</summary>
+      <p>至少需要：（1）奖励里的质量信号与最终 benchmark 对齐（next-token loss 对 VL 模型的视觉 token 根本没有监督信号，这也是作者没在 VL 上跑 Ada-K 的原因）；（2）把真实运行时成本（ragged 开销、通信）放进代价项，而不是只罚专家数；（3）allocator 的输入要包含静态 baseline 拿不到的信息（如 token 难度、上下文位置），否则它最多学到一个分模态 / 分层的常数策略——那就是静态 baseline。可以进一步讨论 per-layer 静态 k（无需校准分布，只需一次离线搜索）是否是更强的中间对照组。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.28369" target="_blank" rel="noopener">arXiv:2610.28369 · Don't Skip the Baseline（Steimle et al.，TUM / Tensordyne）</a></li>
+      <li>被比较方法：NAEE（Lu et al. 2024，<em>Not All Experts are Equal</em>）、DiEP（Bai et al. 2025）、MoDES（Huang et al. 2026）、Ada-K（Yue et al. 2025），引用信息见原文参考文献</li>
+      <li><a href="https://github.com/vllm-project/guidellm" target="_blank" rel="noopener">vllm-project/guidellm</a>（论文用于端到端测速）</li>
+      <li>站内：
+        <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a> ·
+        <a href="daily-2026-10-16-spectral-moe.html">Spectral-MoE</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV Cache</a> ·
+        <a href="daily-2026-10-19-kv-tier-pcp.html">远端 KV tier + PCP</a> ·
+        <a href="daily-2026-08-28-algo-ppo.html">PPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

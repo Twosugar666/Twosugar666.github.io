@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Cache Engineering for Agents：不改上下文、直接改 KV——drop / repos 两个缓存操作，让 Agent 丢旧工具输出不必重 prefill；AKV 用带 drop 节点的 radix tree 与 segment-batch attention 做正确复用，成本降 27.7%、P95 延迟快 1.51× · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Cache Engineering for Agents：不改上下文、直接改 KV——drop / repos 两个缓存操作，让 Agent 丢旧工具输出不必重 prefill；AKV 用带 drop 节点的 radix tree 与 segment-batch attention 做正确复用，成本降 27.7%、P95 延迟快 1.51×</h1>
+    <p class="post-meta">2026-10-22 · 收藏夹：Harness / Agent / Infra · 学习笔记<br />
+      来源：Tianyu Fu、Ruoxi Wang、Zihan Min、Zhongqi Ren、Zhihao Li、Tengxuan Liu、Shengxu Mu、Hanling Zhang、Yu Wang（清华大学 / 香港中文大学）· <em>Cache Engineering for Agents</em>（<a href="https://arxiv.org/abs/2610.28577" target="_blank" rel="noopener">arXiv:2610.28577</a>，2026-10-20 提交）；代码 <a href="https://github.com/thu-nics/AKV" target="_blank" rel="noopener">thu-nics/AKV</a>。
+      数字均为论文自报：成本按 Groq / MiniMax 官方 token 价折算，服务实验在 8×A800-80GB（4 prefill + 4 decode，TP=4，权重 BF16）上基于 SGLang。
+      交叉：
+      <a href="daily-2026-10-21-harness-reobserve.html">When the Harness Decides Success</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">上下文压缩（compaction）</a>、
+      <a href="daily-2026-09-01-kv-cache.html">KV Cache</a>、
+      <a href="daily-2026-10-13-algo-rope.html">RoPE</a>、
+      <a href="daily-2026-10-22-moe-expert-skipping.html">今日一线：MoE 跳专家</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 Agent（deep research、SWE）一跑就是上百轮，上下文里堆满工具输出。作者统计在他们的设置下 <strong>KV cache 读取占总 API 成本的 82.4%</strong>（自报）。harness 的常规对策是 context engineering：到阈值就 trim 或 summary。问题在于 prefix 一改，后面所有缓存失效，保留下来的后缀要重新 prefill；改得越早，重算越多。于是 harness 只敢「攒到阈值再一刀切」，只留最近几轮——这正是 <a href="daily-2026-10-21-harness-reobserve.html">昨天那篇</a> 测到的「截断破坏 prompt cache、账单 2.9~4.0×」与「信息不可再观测就掉点」的双重代价。
+    </p>
+    <p>
+      这篇的思路是换一层动手：<strong>文本轨迹一字不改，只改 attention 能看到的 KV</strong>。旧的工具输出从「之后的 attention」里拿掉，保留下来的 KV 原样复用，不用重 prefill。代价是：同样的 token 序列可以对应不同的缓存状态，传统的「前缀相同即可复用」失效，需要服务端重新设计。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 三个缓存操作</h3>
+    <pre><code># C：active cache（之后 attention 可见的 KV 集合），按逻辑 token 序排列
+append(x_{t+1}):  C ← [C ; C_{t+1}]            # 标准 decode/prefill；位置索引 +1
+drop(P):          C ← C \ {C_i : i ∈ P}         # 从之后的 attention 中排除；保留项及其位置编码不变
+                                                # 注意：drop 不重置下一个 token 的位置索引
+repos:            保留的 r 个 KV 的位置重排为 0..r-1，下一个 append 用 r
+                  K ← R(q) · R(p)^{-1} · K      # RoPE：把 key 从位置 p 转到 q；V 不变
+
+# 轨迹 = 操作序列 o_{1:m}，o_j ∈ {append(x), drop(P), repos}
+# 对固定模型，操作序列唯一决定缓存状态（而 token 序列不能）</code></pre>
+    <p>
+      repos 解决的是一个容易忽略的问题：drop 只减少了 KV 数量，位置索引仍随逻辑轨迹增长，几百轮后会撞上模型的位置上限，哪怕 active cache 很小。用 <a href="daily-2026-10-13-algo-rope.html">RoPE</a> 的旋转可组合性，把 key 直接旋到新位置即可，不需要重算 hidden state。
+    </p>
+
+    <h3>② 历史依赖：为什么前缀匹配不够</h3>
+    <table>
+      <thead><tr><th>轨迹</th><th>操作顺序</th><th>保留的 KV</th><th>B 的 KV</th><th>C 的 KV</th></tr></thead>
+      <tbody>
+        <tr><td>①</td><td>append A,B,C → drop A</td><td>B, C</td><td>看过 A</td><td>看过 A、B</td></tr>
+        <tr><td>②</td><td>append A,B → drop A → append C</td><td>B, C</td><td>看过 A</td><td>只看 B（但 B 里带着 A 的信息）</td></tr>
+        <tr><td>③</td><td>append B,C</td><td>B, C</td><td>无前缀</td><td>只看无前缀的 B</td></tr>
+      </tbody>
+    </table>
+    <p>
+      三条轨迹保留的 token 和位置都一样，但 C 的 KV 三者两两不同。也正因为「保留下来的 KV 是在看过被丢内容的情况下算出来的」，drop 并不等于信息完全丢失——这是它比文本 trim 精度更好的直觉来源之一（类似 StreamingLLM 观察到的现象）。
+    </p>
+
+    <h3>③ AKV：无状态接口、有状态服务</h3>
+    <pre><code>{ "model": "gpt-oss-120b",
+  "messages": [
+    {"role": "user",      "content": "Search ICLR"},   # append(m0)
+    {"role": "assistant", "content": "Searching"},     # append(m1)
+    {"role": "tool",      "content": "ICLR is..."}     # append(m2)
+  ],
+  "cache": {
+    "drop": {"1": [0], "2": [1]},   # 在 m1 之后 drop m0；在 m2 之后 drop m1
+    "reposition": [2]               # 在 m2 之后 repos；同一边界先 drop 后 repos
+  } }</code></pre>
+    <p>
+      客户端每次仍然发完整的 messages（逻辑 token 序列）加上操作历史，不需要知道服务端还驻留哪些 KV——和 OpenAI 兼容 API 一样无状态，服务端被驱逐后也能完整重建。内部三件事：
+    </p>
+    <table>
+      <thead><tr><th>挑战</th><th>AKV 的做法</th></tr></thead>
+      <tbody>
+        <tr><td>前缀相同不代表状态相同 → 普通 radix 匹配会错用</td><td><strong>扩展 radix tree</strong>：在 drop 触发点插入 drop 节点 Δ（记录被丢的逻辑索引）；repos 产生按位置区分的分支和 reposition 节点。匹配时同时比 token 与操作历史；位置索引不同就做 key rotation 复用</td></tr>
+        <tr><td>A 被一个请求 drop，另一个请求可能还要用</td><td><strong>drop-aware eviction</strong>：只有当前没有任何计算/恢复需要时才可驱逐；被驱逐后树节点留作占位，后代仍可匹配；优先驱逐已 drop 的缓存，其次才是已完成请求的缓存（后者更可能被下一轮复用）；每个位置版本独立驱逐</td></tr>
+        <tr><td>普通 causal prefill 无法重现 drop/repos 之后的状态；逐步重放要多次前向</td><td><strong>segment-batch attention</strong>：每层 query 在 drop / repos 触发点切段，每段只 attend 自己和更早段里仍 active 的 KV（被丢的 KV 对更早的段仍可见），需要不同位置编码的段用临时旋转出的 KV 版本；只有 attention 分段，FFN 整批一次过，避免重复读权重。一个 prefill pass 恢复全部</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ 策略：tool-response rolling drop</h3>
+    <p>
+      选什么 drop 的依据来自一张 attention 统计：越旧的 token 被关注越少；在相近的相对位置上，<strong>工具输出比 assistant 消息得到的 attention 更少</strong>。于是默认策略是：保留所有推理 / assistant 消息的 KV，只保留最近 K=12 个工具输出的 KV，更早的工具输出逐轮 drop；位置逼近模型阈值时 repos。
+    </p>
+    <p>
+      动机实验（GPT-OSS-120B，BrowseComp-Plus 前 100 题，每题 4 次、最多 100 轮，自报）：只留最近 12 轮工具输出的<strong>文本 trim</strong> 成本是 full-context 的 1.85×（每轮都改 prefix，每轮都重 prefill）；48K 阈值 summary 省约 7% 成本但掉 5 个点；KV drop 同时提精度、降成本。
+    </p>
+
+    <h3>⑤ 结果（自报）</h3>
+    <table>
+      <thead><tr><th>模型</th><th>方法</th><th>平均分（%）</th><th>平均每题成本（美分）</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="3">MiniMax-M2.7（230B/10B 激活）</td><td>Standard（96K 阈值 summary）</td><td>52.4</td><td>5.0</td></tr>
+        <tr><td>Text Engineering（48K 阈值 summary）</td><td>52.8</td><td>5.7</td></tr>
+        <tr><td>AKV（rolling drop K=12）</td><td>53.7</td><td>4.4</td></tr>
+        <tr><td rowspan="3">GPT-OSS-120B（5.1B 激活）</td><td>Standard</td><td>51.0</td><td>11.2</td></tr>
+        <tr><td>Text Engineering</td><td>48.3</td><td>10.2</td></tr>
+        <tr><td>AKV</td><td>53.1</td><td>7.3</td></tr>
+        <tr><td rowspan="3">MiroThinker-1.7-Mini（30B/3B 激活）</td><td>Standard（192K 阈值）</td><td>44.1</td><td>20.4</td></tr>
+        <tr><td>Text Engineering</td><td>37.1</td><td>18.1</td></tr>
+        <tr><td>AKV</td><td>45.8</td><td>14.8</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>平均覆盖 BCP、GAIA-Text（103 题）、SWE-Verified、xbench-DS 四个 benchmark。相对 Standard 成本平均降 27.7%、相对 Text Engineering 降 21.9%；分数平均高 1.3~2.1 / 0.9~8.7 个点。repos 也按 cache-hit 价计费，作者称这是故意高估。</li>
+      <li>不是所有格子都赢：例如 MiniMax 的 BCP 上 Text Engineering 62.3 高于 AKV 58.9；SWE-Verified 上 MiniMax 的 Standard 75.2 略高于 AKV 74.4。</li>
+      <li>精度来源：BCP 上三者在 48K 逻辑长度以下持平；48~96K 区间 Text Engineering 最差，96K+ Standard 最差——各自的 summary 阈值处出现断崖，rolling drop 是渐进的。</li>
+      <li>服务端（GPT-OSS-120B、SWE-Verified Top-80）：各自峰值吞吐点 AKV（并发 14）对 Standard（并发 12），平均 / P95 请求延迟快 1.36× / 1.51×，输入 / 输出吞吐 1.53× / 1.18×。并发 16 时 Standard 的 P95 延迟 229.90 s vs AKV 30.63 s——KV 压力迫使 Standard 不停重 prefill，能同时 decode 的请求变少。decode 加速主要来自 full-attention 时间下降。</li>
+      <li>消融（各 benchmark 前 100 题）：只 drop 工具输出、不 repos 时 BCP 55%，加 repos 到 62%（不 repos 会撞位置上限提前终止）；drop 推理 KV（单独或一起）在 BCP 和 SWE 上都更差。</li>
+      <li>让模型自己写缓存策略（RSI，MiniMax-M2.7 在 20 题上迭代，100 题 held-out 评估）：第 3、6 轮策略相对 Standard 成本降 15.6% / 17.8%，摘要报告比人工设计再省 7.1%。把缓存管理暴露成工具（Cache-As-Tool）：BCP 子集上 GPT-OSS-120B 61.0%（Standard 52.1%），MiniMax 64.0%（Standard 56.0%）但成本从 5.4 涨到 5.9 美分（跑了更多轮）。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>harness 侧先做的事</strong>：即便没有 AKV，也应把「旧工具输出」和「推理 / 决策」区别对待——消融显示推理 KV 不该丢。用文本层实现时，尽量把会被丢的大块工具输出放在不会被改动的位置之后，或者把丢弃批量化，减少 prefix 改动次数。</li>
+      <li><strong>阈值 summary 的断崖要监控</strong>：按逻辑长度分桶看成功率（本文图 7 的做法），能直接看到你的 compaction 阈值在哪里掉点。</li>
+      <li><strong>服务端前缀缓存的正确性</strong>：一旦允许任何「不重算的 KV 修改」（drop、位置重排、KV 压缩、跨请求拼接），缓存 key 必须包含操作历史，否则会静默复用错误状态——这类 bug 不报错，只会让输出分布悄悄变了。</li>
+      <li><strong>和 provider prompt cache 的关系</strong>：商用 API 目前不提供 drop / repos，这套方案需要自托管（SGLang 基础上的 AKV）。对使用闭源 API 的团队，可借鉴的是策略本身（rolling 地处理工具输出），在文本层以「追加式」的方式实现以保住缓存命中。</li>
+      <li><strong>训练侧注意</strong>：作者把「在 cache engineering 下训练 Agent」列为未来工作。若推理用 drop 而 RL 训练时用完整上下文，就是新的训推不一致来源（参见 <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a> 对缓存一致性的讨论）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. drop 之后为什么不能直接用「保留下来的 token 序列」做前缀匹配复用？给一个会出错的具体例子。</summary>
+      <p>见上表：请求 X 走轨迹 ①（C 看过 A），请求 Y 走轨迹 ③（从没有 A）。两者保留的都是 B、C，位置也可能相同。若服务端只按「保留 token + 位置」匹配，Y 会复用 X 的 C 的 KV，而这份 KV 编码了 A 的信息，Y 的输出分布就被别的请求的历史污染了——既是正确性问题，也是请求隔离（安全）问题。所以 AKV 把 drop 节点放进 radix tree。</p>
+    </details>
+    <details>
+      <summary>2. repos 用 K ← R(q)R(p)<sup>-1</sup>K 把 key 旋到新位置。为什么这对 RoPE 是「精确」的，而对加性绝对位置编码不行？</summary>
+      <p>RoPE 只作用在 q、k 上，且 R(p) 是正交旋转、满足 R(q)R(p)<sup>-1</sup> = R(q−p)。K 的缓存值 = R(p)·W<sub>k</sub>h，旋转后就是 R(q)·W<sub>k</sub>h，与在位置 q 上直接计算的 key 完全一致（h 不变）。但这只是 key 的位置被改正了，<strong>h 本身</strong>是在旧上下文、旧位置下算出来的；加性绝对位置编码把位置加在输入 embedding 上，会流经所有层进入 h 和 V，无法只改 key 补救。另外 ALiBi 类按距离加 bias 的方法本来就在 attention 时计算距离，处理方式又不同。</p>
+    </details>
+    <details>
+      <summary>3. segment-batch attention 里「被 drop 的 KV 对更早的段仍可见」——为什么必须这样？</summary>
+      <p>恢复的目标是重现原始轨迹下的缓存状态。在原始执行中，drop 之前生成的 token（更早的段）在计算时确实 attend 过那些 KV；如果恢复时对所有段都屏蔽被 drop 的 KV，重建出的早期 token 的 KV 与原始不同，后续段又以此为条件，误差逐段传递，状态就不再等价。因此 mask 是「按段、按 drop 时间点」的块状 mask，而不是全局 mask。</p>
+    </details>
+    <details>
+      <summary>4. Cache-As-Tool 在 MiniMax-M2.7 上分数从 56.0 到 64.0，但成本从 5.4 涨到 5.9 美分。这说明什么？如何评估这类「让 Agent 管自己上下文」的方案？</summary>
+      <p>说明缓存管理不只是省钱工具，也延长了 Agent 能有效工作的轮数：上下文不再被撑爆或被 summary 破坏后，Agent 选择继续探索，总 token 增加。评估时不能只看单题成本，要看「每个成功解决的任务的成本」与固定预算下的成功率曲线（类似本文图 9 的 pass rate vs GPU 小时）；同时要和 <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> 那类文本层自主遗忘对照，区分「主动管理」本身的收益和「KV 层不重算」的收益。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）与 <a href="daily-2026-10-21-harness-reobserve.html">昨天的再观测文</a> 联系：rolling drop 对「不可再观测」的事实（例如一次性环境反馈）风险更高还是更低？如何设计一个结合两者的策略？</summary>
+      <p>风险更高：drop 的工具输出在文本中仍在，但模型之后看不到；如果事实可以重新调用工具拿到（可恢复），丢掉成本很低；不可恢复的事实一旦 drop，只能依赖保留 KV 里「间接带着」的信息（不可靠）。结合方案：harness 对工具输出打「可恢复性」标签（文件读取、搜索可重查；一次性观测、副作用操作结果不可重查），rolling drop 只作用于可恢复类；不可恢复类先让模型写成笔记（assistant 消息，KV 不丢）再 drop 原文。这恰好也和消融结论一致：推理 / 笔记类 KV 不要丢。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.28577" target="_blank" rel="noopener">arXiv:2610.28577 · Cache Engineering for Agents（Fu et al.，清华 / CUHK）</a> · <a href="https://github.com/thu-nics/AKV" target="_blank" rel="noopener">thu-nics/AKV</a></li>
+      <li><a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">arXiv:2312.07104 · SGLang / RadixAttention（Zheng et al.）</a> · <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">arXiv:2309.17453 · StreamingLLM（Xiao et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-21-harness-reobserve.html">When the Harness Decides Success</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">上下文压缩</a> ·
+        <a href="daily-2026-10-12-harness-agent-forgetting.html">Agent-Controlled Forgetting</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV Cache</a> ·
+        <a href="daily-2026-10-13-algo-rope.html">RoPE</a> ·
+        <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>
