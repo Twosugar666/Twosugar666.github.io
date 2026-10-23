@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Harness Scaling：把「怎么执行」当成 Agentic RL 的新扩展轴——5 组件 × 3 变体的 243 格 harness 空间，strength-2 正交表只挑 18 个训练，同一任务配邻近 harness；Qwen3-4B GRPO 平均 29.81→39.04，迁移到 Claude Code 胜过直接在 OpenClaw 上训 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Harness Scaling：把「怎么执行」当成 Agentic RL 的新扩展轴——5 组件 × 3 变体的 243 格 harness 空间，strength-2 正交表只挑 18 个训练，同一任务配邻近 harness；Qwen3-4B GRPO 平均 29.81→39.04，迁移到 Claude Code 胜过直接在 OpenClaw 上训</h1>
+    <p class="post-meta">2026-10-23 · 收藏夹：Harness / Agent / RL · 学习笔记<br />
+      来源：Fei Bai*、Huatong Song*、Chuan Hao、Ran Tao、Jian Yang、Bryan Dai、Wayne Xin Zhao†、Ji-Rong Wen（中国人民大学高瓴人工智能学院 / IQuest Research / 北京航空航天大学）· <em>Harness Scaling for Generalizable Agentic Reinforcement Learning</em>（<a href="https://arxiv.org/abs/2610.29458" target="_blank" rel="noopener">arXiv:2610.29458</a>，2026-10-21 提交）。
+      数字均为论文自报：Pass@1 为 3 次独立评测均值，In-Space 再对 18 个 held-out 配置取平均；rubric 类评测与行为分析用 GPT-5.4 作 judge。「box 小验证」一节为本文在 box 上用 Python 对论文附录给出的配置表实算。
+      交叉：
+      <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a>、
+      <a href="daily-2026-09-21-harness-design-study.html">Coding Agent Harness 组件消融</a>、
+      <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a>、
+      <a href="daily-2026-10-21-harness-reobserve.html">When the Harness Decides Success</a>、
+      <a href="daily-2026-10-23-flashnext-rl.html">今日一线：FlashNext-RL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      本站 harness 系列反复看到同一个现象：<strong>同一个模型换个 harness，分数能差一大截</strong>——<a href="daily-2026-09-21-harness-design-study.html">组件消融</a>里规划 / 动作空间 / 上下文管理各自能拉开差距，<a href="daily-2026-10-21-harness-reobserve.html">再观测那篇</a>里上下文策略能决定成败。于是「直接在 harness 里做 RL」成了主流（<a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning</a>、OpenClaw-RL 等）。但这些方法几乎都只在<strong>一个固定 harness</strong> 里训：策略学会的可能是这个 harness 的工具命名、提示措辞、观测格式，而不是「在任意执行环境里把事做成」。
+    </p>
+    <p>
+      这篇的主张是：task scaling 扩展「解什么」，environment scaling 扩展「在哪儿解」，还缺一条 <strong>harness scaling——同一任务、同一环境，换「怎么执行」</strong>。难点不在想法，而在组织：harness 变体组合爆炸，全训既贵又冗余；随便抽一些又没有覆盖保证。作者借用了实验设计里的<strong>正交表（orthogonal array）</strong>来回答「挑哪些」，再用 Hamming 距离回答「同一任务配哪些」。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 把 harness 因子化：5 个组件 × 3 个实现</h3>
+    <p>
+      harness 被拆成 system prompt（S）、tool interface（T）、observation（O）、context management（C）、workflow（W）五个组件，每个组件从 base 出发由 Opus-4.7 生成变体，约束是「只改目标组件，任务语义、环境行为和其他组件功能不变」。完整空间 H = S×T×O×C×W = 3<sup>5</sup> = 243 个配置，构成 Hamming 图 H(5,3)：相邻配置恰好差一个组件。
+    </p>
+    <table>
+      <thead><tr><th>组件</th><th>Base（0）</th><th>Variant I（1）</th><th>Variant II（2）</th></tr></thead>
+      <tbody>
+        <tr><td>S 系统提示</td><td>直接给出角色与执行规则</td><td>同样要求嵌入一个模拟产品语境，附平台与 UI 描述</td><td>用叙事 / 角色扮演方式重述要求</td></tr>
+        <tr><td>T 工具接口</td><td>原始工具名与 schema（如 execute_bash、file_editor），无干扰项</td><td>语义相关的别名 + 若干无功能干扰工具</td><td>不透明标识符 + 干扰工具，基本去掉工具名里的词汇线索</td></tr>
+        <tr><td>O 观测</td><td>原始工具输出</td><td>附加模拟基础设施元数据（pod 名、namespace、调度信息）</td><td>附加 XML 风格结构化元数据（工具名、exit code、PID、耗时、执行节点）</td></tr>
+        <tr><td>C 上下文管理</td><td>完整历史保留</td><td>LLM 周期性 compaction 总结早期历史，保留最近 5 轮</td><td>更激进：只留最近 3 轮，总结外置到辅助文件</td></tr>
+        <tr><td>W 工作流</td><td>自由执行</td><td>plan-first，执行前必须显式规划</td><td>规划 + 每 3 步一次进度核查</td></tr>
+      </tbody>
+    </table>
+    <p>
+      base 工具族有五类：文件读写编辑、Bash、代码解释器、搜索、网页抓取。注意 T 的变体 II 很「狠」：工具名不再泄露功能，策略必须读 schema 与反馈来推断用途——这正是固定 harness 训练最容易过拟合的地方。
+    </p>
+
+    <h3>② 挑 18 个：strength-2 正交表</h3>
+    <pre><code># 把 harness 空间看作因子设计：组件 = 因子，实现 = 水平
+# 目标：保住低阶结构
+#   一阶（component balance）：每个组件的每个实现出现次数相同
+#   二阶（pairwise balance）：任意两组件 i≠j 的任意实现对 (ℓ, ℓ') 出现次数相同
+#         N_ij(ℓ, ℓ') = λ
+# M 个组件、每个 L 个实现：
+#   N = λ · L²                  （任意两组件的 L² 种组合划分了全部选中配置）
+#   N ≥ 1 + M(L − 1)            （Rao bound）
+# 本文 M=5, L=3：N = 9λ 且 N ≥ 11 → 最小 N = 18（λ = 2）
+#   每个实现出现 λL = 6 次，每个跨组件实现对恰好出现 2 次</code></pre>
+    <p>
+      18 / 243 ≈ 7.4%。一阶与二阶投影完全平衡，但大量三阶以上的完整组合训练时没见过——这正好留出「组合泛化」的评测空间：从 H \ H<sub>tr</sub> 里固定选 18 个 held-out 配置（每个实现在其中也恰好出现 6 次，配置间两两 Hamming 距离 2–5），所有 benchmark / 模型 / 算法共用。
+    </p>
+
+    <h3>③ 同一任务配谁：locality-aware 分配</h3>
+    <pre><code>for task x:
+    h_x ~ Uniform(H_tr)                       # anchor：全局覆盖
+    neighbors = argsort_{h ∈ H_tr \ {h_x}} d_H(h_x, h)[:K-1]   # 最近的 K-1 个：局部变化
+    H_x = {h_x} ∪ neighbors
+# K 个 (x, h) 实例在 K 个连续训练 step 中使用
+# 优化目标不变：标准 clipped objective，token 级 mean
+L(θ) = (1/N_B) Σ_{(x,h,τ)∈B} Σ_t M_t · min(ρ_t A_t, clip(ρ_t, 1−ε, 1+ε) A_t)
+# ρ_t 的条件里带着 h：π_θ(τ_t | x, h, τ_&lt;t) / π_old(τ_t | x, h, τ_&lt;t)</code></pre>
+    <p>
+      设计意图是「全局 + 局部」：随机 anchor 让不同任务铺满整个 H<sub>tr</sub>；最近邻让同一任务在<strong>结构上相近但不同</strong>的配置下各跑一次，相当于对 harness 做受控扰动，逼策略把「任务解法」和「harness 表面特征」分开。Harness Scaling 只改变 rollout 用哪些 (task, harness) 实例，RL 算法本身（PPO / GRPO）不动。
+    </p>
+    <p>
+      一个容易被忽略的训练细节（附录 C.1）：C 组件的 compaction 会把一条 rollout 切成多个训练段。所有段共享 rollout 级奖励，GRPO 的组归一化仍只在 8 条原始 rollout 的奖励上算，段继承父 rollout 的组身份和 advantage、不额外进入均值方差；loss 用全 batch 有效 token 的 mean，所以切成几段都不会给某条 rollout 额外的样本级权重。这和 <a href="daily-2026-09-07-harness-compaction.html">compaction</a> 文里讨论的「压缩后怎么训」是同一问题的一个干净解法。
+    </p>
+
+    <h3>④ 实验设置</h3>
+    <table>
+      <thead><tr><th>项</th><th>设置（论文自报）</th></tr></thead>
+      <tbody>
+        <tr><td>模型</td><td>Qwen3-4B-Instruct、Qwen3-30B-A3B-Instruct</td></tr>
+        <tr><td>训练数据</td><td>ClawGym-Task，13.5K 个 workspace 型通用 Agent 任务</td></tr>
+        <tr><td>算法</td><td>GRPO：每步 16 任务 × 8 rollout；PPO：每步 128 任务 × 1 rollout（GAE γ=λ=1，critic 屏蔽 observation token、value head 零初始化）</td></tr>
+        <tr><td>超参</td><td>K=2，300 步；actor lr 1e-6；非对称 clip 0.2 / 0.28；无 KL、无 entropy 正则；veRL + 异步 vLLM rollout，H20 GPU（4B 用 16 卡，30B-A3B 用 32 卡）</td></tr>
+        <tr><td>评测</td><td>ClawGym-Bench、PinchBench、JobBench-Easy（均与训练集不相交）；In-Space = 18 个 held-out 配置；Out-of-Space = Claude Code v2.1.205（主），附加 OpenClaw</td></tr>
+        <tr><td>基线</td><td>原模型；Single-Harness RL（固定 base 配置 S0T0O0C0W0）；Black-Box SFT（OpenClaw v2026.4.5 上收集的 12,800 条轨迹训 3 epoch）；Black-Box RL（在 OpenClaw 里 GRPO 300 步 × 128 rollout）。两个黑盒基线约 38,400 次轨迹级训练曝光</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 主结果</h3>
+    <table>
+      <thead><tr><th>模型 / 算法</th><th>Single 平均</th><th>Scaling 平均</th><th>In-Space 增益（3 benchmark 平均）</th><th>JobBench-Easy · Claude Code</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3-4B · GRPO</td><td>29.81</td><td><strong>39.04</strong></td><td>+9.80</td><td>5.79 → 14.83</td></tr>
+        <tr><td>Qwen3-4B · PPO</td><td>33.91</td><td>36.93</td><td>+3.57</td><td>9.68 → 13.39</td></tr>
+        <tr><td>Qwen3-30B-A3B · GRPO</td><td>37.29</td><td><strong>42.78</strong></td><td>+5.21</td><td>10.05 → 14.20</td></tr>
+        <tr><td>Qwen3-30B-A3B · PPO</td><td>36.31</td><td>41.89</td><td>+4.90</td><td>12.11 → 18.90</td></tr>
+      </tbody>
+    </table>
+    <p>
+      「平均」是 3 个 benchmark × {In-Space, Claude Code} 六格的均值（Table 1）。一个有意思的细节：Qwen3-4B 在 JobBench-Easy 的 Claude Code 上，Single-Harness GRPO（5.79）还不如原模型（6.78）——固定 harness RL 在最难、最「异域」的组合上可能是负迁移；Harness Scaling 拉到 14.83。
+    </p>
+    <table>
+      <thead><tr><th>Claude Code（未见黑盒）平均 Pass@1</th><th>Black-Box SFT</th><th>Black-Box RL</th><th>Harness Scaling</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3-4B</td><td>35.08</td><td>33.38</td><td><strong>37.22</strong></td></tr>
+        <tr><td>Qwen3-30B-A3B</td><td>38.08</td><td>36.28</td><td><strong>41.20</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      这张表是全文最有说服力的部分：在一个复杂真实 harness（OpenClaw）里直接训，迁移到另一个复杂真实 harness（Claude Code）时，<strong>不如在结构化的白盒变体上训</strong>。在 OpenClaw 上做附加 out-of-space 评测（训练时两种方法都没见过 OpenClaw）也同方向：4B 32.02→36.07，30B-A3B 36.66→41.20。代价方面，Qwen3-30B-A3B · GRPO 在 ClawGym-Bench 的 base harness 上只掉 0.19（59.82→59.63），In-Space +10.48、Claude Code +3.60。
+    </p>
+
+    <h3>⑥ 消融：多不等于好，组织方式才是关键</h3>
+    <table>
+      <thead><tr><th>设置（Qwen3-4B，GRPO）</th><th>ClawGym-Bench In-Space / Claude Code</th><th>PinchBench In-Space / Claude Code</th></tr></thead>
+      <tbody>
+        <tr><td>Single-Harness RL</td><td>37.33 / 38.96</td><td>45.60 / 40.95</td></tr>
+        <tr><td>Harness Scaling，K=1</td><td>48.21 / 43.17</td><td>54.23 / 49.26</td></tr>
+        <tr><td>Repeat-2（同一 anchor 用两次）</td><td>49.76 / 43.60</td><td>50.34 / 48.64</td></tr>
+        <tr><td><strong>Harness Scaling，K=2</strong></td><td><strong>52.78 / 45.37</strong></td><td><strong>56.24 / 51.47</strong></td></tr>
+        <tr><td>Harness Scaling，K=4</td><td>49.56 / 41.99</td><td>53.90 / 50.04</td></tr>
+        <tr><td>Random-18（同大小随机集）</td><td>47.90 / 42.78</td><td>51.28 / 48.74</td></tr>
+        <tr><td>Random Assign.（非邻近分配）</td><td>50.46 / 43.17</td><td>53.20 / 50.23</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>训练集规模</strong>：1 → 3（一阶覆盖，每个实现至少出现一次）已有 +11.43 / +4.84（ClawGym）与 +3.44 / +7.86（PinchBench）；18 个结构化配置再 +4.02 / +1.57 与 +7.20 / +2.66；<strong>全 243 个配置（包括评测配置本身）在同预算下反而更差</strong>——穷举覆盖不保证更好，预算被摊薄了。</li>
+      <li><strong>K=1 已大幅领先 Single</strong>：说明「不同任务用不同 harness」本身就有价值；K=2 比 Repeat-2 稳定更好（ClawGym +3.02 / +1.77，PinchBench +5.90 / +2.83），排除了「只是同一任务多见一次」的解释；K=4 无进一步收益。</li>
+      <li><strong>基线敏感性</strong>：换三个结构上最分散的固定 harness 作 Single 基线（三个 benchmark 平均 In-Space 31.06–35.79、Claude Code 28.57–36.11），Harness Scaling（40.86 / 37.22）仍全部领先，说明优势不是 base 配置选得差造成的。</li>
+    </ul>
+
+    <h3>⑦ 行为层面：学到了什么</h3>
+    <p>
+      用 GPT-5.4 对 200 条轨迹 × 18 个 held-out harness 按 5 分制打六个维度：instruction following、interface handling、observation reading、state tracking、workflow compliance、error recovery。增益最大的是 <strong>state tracking、workflow compliance、error recovery</strong>，observation reading 增益最小。两个差 4 个组件的 held-out 配置（A = S0T2O1C1W2，B = S2T1O1C2W0）上的逐任务配对奖励，Harness Scaling 整体向右上移动，且更贴近对角线——换 harness 时逐任务表现更一致。
+    </p>
+
+    <h3>⑧ box 小验证：18 个配置的结构（本文实算）</h3>
+    <pre><code># 输入：论文 Table 6 的 18 个训练配置、Table 8 的 18 个评测配置
+跨组件实现对：90 种（C(5,2)×9），每种恰好出现 2 次   → strength-2，λ=2 ✓
+每个组件的每个实现：恰好 6 次                        ✓
+训练集 ∩ 评测集 = ∅                                   ✓
+训练集内两两 Hamming 距离分布：d=2: 12 对, d=3: 54, d=4: 81, d=5: 6
+每个 anchor 在 H_tr 内的最近邻距离：全部是 d=2（没有 d=1 的邻居）
+  其中 12 个 anchor 只有 1 个 d=2 邻居、6 个有 2 个
+评测配置到训练集的最近距离：d=1: 8 个, d=2: 10 个
+全部 243 个配置到训练集的最近距离：d=0: 18, d=1: 156, d=2: 69</code></pre>
+    <p>
+      这组数字补充了论文没明说的一点：在论文给出的这张 18 行正交表里，<strong>任意两行至少差 2 个组件</strong>（实算中没有 d=1 的行对），所以 K=2 时「最近邻」实际上是<strong>差 2 个组件</strong>的配置，而且对 2/3 的 anchor 是唯一确定的。论文图 1 画的「Edge (d=1)」应理解为 Hamming 图的概念示意。另外，评测集里有 8 个配置离训练集只差 1 个组件、10 个差 2 个，所谓「组合泛化」主要是在 1–2 步邻域内泛化。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>做 harness RL 时，至少做一阶覆盖</strong>：哪怕只有 3 个变体（每个组件的每个实现出现一次），收益已经很大（ClawGym In-Space +11.43）。成本只是多写几套 prompt / 工具别名 / 观测包装。</li>
+      <li><strong>变体要「功能等价、表面不同」</strong>：论文的约束是只改目标组件、不改任务语义。工具别名 + 干扰工具、观测里加无关元数据，是最便宜也最有效的「去捷径」扰动。</li>
+      <li><strong>用正交表而不是随机抽或穷举</strong>：组件数 M、实现数 L 给定后，先用 N = λL² 与 Rao bound 算最小规模；Random-18 与 Full-243 都更差。</li>
+      <li><strong>同一任务配一个近邻 harness（K=2）</strong>，连续两步使用；不要贪多（K=4 回落）。</li>
+      <li><strong>评测要分 In-Space 与真实黑盒两档</strong>，并把「base harness 上掉多少」作为代价一起报告——这比单一 harness 的 leaderboard 分数更接近部署现实。</li>
+      <li><strong>context management 作为变体时，注意训练段的权重语义</strong>：段继承 rollout 级奖励与 advantage、组归一化只在原始 rollout 上做、loss 按 token mean。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 Full-243（训练集甚至包含评测配置）在同预算下反而不如结构化的 18 个？</summary>
+      <p>固定 300 步、每步 16 个任务的预算下，243 个配置意味着大多数配置只被少数几个任务碰到，每个 (任务, harness) 组合的信号很稀；而且同一任务几乎不会在相近配置下被比较，局部对比（K 个近邻）的效应被稀释。18 个配置在一阶、二阶上精确平衡，每个配置有足够曝光，近邻分配又提供了受控扰动。本质上是「覆盖」与「每格样本量」的 trade-off：正交表在低阶交互上做到了最省的完全覆盖。</p>
+    </details>
+    <details>
+      <summary>2. Repeat-2（同一 anchor 用两次）为什么是必要的对照？它的结果说明了什么？</summary>
+      <p>K=2 把每个任务连续用两步，相比 K=1 多了一次同任务曝光；如果收益只是来自「同一任务多学一次」，Repeat-2 应和 K=2 一样好。结果是 Repeat-2 相对 K=1 有涨有跌（PinchBench In-Space 54.23→50.34 反而掉），而 K=2 在两个 benchmark 的两种评测上都优于 Repeat-2，说明「同一任务换 harness」本身贡献了额外收益，类似对 harness 做数据增强、让策略学到对表面特征的不变性。</p>
+    </details>
+    <details>
+      <summary>3. box 实算显示：在论文的 18 行正交表里，每个 anchor 的最近邻都差 2 个组件。这对「locality-aware 分配」的解读和复现意味着什么？</summary>
+      <p>（1）解读：K=2 时同一任务看到的两个 harness 总是同时改动两个组件，扰动强度比「只差一个组件」更大，且无法区分是哪个组件带来的不变性；论文里「邻近」的含义是「在 H<sub>tr</sub> 内最近」，不是 Hamming 图上的相邻。（2）复现：同为 strength-2、λ=2 的等价正交表（行置换、列内水平重标号之外的不同构造）可能有不同的行间距离分布，K=2 的实际扰动强度会随之变化，应报告实际分配到的距离分布。（3）可做的消融：在 H<sub>tr</sub> 外额外允许 d=1 的配置作为同任务伙伴（牺牲严格平衡），检验「更小的局部扰动」是否更好——这能把「局部性」与「正交平衡」两个因素拆开。</p>
+    </details>
+    <details>
+      <summary>4. 行为分析里 observation reading 增益最小，而 state tracking / error recovery 增益最大。结合 O 与 C 两个组件的设计，你怎么解释？</summary>
+      <p>O 的变体只是在原始输出外面加元数据（pod 名、PID、耗时等），任务相关内容不变，强一点的基座模型本来就能忽略噪声，所以上升空间有限。C 的变体会删掉或外置历史（只留 3–5 轮），W 的变体要求定期核查进度，这些直接迫使策略维护内部任务状态、在信息缺失时恢复——正好对应 state tracking 与 workflow compliance；T 的不透明工具名让早期调用更容易失败，训练出 error recovery。也可以联系 <a href="daily-2026-10-21-harness-reobserve.html">再观测文</a>：当上下文策略让信息不可再观测时，记笔记 / 状态跟踪能力最值钱。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果把 Harness Scaling 与 <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a> 或 Harness 自动进化（如 <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness-RL</a>）结合，会出现什么新问题？</summary>
+      <p>自动进化会持续产生新的 harness 变体，空间不再是固定的 S×T×O×C×W 笛卡尔积，正交表无法预先构造；可以把进化产生的变体按组件归类后周期性重建正交表，或用 covering array（只保证每对至少出现一次）降低重建成本。另一个问题是因果混淆：harness 在变、策略也在变，分数提升难以归因（参见 <a href="daily-2026-10-20-harness-hda.html">HDA</a> 的归因思路）。还要警惕「harness 变体由强模型生成」带来的分布偏置——Opus-4.7 写的变体是否覆盖了真实生产 harness 的差异维度（例如权限模型、并行工具调用、子 Agent），论文的 5 组件并未包含。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.29458" target="_blank" rel="noopener">arXiv:2610.29458 · Harness Scaling for Generalizable Agentic Reinforcement Learning（Bai, Song et al.，人大高瓴 / IQuest Research / 北航）</a></li>
+      <li><a href="https://arxiv.org/abs/2604.26904" target="_blank" rel="noopener">arXiv:2604.26904 · ClawGym（训练任务来源）</a> · <a href="https://arxiv.org/abs/2608.17528" target="_blank" rel="noopener">arXiv:2608.17528 · Agent Lightning v1.0</a> · Hedayat, Sloane, Stufken · <em>Orthogonal Arrays: Theory and Applications</em>（Springer, 1999）</li>
+      <li>站内：
+        <a href="daily-2026-08-28-agent-lightning-v1.html">Agent Lightning v1.0</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">Coding Agent Harness 组件消融</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">上下文压缩</a> ·
+        <a href="daily-2026-10-21-harness-reobserve.html">When the Harness Decides Success</a> ·
+        <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a> ·
+        <a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>

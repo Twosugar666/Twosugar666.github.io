@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜FlashNext-RL：一台 8×B200 训 125B MoE 的 131K 长程 SWE Agent RL——先修 host offload 与梯度累加，再谈 kernel；8 层阶梯 7.4×、全模型 395→4,438 tok/s/GPU，1,024 条 rollout 一轮 22.4 分钟 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜FlashNext-RL：一台 8×B200 训 125B MoE 的 131K 长程 SWE Agent RL——先修 host offload 与梯度累加，再谈 kernel；8 层阶梯 7.4×、全模型 395→4,438 tok/s/GPU，1,024 条 rollout 一轮 22.4 分钟</h1>
+    <p class="post-meta">2026-10-23 · 收藏夹：Infra / RL / 显卡 · 一线追踪<br />
+      来源：Zhewei Yao、Yuxiong He（Snowflake AI Research）· <em>FlashNext-RL: A System Optimization Study for Long-Horizon Agentic RL of Qwen3.8-Flash-Next</em>（<a href="https://arxiv.org/abs/2610.28998" target="_blank" rel="noopener">arXiv:2610.28998</a>，2026-10-20 提交，24 页 / 16 张表）。
+      基于 prime-rl（训练与编排）+ verifiers（环境）+ vLLM 0.31（rollout）。文中数字均为论文自报；作者明确说明 TFLOPs 是按 FLOP 记账估算，不是硬件计数器读数，且本研究只覆盖短程 RL run，不证明长期收敛或任务精度提升。
+      交叉：
+      <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE（同为 Snowflake 的异步 SWE RL 基线）</a>、
+      <a href="daily-2026-10-23-algo-zero.html">今日算法：ZeRO</a>、
+      <a href="daily-2026-10-07-algo-muon.html">Muon</a>、
+      <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由</a>、
+      <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a>、
+      <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 Agentic RL 的通用框架（OpenRLHF、veRL / HybridFlow、AReaL、prime-rl……）越来越成熟，但一旦模型带着「非标准」结构——混合线性注意力、稀疏注意力索引器、多流残差、超大冻结 embedding 表、512 专家的细粒度 MoE——通用路径就会在三处同时卡住：<strong>GPU 显存、host 内存、缺少反向 kernel</strong>。这篇是 Snowflake 的系统研究报告：目标是在<strong>一台 8×B200 节点</strong>上，用 BF16 训练 Qwen3.8-Flash-Next 全部 48 层（冻结前 2 层、n-gram 表、QSA indexer、MTP 头），上下文 131,072 token，SWE 任务，每步 1,024 条可训练 rollout。作者开宗明义：目标不是最好的模型精度或最高效的 RL 配方，而是找出「让这个模型的长程 Agent RL 变得可行」的模型专属优化。
+    </p>
+    <p>
+      对做 RL infra 的读者，这篇最有价值的是<strong>累积阶梯实验</strong>和一张 16 行的显存优化清单：它把「哪一步真正值钱」量化了——结论和直觉相反：kernel 再快，如果 GPU 在等 host 拷贝，一点用都没有。
+    </p>
+
+    <h3>模型长什么样（论文 §1，与公开 config 一致）</h3>
+    <table>
+      <thead><tr><th>组件</th><th>配置</th><th>给训练带来的麻烦</th></tr></thead>
+      <tbody>
+        <tr><td>混合注意力</td><td>48 层中 36 层 Gated DeltaNet（线性注意力）；12 层 Qwen Sparse Attention（QSA），轻量 indexer 为每个 query 选最多 512 个 4-key block</td><td>ring attention 不直接支持 GDN 递归；QSA 稀疏 GQA 的反向缺高效实现</td></tr>
+        <tr><td>Gated residual</td><td>4 分支残差流（4×2560 = 10,240 宽），可学习 read / write gate</td><td>每层两次 read/inject，访存受限，中间量巨大</td></tr>
+        <tr><td>N-gram embedding</td><td>冻结的 51B 参数 n-gram 表提供 per-layer embedding（PLE），BF16 约 95.4 GiB</td><td>常驻 host 内存，查表在 CPU 上做会让 GPU 空等</td></tr>
+        <tr><td>细粒度 MoE</td><td>每层 512 routed experts、top-10、intermediate 640，外加 shared expert</td><td>640 不是 128/256 倍数友好尺寸；EP=8 下的 MoE kernel 少</td></tr>
+        <tr><td>MTP 头</td><td>4B 参数，仅用于推测解码，RL 中不训练</td><td>训练不更新 → 接受率可能随 run 衰减，需监控</td></tr>
+        <tr><td>总量</td><td>125B 参数（每 token 激活 6B）+ 51B n-gram 表 + 4B MTP 头</td><td>—</td></tr>
+      </tbody>
+    </table>
+
+    <h2>机制拆解</h2>
+    <h3>① 为什么一台节点放不下：三笔账</h3>
+    <pre><code># GPU：不开 context parallel 时，每层保留一份残差流输入做 activation checkpoint
+48 层 × 131,072 token × 10,240 宽 × 2 B (BF16) ≈ 129 GB (120 GiB) / GPU   # 还没算权重、梯度和层内中间量
+
+# Host（CPU offload）：每参数 fp32 master + fp32 grad + 2 个 fp32 AdamW moment = 16 B
+按 ~129B 参数做保守预算（节点可用约 1,937 GiB）：
+  AdamW       16 B/param → 1,922 GiB，加 n-gram 表 ~95.4 GiB → 2,018 GiB   不够
+  Muon 预算   12 B/param → 1,442 GiB，加 n-gram 表          → 1,537 GiB   够
+# 节点：8×B200（179 GiB/卡）、192 CPU 核、约 2.0 TB host 内存；4 节点间 8×400 Gb/s EFA
+
+# Kernel：QSA 稀疏 GQA 的反向、I=640 + EP=8 的 MoE、gated residual 与 PLE 的融合 kernel 都缺</code></pre>
+    <p>
+      这里的 16 B/param 正是今天算法篇 <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 里「K=12 的优化器状态」那笔账的 offload 版本。换 <a href="daily-2026-10-07-algo-muon.html">Muon</a>（矩阵参数只存一个 moment）是为了<strong>放得下</strong>，不是为了收敛更快——官方仓库说预训练就是 Muon + AdamW 分组，作者沿用这一划分。
+    </p>
+
+    <h3>② 训练端布局</h3>
+    <table>
+      <thead><tr><th>手段</th><th>做法</th></tr></thead>
+      <tbody>
+        <tr><td>FSDP2 + CPU offload</td><td>参数和优化器状态放 host，FSDP unit 按需 gather 到 GPU；专家梯度在一个 step 内留在 GPU 累加，最后再 offload</td></tr>
+        <tr><td>StreamingMuon</td><td>Newton–Schulz 正交化在 GPU 上逐参数做，参数从 host 流式搬入；A×B 矩阵的更新按 0.2·√max(A,B) 缩放，使 RMS 与 AdamW 对齐</td></tr>
+        <tr><td>EP = 8</td><td>每卡持有每层 512 个专家中的 64 个</td></tr>
+        <tr><td>Ulysses CP = 4</td><td>131K 序列切 4 卡；每层用 all-to-all 在「序列分片 ↔ head 分片」间切换（Q/K/V 三个 all-to-all 打包成一个）</td></tr>
+        <tr><td>全量 activation checkpoint</td><td>重算时复用前向的路由决策</td></tr>
+        <tr><td>冻结前 2 层</td><td>去掉最大的单个瞬时显存（PLE 层在 10,240 宽流上的反向）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Ulysses 而非 ring：ring attention 是为 softmax attention 设计的，不直接实现 GDN 递归。具体适配：GDN 的 16 个 key head / 48 个 value head 按 CP rank 切；QSA 的 24 个 query head 切、2 个 KV head 复制；indexer 只有 4 个 head 且要对 head 求和，所以不切——每个 rank all-gather 小投影后冗余计算选择（131K 下 22 ms）并缓存给重算；PLE 卷积用 sequence→channel 的 all-to-all，避免 halo 交换和 packed 边界的边角情况。CP 4 比 CP 8 快（1,368/1,571 vs 1,132/1,182 tok/s/GPU），因为每个 micro step 有固定开销，CP 8 让每卡分摊的 token 减半；CP 8 峰值更低（124.9 vs 149.3 GiB），但 CP 4 放得下就够了。
+    </p>
+
+    <h3>③ 最值钱的两刀：host 拷贝路径</h3>
+    <p>
+      <strong>PinnedArena。</strong>FSDP2 的 pinned offload 走 PyTorch caching host allocator：每个块向上取整到 2 的幂（这里多 28%），且从不归还——全模型在 1,887 GiB 被 kill。pageable offload 放得下（峰值 1,555 GiB），但拷贝慢，一次 StreamingMuon step ~75 s。原地 <code>cudaHostRegister</code> 也不行：注册过的区域释放后地址被复用，下次注册失败，rank 直接挂。PinnedArena 的做法是每个 rank 映射<strong>一块精确大小</strong>的区域、只注册一次，FSDP 扁平参数分片与 Muon moment 都从里面切，注册过的内存永不释放；另有一块梯度 arena 接收 FSDP 拷回 host 的梯度。
+    </p>
+    <table>
+      <thead><tr><th>Offload 路径（全模型，CP 4，131K bin）</th><th>Muon step</th><th>Step</th><th>REAL tok/s/GPU</th></tr></thead>
+      <tbody>
+        <tr><td>Pageable</td><td>66 s</td><td>349 s</td><td>~426</td></tr>
+        <tr><td>PinnedArena</td><td>28 s</td><td>288 s</td><td>~516</td></tr>
+        <tr><td>+ pinned gradients</td><td>12.5 s</td><td>242 s</td><td>571–638</td></tr>
+      </tbody>
+    </table>
+    <p>
+      <strong>GPU 常驻的专家梯度。</strong>即便有了 PinnedArena，一个 ~32K 本地 token 的 micro step 仍要 ~51 s，而计算只有 ~8 s。profile 显示 autograd 线程 89.3% 的采样落在 FSDP2 的 <code>new_sharded_grad.to("cpu")</code>，GPU 利用率 7–8%：从第二个 micro step 起，只要 host 上已经有梯度，FSDP2 就用 <code>non_blocking=False</code> 拷贝新梯度并在 host 上相加——每 rank 约 63 GB fp32 梯度（主要是 EP 本地专家）每个 micro step 以 1.8 GB/s 搬一遍。关键观察：<strong>EP 本地专家是 world size 1 的 FSDP unit，分片梯度和完整梯度是同一个张量</strong>，所以除最后一个 micro step 外都跳过梯度同步，让它们在 GPU 上累加，一个 step 只经 pinned 非阻塞路径下 host 一次；dense unit（每 rank ~4 GB）保留 offload 累加器，但拷贝也改成 pinned 非阻塞、加法移出关键路径。
+    </p>
+    <table>
+      <thead><tr><th>梯度路径（全模型，CP 4，131K，16 样本 batch ≈1.1M token）</th><th>Micro step</th><th>Step</th><th>GPU 峰值</th><th>REAL tok/s/GPU</th></tr></thead>
+      <tbody>
+        <tr><td>FSDP2 host 累加</td><td>~51 s</td><td>242 / 243 s</td><td>118.5 GiB</td><td>571 / 589</td></tr>
+        <tr><td>GPU 常驻专家梯度</td><td>13–16 s</td><td>101 / 91 s</td><td>149.3 GiB</td><td>1,368 / 1,571</td></tr>
+      </tbody>
+    </table>
+    <p>
+      代价是专家累加器每 rank 约 60 GB 显存（实测峰值增幅更小，因为张量生命周期重叠方式变了）。这是一个典型的「用显存换 PCIe」：在 ZeRO 的语言里，等于对 EP 本地专家放弃了梯度分片的 offload，换回 2.4–2.7× 吞吐。
+    </p>
+
+    <h3>④ Kernel 与杂项：每项拿多少</h3>
+    <table>
+      <thead><tr><th>优化</th><th>做法</th><th>孤立对比（论文自报）</th></tr></thead>
+      <tbody>
+        <tr><td>MoE：DeepEP → Mixture-of-Kittens</td><td>基于 ThunderKittens 的持久化 kernel，把 dispatch、专家 GEMM、combine 融成一个，前反向都在 kernel 内重叠通信；fork 支持原生 I=640（上游要 256 倍数、pad 到 768 多 20% FLOPs，改为按 ceil 划 tile、TMA 零填充尾 tile）；通信 SM 从 24/28 提到 52/52</td><td>每层 1.56–2.24× 更快（16K→131K token/rank）；131K 峰值 15.9 vs 71.1 GiB；原生尺寸 + 更多通信 SM 再减 22.7%（32K/rank 时 dispatch/combine 比 GEMM 更是瓶颈）</td></tr>
+        <tr><td>静态专家放置</td><td>用几步真实负载按 LPT（最长处理时间优先）拟合静态置换，路由仍用逻辑 id，广播与 HF 导出时映射回去</td><td>max/mean rank 负载 1.233→1.059（全模型）；最热专家不超过 rank 均值的 0.2，无需副本</td></tr>
+        <tr><td>QSA indexer：cuDNN 融合 indexer + top-k</td><td>cuDNN DSA kernel 要求每 KV head 32/64 个 query head，QSA indexer 只有 4 个 → 零填充到 32；按 2 的幂长度桶 padding（≥4,096，用序列自身行环绕填充，填充 block 落在所有真实 query 的因果窗口外，选择不变），只编译约 6 个桶</td><td>131K 下 123.8→22.5 ms（5.5×）；省去每个新长度约 1 s 的 host JIT（48 层约 24 s / micro step）</td></tr>
+        <tr><td>QSA attention：GQA 原生 Triton → CuTe-DSL dK/dV</td><td>原始代码用 dense FlashAttention 跑 QSA——序列 &gt;2,048 后计算的是另一个函数；block-sparse mask 无效（128 个连续 query 的 tile 会碰到 90–94% 的因果 key tile），必须 token 级稀疏。Triton kernel 把 5 个相邻 query × 12 head 填进 64 行 MMA，对它们选中 block 的并集做计算（并集约为单 query 的 2× 而非 5×），gather 流量降到 ~0.41×；dK/dV 再上 TMA 和 sm100 CuTe-DSL（warp 特化、累加器全在 tensor memory）</td><td>前+反向 64K：cuDNN DSA 219.8 ms → Triton 164.5 → +TMA 138.5 → CuTe 106.4 ms；dK/dV 97→46.7 ms，接近 gather 下限 ~41 与 MMA 下限 ~40 ms</td></tr>
+        <tr><td>Gated residual 融合</td><td>Triton + cuBLAS 的 read / inject kernel，反向重算廉价中间量</td><td>131K：eager 75.17 / compile 34.74 / fused 17.84 ms；为反向保留的显存 15.79 / 5.79 / 0.71 GiB；单个 GDN 层前反向 −31%</td></tr>
+        <tr><td>N-gram：CPU gather → UVA gather</td><td>GPU 通过 UVA 直接读 host 映射的表（tmpfs 文件，8 rank 共享），走 side stream</td><td>131K：单线程 CPU 395–464 ms / 16 线程 117–131 ms / UVA 42 ms；全模型单项 +8.1%</td></tr>
+        <tr><td>编译与掉队者</td><td>CP 下只 compile token-local 块；去掉导致按 token 数重编译的 graph break；FLA Triton kernel 的 autotune key 去掉 token 数（某 rank 曾 45.5% 时间空等）；启动时预热</td><td>预热让 step 1 从 171.9 s 到 23.8 s；延后 per-micro-step 日志使 GPU busy 90%→96%</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 8 层累积阶梯：顺序决定收益</h3>
+    <p>
+      为了把孤立对比「重新放进同一把尺子」，作者在前 8 层（6 GDN + 2 QSA，与全模型 3:1 相同，含 PLE 层和 n-gram 表）上逐项累加，同一批真实 rollout，run-to-run 噪声 ±0.3%：
+    </p>
+    <table>
+      <thead><tr><th>阶</th><th>新增</th><th>REAL tok/s/GPU</th><th>vs 上一阶</th><th>模型 TFLOPs</th></tr></thead>
+      <tbody>
+        <tr><td>L0</td><td>baseline（无编译、DeepEP、cuDNN DSA、eager gated residual、CPU n-gram、pageable offload）</td><td>2,391</td><td>—</td><td>20</td></tr>
+        <tr><td>L1</td><td>+ torch.compile（token-local 块）</td><td>1,916</td><td>−19.9%</td><td>16</td></tr>
+        <tr><td>L2</td><td>+ 参数跨 micro step 常驻</td><td>3,142</td><td>+64.0%</td><td>26</td></tr>
+        <tr><td>L3–L4</td><td>+ PinnedArena、pinned 梯度拷贝</td><td>3,381</td><td>+2.6% / +4.8%</td><td>28</td></tr>
+        <tr><td>L5</td><td>+ GPU 常驻专家梯度</td><td>8,587</td><td><strong>+154.0%</strong></td><td>71</td></tr>
+        <tr><td>L6</td><td>+ dense 梯度累加</td><td>9,618</td><td>+12.0%</td><td>79</td></tr>
+        <tr><td>L7</td><td>+ fused gated residual</td><td>10,981</td><td>+14.2%</td><td>91</td></tr>
+        <tr><td>L8</td><td>+ UVA n-gram gather</td><td>11,591</td><td>+5.6%</td><td>96</td></tr>
+        <tr><td>L9</td><td>+ MoK（I=640，52/52 SM）</td><td>14,445</td><td>+24.6%</td><td>119</td></tr>
+        <tr><td>L10–L12</td><td>+ 静态放置、GQA 原生 Triton QSA、CuTe dK/dV</td><td>17,135</td><td>+1.0% / +13.6% / +3.4%</td><td>141</td></tr>
+        <tr><td>L13–L14</td><td>+ compile 预热、fused decoder glue</td><td>17,678</td><td>+0.0% / +3.2%</td><td>146（含重算 195）</td></tr>
+        <tr><td>L15</td><td>+ expert-weight prefetch</td><td>17,570</td><td>−0.6%</td><td>145</td></tr>
+      </tbody>
+    </table>
+    <p>
+      三个读法：（1）<strong>offload 路径先行</strong>：参数常驻（+64%）与 GPU 常驻专家梯度（2.54×）贡献了大部分增益，在此之前 GPU 主要在等 host 拷贝；（2）<strong>顺序很重要</strong>：torch.compile 在 L0 上 −20%（step 被 eager gated residual 与 pageable 拷贝卡住），在最终栈上 +2%；（3）反向消融（从 L14 逐项拿掉）：MoK −22.4%、fused gated residual + glue −19.6%、GQA 原生 QSA −14.9%、UVA n-gram −9.0%，静态放置只 −0.1%。
+    </p>
+    <p>
+      全模型的开发记录：首个全模型 step（CP 1、32K bin、pageable）约 395 tok/s/GPU、20 硬件 TFLOPs；最终配置（CP 4、131K bin）4,438 tok/s/GPU、213 硬件 matmul TFLOPs/GPU。作者特意强调这两个端点之间 bin 大小、batch 大小都变了，<strong>不是受控加速比</strong>。冻结前 2 层在全模型上约 +10%，并省 37 GiB host 内存。
+    </p>
+
+    <h3>⑥ 端到端 RL：瓶颈从 GPU 挪到「每个副本」</h3>
+    <p>
+      拓扑：4 台 8×B200，1 台训练（8 个 trainer rank + sandbox 集群的 k3s server，不跑 sandbox），3 台推理，每台 2 个 vLLM 引擎（TP4 + EP，MTP3 推测解码，BF16 权重与 KV，prefix cache 开），每条 rollout 一个 Kubernetes pod。编排器保持 672 条 rollout 在飞，生成与训练重叠；每步后 rank 0 用 NCCL over EFA 把新权重广播给 24 张推理卡。
+    </p>
+    <table>
+      <thead><tr><th>推理端决策</th><th>依据（论文自报）</th></tr></thead>
+      <tbody>
+        <tr><td>EP 而非纯 TP</td><td>B200 上 vLLM BF16 MoE 后端把每 rank 专家 intermediate 向上取整到 128 倍数：TP4 时每 rank 160 列被 pad 到 256（1.6×），routed experts 每 rank 90.0 GiB；EP 不切专家无需 pad，56.25 GiB</td></tr>
+        <tr><td>TP4（回放真实 SWE rollout 测吞吐）</td><td>TP2 轻载最快，但 KV 只有 1.76M，超过 10.5 session/GPU 后 prefix cache 不再命中并开始抢占；TP8 KV 最大但每档都最慢；TP4+EP 在 26 session/GPU 时 1,091 output tok/s/GPU</td></tr>
+        <tr><td>gpu_memory_utilization = 0.86</td><td>0.92 时 KV 在启动时占满，第一次权重更新时 4.83 GiB 接收缓冲遇上 3.3 GiB 空闲，6 个引擎全部 OOM</td></tr>
+        <tr><td>准入控制</td><td>引擎 KV 使用率 &gt;65% 停止接新 session，&lt;55% 恢复——hybrid prefix cache 在 ~70% 以上不再命中</td></tr>
+        <tr><td>Router replay</td><td>BF16 下两套实现对同一 token 常选出不同 top-10 专家；离线测量中路由翻转解释约 96% 的训推 mismatch。引擎经 auxiliary-output connector 回传每 token 的路由（[T, 48, 10] uint16，960 字节/token），trainer 重放</td></tr>
+        <tr><td>n-gram 表每节点一份</td><td>默认每个引擎各 pin 一份 ~95.4 GiB；改为节点本地 tmpfs 映射共享，第二个引擎只多 2.2 GB（<code>cudaHostRegister</code> 拒绝对普通文件的可写共享映射；pod 的 /dev/shm 是 100 GiB 内存卷，溢出会驱逐 pod）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      最有工程味的是 host 内存的 16 项优化表。几个代表：<strong>测 PSS 不测 RSS</strong>——8 个 rank 都映射共享 tmpfs、各自把它算满，RSS 合计 2,251 GiB 而 PSS 只有 1,578 GiB（高估 43%）；<strong>重新冻结</strong>——EP 会用新参数替换专家权重，默认 <code>requires_grad=True</code>，冻结层的专家又被分配了梯度缓冲和优化器状态（37 GiB/节点）；<strong>惰性优化器状态</strong>——构造时分配 Muon moment 会在启动时新增 450 GiB pinned 内存，正撞上编排器拉起前 630 个 sandbox；<strong>每个 CP rank 只留自己 1/4 的路由</strong>（每 token 少 720 字节，39M token 的 batch 每节点省约 110 GB）；<strong>harness tarball 本地化</strong>——每个 sandbox 把 238 MB 的 agent-harness tarball 读进 env worker 内存再经各自的 kubectl exec 管道送入，数百个并发时 env worker 到 ~200 GB；改为每节点拷一份到本地盘（SHA-256 校验）、sandbox 只读挂载，setup 17.9→4.7 s，env worker 200→17.6 GB。最后把编排器、env worker、模型请求代理和 kubectl exec 进程都挪到 host 内存基本闲置的第一台推理节点（实跑约 190 GB）。
+    </p>
+    <p>
+      权重同步：每步约 260 GB BF16 权重发往 6 个引擎。EFA 节点间约 390 GB/s，纯字节每个接收节点约 0.7 s，<strong>网络不是瓶颈</strong>，成本在 gather、转换和加载，以及每阶段的内存：逐层 gather → 改名为 HF checkpoint 名 → 撤销静态专家放置 → 把 512 专家重排成 checkpoint 的融合布局；n-gram 表从不传；每层约 4.8 GiB 拆成 ≤1 GiB 的 bucket 限制接收端瞬时内存；接收端逐层 reload 时交出 clone 而非 view（用 view 时两个半加载模块会让所有接收缓冲一直存活直到 OOM）。实测 15–18 s，实跑均值 18.6 s。checkpoint：DCP（923 GB）写本地 NVMe 约 70 s；HF 导出从「逐层流式 236 s」改为「复用广播已 gather 的层 + 4 个 pinned 缓冲后台写」，checkpoint 步开销 307→102 s。
+    </p>
+
+    <h3>⑦ 实跑：steps 5–15</h3>
+    <table>
+      <thead><tr><th>指标</th><th>数值（论文 Table 16 均值，区间为各步范围）</th></tr></thead>
+      <tbody>
+        <tr><td>每步收集 / 训练 rollout</td><td>1,393 / 1,026（1,249–1,584 收集）；全组同奖励、advantage 全 0 的组不训练，所以多收</td></tr>
+        <tr><td>迭代时间</td><td>1,344 s（22.4 min），1,137–1,690 s</td></tr>
+        <tr><td>trainer 工作</td><td>1,013 s：前反向 964 s（约 36.5M packed token）、数据加载 10 s、StreamingMuon 12 s、权重广播 19 s</td></tr>
+        <tr><td>trainer 等 rollout</td><td>331 s（186–702 s）→ 环路受生成约束</td></tr>
+        <tr><td>trainer 吞吐</td><td>4,737 tok/s/GPU（按 packed 131K bin 计，含 padding）≈ 229 硬件 matmul TFLOPs/GPU</td></tr>
+        <tr><td>生成</td><td>17.1K output tok/s（6 引擎）；每引擎 112 session 中约 77 在生成，其余在等 sandbox 命令；KV 平均 50%、峰值 72%；prefix cache 命中 85% prompt token；MTP 平均接受长度 2.55</td></tr>
+        <tr><td>长度</td><td>中位 29K、p90 61K、p99 108K；&gt;64K 的 rollout 占 7.7% 条数但占 19% token</td></tr>
+        <tr><td>数值</td><td>step 1 之后 entropy 0.66–0.76 nats/token；带 router replay 的 mismatch KL 3.6–4.0×10<sup>−3</sup>；训练节点最低可用 host 内存 137–165 GiB</td></tr>
+      </tbody>
+    </table>
+    <p>
+      作者还给了一个明确标注为「示意性」的容量估计：如果 trainer 慢 7.4×（8 层阶梯比）到 10.4×（全模型 131K 开发比），在理想线性扩展下要 8–11 台训练节点（含推理 11–14 台）才能把 1,013 s 的 trainer 工作压回去，单节点服务时间会是 2.1–2.9 h 而不是 17 min。这只是外推，不是实测资源需求。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先 profile host 路径</strong>：offload 训练里 GPU 利用率个位数时，先看 autograd 线程是否卡在 <code>.to("cpu")</code>。FSDP2 + CPU offload 在梯度累加时默认的阻塞拷贝 + host 相加，是这篇里单项最大的坑（L5 +154%）。</li>
+      <li><strong>EP 本地专家别当普通 FSDP unit 处理</strong>：world size 1 的 unit 不需要梯度同步，累加放 GPU，最后一个 micro step 再下 host；有显存余量时这是最便宜的 2× 级收益。</li>
+      <li><strong>pinned 内存自己管</strong>：caching host allocator 的 2 的幂取整 + 永不释放会在 TB 级 offload 下直接 OOM；精确大小的 arena + 一次性注册更稳，也更快。</li>
+      <li><strong>稀疏注意力训练必须与推理同函数</strong>：用 dense attention 训一个推理时 token 级稀疏的模型，计算的就是另一个函数；这和 <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a> 里「FP32 递归状态 / 权重刷新后重算缓存」是同一类训推一致性问题。MoE 则用 router replay 消掉约 96% 的 mismatch 来源。</li>
+      <li><strong>内存账按 PSS 记</strong>，并把编排器、env worker、kubectl 这类「Agent 侧」进程挪离训练节点——长程 Agent RL 的 host 内存很大一块不在 trainer 里，而在 sandbox 管理面。</li>
+      <li><strong>注意适用范围</strong>：结论高度模型专属（I=640、4 head indexer、10,240 宽残差流），而且只有 11 步实跑；把它当方法论与 checklist，而不是可直接搬的配置。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 torch.compile 在 L0 上让吞吐掉了 19.9%，在最终栈上却 +2%？这对「做优化消融」有什么启示？</summary>
+      <p>L0 的 step 时间由 eager gated residual 和 pageable 拷贝主导，compile 带来的 graph break、resume frame 和编译开销反而成为额外负担，而它能优化的那部分计算并不在关键路径上。等 host 路径和大 kernel 都修好后，剩下的是大量小的 token-local 算子，compile 的融合才有价值。启示：孤立对比的收益依赖「其他东西是否已经是瓶颈」，所以需要同一数据上的累积阶梯 + 逐项移除两种视角（论文 Table 10 与 Table 11），且要报告顺序。</p>
+    </details>
+    <details>
+      <summary>2. GPU 常驻专家梯度为什么对 EP 本地专家安全，而不能直接推广到 dense 参数？</summary>
+      <p>EP 本地专家只存在于一个 rank 上，FSDP unit 的 world size 为 1，分片梯度就是完整梯度，跨 micro step 累加不需要任何集合通信，只是把 host 上的加法挪到 GPU。dense 参数在 FSDP 下是跨 rank 分片的，每个 micro step 的梯度需要 reduce-scatter 才得到本 rank 的分片；若跳过同步在 GPU 上保留完整梯度，就要多占 dense 参数完整梯度大小的显存，失去分片的意义。论文对 dense unit（约 4 GB/rank）的处理是保留 offload 累加器，只把拷贝改成 pinned 非阻塞并把加法移出关键路径（最终配置再 +4%）。</p>
+    </details>
+    <details>
+      <summary>3. 推理端为什么选 TP4 + EP 而不是吞吐最高的 TP2？这和 Agent rollout 的什么特性有关？</summary>
+      <p>SWE rollout 的上下文长（实跑中位 29K、p99 108K），多轮且共享前缀，prefix cache 命中对吞吐至关重要。TP2 每引擎 KV 只有 1.76M token：17.5 session/GPU 时 prefix cache 命中率已掉到 0.06，到目标并发 26 session/GPU 时出现 318 次抢占，吞吐（771）反而低于 TP4（1,091）。Agent 场景的「session 驻留」需要 KV 容量，而不仅是单请求解码速度；另外 session 中有约 1/3 在等 sandbox 命令，KV 必须为它们保留。</p>
+    </details>
+    <details>
+      <summary>4. 实跑中 trainer 平均等 rollout 331 s，环路受生成约束。在不加节点的前提下，可以从哪些方向缩短迭代时间？</summary>
+      <p>（1）生成侧：约 1/3 session slot 在等 sandbox 命令执行，可以提高 max_num_seqs 或做跨 session 的更激进调度，但受 KV 准入（65%/55%）与 hybrid prefix cache ~70% 失效点约束；（2）长尾：&gt;64K 的 7.7% rollout 占 19% token，可以考虑部分 rollout / 截断续写或异步 off-policy 消费（代价是 staleness，参见 <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>）；（3）样本效率：每步收集 1,393 条只训 1,026 条，全组同奖励的组被丢弃，可用难度过滤 / 动态采样（<a href="daily-2026-09-04-algo-dapo.html">DAPO</a>）提前筛题；（4）MTP 头不训练，接受率可能衰减，需要监控或周期性更新。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）论文把「AdamW 16 B/param 放不下、Muon 12 B/param 放得下」作为换优化器的理由。如果坚持 AdamW，还有哪些路径？各自代价是什么？</summary>
+      <p>（1）多节点 ZeRO-3 / FSDP 分片：host 与显存压力都按节点数线性下降，但引入跨节点 all-gather / reduce-scatter，且论文的示意估计显示需要多台训练节点；（2）NVMe offload（ZeRO-Infinity 思路）：容量足够，但带宽远低于 pinned host 内存，Muon step 已经是 12 s 量级，AdamW 的 step 会更慢；（3）低精度优化器状态（8-bit Adam 等）：每参数显著降字节，但对 RL 这种小 lr、长程、对 mismatch 敏感的训练，需要额外验证数值稳定；（4）冻结更多层或只训部分专家：省内存最直接，但改变了「全模型 RL」的设定。可以和今日算法篇 <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 的分阶段账对照思考。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.28998" target="_blank" rel="noopener">arXiv:2610.28998 · FlashNext-RL（Yao &amp; He，Snowflake AI Research）</a></li>
+      <li><a href="https://github.com/PrimeIntellect-ai/prime-rl" target="_blank" rel="noopener">prime-rl</a> · <a href="https://arxiv.org/abs/2309.14509" target="_blank" rel="noopener">arXiv:2309.14509 · DeepSpeed Ulysses</a> · <a href="https://arxiv.org/abs/2502.16982" target="_blank" rel="noopener">arXiv:2502.16982 · Muon is Scalable for LLM Training</a></li>
+      <li>站内：
+        <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a> ·
+        <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> ·
+        <a href="daily-2026-10-07-algo-muon.html">Muon</a> ·
+        <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a> ·
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-09-07-speculative-decoding.html">推测解码</a> ·
+        <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>

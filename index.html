@@ -93,6 +93,27 @@
           <button class="chip" data-filter="pc">配件</button>
         </div>
         <ul class="post-list">
+          <li data-cat="infra rl gpu">
+            <a href="posts/daily-2026-10-23-flashnext-rl.html">一线追踪｜FlashNext-RL：一台 8×B200 训 125B MoE 的 131K 长程 SWE Agent RL——先修 host offload 与梯度累加，再谈 kernel；8 层阶梯 7.4×、全模型 395→4,438 tok/s/GPU，1,024 条 rollout 一轮 22.4 分钟</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span><span class="post-cat">RL</span><span class="post-cat">显卡</span>
+              <span class="post-date">2026-10-23</span>
+            </span>
+          </li>
+          <li data-cat="harness agent rl">
+            <a href="posts/daily-2026-10-23-harness-scaling.html">学习笔记｜Harness Scaling：把「怎么执行」当成 Agentic RL 的新扩展轴——5 组件 × 3 变体的 243 格 harness 空间，strength-2 正交表只挑 18 个训练，同一任务配邻近 harness；Qwen3-4B GRPO 平均 29.81→39.04，迁移到 Claude Code 胜过直接在 OpenClaw 上训</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-10-23</span>
+            </span>
+          </li>
+          <li data-cat="algo infra">
+            <a href="posts/daily-2026-10-23-algo-zero.html">学习笔记｜ZeRO：数据并行的显存冗余怎么一层层切掉——16Ψ 字节的模型状态账，P<sub>os</sub> / P<sub>os+g</sub> / P<sub>os+g+p</sub> 三阶段（4× / 8× / 随 N<sub>d</sub> 线性），为什么 ZeRO-2 通信不变、ZeRO-3 只多 50%，再到 ZeRO-R、FSDP 与 Offload</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-23</span>
+            </span>
+          </li>
           <li data-cat="infra">
             <a href="posts/daily-2026-10-22-moe-expert-skipping.html">一线追踪｜Don't Skip the Baseline：MoE 动态跳专家在同等实测算力下打不过「静态把 k 调小」——NAEE / DiEP / MoDES / Ada-K 最多领先 2.6 个点，校准出的 K<sub>eff</sub> 到测试时能偏 6 倍；k<sub>text</sub>=6、k<sub>vision</sub>=1 砍掉 85% 专家只掉 2%</a>
             <span class="post-side">

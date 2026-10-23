@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜ZeRO：数据并行的显存冗余怎么一层层切掉——16Ψ 字节的模型状态账，Pos / Pos+g / Pos+g+p 三阶段（4× / 8× / 随 Nd 线性），为什么 ZeRO-2 通信不变、ZeRO-3 只多 50%，再到 ZeRO-R、FSDP 与 Offload · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜ZeRO：数据并行的显存冗余怎么一层层切掉——16Ψ 字节的模型状态账，P<sub>os</sub> / P<sub>os+g</sub> / P<sub>os+g+p</sub> 三阶段（4× / 8× / 随 N<sub>d</sub> 线性），为什么 ZeRO-2 通信不变、ZeRO-3 只多 50%，再到 ZeRO-R、FSDP 与 Offload</h1>
+    <p class="post-meta">2026-10-23 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Samyam Rajbhandari、Jeff Rasley、Olatunji Ruwase、Yuxiong He（Microsoft）· <em>ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</em>（<a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054</a>，SC 2020）。
+      延伸：<em>ZeRO-Offload</em>（<a href="https://arxiv.org/abs/2101.06840" target="_blank" rel="noopener">2101.06840</a>）、<em>ZeRO-Infinity</em>（<a href="https://arxiv.org/abs/2104.07857" target="_blank" rel="noopener">2104.07857</a>）、<em>ZeRO++</em>（<a href="https://arxiv.org/abs/2306.10209" target="_blank" rel="noopener">2306.10209</a>）、<em>PyTorch FSDP</em>（<a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">2304.11277</a>）。
+      论文数字按原文（V100 / DGX-2 时代）；「box 小实验」一节为本文在 box 上用 numpy 实跑。
+      交叉：
+      <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>、
+      <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a>、
+      <a href="daily-2026-10-07-algo-muon.html">Muon</a>、
+      <a href="daily-2026-10-21-algo-lora.html">LoRA</a>、
+      <a href="daily-2026-10-23-flashnext-rl.html">今日一线：FlashNext-RL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      昨天的 <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度</a> 留下一个账：FP32 master weights 和 Adam 的两个 moment 一个都不能省。于是 1.5B 的 GPT-2，FP16 权重只要 3 GB，32 GB 的 V100 却训不起来——钱都花在了「模型状态」上。普通数据并行（DP）更糟：<strong>每张卡都存一份完整的参数、梯度和优化器状态</strong>，加卡只加算力不加显存。模型并行（MP）能切，但它按层内切分，计算粒度变细、通信量大，跨节点效率掉得很快（论文实测 40B 模型用 Megatron-LM 跨两台 DGX-2，每卡约 5 TFlops，不到峰值 5%）。
+    </p>
+    <p>
+      ZeRO（Zero Redundancy Optimizer）的问题意识很朴素：DP 的冗余是不是必要的？答案是——<strong>每个状态在一个 step 里大部分时间都用不到全量</strong>，所以可以分片存放，用到时再取。今天几乎所有大模型训练框架（DeepSpeed ZeRO-1/2/3、PyTorch FSDP / FSDP2、Megatron 的 distributed optimizer）都是这个思路的变体；今天一线篇 <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> 用的 FSDP2 + CPU offload 也正是这条线上的终点之一。巧合的是，两篇都有 Yuxiong He 署名。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 显存去哪了：模型状态 + 残余状态</h3>
+    <pre><code># 混合精度 + Adam，Ψ 个参数（ZeRO §3.1）
+FP16 参数        2Ψ
+FP16 梯度        2Ψ
+优化器状态       KΨ，K = 12：FP32 参数副本 4Ψ + momentum 4Ψ + variance 4Ψ
+合计             2Ψ + 2Ψ + 12Ψ = 16Ψ 字节
+例：GPT-2 1.5B → 至少 24 GB（FP16 参数本身只有 3 GB）
+
+# 残余状态（residual states）
+激活            1.5B GPT-2，seq 1K、batch 32 约 60 GB；activation checkpoint 后约 8 GB（约 33% 重算开销）
+临时缓冲        梯度 all-reduce / 范数计算常把梯度融成一个扁平 FP32 buffer：1.5B 模型 6 GB
+碎片            长短生命周期张量交错；极端情况下还有 30% 以上空闲显存时 OOM</code></pre>
+    <p>
+      关键观察：优化器状态是大头（12/16 = 75%），而它<strong>只在 optimizer step 时用一次</strong>；梯度只在反向产生后到 step 前存在；参数虽然前反向都要用，但每一层只在算到它的那一刻需要。这三种「用的时机」决定了三个分片阶段。
+    </p>
+
+    <h3>② ZeRO-DP 三阶段</h3>
+    <table>
+      <thead><tr><th>阶段（常见叫法）</th><th>分片内容</th><th>每卡模型状态</th><th>N<sub>d</sub> 大时</th><th>每步通信量（每卡）</th></tr></thead>
+      <tbody>
+        <tr><td>Baseline DP</td><td>无</td><td>(2+2+K)Ψ = 16Ψ</td><td>16Ψ</td><td>2Ψ（all-reduce）</td></tr>
+        <tr><td>P<sub>os</sub>（ZeRO-1）</td><td>优化器状态</td><td>4Ψ + KΨ/N<sub>d</sub></td><td>≈4Ψ（4×）</td><td>2Ψ</td></tr>
+        <tr><td>P<sub>os+g</sub>（ZeRO-2）</td><td>+ 梯度</td><td>2Ψ + (2+K)Ψ/N<sub>d</sub></td><td>≈2Ψ（8×）</td><td>2Ψ（reduce-scatter Ψ + all-gather Ψ）</td></tr>
+        <tr><td>P<sub>os+g+p</sub>（ZeRO-3）</td><td>+ 参数</td><td>(2+2+K)Ψ/N<sub>d</sub></td><td>16Ψ/N<sub>d</sub>（线性）</td><td>3Ψ（前向 all-gather Ψ + 反向 all-gather Ψ + reduce-scatter Ψ），1.5×</td></tr>
+      </tbody>
+    </table>
+    <p>
+      论文 Table 1 用 Ψ = 7.5B、K = 12 算出的每卡显存（GB，不含激活）：
+    </p>
+    <table>
+      <thead><tr><th>N<sub>d</sub></th><th>P<sub>os</sub></th><th>P<sub>os+g</sub></th><th>P<sub>os+g+p</sub></th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>120</td><td>120</td><td>120</td></tr>
+        <tr><td>4</td><td>52.5</td><td>41.3</td><td>30</td></tr>
+        <tr><td>16</td><td>35.6</td><td>21.6</td><td>7.5</td></tr>
+        <tr><td>64</td><td>31.4</td><td>16.6</td><td>1.88</td></tr>
+        <tr><td>1024</td><td>30.1</td><td>15.1</td><td>0.12</td></tr>
+      </tbody>
+    </table>
+    <p>
+      注意 P<sub>os</sub> 和 P<sub>os+g</sub> 会趋于饱和（30 GB / 15 GB，即 4Ψ 和 2Ψ），只有 P<sub>os+g+p</sub> 随卡数无限下降。论文的推论：1T 参数、Adam、16 位精度约需 16 TB 模型状态，1024 卡分下来每卡 16 GB——「理论上能放下」。
+    </p>
+
+    <h3>③ 为什么 ZeRO-2 通信「免费」：all-reduce = reduce-scatter + all-gather</h3>
+    <pre><code># 标准 DP：all-reduce 的流水线实现 = reduce-scatter（Ψ）+ all-gather（Ψ）= 2Ψ
+#   每个元素被发送约 2·(N_d−1)/N_d 次（ring）
+
+# ZeRO-2：
+grads  = backward(...)                         # 按 bucket 产出
+g_mine = reduce_scatter(grads)                 # Ψ：rank k 只拿到自己 1/N_d 分片的「求和后」梯度
+                                               #    其余分片的梯度用完即弃 → 梯度显存 /N_d
+w_mine = adam_step(w32_mine, m_mine, v_mine, g_mine)   # 只更新自己的分片（优化器状态 /N_d）
+params = all_gather(fp16(w_mine))              # Ψ：取回完整 FP16 参数
+# 合计 Ψ + Ψ = 2Ψ —— 与 baseline 完全相同，只是把 all-reduce 的两半拆开，中间插入「分片更新」</code></pre>
+    <p>
+      这是 ZeRO 最漂亮的一点：all-reduce 本来就在内部做了「先归约到分片、再广播」，ZeRO-1/2 只是<strong>在两半之间插入分片的 optimizer step</strong>，于是梯度和优化器状态都不需要全量常驻，通信一个字节都不多。工程上梯度按 bucket 做 reduce（而不是 all-reduce）以重叠通信与反向计算。
+    </p>
+
+    <h3>④ ZeRO-3：参数也分片，多出的 50% 从哪来</h3>
+    <pre><code># 前向：逐层（或逐 FSDP unit）
+for layer in layers:
+    W = all_gather(W_shard[layer])     # 用到前取回完整参数
+    x = layer(x, W); free(W)           # 用完即丢 → 参数常驻显存 /N_d
+# 反向：倒序再 all-gather 一次（前向丢掉了）
+for layer in reversed(layers):
+    W = all_gather(W_shard[layer]); grad = layer.backward(W); free(W)
+    g_shard = reduce_scatter(grad)
+# 合计 Ψ（前向 AG）+ Ψ（反向 AG）+ Ψ（RS）= 3Ψ = 1.5 × baseline</code></pre>
+    <p>
+      代价是 50% 的额外通信和更细的通信粒度（每层一次集合通信，必须和计算重叠，否则延迟会暴露）。PyTorch FSDP 的实现要点——把若干层包成一个 FSDP unit、预取下一个 unit 的 all-gather、前向后是否 reshard（<code>reshard_after_forward</code>）——都是围绕「怎么把这 3Ψ 藏到计算后面」。FlashNext-RL 的 8 层阶梯里，「参数跨 micro step 常驻」（等价于在梯度累加期间不 reshard）单项就 +64%，就是这个开关的现实版。
+    </p>
+
+    <h3>⑤ ZeRO-R：残余状态的三刀</h3>
+    <table>
+      <thead><tr><th>优化</th><th>问题</th><th>做法</th><th>论文例子</th></tr></thead>
+      <tbody>
+        <tr><td>P<sub>a</sub>：分片激活检查点</td><td>MP 下每张卡都存一份完整的层输入激活（复制）</td><td>checkpoint 只存 1/N<sub>m</sub> 分片，重算前 all-gather；可再 offload 到 CPU（P<sub>a+cpu</sub>）</td><td>100B 模型、batch 32、seq 1024、MP 16：每层一个 checkpoint 需约 33 GB/卡 → 约 2 GB/卡；额外通信不到 MP 原有通信的 10%</td></tr>
+        <tr><td>C<sub>B</sub>：常量大小缓冲</td><td>融合 buffer 随模型线性增大</td><td>用固定大小但足够大的融合 buffer</td><td>3B 模型的 FP32 融合 buffer 要 12 GB</td></tr>
+        <tr><td>M<sub>D</sub>：显存碎片整理</td><td>checkpoint 激活（长寿）与丢弃激活（短命）交错；参数梯度（长寿）与激活梯度（短命）交错</td><td>为长寿张量预分配连续内存，产生时搬入</td><td>—</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑥ 论文的实证（ZeRO-100B = P<sub>os+g</sub> + ZeRO-R）</h3>
+    <ul>
+      <li>与 Megatron MP 组合，400 张 V100 上高效训练至 170B 参数（Megatron 单独跨节点后在 40B 以上效率骤降）；8B–100B 模型平均持续 15 PFlops（峰值 30% 以上），最高 10× 于基线。</li>
+      <li>60B 模型从 64 卡到 400 卡呈<strong>超线性</strong>加速：卡越多，每卡模型状态越少，能放更大的每卡 batch，算术强度上升。</li>
+      <li>不用 MP、只用 ZeRO 驱动的 DP，128 卡上可训到 13B，平均每卡 40 TFlops 以上；没有 ZeRO 时纯 DP 最大 1.4B，每卡不到 20 TFlops。</li>
+      <li>固定 batch、MP 16 时最大可训模型：C1（P<sub>os</sub>）40B → C2（+P<sub>a</sub>）60B → C4（P<sub>os+g</sub>+P<sub>a</sub>）140B → C5（+P<sub>a+cpu</sub>）150B。</li>
+      <li>当时用它训练了 17B 的 Turing-NLG。</li>
+    </ul>
+
+    <h3>⑦ 之后的演化</h3>
+    <table>
+      <thead><tr><th>工作</th><th>在 ZeRO 上加了什么</th></tr></thead>
+      <tbody>
+        <tr><td>ZeRO-Offload（2101.06840）</td><td>把 FP32 优化器状态和 optimizer step 放到 CPU，梯度 offload；GPU 只留 FP16 参数与计算</td></tr>
+        <tr><td>ZeRO-Infinity（2104.07857）</td><td>再往下扩到 NVMe，参数 / 梯度 / 优化器状态都可分层放在 GPU / CPU / NVMe</td></tr>
+        <tr><td>PyTorch FSDP（2304.11277）</td><td>ZeRO-3 思路的 PyTorch 原生实现：FSDP unit、预取、reshard 策略、混合分片（节点内分片、节点间复制）</td></tr>
+        <tr><td>ZeRO++（2306.10209）</td><td>面向低带宽集群压 ZeRO-3 的通信：量化权重 all-gather、节点内保留二级参数分片、量化梯度通信</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑧ box 小实验（numpy，本文实跑）</h3>
+    <pre><code># 1) 复算 Table 1（Ψ=7.5B，K=12，GB）
+N_d=4:    52.5 / 41.25 / 30.0
+N_d=64:   31.41 / 16.64 / 1.88
+N_d=1024: 30.09 / 15.1 / 0.12          # 与论文一致（论文四舍五入到 0.1）
+
+# 2) 数值等价性：4 个 rank，1000 参数，50 步 Adam，梯度依赖当前参数
+#    A：复制式 DP（all-reduce 均值梯度，各 rank 存完整 m / v）
+#    B：ZeRO-2/3 式（reduce-scatter → 各 rank 只更新自己 1/4 分片 → all-gather）
+max|w_A − w_B| = 0.0                    # 逐元素 Adam 无跨分片耦合，分片更新与整体更新完全一致
+每 rank 优化器浮点数：复制 2000 vs 分片 500
+
+# 3) ring 集合通信每 rank 发送量（单位 Ψ）
+N_d=8:    DP all-reduce 1.75    ZeRO-3 2.625
+N_d=64:   1.969                 2.953
+N_d=1024: 1.998                 2.997   # 趋于 2Ψ vs 3Ψ</code></pre>
+    <p>
+      实验 2 的结果之所以是严格的 0.0，是因为本实验里两种路径的梯度求和顺序相同。真实集群里 reduce-scatter 与 all-reduce 的归约顺序可能不同，会有浮点级差异；但<strong>算法层面</strong> ZeRO 是精确等价的——这正是它与 8-bit 优化器、梯度压缩等「近似省显存」方法的根本区别。等价性的前提是优化器逐元素：Adam / AdamW 满足；<a href="daily-2026-10-07-algo-muon.html">Muon</a> 的 Newton–Schulz 作用在整个矩阵上，参数被按扁平维度切开后无法在分片上直接做，这就是 FlashNext-RL 里 StreamingMuon 要「逐参数把完整矩阵流到 GPU 上」的原因。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先算账再选阶段</strong>：每卡模型状态 ≈ 16Ψ/N<sub>d</sub>（ZeRO-3）或 2Ψ + 14Ψ/N<sub>d</sub>（ZeRO-2）。若 ZeRO-2 已放得下（含激活），优先 ZeRO-2：通信与 DP 相同、粒度粗、对网络更友好。</li>
+      <li><strong>ZeRO-3 / FSDP 的性能关键在重叠</strong>：合理的 unit 粒度（太细则集合通信次数多、延迟暴露，太粗则峰值显存高）、开启 prefetch；梯度累加时考虑前向后不 reshard，用显存换通信。</li>
+      <li><strong>跨节点带宽差时用混合分片</strong>（HSDP：节点内 ZeRO-3、节点间 DP），或 ZeRO++ 类的量化通信。</li>
+      <li><strong>Offload 先看 host 路径</strong>：pinned vs pageable、拷贝是否阻塞、host 端加法是否在关键路径——<a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> 的数据显示，这里修好之前 kernel 优化几乎没有意义。</li>
+      <li><strong>非逐元素优化器</strong>（Muon、Shampoo 类）与 ZeRO 组合时，要么按完整参数分配所有权（每个 rank 负责若干完整矩阵），要么在 step 前 gather 完整矩阵；都要重新算通信与负载均衡。</li>
+      <li><strong>RL / 微调场景</strong>：<a href="daily-2026-10-21-algo-lora.html">LoRA</a> 让可训练参数很小，ZeRO 主要用来分片冻结基座的 FP16 参数（ZeRO-3）；全参 RL（actor + reference + critic）时模型状态翻倍，ZeRO-3 + offload 几乎是单节点的唯一选择。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 P<sub>os</sub> 在 N<sub>d</sub> 很大时最多只能省 4×，而不是 16×？</summary>
+      <p>P<sub>os</sub> 只分片了 KΨ = 12Ψ 的优化器状态，FP16 参数 2Ψ 与 FP16 梯度 2Ψ 仍在每卡全量存放：4Ψ + 12Ψ/N<sub>d</sub> → 4Ψ，相对 16Ψ 是 4×。同理 P<sub>os+g</sub> 的上限是 16Ψ/2Ψ = 8×。只有参数也分片，才没有不随 N<sub>d</sub> 下降的项。</p>
+    </details>
+    <details>
+      <summary>2. ZeRO-2 的通信量和普通 DP 一样都是 2Ψ，那它是否完全没有代价？</summary>
+      <p>通信量相同，但有其他代价：（1）梯度变成 reduce-scatter 后，梯度裁剪需要全局范数——每个 rank 先算本分片的平方和，再做一次标量 all-reduce（很便宜，但需要正确实现）；（2）参数 all-gather 必须在下一步前向前完成，失去了「all-reduce 一步到位」的简单性；（3）分片更新要求优化器逐元素，或者需要额外处理（见正文 Muon 的讨论）；（4）bucket 划分与分片边界的对齐会带来一些工程复杂度和小的负载不均。</p>
+    </details>
+    <details>
+      <summary>3. ZeRO-3 的 3Ψ 里，反向时为什么还要再 all-gather 一次参数？有没有办法省掉？</summary>
+      <p>前向为了省显存，每层用完就释放完整参数；反向计算该层的输入梯度需要完整权重，所以要再取一次。省掉的方法是前向后不 reshard（保留完整参数直到反向用完），代价是参数峰值显存回到接近全量——这正是 FSDP 的 <code>reshard_after_forward=False</code>（类 ZeRO-2 行为）或 HSDP 节点内保留副本、ZeRO++ 二级分片的折中。梯度累加多个 micro step 时，保留参数还能省掉每个 micro step 的重复 all-gather。</p>
+    </details>
+    <details>
+      <summary>4. 论文观察到 60B 模型从 64 卡到 400 卡是超线性加速。这和 ZeRO 的哪个性质有关？在什么条件下会消失？</summary>
+      <p>卡数增加 → 每卡模型状态（P<sub>os+g</sub> 下的 14Ψ/N<sub>d</sub> 部分）减少 → 释放的显存可用于更大的每卡 batch → 矩阵乘算术强度提高、每卡 TFlops 上升。消失条件：（1）每卡 batch 已经足够大，算术强度饱和；（2）全局 batch 太大影响收敛（论文脚注指出当时仍处于 batch 足够小的区间）；（3）激活成为主要显存占用时，模型状态的节省不再转化为 batch 增长；（4）网络带宽成为瓶颈。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）RL 训练里同时有 actor、reference、critic（PPO）以及推理引擎的权重副本。用 ZeRO 的账分析：哪些状态必须全量、哪些可以分片、哪些可以干脆不要？</summary>
+      <p>actor：参数、梯度、优化器状态全套，ZeRO-3 分片；critic：同上（<a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 直接去掉 critic 就省掉一整套 16Ψ）；reference：只需 FP16/BF16 参数做前向，可以 ZeRO-3 分片或 offload，甚至用 LoRA 时直接用「关掉 adapter 的 actor」代替；推理引擎：需要完整（或 TP 切分的）权重，权重同步时要从 ZeRO 分片 gather——FlashNext-RL 的逐层 gather + 改名 + 分 bucket 广播就是这个问题的工程答案。值得讨论的是：rollout 与训练共置（colocate）时，ZeRO 分片的 offload 与推理 KV cache 怎样分时复用显存。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">arXiv:1910.02054 · ZeRO: Memory Optimizations Toward Training Trillion Parameter Models（Rajbhandari, Rasley, Ruwase, He，Microsoft，SC 2020）</a></li>
+      <li><a href="https://arxiv.org/abs/2101.06840" target="_blank" rel="noopener">arXiv:2101.06840 · ZeRO-Offload</a> · <a href="https://arxiv.org/abs/2104.07857" target="_blank" rel="noopener">arXiv:2104.07857 · ZeRO-Infinity</a> · <a href="https://arxiv.org/abs/2306.10209" target="_blank" rel="noopener">arXiv:2306.10209 · ZeRO++</a> · <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">arXiv:2304.11277 · PyTorch FSDP</a></li>
+      <li>站内：
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-09-08-algo-adam.html">Adam / AdamW</a> ·
+        <a href="daily-2026-10-07-algo-muon.html">Muon</a> ·
+        <a href="daily-2026-10-21-algo-lora.html">LoRA</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

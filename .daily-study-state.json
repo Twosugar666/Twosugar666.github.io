@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 3,
+  "next": 4,
   "daily_streams": [
     "frontline",
     "harness",
@@ -858,6 +858,27 @@
       "source": "algo",
       "topic": "混合精度训练：FP32 master weights（比值≥2048 更新被舍入；Mandarin 直接更新 FP16 相对损失 80%）、loss scaling（SSD 67% 梯度为 0，S=8 救回 77.1% vs 76.9%；bigLSTM S=128；S·max|g|<65504）、FP32 累加；动态 scaler 2^16/×0.5/2000 步×2；BF16 8 位指数免 loss scaling 但 7 位尾数阈值 256；box 实验：下溢 24.38%→0%（S=32768）、1e-4×10000 FP16/BF16 停在 1.0、FP16 累加 1e5×0.01=32（arXiv:1710.03740 / 1905.12322）",
       "file": "posts/daily-2026-10-22-algo-mixed-precision.html"
+    },
+    {
+      "date": "2026-10-23",
+      "domain": "infra rl gpu",
+      "source": "frontline",
+      "topic": "FlashNext-RL：单台 8×B200 BF16 训练 Qwen3.8-Flash-Next 全 48 层（125B/6B 激活 + 51B n-gram 表，冻结前 2 层/n-gram/QSA indexer/MTP）的 131K SWE Agent RL；host 账 AdamW 16B/param 2,018 GiB 放不下→Muon 12B/param；FSDP2+CPU offload、StreamingMuon、EP8、Ulysses CP4；PinnedArena（Muon step 66→12.5 s）、GPU 常驻专家梯度（2.4–2.7×，L5 +154%）、MoK 1.56–2.24×、cuDNN indexer 5.5×、CuTe dK/dV 46.7 ms、fused gated residual 1.95×、UVA n-gram +8.1%；8 层阶梯 2,391→17,678（7.4×）；全模型 ~395→4,438 tok/s/GPU、213 HW TFLOPs；vLLM TP4+EP、MTP3、router replay（路由翻转解释 ~96% mismatch）；实跑 1,024 rollout/步、22.4 min/iter、trainer 4,737 tok/s/GPU、mismatch KL 3.6–4.0e-3（Yao & He, Snowflake AI Research arXiv:2610.28998）",
+      "file": "posts/daily-2026-10-23-flashnext-rl.html"
+    },
+    {
+      "date": "2026-10-23",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "Harness Scaling：harness 因子化为 S/T/O/C/W 五组件×3 实现=243 配置（Hamming 图 H(5,3)），strength-2 正交表 N=9λ≥11→18 个训练配置（λ=2），locality-aware 分配 K=2；ClawGym-Task 13.5K、Qwen3-4B/30B-A3B、GRPO/PPO 300 步；4B GRPO 平均 29.81→39.04、In-Space +9.80；Claude Code 黑盒 37.22/41.20 胜 Black-Box SFT 35.08/38.08、RL 33.38/36.28；Full-243 与 Random-18 更差，K=2>Repeat-2，K=4 回落；base harness 仅 -0.19；box 验证 18 行表无 d=1 行对、近邻均为 d=2（Bai, Song et al. 人大高瓴/IQuest/北航 arXiv:2610.29458）",
+      "file": "posts/daily-2026-10-23-harness-scaling.html"
+    },
+    {
+      "date": "2026-10-23",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "ZeRO：16Ψ 模型状态账（K=12）、GPT-2 1.5B 24GB；Pos/Pos+g/Pos+g+p 4×/8×/线性，7.5B N_d=64 31.4/16.6/1.88 GB；all-reduce=RS+AG 故 ZeRO-2 通信 2Ψ 不变、ZeRO-3 3Ψ（1.5×）；ZeRO-R Pa（100B MP16 33GB→2GB）/CB/MD；ZeRO-100B 170B、15 PFlops、超线性、13B 无 MP；Offload/Infinity/FSDP/ZeRO++；box 实验：Table 1 复算、分片 Adam 与复制 Adam 误差 0、ring 通信 2Ψ vs 3Ψ（arXiv:1910.02054）",
+      "file": "posts/daily-2026-10-23-algo-zero.html"
     }
   ]
 }
