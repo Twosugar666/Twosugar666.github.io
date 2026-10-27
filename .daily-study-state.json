@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 4,
+  "next": 1,
   "daily_streams": [
     "frontline",
     "harness",
@@ -879,6 +879,27 @@
       "source": "algo",
       "topic": "ZeRO：16Ψ 模型状态账（K=12）、GPT-2 1.5B 24GB；Pos/Pos+g/Pos+g+p 4×/8×/线性，7.5B N_d=64 31.4/16.6/1.88 GB；all-reduce=RS+AG 故 ZeRO-2 通信 2Ψ 不变、ZeRO-3 3Ψ（1.5×）；ZeRO-R Pa（100B MP16 33GB→2GB）/CB/MD；ZeRO-100B 170B、15 PFlops、超线性、13B 无 MP；Offload/Infinity/FSDP/ZeRO++；box 实验：Table 1 复算、分片 Adam 与复制 Adam 误差 0、ring 通信 2Ψ vs 3Ψ（arXiv:1910.02054）",
       "file": "posts/daily-2026-10-23-algo-zero.html"
+    },
+    {
+      "date": "2026-10-27",
+      "domain": "rl infra",
+      "source": "frontline",
+      "topic": "Rounding-Location Alignment：vLLM↔HF compiled/eager 2×2 交叉组合崩、一致组合稳；融合把 Qwen 的 RoPE 路径（含 Q/K norm）/ SwiGLU / 残差 RMSNorm 中间值留 FP32，训练端只在这三处保留 FP32；静态 KL 降 25.5/9.1/12.5%，Shapley RoPE 81.5/91.8/76.9%、SwiGLU 8.6/−3.8/−14.3%；4 个 Qwen 模型 BF16 基线全崩，仅 RoPE 对齐即稳（+0.90–2.04% 延迟、显存不变），三处 +5.33–10.92%；cell phase 残差和 0.443–0.472；box 复算 Shapley 一致、numpy BF16 模拟 RoPE 32.17% 元素不同（Ke, Cai, Wang · ByteDance Seed/PKU arXiv:2610.32951）",
+      "file": "posts/daily-2026-10-27-rounding-location.html"
+    },
+    {
+      "date": "2026-10-27",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Compact-Bench：35 个 SWE-bench 修复 PRE(全历史)/POST(摘要) 配对续跑（Phase A ≤10 步、续跑 ≤8 步、3 种子 stable damage），14 个摘要模型稳定损坏 5–64%/22（Opus 4.8 最好、DeepSeek-Flash 最差），Kimi Code prompt 19/22、Claude Code 细节 15.0%；LLM 摘要细节保留 ≤16.0% vs 机械 anchor_index 79.1%；生产链 15.7/19.9/4.9/1.8%；保留补丁 token 仍失败（证据→编辑断裂）；v2 路径泄漏 22/34；box 复算 Wilson CI 一致、Fisher 检验（Sun et al. USTC arXiv:2610.31710）",
+      "file": "posts/daily-2026-10-27-harness-compact-bench.html"
+    },
+    {
+      "date": "2026-10-27",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "激活重计算：Chen et al. O(n/k)+O(k)→k=√n、递归 k·log_{k+1}n、预算贪心 Alg.3、1000 层 ResNet 48G→7G、+30% 时间；Korthikanti et al. 每层 sbh(34+5as/h)、TP/SP/selective/full 公式、GPT-3 省 70% 仅 +2.7% FLOPs、22B 单层 39%→7%→4%、端到端 +29.0–32.1%、530B 2240 卡 MFU 54.2%；与 FlashAttention 关系；box 实验 64 层 MLP 峰值 16=2√64、梯度逐位一致（arXiv:1604.06174 / 2205.05198）",
+      "file": "posts/daily-2026-10-27-algo-activation-checkpointing.html"
     }
   ]
 }

@@ -93,6 +93,27 @@
           <button class="chip" data-filter="pc">配件</button>
         </div>
         <ul class="post-list">
+          <li data-cat="rl infra">
+            <a href="posts/daily-2026-10-27-rounding-location.html">一线追踪｜Where Rounding Happens Matters：BF16 RL 崩掉，可能只是因为「在哪儿舍入」不一致——vLLM 融合 kernel 把 RoPE / SwiGLU / 残差 RMSNorm 的中间值留在 FP32，训练端逐个算子先舍成 BF16；只把训练端 RoPE 路径对齐就足以防崩，延迟 +0.90–2.04%</a>
+            <span class="post-side">
+              <span class="post-cat">RL</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-27</span>
+            </span>
+          </li>
+          <li data-cat="harness agent">
+            <a href="posts/daily-2026-10-27-harness-compact-bench.html">学习笔记｜Compact-Bench：上下文压缩到底让 Coding Agent 丢了什么——同一快照下「全历史 vs 只给摘要」成对续跑，14 个摘要模型稳定损坏 5–64% 的已解修复；LLM 摘要最多留住 16.0% 的复现细节，机械抽取 79.1%，而留住文件名和补丁字符串也救不回「进度」</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-10-27</span>
+            </span>
+          </li>
+          <li data-cat="algo infra">
+            <a href="posts/daily-2026-10-27-algo-activation-checkpointing.html">学习笔记｜激活重计算（Gradient Checkpointing）：用一次额外前向换 O(√n) 显存——Chen et al. 的分段 / 递归 O(log n) / 按预算规划，到 Megatron 的 34+5as/h 激活账、selective recompute 与 sequence parallel：GPT-3 激活省 70% 只多 2.7% FLOPs</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-27</span>
+            </span>
+          </li>
           <li data-cat="infra rl gpu">
             <a href="posts/daily-2026-10-23-flashnext-rl.html">一线追踪｜FlashNext-RL：一台 8×B200 训 125B MoE 的 131K 长程 SWE Agent RL——先修 host offload 与梯度累加，再谈 kernel；8 层阶梯 7.4×、全模型 395→4,438 tok/s/GPU，1,024 条 rollout 一轮 22.4 分钟</a>
             <span class="post-side">

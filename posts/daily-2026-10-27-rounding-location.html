@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Where Rounding Happens Matters：BF16 RL 崩掉，可能只是因为「在哪儿舍入」不一致——vLLM 融合 kernel 把 RoPE / SwiGLU / 残差 RMSNorm 的中间值留在 FP32，训练端逐个算子先舍成 BF16；只把训练端 RoPE 路径对齐就足以防崩，延迟 +0.90–2.04% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Where Rounding Happens Matters：BF16 RL 崩掉，可能只是因为「在哪儿舍入」不一致——vLLM 融合 kernel 把 RoPE / SwiGLU / 残差 RMSNorm 的中间值留在 FP32，训练端逐个算子先舍成 BF16；只把训练端 RoPE 路径对齐就足以防崩，延迟 +0.90–2.04%</h1>
+    <p class="post-meta">2026-10-27 · 收藏夹：RL / Infra · 一线追踪<br />
+      来源：Yijing Ke、Tianle Cai†、Ruosong Wang†（字节跳动 Seed / 北京大学；†通讯作者）· <em>Where Rounding Happens Matters: Rounding-Location Alignment Stabilizes LLM Reinforcement Learning</em>（<a href="https://arxiv.org/abs/2610.32951" target="_blank" rel="noopener">arXiv:2610.32951</a>，cs.LG，2026-10-23 提交，出现在 arXiv 10-26 的 /new 批次）。
+      文中数字均为论文自报；实验覆盖 4 个 Qwen 家族模型、两个数学数据集，作者明确说只在这一个架构家族上验证。「box 小验证」一节为本文在 box 上用 numpy 模拟 BF16 舍入实算。
+      交叉：
+      <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>、
+      <a href="daily-2026-10-13-algo-rope.html">RoPE</a>、
+      <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a>、
+      <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL（router replay 与 mismatch KL）</a>、
+      <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      现在几乎所有 LLM RL 栈都是「两套实现」：rollout 用 vLLM / SGLang 这类推理引擎（融合 kernel、CUDA graph、torch.compile），训练端用 Hugging Face Transformers / Megatron 重算同一批 token 的 log-prob 再求梯度。权重相同、dtype 都写着 BF16，两边算出来的概率却并不相同——这就是 <strong>training–inference mismatch</strong>：本该 on-policy 的更新悄悄变成了 off-policy。本站之前在 <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> 里见过它的 MoE 版本（路由翻转解释了约 96% 的 mismatch，靠 router replay 修），在 <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a> 一文里也讨论过用 TIS 一类修正去「补」。
+    </p>
+    <p>
+      已有的解法大致三类：(1) 改全局精度（Qi et al. 的「换 FP16」，arXiv:2510.26788）；(2) 改目标函数（TIS、trust-region masking、按 mismatch 调 LR 等）；(3) 把整个推理栈和训练栈逐位对齐（batch-invariant kernel、同一份 HF 实现跑推理）。这篇问了一个更省事的问题：<strong>能不能只对齐执行栈中「被选中的几处」，就让 BF16 RL 稳住，而其他实现差异照旧存在？</strong> 答案是可以，而且关键线索出人意料地小：不是 matmul、不是 attention kernel，而是<strong>舍入发生在哪儿</strong>。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 动机实验：compiled / eager 的 2×2</h3>
+    <p>
+      用 DeepSeek-R1-Distill-Qwen-1.5B（BF16），推理端 vLLM 开 / 关编译（<code>enforce_eager</code>），训练端 HF 开 / 关 <code>torch.compile</code>（每个 decoder layer），组成四种条件。结果（论文 Figure 1）：<strong>两边模式一致（compiled–compiled、eager–eager）都稳定；两种交叉组合都先涨后崩</strong>，崩的同时估计的 per-token KL 上升；一致条件下 KL 也不是 0，只是小。
+    </p>
+    <p>
+      关键对照：固定 eager 训练不动，只把推理从 compiled 切回 eager，就恢复了稳定——<strong>没有提高训练端任何精度</strong>。这把「稳定性来自更高精度」的解释排除掉了，指向「两边一致」本身。
+    </p>
+
+    <h3>② 舍入位置失配（rounding-location mismatch）</h3>
+    <pre><code># 两个算子 f、g，R_bf16 表示舍入到 BF16
+eager（分开的 kernel）:  R_bf16( g( R_bf16( f(x) ) ) )   # 中间值先落成 BF16 再读回
+fused（一个 kernel）  :  R_bf16( g( f(x) ) )             # 中间值留在 FP32 寄存器里
+# 输出都是 BF16，但 g 看到的输入不同 → 输出可能差 1 个（或更多）BF16 格</code></pre>
+    <p>
+      论文把 mismatch 来源分三类：精度与 cast 位置、kernel 选择（vLLM 合并 QKV / gate-up 投影，HF 分开算；attention 实现不同）、归约顺序（浮点加法不满足结合律，batch / TP / tiling 都会改结果）。本文只动第一类里的一小块：<strong>融合把哪些中间值从 BF16 挪到了 FP32</strong>。
+    </p>
+
+    <h3>③ Qwen2 / Qwen3 上被融合挪动的三处</h3>
+    <table>
+      <thead><tr><th>区域</th><th>vLLM（融合）</th><th>HF eager（逐算子）</th><th>训练端干预</th></tr></thead>
+      <tbody>
+        <tr><td>RoPE 路径（含 Q/K norm，若有）</td><td>Q/K norm 的统计量、归一化缩放后的 Q/K、RoPE 的乘积与加和都在 FP32，只把旋转后的 Q/K 存 BF16</td><td>每一步都落 BF16</td><td>Q/K → RoPE 全程 FP32，输出处 cast 回 BF16</td></tr>
+        <tr><td>SwiGLU</td><td>sigmoid / SiLU 结果在 FP32 里直接乘 up 投影，乘积存 BF16</td><td>SiLU 输出先存 BF16 再乘</td><td>SiLU 输出与 gate 乘法用 FP32</td></tr>
+        <tr><td>残差 + RMSNorm</td><td>RMSNorm 吃未舍入的 FP32 残差和；输出和残差流副本各存一份 BF16</td><td>残差和先舍成 BF16 再进 RMSNorm</td><td>残差加法与 RMSNorm 用 FP32</td></tr>
+      </tbody>
+    </table>
+    <p>
+      注意干预全部是<strong>pointwise / normalization</strong>算子：BF16 权重、推理引擎、matmul 与 attention kernel、学习目标都不动。残差 RMSNorm 在每个 block 出现两次（attention 后、MLP 后），这是 <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a> 文里「Pre-LN 残差流」那条路径。
+    </p>
+
+    <h3>④ 静态归因：固定权重，看 KL 降了多少</h3>
+    <pre><code># 训练目标：PPO-clipped GRPO，无任何 mismatch 修正（刻意保持简单）
+A_i = R_i − mean(R)                       # 组内中心化，不除 std
+r_{i,t}(θ) = π_θ(a|s) / π_θ0(a|s)         # 分母也是训练端算的 → 起点 r=1
+# 所以 clip 只管「训练端策略变化」，推理端 μ_θ0 与训练端 π_θ0 的初始差距没有任何修正
+# mismatch 估计（同一组参数、对 μ 采到的 token）：
+D_KL ≈ (1/N) Σ_i Σ_t [ log μ_θ0(a_t|s_t) − log π_θ0(a_t|s_t) ]</code></pre>
+    <table>
+      <thead><tr><th>FP32 区域（HF 重算端）</th><th>R1-Distill-Qwen-1.5B</th><th>Qwen3-1.7B</th><th>Qwen3-8B-Base</th></tr></thead>
+      <tbody>
+        <tr><td>无（BF16 基线）</td><td>6.5416</td><td>7.4461</td><td>3.7599</td></tr>
+        <tr><td>仅 RoPE 路径</td><td>5.0951</td><td>7.1912</td><td>3.4247</td></tr>
+        <tr><td>仅 SwiGLU</td><td>6.1650</td><td>7.6227</td><td>4.1681</td></tr>
+        <tr><td>仅残差 RMSNorm</td><td>6.1040</td><td>7.4906</td><td>3.4921</td></tr>
+        <tr><td><strong>三处全开</strong></td><td><strong>4.8741</strong></td><td><strong>6.7689</strong></td><td><strong>3.2891</strong></td></tr>
+        <tr><td>RoPE 路径降幅 / 三处降幅</td><td>22.1% / 25.5%</td><td>3.4% / 9.1%</td><td>8.9% / 12.5%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      表中单位为 D̂<sub>KL</sub>×10<sup>4</sup>（论文 Table 1，每模型 512 条 prompt × 1 条回复，回复 token 数 55 万–286 万）。用 Shapley 值把三处的联合降幅分摊：RoPE 路径占 81.5% / 91.8% / 76.9%，SwiGLU 占 8.6% / <strong>−3.8%</strong> / <strong>−14.3%</strong>，残差 RMSNorm 占 9.9% / 12.0% / 37.4%。SwiGLU 为负意味着单独把它提到 FP32 平均反而<strong>加大</strong>失配——「提高中间精度」不等于「更一致」，一致的对象是推理端，而推理端那一块未必和训练端的 FP32 写法逐位相同。
+    </p>
+    <p>
+      附录给了一个直观的放大镜：把 per-token 的 log-prob 差在一条回复内求和，基线下三个模型平均是 3.65、3.80、0.40 nats——每个 token 的小差异在长 CoT 上累积成相当大的序列级比值。
+    </p>
+
+    <h3>⑤ RL 训练：只对齐 RoPE 就不崩</h3>
+    <table>
+      <thead><tr><th>项</th><th>设置（论文自报，附录 Table 3）</th></tr></thead>
+      <tbody>
+        <tr><td>模型</td><td>DeepSeek-R1-Distill-Qwen-1.5B、Qwen3-1.7B、Qwen3-4B-Base、Qwen3-8B-Base（8 / 8 / 16 / 32 GPU）</td></tr>
+        <tr><td>数据</td><td>Sanity-Test-R1D-1.5B（MATH 子集，挑「不太易也不太难」的题）；附录用 DAPO-Math-17k 复验；评测 AIME 2025</td></tr>
+        <tr><td>采样 / 优化</td><td>每步 64 prompt × 8 回复，回复上限 10,240 token；温度 1.0，无 top-p/top-k；Adam (0.9, 0.95)，lr 1e-6，clip (0.2, 0.28)</td></tr>
+        <tr><td>栈</td><td>vLLM（FlashAttention）生成，HF Transformers（SDPA、不编译）+ FSDP 训练</td></tr>
+        <tr><td>四种条件</td><td>BF16 基线；仅 RoPE 路径 FP32；三处 FP32；Zero-mismatch backend（推理和训练用同一份未编译 HF 实现 + Triton 写的 batch-invariant matmul / log-softmax / mean / attention，基于 Thinking Machines 的开源代码）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      结果（Figure 3）：<strong>BF16 基线在 4 个模型上全部先涨后崩</strong>，D̂<sub>KL</sub> 随崩溃上升（DeepSeek 那条陡升，Qwen3-1.7B 较缓）；两种定向对齐和 Zero-mismatch backend 都不崩、AIME 2025 更高。定向对齐的 KL 仍然是「小而非零」，Zero-mismatch 则恒为 0。也就是说，<strong>稳定并不需要消除全部数值差异</strong>——三处对齐只把静态 KL 降了 9.1–25.5%，却阻止了崩溃；作者给出的可能解释是不同位置的数值误差对更新的影响不同，对齐一个「敏感区域」就能大幅改善稳定性，而平均失配大部分还在。
+    </p>
+    <table>
+      <thead><tr><th>开销（8 卡 FSDP，5,120 token/卡，前向+全词表 log-softmax+反向）</th><th>RoPE 路径</th><th>三处</th></tr></thead>
+      <tbody>
+        <tr><td>R1-Distill-Qwen-1.5B（基线 702.61 ms）</td><td>+1.59%，显存不变</td><td>+10.92%，+0.41 GiB</td></tr>
+        <tr><td>Qwen3-1.7B（基线 878.04 ms）</td><td>+2.04%，显存不变</td><td>+7.82%，+0.55 GiB</td></tr>
+        <tr><td>Qwen3-8B-Base（基线 3,025.63 ms）</td><td>+0.90%，显存不变</td><td>+5.33%，+0.89 GiB</td></tr>
+      </tbody>
+    </table>
+    <p>这些只算训练计算；算上 rollout 生成，在整轮 RL 时间里的占比会更小。</p>
+
+    <h3>⑥ 为什么是这三处：BF16 cell phase</h3>
+    <p>
+      第 8 节给了一个数值侧写：把一个 FP32 值在相邻两个 BF16 之间的归一化位置叫 cell phase φ(x)=frac(x/h(x))，h(x)=2<sup>⌊log2|x|⌋−7</sup>。若 φ 均匀分布，round-to-nearest-even 的平均舍入误差为 0；φ 越不均匀，舍入误差越可能有系统方向。用前 16 个 Fourier 分量的 RMS 衡量「不均匀度」，各层中位数：Q/K/V、attention、RMSNorm 输出只有 1.5e-5–8.0e-4，SiLU 输出 0.038–0.040，RoPE 乘积 0.054–0.192，<strong>残差和高达 0.443–0.472</strong>。被融合改变舍入位置的三组恰好是 phase 最不均匀的三组。作者谨慎地只把它当作「补充视角」，不声称因果。
+    </p>
+
+    <h3>⑦ box 小验证（本文实算）</h3>
+    <pre><code># 1) 复算 Shapley（输入：论文 Table 1 的 8×3 个 D̂_KL）
+R1-Distill-1.5B: 联合降幅 25.5%  RoPE 81.5%  SwiGLU  8.6%  RMSNorm  9.9%   ✓
+Qwen3-1.7B     : 联合降幅  9.1%  RoPE 91.8%  SwiGLU -3.8%  RMSNorm 12.0%   ✓
+Qwen3-8B-Base  : 联合降幅 12.5%  RoPE 76.9%  SwiGLU -14.3% RMSNorm 37.4%   ✓
+
+# 2) numpy 模拟 BF16（round-to-nearest-even），随机 BF16 输入，比较 fused vs eager 输出
+RoPE（4096 位置 × 128 维，θ=10000）: 32.17% 的输出元素不同
+   其中 84.8% 只差 1 个 BF16 格；相对 FP64 参考，平均绝对误差 fused 2.25e-3 vs eager 3.23e-3
+residual + RMSNorm（4096 × 1024）   : 22.51% 不同
+SwiGLU（4096 × 1024）              : 27.46% 不同</code></pre>
+    <p>
+      数字本身依赖随机输入分布（不是 Qwen 的真实激活），只说明一件事：<strong>同为「BF16 输出」，舍入位置一挪，大约四分之一到三分之一的输出元素就和另一边不一样</strong>，主要是 1-ulp 级别。它们之后还要经过几十层和 softmax 才变成 log-prob，所以静态 KL 只有 1e-4 量级，但 RL 的 ratio 是逐 token 的、序列上会累积。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先做 2×2 诊断</strong>：推理 / 训练各开关一次编译，看 mismatch KL 和训练曲线。若只有交叉组合崩，问题大概率在「执行一致性」而不在算法。</li>
+      <li><strong>对着推理端图逐处查「中间值存什么 dtype」</strong>：vLLM 的融合 RoPE（含 Q/K norm）、fused SiLU-and-mul、fused add + RMSNorm 都是候选；在训练端对应位置保留 FP32、只在区域出口 cast 回 BF16。先只做 RoPE 路径（论文里开销 &lt; 2.1%、显存不变）。</li>
+      <li><strong>不要「全提 FP32」了事</strong>：SwiGLU 的 Shapley 份额为负说明更高精度可能离推理端更远；目标是<em>和推理端一致</em>，不是更准。</li>
+      <li><strong>把 per-token mismatch KL 当常驻监控</strong>：论文和 <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> 都显示崩溃前 KL 会抬头；配合序列级 log-prob 差（论文基线 3.65 nats/条）一起看。</li>
+      <li><strong>与目标函数修正正交</strong>：本文刻意不用 TIS / masking 以隔离变量；生产中两者可以叠加。MoE 还要单独处理路由失配（router replay）。</li>
+      <li><strong>换架构要重做图检查</strong>：作者明确只在 Qwen2/Qwen3 上验证；MLA、gated attention、不同 norm 位置的模型，融合挪动的位置可能完全不同。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 在本文的 GRPO 目标里，为什么 clip 管不住 training–inference mismatch？</summary>
+      <p>ratio 的分子分母都用训练端实现：r(θ)=π<sub>θ</sub>/π<sub>θ0</sub>，更新开始时恒等于 1。clip 只限制「训练端策略相对训练端旧策略」的变化，而样本是从推理端 μ<sub>θ0</sub> 采的，μ 与 π<sub>θ0</sub> 的初始差距既不进 ratio 也不被截断。要在目标里修正，需要显式引入 π<sub>θ0</sub>/μ<sub>θ0</sub> 的重要性权重（TIS、MIS、序列级 masking 等，见 <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a>）；本文则从执行侧把这个比值本身拉近 1。</p>
+    </details>
+    <details>
+      <summary>2. 为什么「推理 compiled→eager、训练保持 eager」恢复稳定这一组对照很关键？</summary>
+      <p>它把两个可能的解释拆开：如果稳定性来自「训练端精度更高」，那训练端不变、只改推理端不应该有效；实际有效，说明决定因素是两端是否一致。再结合「compiled–compiled 也稳定」，可以排除「编译本身有 bug」或「eager 更准」之类的解释。这是一个很干净的因果设计，值得在自己的栈上复现。</p>
+    </details>
+    <details>
+      <summary>3. 三处全对齐只把静态 KL 降 9–25%，为什么能阻止崩溃？给出至少两种可能机制。</summary>
+      <p>(a) 误差不是同质的：RoPE 路径的偏差直接作用于 q·k 的相对位置结构（参见 <a href="daily-2026-10-13-algo-rope.html">RoPE</a> 与 BF16 破坏 RoPE 相对位置性的已有研究），可能对某些 token（长上下文、低概率 token）的 log-prob 有系统性偏移，而平均 KL 被大量无害 token 稀释；(b) 系统性 vs 随机：cell phase 不均匀意味着舍入误差带方向，系统偏差在训练中会被梯度持续放大，随机误差则相互抵消；(c) 反馈回路：mismatch 让更新略偏 → 策略分布变尖 / 出现低概率 token → mismatch 进一步增大，KL 曲线在崩溃前抬头正是这个回路；初始失配稍小就可能不越过触发阈值。论文自己只给出 (a) 类解释，并保持谨慎。</p>
+    </details>
+    <details>
+      <summary>4. 为什么作者不直接推荐「训练端也 torch.compile」？</summary>
+      <p>论文列了几点：训练端编译覆盖前向和反向，首次编译开销大；变长回复会触发重编译，数据相关控制流和不支持的算子会造成 graph break；FSDP 分片、自定义 kernel 需要和编译器适配；更根本的是，编译后的 HF 仍然不是编译后的 vLLM——kernel、cast 位置、归约顺序还可能不同，并不保证一致。定向对齐只改几处 pointwise 运算，侵入性小得多。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把这个思路推广到 FP8 / NVFP4 rollout 的 RL（如 Jet-RL、QeRL、QaRL），会遇到什么新问题？</summary>
+      <p>低比特下「舍入位置」不止是中间激活，还包括权重 / 激活量化的 block 边界、scale 的计算方式（per-tensor / per-block、amax 的来源）、是否用随机舍入，推理端和训练端很难逐处对齐；误差量级也比 BF16 1-ulp 大一个数量级以上，定向对齐可能不再足够，需要 QaRL 那样在训练前向里复刻量化 matmul 再加重要性修正。另一方面，本文的方法论仍然适用：先用 2×2（量化 / 不量化 × 两端）诊断，再用 Shapley 归因找「敏感区域」，把有限的对齐预算花在最值钱的地方。另参考 <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度</a> 里 BF16 / FP16 的尾数位差异。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.32951" target="_blank" rel="noopener">arXiv:2610.32951 · Where Rounding Happens Matters: Rounding-Location Alignment Stabilizes LLM Reinforcement Learning（Ke, Cai, Wang · ByteDance Seed / PKU）</a></li>
+      <li><a href="https://arxiv.org/abs/2510.26788" target="_blank" rel="noopener">arXiv:2510.26788 · Defeating the Training-Inference Mismatch via FP16</a> · <a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/" target="_blank" rel="noopener">Thinking Machines · Defeating Nondeterminism in LLM Inference</a> · <a href="https://arxiv.org/abs/2601.14243" target="_blank" rel="noopener">arXiv:2601.14243 · Jet-RL</a> · <a href="https://arxiv.org/abs/2604.07853" target="_blank" rel="noopener">arXiv:2604.07853 · QaRL</a></li>
+      <li>站内：
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-10-13-algo-rope.html">RoPE</a> ·
+        <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a> ·
+        <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> ·
+        <a href="daily-2026-10-27-harness-compact-bench.html">今日 Harness：Compact-Bench</a> ·
+        <a href="daily-2026-10-27-algo-activation-checkpointing.html">今日算法：激活重计算</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>

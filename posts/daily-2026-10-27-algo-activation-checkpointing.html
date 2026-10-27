@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜激活重计算（Gradient Checkpointing）：用一次额外前向换 O(√n) 显存——Chen et al. 的分段 / 递归 O(log n) / 按预算规划，到 Megatron 的 34+5as/h 激活账、selective recompute 与 sequence parallel：GPT-3 激活省 70% 只多 2.7% FLOPs · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜激活重计算（Gradient Checkpointing）：用一次额外前向换 O(√n) 显存——Chen et al. 的分段 / 递归 O(log n) / 按预算规划，到 Megatron 的 34+5as/h 激活账、selective recompute 与 sequence parallel：GPT-3 激活省 70% 只多 2.7% FLOPs</h1>
+    <p class="post-meta">2026-10-27 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Tianqi Chen、Bing Xu、Chiyuan Zhang、Carlos Guestrin（华盛顿大学 / Dato / MIT）· <em>Training Deep Nets with Sublinear Memory Cost</em>（<a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">arXiv:1604.06174</a>，2016）；
+      Vijay Korthikanti、Jared Casper、Sangkug Lym、Lawrence McAfee、Michael Andersch、Mohammad Shoeybi、Bryan Catanzaro（NVIDIA）· <em>Reducing Activation Recomputation in Large Transformer Models</em>（<a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198</a>，MLSys 2023）。
+      思想源头：自动微分里的 checkpointing（Griewank &amp; Walther, <em>Revolve</em>, ACM TOMS 2000）。
+      论文数字按原文（Titan X / A100 时代）；「box 小实验」一节为本文在 box 上用 numpy 实跑。
+      交叉：
+      <a href="daily-2026-10-23-algo-zero.html">ZeRO</a>、
+      <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a>、
+      <a href="daily-2026-10-27-rounding-location.html">今日一线：Rounding-Location Alignment</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 一文把「模型状态」（参数 / 梯度 / 优化器状态，16Ψ 字节）切到了每卡 16Ψ/N<sub>d</sub>，并顺带提了一句 ZeRO-R 里的 activation partitioning。剩下的大头就是<strong>激活</strong>：反向传播要用前向的中间结果，n 层网络就得存 O(n) 份，而且它还随 batch 和序列长度线性（attention 分数甚至二次）增长。长上下文 RL（今天一线篇用的回复上限是 10,240 token，<a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> 是 131K）里，激活往往比模型状态更先撑爆显存。
+    </p>
+    <p>
+      激活重计算的想法极其朴素：<strong>前向时只留一部分中间结果，反向需要时从最近的保留点重新前向算回来</strong>——用算力换显存。2016 年 Chen et al. 把它系统化成 O(√n) 显存、多一次前向的算法；2022 年 Megatron 团队指出「全量重算」浪费了 30–40% 时间，只重算 attention 里「显存大、算量小」的那一块就够了。今天的 <code>torch.utils.checkpoint</code>、Megatron 的 <code>--recompute-granularity</code>、DeepSpeed 的 activation checkpointing 都是这两篇的工程化。顺带一提，今天一线论文测训练开销时就开着 non-reentrant gradient checkpointing。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 分段：O(n/k) + O(k)，取 k=√n</h3>
+    <pre><code># Chen et al. Alg.1（线性链）
+前向：把 n 层切成 k 段，只保存每段的输入 temp[k]，段内中间结果全部丢弃
+反向：for 段 k = 最后 → 第一：
+          从 temp[k] 重新前向本段，暂存段内中间结果 localtemp
+          段内逐层反向，用完即释放
+显存 = max_i cost(segment_i) + O(k) = O(n/k) + O(k)
+k = √n  ⇒  O(2√n)；代价 = 每段多前向一次 ≈ 多一次完整前向
+# 反向约是前向的 2 倍，所以总时间约从 3F 变 4F（+33% 上限）</code></pre>
+    <p>
+      论文实测（MXNet，Titan X）：1,000 层 ResNet（batch 32，224×224）的特征图显存从 48 GB 降到 7 GB；4 层、1024 隐层的 LSTM 长序列展开，sublinear plan 比已优化的方案再省 4 倍以上；速度代价约 30%。不做重计算，即使开满 inplace 与 memory sharing，「只能训到 200 层 ResNet」。
+    </p>
+
+    <h3>② 递归：O(log n)，代价是 O(n log n) 的前向</h3>
+    <pre><code># 把每段看成一个「子程序算子」，段内再递归套用同样的策略
+g(n) = k + g(n / (k+1))   ⇒   g(n) = k · log_{k+1}(n)
+k = 1 时 g(n) = log₂ n ；但需要 O(n log n) 的前向计算，实践中很少用</code></pre>
+
+    <h3>③ 真实网络不等长：按预算贪心 + 网格搜索</h3>
+    <pre><code># Alg.3 Memory Planning with Budget B
+temp = 0
+for v in 拓扑序:
+    temp += size(v)
+    if v 是候选切分点 and temp > B:  保留 v（m(v)=0），x += size(v)，y = max(y, temp)，temp = 0
+    else:                           丢弃 v（m(v)=1，反向时重算）
+# 先 B=0 跑一次得到 x、y，再取 B=√(xy)，在 [B/√2, √2·B] 上 6 点网格搜索</code></pre>
+    <p>
+      还有两条常被忽略的「免费午餐」：(1) 先做计算图的 liveness 分析，inplace + memory sharing 已能省 2–3 倍（仍是线性）；(2) <strong>只丢便宜算子的输出</strong>——Conv-BN-ReLU 里保留卷积输出、丢掉 BN / ReLU / pooling 的结果，几乎不增加算量。第二条正是 2022 年 selective recompute 的前身。Chen et al. 用一个「mirror count」m(v) 统一表达：m=0 保留，m=1 重算一次，m&gt;1 对应递归。
+    </p>
+
+    <h3>④ Transformer 的激活账：sbh(34 + 5as/h)</h3>
+    <table>
+      <thead><tr><th>组件（16-bit 激活，dropout mask 1 字节）</th><th>需保存</th><th>字节</th></tr></thead>
+      <tbody>
+        <tr><td>QKV 投影输入</td><td>共享输入</td><td>2sbh</td></tr>
+        <tr><td>QK<sup>T</sup></td><td>Q、K</td><td>4sbh</td></tr>
+        <tr><td>softmax 输出 / softmax dropout mask</td><td>注意力矩阵</td><td><strong>2as²b + as²b</strong></td></tr>
+        <tr><td>attention over V</td><td>dropout 输出 + V</td><td><strong>2as²b</strong> + 2sbh</td></tr>
+        <tr><td>输出投影输入 + attention dropout mask</td><td></td><td>2sbh + sbh</td></tr>
+        <tr><td>MLP（两层输入 2sbh、8sbh；GeLU 输入 8sbh；dropout mask sbh）</td><td></td><td>19sbh</td></tr>
+        <tr><td>两个 LayerNorm 输入</td><td></td><td>4sbh</td></tr>
+        <tr><td><strong>每层合计</strong></td><td></td><td><strong>sbh(34 + 5as/h)</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      s 序列长、b micro-batch、h 隐层、a 头数。关键观察：5as/h 那一项（softmax、softmax dropout、attention over V 的输入）<strong>占显存大、每元素 FLOPs 极低</strong>。GPT-3（a=96, s=2048, h=12288）5as/h=80，MT-NLG（a=128, h=20480）为 64，都比其余部分的 34 还大。
+    </p>
+
+    <h3>⑤ 各种并行 + 重算组合下的每层激活（论文 Table 2）</h3>
+    <table>
+      <thead><tr><th>配置</th><th>每层激活（字节）</th></tr></thead>
+      <tbody>
+        <tr><td>无并行</td><td>sbh(34 + 5as/h)</td></tr>
+        <tr><td>tensor parallel（基线）</td><td>sbh(10 + 24/t + 5as/(ht))</td></tr>
+        <tr><td>tensor + sequence parallel</td><td>sbh(34/t + 5as/(ht))</td></tr>
+        <tr><td>TP + selective recompute</td><td>sbh(10 + 24/t)</td></tr>
+        <tr><td><strong>TP + SP + selective recompute</strong></td><td><strong>sbh · 34/t</strong></td></tr>
+        <tr><td>full recompute</td><td>sbh · 2（只存每层输入）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      TP 里没切开的「10」来自 LayerNorm 与 dropout 等被复制的部分；sequence parallel 沿序列维把它们也切开，通信从 TP 的 all-reduce 变成 reduce-scatter + all-gather，带宽相同（ring all-reduce 本来就是 RS + AG，和 <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 里 ZeRO-2 通信不变是同一个论证）。selective recompute 只重算 attention 核心那一块：GPT-3 激活省 70%、MT-NLG 省 65%，额外 FLOPs 只有 2.7% 和 1.6%；剩余显存 34sbhL/t 随序列长度线性、与头数无关。
+    </p>
+    <table>
+      <thead><tr><th>22B 单层（A100，论文 Table 4）</th><th>前向 ms</th><th>反向 ms</th><th>合计 ms</th><th>开销</th></tr></thead>
+      <tbody>
+        <tr><td>不重算</td><td>7.7</td><td>11.9</td><td>19.6</td><td>—</td></tr>
+        <tr><td>+ sequence parallel</td><td>7.2</td><td>11.8</td><td>19.0</td><td>−3%</td></tr>
+        <tr><td>full recompute</td><td>7.7</td><td>19.5</td><td>27.2</td><td>39%</td></tr>
+        <tr><td>selective recompute</td><td>7.7</td><td>13.2</td><td>20.9</td><td>7%</td></tr>
+        <tr><td><strong>selective + SP</strong></td><td>7.2</td><td>13.1</td><td>20.3</td><td><strong>4%</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      端到端（Table 5，t=8，不含 DP）：相对 full recompute，吞吐提升 29.0%（22B）、31.8%（175B）、29.7%（530B）、32.1%（1T）；1T 模型 MFU 56.3%、HFU 57.0%。530B 扩到 2240 张 A100（8 路 DP）MFU 54.2%，相对使用全量重算的 42.1% 快 29%。组合后激活显存约为 TP 基线的 20% 以下（约 5× 缩减），只是 full recompute（约 10%）的两倍左右。
+    </p>
+    <p>
+      与 <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> 的关系：FlashAttention 在反向里用保存的 softmax 统计量从 Q、K、V 重算注意力块，从不把 s×s 矩阵写回 HBM——这本身就是 kernel 内的 selective recompute。所以在 FA 时代，5as/h 项基本自动消失，每层约剩 34sbh/t 量级，「该不该重算」的问题转移到 MLP 和 norm 上（SwiGLU 的 gate/up 中间张量是大头）。
+    </p>
+
+    <h3>⑥ box 小实验（本文实跑）</h3>
+    <pre><code># 64 层 tanh MLP（d=256, batch 32, float64），手写前向/反向；分 k 段重算 vs 全存
+plain : 存储激活 65 份，前向层计算 64 次
+k= 2  : 峰值 34 份，前向 126 次（+97%），梯度与 plain 最大差 0.0
+k= 4  : 峰值 20 份，前向 124 次（+94%），差 0.0
+k= 8  : 峰值 16 份（= 2√64），前向 120 次（+88%），差 0.0
+k=16  : 峰值 20 份，前向 112 次（+75%），差 0.0
+k=32  : 峰值 34 份，前向  96 次（+50%），差 0.0
+递归 g(64)：k=1 → 6.0，k=2 → 7.6，k=7 → 14.0
+
+# 按 Table 2 公式算 GPT-3 175B / MT-NLG 530B（s=2048, b=1, t=8, 全部 L 层）
+GPT-3 : 5as/h=80 → selective 省 70.2%；TP+SP 不重算 32.1 GiB、selective 9.6 GiB、full 4.5 GiB
+MT-NLG: 5as/h=64 → selective 省 65.3%；50.2 GiB / 17.4 GiB / 8.2 GiB</code></pre>
+    <p>
+      两点观察：(1) 峰值在 k=√n 处最小，U 形两侧对称（段太少 → 段内大；段太多 → checkpoint 多），和 O(n/k)+O(k) 完全吻合；(2) 重算前向次数是 n−k（每段最后一层的输出就是下一段的 checkpoint，不用再算），所以段越多越便宜——显存与算力不是单调 trade-off。梯度逐位相同，因为重算走的是<strong>同一份确定性代码</strong>；如果重算路径换了 kernel 或舍入位置（比如前向编译、重算 eager），这个「0.0」就不再成立——这正是今天一线篇讲的问题在训练端内部的翻版。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先算账再开关</strong>：用 sbh(34+5as/h)·L/t 估算激活（用了 FlashAttention 就先去掉 5as/h 项），和 ZeRO 后的模型状态加在一起看是否超显存，不要一上来就全量重算。</li>
+      <li><strong>优先 selective</strong>：Megatron 用 <code>--recompute-granularity selective</code>；只在仍放不下时用 <code>full</code>，并配合 <code>--recompute-method uniform/block</code> 与 <code>--recompute-num-layers</code> 只对部分层全量重算（论文第 5 节也建议流水线并行时「显存允许存几个 micro-batch 的激活就存几个，其余再做 full 或 selective 重算」）。</li>
+      <li><strong>PyTorch 用 non-reentrant</strong>：<code>torch.utils.checkpoint(..., use_reentrant=False)</code>，与 FSDP、<code>torch.compile</code> 的兼容性更好；保留默认的 RNG 状态恢复，否则 dropout mask 在重算时不同，梯度就错了。</li>
+      <li><strong>checkpoint 粒度跟着 block 走</strong>：Transformer 天然以 decoder block 为段（HF 的 <code>gradient_checkpointing_enable()</code> 就是每层一个 checkpoint，相当于 k=L）；需要更省时用每 2–4 层一段。</li>
+      <li><strong>RL 训练端的特殊性</strong>：rollout 回复长、micro-batch 小，激活随 s 线性；序列打包 + checkpoint + Ulysses / ring CP 是常见组合。重算路径务必与前向一致（同 kernel、同 dtype、同舍入位置），否则会引入一个与 rollout mismatch 叠加的新误差源。</li>
+      <li><strong>与 offload 的取舍</strong>：CPU offload 用 PCIe 带宽换显存，重算用 FLOPs 换显存；GPU 算力越强、PCIe 越成为瓶颈，重算越划算——Chen et al. 2016 年就指出重算「不占用 PCIe 带宽」。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说 √n 重算只让训练慢「不到三分之一」，而 Megatron 实测 full recompute 单层开销是 39%？</summary>
+      <p>理论上前向 F、反向约 2F，多一次前向即 3F→4F，+33%。Megatron 在论文里解释了多出来的部分：基线反向中有一项优化——把 TP 的 all-reduce 通信与线性层权重梯度计算重叠；full recompute 的时间对比里这部分收益体现不出来，于是实测 39% 高于预期的 33%（作者指出这一收益随模型变大而增加）。Chen et al. 的约 30% 则是在 ResNet / LSTM 上测的，反向 / 前向比例与 Transformer 不同。核心结论不变：全量重算的代价约三分之一，selective 把它压到个位数（22B 单层 7%，配合 SP 4%）。</p>
+    </details>
+    <details>
+      <summary>2. selective recompute 为什么偏偏选 attention 的 softmax / dropout / attention-over-V 这一块？</summary>
+      <p>因为它满足「显存 / FLOPs 比最大」：这一块的激活是 5as²b，与 s² 成正比，而算它只需对已保存的 Q、K、V 做一次 QK<sup>T</sup>、softmax 和 dropout（mask 可由 RNG 重新生成），每元素 FLOPs 很低；相反 MLP 的 matmul 激活只有 O(sbh) 但每元素算量大，重算不划算。这是 Chen et al.「只丢便宜算子输出」思想的直接应用。</p>
+    </details>
+    <details>
+      <summary>3. 用了 FlashAttention 之后，还需要 selective recompute 吗？剩下的显存大头在哪？</summary>
+      <p>FA 已经在 kernel 内部做了注意力块的重算（只存每行 logsumexp 统计量，s×s 矩阵不落 HBM），5as/h 项基本消失，Megatron 的 selective 在 attention 部分就是冗余的。剩下的 34sbh 里，MLP 占 19sbh（SwiGLU 的 gate / up 输出与激活函数输入更大），LayerNorm / RMSNorm 输入和残差也占相当份额。所以 FA 时代的「selective」通常转向重算激活函数和 norm（这类 pointwise 算子便宜），或者对 MLP 整块重算。</p>
+    </details>
+    <details>
+      <summary>4. box 实验里重算后的梯度与 plain 逐位相同。列出至少三种会破坏这一点的工程情形。</summary>
+      <p>(a) dropout 等随机算子没有恢复 RNG 状态，重算时 mask 不同；(b) 重算走了不同的 kernel / 编译路径 / 融合方式，舍入位置不同（与今天一线篇同理）；(c) 非确定性 kernel（atomic add 的 split-K、某些 scatter），两次结果不同；(d) 有状态的算子（BatchNorm 的 running stats）在重算时被二次更新；(e) MoE 路由在重算时因数值抖动选了不同专家，导致前向与反向用的不是同一个计算图。生产中 (a)(d) 一般由框架处理，(b)(c)(e) 需要自己检查。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把激活重计算、ZeRO-3、CPU offload、sequence / context parallel 放在一起，如何为一个 32K 回复长度的 RL 训练任务决定组合？</summary>
+      <p>先分开算两本账：模型状态（<a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 的 16Ψ/N<sub>d</sub>，或 offload 后的 GPU 常驻部分）和激活（约 34sbh·L/t，s=32K 时极大）。激活随 s 线性，CP / Ulysses 能把 s 维切到 cp 份，是最「不花算力」的手段，但要额外通信；selective 重算几乎免费，应默认打开；full 重算再省约一半激活，代价约 30%；offload 激活则取决于 PCIe / NVLink-C2C 带宽。一个合理顺序是：FA + selective → 序列打包 + CP 直到激活放得下 → 仍不够再对部分层 full 重算 → 最后才考虑激活 offload。同时要把重算路径的数值一致性纳入 mismatch 监控。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">arXiv:1604.06174 · Training Deep Nets with Sublinear Memory Cost（Chen, Xu, Zhang, Guestrin）</a></li>
+      <li><a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198 · Reducing Activation Recomputation in Large Transformer Models（Korthikanti et al., NVIDIA）</a></li>
+      <li>Griewank &amp; Walther · Algorithm 799: Revolve（ACM TOMS 26(1), 2000）· <a href="https://docs.pytorch.org/docs/stable/checkpoint.html" target="_blank" rel="noopener">PyTorch torch.utils.checkpoint 文档</a> · <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">arXiv:2205.14135 · FlashAttention</a></li>
+      <li>站内：
+        <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> ·
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a> ·
+        <a href="daily-2026-09-01-kv-cache.html">KV cache 的一生</a> ·
+        <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> ·
+        <a href="daily-2026-10-27-rounding-location.html">今日一线：Rounding-Location Alignment</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

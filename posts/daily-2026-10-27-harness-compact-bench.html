@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Compact-Bench：上下文压缩到底让 Coding Agent 丢了什么——同一快照下「全历史 vs 只给摘要」成对续跑，14 个摘要模型稳定损坏 5–64% 的已解修复；LLM 摘要最多留住 16.0% 的复现细节，机械抽取 79.1%，而留住文件名和补丁字符串也救不回「进度」 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Compact-Bench：上下文压缩到底让 Coding Agent 丢了什么——同一快照下「全历史 vs 只给摘要」成对续跑，14 个摘要模型稳定损坏 5–64% 的已解修复；LLM 摘要最多留住 16.0% 的复现细节，机械抽取 79.1%，而留住文件名和补丁字符串也救不回「进度」</h1>
+    <p class="post-meta">2026-10-27 · 收藏夹：Harness / Agent · 学习笔记<br />
+      来源：Ruopei Sun、Jianfeng Cai、Kangwen Zhao、Wengang Zhou、Houqiang Li（中国科学技术大学）· <em>Compact-Bench: Measuring What Context Compaction Costs Long-Horizon Coding Agents</em>（<a href="https://arxiv.org/abs/2610.31710" target="_blank" rel="noopener">arXiv:2610.31710</a>，cs.SE，2026-10-22 提交，出现在 arXiv 10-26 的 /new 批次）。
+      代码 <a href="https://github.com/cai-jianfeng/compact-bench" target="_blank" rel="noopener">cai-jianfeng/compact-bench</a>，数据在 Hugging Face（caijanfeng/compact-bench）。数字均为论文自报；会话类数据来自作者机构平台的真实 agent 流量，私有 payload 不公开。「box 小验证」一节为本文用 Python 对论文表格实算。
+      交叉：
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction（bound / prune / checkpoint）</a>、
+      <a href="daily-2026-10-21-harness-reobserve.html">When the Harness Decides Success</a>、
+      <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a>、
+      <a href="daily-2026-10-08-harness-refold.html">ReFold</a>、
+      <a href="daily-2026-08-31-supo.html">SUPO</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 coding agent 跑到上下文上限时，harness 会触发 <strong>compaction</strong>：调一个 LLM 把历史写成摘要，然后用摘要替换历史继续干活。Claude Code、Codex、Gemini CLI、opencode、Kimi Code 都内置了这一步，各自有一段「压缩 prompt」。本站 <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> 讲过它的工程形态，<a href="daily-2026-10-21-harness-reobserve.html">再观测</a> 那篇说明「信息还能不能再拿到」决定截断代价，<a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> 发现压缩后 loop 率飙升。
+    </p>
+    <p>
+      但评测一直有个缺口：效率指标（省了多少 token）、信息保留（摘要里还有没有某个事实）、端到端成功率，都<strong>不能把「这一次替换」的影响单独剥离出来</strong>——任务失败可能是模型本来就不会，也可能是摘要丢了状态。Compact-Bench 的核心设计就是一个配对控制实验：同一段历史、同一个仓库快照、同一个续跑 agent，一边给全历史（PRE），一边只给摘要（POST），看谁还能把补丁打完。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 三条评测轨道</h3>
+    <table>
+      <thead><tr><th>轨道</th><th>规模</th><th>测什么</th><th>判据</th></tr></thead>
+      <tbody>
+        <tr><td>Task Preservation</td><td>35 个 SWE-bench 修复（pytest 18、sympy 6、xarray 3、pylint 3、requests 2、sphinx 2、flask 1）</td><td>全历史能修好的，换成摘要还能不能修好</td><td>仓库的 FAIL_TO_PASS 测试</td></tr>
+        <tr><td>Recurring-Detail Retention</td><td>146 个会话（143 真实 + 3 模拟器合成；Kimi Code 73、Claude Code 50、opencode 14、其他 9），9,330 个复现细节</td><td>边界前出现、之后 3–8 个请求里又出现的结构化值，摘要里还有没有</td><td>确定性抽取 + 大小写敏感子串匹配</td></tr>
+        <tr><td>Production-Chain Retention</td><td>106 个真实会话、224 个生产压缩边界（每会话中位 2、最多 4 个）</td><td>线上真实摘要在连续多次压缩后还剩多少未来要用的细节</td><td>同上，另测「已写完的文件被说成待办」</td></tr>
+      </tbody>
+    </table>
+    <p>
+      「结构化值」指路径、commit SHA、PR / issue 号、错误类型、URL、key-value、IP 地址。会话入选要求：无压缩标记、≥8 个请求、最大请求 ≥60,000 token、完整度 ≥0.8；人为边界放在第 ⌊0.65n⌋ 个请求。
+    </p>
+
+    <h3>② Task Preservation 的配对回放</h3>
+    <pre><code>Phase A: agent 在 repo 上最多跑 10 步 → 缓存历史 H 和工作树快照 D（所有方法与种子共享）
+S = C(H)                                   # C = 摘要模型 + 压缩 prompt + 固定的序列化/截断
+PRE : 恢复 D，给 H，续跑 ≤ 8 步 → 跑 FAIL_TO_PASS
+POST: 恢复 D，只给 S，续跑 ≤ 8 步 → 跑 FAIL_TO_PASS
+标签: PRE✓POST✓ preserved | PRE✓POST✗ damaged | PRE✗POST✓ rescue | 都✗ unsolved
+损坏率 = damaged / PRE 通过数（22 个经验证的 PRE-pass）
+首轮 damaged/rescue 再补 2 个种子；3 次中 POST 至少 2 次失败才算 stable damage</code></pre>
+    <p>
+      把 damage 和 rescue 分开报是这篇的一个要点：如果只看总成功率，「摘要帮 A 题翻盘」会抵消「摘要害 B 题失败」。续跑 agent 只有两个工具：<code>read_file</code>（限工作目录）和带白名单的 <code>run_command</code>（pytest、python、grep、rg、sed、git、patch 等），命令输出截到 3,000 字符、读文件截到 8,000；命令超时 120 s、测试超时 300 s。这是一个 <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> 量级的极简 harness，目的就是让变量只剩「摘要」。
+    </p>
+    <p>
+      作者在附录 D 讲了一个踩坑：v1 用系统解释器，老仓库根本 import 不了；v2 用实例解释器但 Phase A 与续跑<strong>在不同目录</strong>，摘要里抄来的绝对路径把 POST 的命令导向了被评判树之外——34 个案例里 22 个中招（xarray-6721、pytest-7521 被误判为 damage）。v3 改为同一目录 + 每次恢复快照，才算干净。这条对所有做「摘要续跑」实验的人都值得记住：<strong>摘要里的路径是有语义的，环境必须保证它们指向同一棵树</strong>。
+    </p>
+
+    <h3>③ 结果一：摘要模型的选择能差 59 个点</h3>
+    <table>
+      <thead><tr><th>摘要模型（Claude Code prompt，Kimi-K3 续跑）</th><th>稳定损坏（/22）</th><th>Wilson 95% CI</th></tr></thead>
+      <tbody>
+        <tr><td>Claude Opus 4.8</td><td><strong>5%（1）</strong></td><td>1–22</td></tr>
+        <tr><td>Kimi-K3 / GPT-5.6-Luna</td><td>18%（4）</td><td>7–39</td></tr>
+        <tr><td>GPT-5.6-Sol</td><td>27%（6）</td><td>13–48</td></tr>
+        <tr><td>Claude Fable 5 / Fable 5.1</td><td>36%（8）</td><td>20–57</td></tr>
+        <tr><td>GPT-6-Astra</td><td>41%（9）</td><td>23–61</td></tr>
+        <tr><td>Qwen3.8-Max / GPT-5.6-Terra / Claude Opus 5.5</td><td>45%（10）</td><td>27–65</td></tr>
+        <tr><td>GLM-5.3</td><td>50%（11）</td><td>31–69</td></tr>
+        <tr><td>DeepSeek-V4-Pro</td><td>55%（12）</td><td>35–73</td></tr>
+        <tr><td>Hy4-Preview</td><td>59%（13）</td><td>39–77</td></tr>
+        <tr><td>DeepSeek-Flash</td><td><strong>64%（14）</strong></td><td>43–80</td></tr>
+      </tbody>
+    </table>
+    <p>
+      126 个首轮 damage 中 120 个经三次复跑确认，说明损坏大多是可复现的，不是采样噪声。损坏集合只部分重叠：14 个模型在 22 题里只对 4 题意见一致；pytest-10081 只有 Opus 4.8 保住，sphinx-9230 有 9 个模型（含 Opus 4.8）都损坏、5 个保住。一个有意思的细节：同为 Anthropic 的 Opus 5.5 损坏 45%，比 Opus 4.8 差得多——「更新的旗舰」不等于「更好的摘要器」。
+    </p>
+
+    <h3>④ 结果二：prompt 本身也是一个变量，而且两个指标会打架</h3>
+    <table>
+      <thead><tr><th>压缩 prompt（Kimi-K3 作摘要器）</th><th>POST 通过（/22）</th><th>复现细节保留</th></tr></thead>
+      <tbody>
+        <tr><td>Kimi Code（296 字符，第一人称交接笔记）</td><td><strong>19（86%）</strong></td><td>8.2%</td></tr>
+        <tr><td>Claude Code（634 字符，要求 9 个小节，摘要约 10,000 字符）</td><td>18（82%）</td><td><strong>15.0%</strong></td></tr>
+        <tr><td>Gemini CLI（279 字符，「极度压缩」）</td><td>17（77%）</td><td>7.2%</td></tr>
+        <tr><td>Codex</td><td>16（73%）</td><td>9.5%</td></tr>
+        <tr><td>opencode</td><td>16（73%）</td><td>9.5%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Kimi Code 与 Claude Code 的失败画像互补：Kimi Code 保住了 Claude Code 弄坏的 3 个 pytest 修复，Claude Code 保住了 Kimi Code 弄坏的 requests-5414 和 sympy-13551；sphinx-9230 两者都坏（5 个 prompt 全坏）。细节保留上，7 个摘要模型 × 5 个 prompt 的矩阵从 5.0% 到 16.0%，DeepSeek-Flash 在 3 个 prompt 下领先、GPT-5.6-Terra 在 2 个下领先——摘要模型与 prompt 存在交互。
+    </p>
+
+    <h3>⑤ 结果三：保留信息 ≠ 保留进度</h3>
+    <table>
+      <thead><tr><th>摘要方式</th><th>复现细节保留（146 会话）</th></tr></thead>
+      <tbody>
+        <tr><td>最好的 LLM 摘要（DeepSeek-Flash）</td><td>16.0%</td></tr>
+        <tr><td>Kimi-K3 / GPT-5.6-Sol / GPT-5.6-Luna</td><td>15.0% / 14.8% / 13.3%</td></tr>
+        <tr><td>机械抽取 anchor_index（读前 400,000 字符、每类最多 40 个值）</td><td><strong>79.1%</strong></td></tr>
+        <tr><td>线上生产摘要（第 1 / 2 / 3 / 4 个边界）</td><td>15.7% / 19.9% / 4.9% / 1.8%（n=106 / 27 / 6 / 1）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      最有冲击力的是交叉对比：<strong>DeepSeek-Flash 的细节保留第一，Task Preservation 却损坏最多（14/22）</strong>；Kimi-K3 细节保留 15.0%、只损坏 4 题。第 4.4 节对 4 个 Kimi-K3 稳定损坏案例逐一审计：摘要都保留了目标文件，pytest 案例保留了 8/12、10/12、5/5 个金标补丁 token——pytest-7571 的 5 个 token 一个没丢，续跑照样失败。sphinx-9230 的摘要留住了修复相关字符串，却丢了「<code>split(None, 1)</code> 应改为 <code>rsplit</code>」这条推理。
+    </p>
+    <p>
+      配对轨迹（附录 I）把差异看得很清楚：PRE 读目标区域 → 建最小复现 → 定位调用 → 用一段 Python 改文件，8 个动作结束；POST 打开同一个文件后开始大范围 grep、读测试和复现代码，13 个动作耗尽 8 步预算也没改。显式的重复 <code>read_file</code> 每种条件至多 1 次，所以失败不是「反复重读」，而是<strong>从证据到编辑的那一步断了</strong>。生产链上还有两个数：带显式摘要指令的 84 个边界平均保留 19.0%，没有指令的 56 个是 11.4%；「已完成写入被说成待办」的检测器在全部边界上触发 0 次。整套 35 题研究约 8,000 次模型调用，压缩本身占 token 不到 5%。
+    </p>
+
+    <h3>⑥ box 小验证（本文实算）</h3>
+    <pre><code># 1) 复算 Table 2 的 Wilson 95% 区间（k/22）
+1/22 → (1, 22)   4/22 → (7, 39)   6/22 → (13, 48)   8/22 → (20, 57)
+9/22 → (23, 61) 10/22 → (27, 65) 11/22 → (31, 69) 12/22 → (35, 73)
+13/22 → (39, 77) 14/22 → (43, 80)                   全部与论文一致 ✓
+
+# 2) 双侧 Fisher 精确检验（把 22 题当独立样本的粗略检验）
+Opus 4.8 1/22 vs DeepSeek-Flash 14/22 损坏: p = 6.3e-05
+Kimi-K3 4/22 vs GPT-5.6-Sol 6/22 损坏     : p = 0.72
+Kimi Code 19/22 vs opencode 16/22 通过    : p = 0.46</code></pre>
+    <p>
+      结论：两端的差距非常显著，但榜单中段、以及 5 个 prompt 之间 1–3 题的差距在 n=22 下统计上分不开。这并不削弱论文（作者自己给了 Wilson 区间，并强调逐题网格比总分更有信息），但读榜时要克制——<strong>prompt 选型应看逐题失败画像，而不是 19 vs 18 的总分</strong>。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>压缩评测用「配对续跑」，不要只看总成功率</strong>：固定 Phase A 历史与快照，PRE / POST 各跑多次，分别统计 damage 与 rescue。</li>
+      <li><strong>摘要器单独选型</strong>：同一续跑 agent 下 5%–64% 的跨度说明，摘要模型不必、也不应默认等于主模型；在自家任务上跑一遍 damage 网格。</li>
+      <li><strong>LLM 摘要 + 机械锚点并用</strong>：路径、SHA、错误类型、URL 这类值用正则抽取原样附在摘要后（79.1% vs 16.0%），成本几乎为零；但别指望它解决「进度」问题。</li>
+      <li><strong>显式写出「下一步要做的编辑」</strong>：失败案例的共同点是丢了「证据 → 编辑」的连接。压缩 prompt 应要求写出已确认的根因、要改的具体行 / 替换、已排除的假设——Kimi Code 的第一人称交接笔记式 prompt 在续跑上最好，可作起点。</li>
+      <li><strong>保证路径语义不变</strong>：续跑必须在同一工作目录、同一解释器下进行，否则摘要里的绝对路径会把 agent 带偏（v2 实验 22/34 中招）。</li>
+      <li><strong>可再观测的信息尽量不放进摘要</strong>：结合 <a href="daily-2026-10-21-harness-reobserve.html">再观测</a> 的结论，文件内容可以重读，真正需要保存的是「判断和进度」；也可以考虑 <a href="daily-2026-10-08-harness-refold.html">ReFold</a> 那样只压渲染层、保留原历史以便回退。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么损坏率以「PRE 通过」为分母，而不是全部 35 题？</summary>
+      <p>只有全历史能修好的题，才能把 POST 失败归因于「历史被替换」。PRE 本身失败的题，POST 失败是模型 / 预算问题，POST 成功则是 rescue（摘要反而帮忙，比如去掉了误导性的旧尝试）。以 PRE-pass 为分母把 damage 定义为条件概率 P(POST✗ | PRE✓)，并单独统计 rescue，避免互相抵消。代价是分母只有 22，统计功效有限（见 box 验证）。</p>
+    </details>
+    <details>
+      <summary>2. DeepSeek-Flash 细节保留第一、任务损坏最多，可能的原因有哪些？</summary>
+      <p>(a) 两个指标测的东西不同：细节保留是字面子串命中，罗列大量路径 / 错误名就能得分，而续跑需要的是因果链与下一步动作；(b) 数据集不同：细节保留在 146 个真实会话上测，Task Preservation 在 22 个 SWE-bench 修复上测，论文明确说这是配置级比较；(c) 摘要风格：倾向于「目录式」列举的摘要在 recall 上占优，但会稀释关键结论，让续跑 agent 重新进入探索模式——正如 sphinx-9230 的 POST 轨迹。</p>
+    </details>
+    <details>
+      <summary>3. 连续多次压缩时，第 2 个边界保留率（19.9%）反而高于第 1 个（15.7%），能据此说「压缩越多越好」吗？</summary>
+      <p>不能。各边界的样本集不同：第 1 个边界 n=106，第 2 个只有 27 个有可评测未来细节的边界，第 3、4 个分别 6 和 1 个；能走到第二次压缩的会话本身就是特定子集（更长、任务结构可能更规整）。论文另给的「同会话末次 / 首次比值」均值 4.07 也只在 20 个会话上算，且受首个值很小时比值放大的影响。正确的读法是：样本量迅速收缩，后续边界的估计不稳定。</p>
+    </details>
+    <details>
+      <summary>4. 如果要把 Compact-Bench 的思路变成训练信号（例如训一个更好的摘要器），奖励应该怎么设计？</summary>
+      <p>直接用 POST 是否通过 FAIL_TO_PASS 作为摘要的结果奖励（可减去 PRE 的基线，即 damage = −1、rescue = +1），这是 <a href="daily-2026-08-31-supo.html">SUPO</a> 一类「把写总结训练进策略」方法的自然延伸；辅以机械锚点覆盖率作为 shaping，防止摘要丢掉必要标识符；再加长度惩罚。注意 credit assignment：同一摘要的效果要在多个续跑种子上取平均（论文显示存在种子方差）；还要防止摘要器学会「直接把补丁写进摘要」这种泄漏捷径——可以在评测时屏蔽摘要中的代码块或限制编辑类指令。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）论文的续跑 agent 只有 8 步预算。预算放宽后，damage 会如何变化？这对 harness 设计意味着什么？</summary>
+      <p>预算更大时，POST 可以通过重读文件、重跑复现来「重建」丢失的进度，damage 可能下降，但代价是 token 与时间——压缩省下的上下文被重新探索吃掉。8 步预算其实度量的是「摘要让 agent 少走多少回头路」。对 harness 而言，这提示应该同时报告「损坏率」与「恢复成本」（达到 PRE 结果所需额外步数 / token），类似 <a href="daily-2026-10-14-harness-longharness.html">LongHarness</a> 关注的长程成本；也提示在压缩边界后可以主动插入一个「验证当前状态」的固定步骤（跑一次测试、看一次 git diff），以低成本重建进度感。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.31710" target="_blank" rel="noopener">arXiv:2610.31710 · Compact-Bench: Measuring What Context Compaction Costs Long-Horizon Coding Agents（Sun et al.，USTC）</a> · <a href="https://github.com/cai-jianfeng/compact-bench" target="_blank" rel="noopener">GitHub</a> · <a href="https://huggingface.co/datasets/caijanfeng/compact-bench" target="_blank" rel="noopener">Hugging Face 数据</a></li>
+      <li>站内：
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-10-21-harness-reobserve.html">When the Harness Decides Success</a> ·
+        <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> ·
+        <a href="daily-2026-10-08-harness-refold.html">ReFold</a> ·
+        <a href="daily-2026-08-31-supo.html">SUPO</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">Coding Agent Harness 组件消融</a> ·
+        <a href="daily-2026-10-27-rounding-location.html">今日一线：Rounding-Location Alignment</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>
