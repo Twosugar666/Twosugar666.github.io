@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Skill Adaptation：Harness 自演化写出的 skill，要按执行模型的能力「改写」——同一批 SKILL.md 让 GPT-5.6-luna +31.1、Gemma-4-E4B −8.8，弱模型 86% 的失败违反的是 skill 里已写明的要求；四类失败蒸馏成 meta-skill，Kimi-K3 改写让弱模型 +5.1–14.1，五轮自演化 7 个执行器全部 +2.0–5.1 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Skill Adaptation：Harness 自演化写出的 skill，要按执行模型的能力「改写」——同一批 SKILL.md 让 GPT-5.6-luna +31.1、Gemma-4-E4B −8.8，弱模型 86% 的失败违反的是 skill 里已写明的要求；四类失败蒸馏成 meta-skill，Kimi-K3 改写让弱模型 +5.1–14.1，五轮自演化 7 个执行器全部 +2.0–5.1</h1>
+    <p class="post-meta">2026-10-28 · 收藏夹：Harness / Agent · 学习笔记<br />
+      来源：Zhihao Yang、Haojin Wang、Juncheng Wu、Kuan Zhang、Yukun Chen、Run Luo、Yaojie Lu、Yuyin Zhou、Lu Wang、Xianpei Han（中国科学院大学 / 中科院软件所中文信息处理实验室 / UC Santa Cruz / 清华大学 / NUS / 独立研究者；通讯作者 Lu Wang、Xianpei Han）· <em>Evolving to Match Capabilities: Improving Harness Self-Evolution via Skill Adaptation</em>（<a href="https://arxiv.org/abs/2610.33024" target="_blank" rel="noopener">arXiv:2610.33024</a>，cs.LG，v1 页眉日期 2026-10-10，出现在 arXiv 10-27 的 /new 批次）。
+      项目页 <a href="https://zhihaoyang30.github.io/skill-adaptation" target="_blank" rel="noopener">zhihaoyang30.github.io/skill-adaptation</a>。数字均为论文自报，每个设置只跑一次；「box 小验证」一节为本文用 Python 对论文表格实算。
+      交叉：
+      <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、
+      <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、
+      <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness</a>、
+      <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a>、
+      <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a>、
+      <a href="daily-2026-09-21-harness-design-study.html">Coding Agent Harness 组件消融</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Harness 自演化（harness self-evolution）是「不改权重、改 harness」的自我改进路线：从执行轨迹和 verifier 反馈里提炼可复用的 skill（Anthropic 式 <code>SKILL.md</code> 加辅助文件），下次注入上下文。本站讲过 <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a>、<a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a>、<a href="daily-2026-10-02-harness-evoharness.html">EvoHarness</a> 等框架，它们关心的都是「经验有没有被正确提炼出来」。
+    </p>
+    <p>
+      这篇论文指出一个被默认掉的前提：<strong>写对了不等于用得上</strong>。同一份 skill 对强模型是大幅加分，对弱模型可能毫无作用甚至减分；而弱模型失败时，违反的要求有 86% 本来就写在 skill 里。于是问题从「提炼什么」转向「怎么表述才能被这个执行器执行」——作者称之为 <strong>skill adaptation</strong>，并把弱模型的失败模式蒸馏成一份固定、与任务无关的改写协议 meta-skill。对我们这种同时在多种尺寸模型上跑 agent（大模型做规划、小模型做批量执行或 RL 训练对象）的场景，这个结论很实用。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 测试床：从 607 个任务里挑出 103 个「对 skill 敏感」的 pair</h3>
+    <table>
+      <thead><tr><th>要素</th><th>设置</th></tr></thead>
+      <tbody>
+        <tr><td>基准</td><td>SkillsBench（实际可跑 87 题，8 个 STEM / 工程领域，确定性 verifier）、DocOps（186 题，打开产出文档检查实际状态）、Tessl（334 题、184 个 skill，LLM judge 按 rubric 判分）；三套构造与判分协议互不相交</td></tr>
+        <tr><td>执行 harness</td><td>SkillsBench 用 OpenHands 的完整 tool 列表；DocOps / Tessl 用 Claude Code 暴露的 tool 名</td></tr>
+        <tr><td>7 个执行模型</td><td>弱：Gemma-4-E4B、Qwen3.5-9B、Qwen3.6-flash；中：GPT-5.4-mini、Claude-Sonnet-4.6；前沿：GPT-5.6-luna、Claude-Opus-5（按无 skill 时的成绩分档）</td></tr>
+        <tr><td>Skill gain</td><td>Δ<sub>m</sub>(T) = s<sub>m</sub>(T, S) − s<sub>m</sub>(T, ∅)，分数归一到 [0,1]；不评估 skill 检索与 progressive disclosure，多 skill 任务当作一整包</td></tr>
+        <tr><td>敏感 pair 规则</td><td>档位 G 受益 ⇔ Δ<sub>G</sub> ≥ τ 且 Δ<sub>G</sub> − Δ<sub>W</sub> ≥ τ（τ=0.10）；前沿档受益，或前沿档无 skill 已 ≥0.95 且中档受益；剔除弱档有 skill 已 ≥0.80 的 pair</td></tr>
+        <tr><td>结果</td><td>103 个 pair（SkillsBench 32 / DocOps 32 / Tessl 39）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      在全部 607 题上，skill 对每个模型都只带来小幅增益、看不出档位规律；但在这 103 个 pair 上，强档与中档平均 +27 分、弱档只有 +1 分（Fig. 1；正文另写前沿档 +29.2、弱档 +1.2），GPT-5.6-luna 最高 +31.1，而最弱的 Gemma-4-E4B 反而 −8.8。注意这个子集是<strong>按「前沿受益、弱档不受益」挑出来的</strong>，差距在定义上就被放大了；论文的主张是「这类任务存在且不少」，而不是「skill 普遍对弱模型无效」。
+    </p>
+
+    <h3>② 诊断：四类失败模式（131 个标签，覆盖 103 个 pair）</h3>
+    <table>
+      <thead><tr><th>失败模式</th><th>轨迹表现</th><th>meta-skill 的对应改写规则</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Tool execution</strong>（最常见）</td><td>调一两次工具就停；把 xlsx 这类文件格式当成工具调用；以未处理的工具错误结束，没有产出</td><td>区分「可调用的工具」与「文档」；加环境检查和常见错误的处理路径</td></tr>
+        <tr><td><strong>Context management</strong></td><td>把 skill 里的示例 / 参考文件当成当前任务；产出写错路径</td><td>开头先写用户任务、允许修改的范围、交付路径；把当前任务与示例 / 背景材料明确分开；需要的支撑内容直接内联</td></tr>
+        <tr><td><strong>Instruction following</strong></td><td>多次调工具、有产出，但漏掉 skill 已写的要求，往往只完成一部分</td><td>每条要求写成「动作 + 目标 + 完成条件」</td></tr>
+        <tr><td><strong>Verification</strong>（最少）</td><td>交付物齐全但答案和 verifier 不一致，轨迹里没有有效自检</td><td>结尾加独立检查：重读结果、换方法重算、与显式阈值比较，不通过就循环</td></tr>
+      </tbody>
+    </table>
+    <p>
+      标注只基于轨迹和 verifier 输出，每条轨迹取「第一个可观测失败」。meta-skill 由作者借助 Claude-Opus-5 写成，还有一条通用规则：<strong>有轨迹时先修第一个失败点，再动后面的步骤</strong>。
+    </p>
+
+    <h3>③ 改写协议：一个 Adapt 步，两种用法</h3>
+    <pre><code>Adapt(S, E):                                  # S=当前 skill, E=执行证据（可为空）
+    o = Rewriter(system=P;  任务指令 I, 执行器工具接口 U_M, S, E)   # 返回新 skill 或 NO_CHANGE
+    if o 不可解析: 带上解析错误重试一次
+    if o == NO_CHANGE 或 gate 拒绝（泄漏答案 / 无法加载）: return S
+    return o
+
+# 用法 1：skill adaptation —— 强模型一次改写，E=∅（看不到任何执行轨迹）
+S1 = Adapt(S0, ∅);  score = Run(M, T, S1)
+
+# 用法 2：self-evolution —— 执行器自己改自己的 skill，5 轮
+τ0, s0 = Run(M, T, S0)
+for t in 1..5:
+    E = (s_{t−1}, τ_{t−1} 的逐步摘要, verifier 输出)
+    S_t = Adapt(S_{t−1}, E);  τ_t, s_t = Run(M, T, S_t)
+
+# 对照臂：除 system prompt P（meta-skill vs 无 / 一句话指令）外，user prompt 完全相同
+# user prompt 里明确：skill 名、文件名、章节标题都「不是可调用工具」</code></pre>
+
+    <h3>④ 结果 A：强模型一次改写（103 个 pair 平均分，论文 Table 1）</h3>
+    <table>
+      <thead><tr><th>改写者（都带 meta-skill）</th><th>Qwen3.6-flash</th><th>Gemma-4-E4B</th><th>Qwen3.5-9B</th><th>平均</th></tr></thead>
+      <tbody>
+        <tr><td>原始 skill</td><td>0.529</td><td>0.029</td><td>0.323</td><td>0.294</td></tr>
+        <tr><td>弱模型自己改</td><td>0.476</td><td>0.056</td><td>0.280</td><td>0.271</td></tr>
+        <tr><td>GPT-5.6-sol</td><td>0.563</td><td>0.139</td><td>0.303</td><td>0.335</td></tr>
+        <tr><td>GPT-5.6-luna</td><td>0.602</td><td>0.119</td><td>0.307</td><td>0.343</td></tr>
+        <tr><td>GLM-5.3</td><td>0.626</td><td>0.138</td><td>0.374</td><td>0.379</td></tr>
+        <tr><td><strong>Kimi-K3</strong></td><td>0.616</td><td><strong>0.170</strong></td><td>0.374</td><td><strong>0.387</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      四个强改写者都抬高了平均；Kimi-K3 和 GLM-5.3 让三个执行器全部提升，平均约 +0.09，最弱的 Gemma-4-E4B 收益最大（0.029→0.170）。弱模型改自己的 skill 则平均掉到原始之下。分离「改写者强」与「meta-skill 有用」：把 meta-skill 换成一句「请改写 skill 使其对所有模型都好用」，Kimi-K3 只提升了三个执行器中的两个，Qwen3.5-9B 略低于原始；换回 meta-skill 后，三者都比一句话指令高，meta-skill 额外贡献 5.1–6.0 分，超过平均增益的一半。
+    </p>
+
+    <h3>⑤ 结果 B：五轮自演化（执行器 = 改写者，看得到失败证据）</h3>
+    <table>
+      <thead><tr><th>执行器</th><th>第 5 轮 meta-skill 臂 − 无 meta-skill 臂</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3.6-flash</td><td>+0.030</td></tr>
+        <tr><td>Gemma-4-E4B</td><td>+0.051</td></tr>
+        <tr><td>Qwen3.5-9B</td><td>+0.049</td></tr>
+        <tr><td>Qwen3.5-27B</td><td>+0.046</td></tr>
+        <tr><td>Gemma-4-26B</td><td>+0.020</td></tr>
+        <tr><td>Qwen3.5-plus</td><td>+0.025</td></tr>
+        <tr><td>Kimi-K2.5</td><td>+0.035</td></tr>
+      </tbody>
+    </table>
+    <p>
+      7 个执行器符号全部为正。没有 meta-skill 时自我修订帮助很小且不稳：Qwen3.5-9B 在第 3 轮见顶后几乎跌回基线，Gemma-4-E4B 每一轮都低于基线。有 meta-skill 也不是单调的（Qwen3.5-9B 第 3 轮后仍回落，Gemma-4-E4B 第 2 轮下探），但终点更高，Gemma-4-E4B 从第 3 轮起一直在基线之上。作者自己提醒：每轮只跑一次，0.02–0.05 的差距大小不宜细读，可依赖的是「七个都同号」。
+    </p>
+    <p>
+      一个耐人寻味的反差：<strong>一次改写时，弱模型带着 meta-skill 改自己的 skill 会变差（3 个里 2 个下降），而在自演化里同样的弱模型能用好 meta-skill</strong>。区别只在有没有失败证据——看见自己怎么失败的，弱模型才知道该改哪一句。
+    </p>
+
+    <h3>⑥ 按失败模式拆解（论文 Table 2，三执行器平均的 meta-skill 增益）</h3>
+    <table>
+      <thead><tr><th>失败模式（pair 数）</th><th>一次改写（Kimi-K3）</th><th>自演化（第 5 轮）</th></tr></thead>
+      <tbody>
+        <tr><td>Execution（51）</td><td>+0.056</td><td>+0.065</td></tr>
+        <tr><td>Instruction（35）</td><td>+0.055</td><td>+0.046</td></tr>
+        <tr><td>Context（28）</td><td><strong>+0.103</strong></td><td>+0.007</td></tr>
+        <tr><td>Verification（17）</td><td>+0.003</td><td><strong>+0.104</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：<strong>文本上看得出的问题，一次改写就能修</strong>（skill 有没有写清可调用工具、每条要求有没有完成条件、开头有没有写任务和交付路径）；<strong>执行中才暴露的问题，要靠自演化</strong>——skill 可以写「请自检」，但执行器有没有真的自检，只有轨迹能告诉你。论文的例子：不带 meta-skill 时，skill 五轮都是一堆参考笔记，同一个错误距离在每一轮都存活；带 meta-skill 后第一轮就补上「交付路径 + EPSG:4087 投影 + ISO 8601 时间 + 重读 answer.json 重算距离直到一致」，Qwen3.6-flash 五轮过四轮，唯一失败那轮是改了脚本却没重跑。
+    </p>
+    <p>
+      最后一个结论很诚实：<strong>meta-skill 修不了执行器本身</strong>。剩下的失败是「skill 写对了，模型没做到」——改脚本不重跑、重复失败调用、写产物前就停、多约束只保留 skill 强调的那条。
+    </p>
+
+    <h3>⑦ box 小验证（本文实算论文表格）</h3>
+    <pre><code># Table 1：相对原始 skill 的增益（Qwen3.6-flash / Gemma-4-E4B / Qwen3.5-9B）
+Kimi-K3      : +0.087 / +0.141 / +0.051   → 5.1–14.1 分，与摘要一致；平均 0.294→0.387
+GLM-5.3      : +0.097 / +0.109 / +0.051
+GPT-5.6-luna : +0.073 / +0.090 / −0.016   # GPT-5.6 两个改写者都让 Qwen3.5-9B 略降
+GPT-5.6-sol  : +0.034 / +0.110 / −0.020
+Weak(self)   : −0.053 / +0.027 / −0.043
+
+# Table 2：Verification 自演化 − 一次改写 = 0.1037 − 0.0030 = +0.101（与正文一致）
+#          Context      自演化 − 一次改写 = 0.0073 − 0.1030 = −0.096
+# 第 5 轮 Δ 七个执行器：min 0.020 / max 0.051 / 均值 0.037
+
+# 噪声提示：同一执行器同一原始 skill，Table 1「Original」与 Table 4 同时间窗重跑的「Base」
+Gemma-4-E4B 0.029 vs 0.104 | Qwen3.6-flash 0.529 vs 0.523 | Qwen3.5-9B 0.323 vs 0.314</code></pre>
+    <p>
+      最后一行值得注意：Gemma-4-E4B 在同一测试床上两次跑原始 skill 相差 0.075，比自演化 Δ<sub>5</sub> 的 +0.051 还大。作者用「同时间窗基线」做对照正是为了规避这一点，但这也说明单次运行下的小差距只能看符号。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>skill 要按执行器分版本</strong>：给前沿模型的 skill 可以是参考手册式；给小模型（或 RL 训练中的 policy）要改写成「任务 / 范围 / 交付路径在前，每条要求带完成条件，结尾带独立验证循环」。同一个 skill 库服务多种模型时，在加载层按模型档位选版本。</li>
+      <li><strong>改写交给强模型，演化交给执行器自己</strong>：没有轨迹时用强模型一次改写（修文本可见问题）；有轨迹后让执行器带着 meta-skill 自演化（修验证类问题）。弱模型在没有失败证据时不要让它改自己的 skill。</li>
+      <li><strong>在 harness 里显式告诉模型「什么不是工具」</strong>：论文把「skill 名、文件名、章节标题都不可调用」写进 user prompt；Tool execution 是最常见的失败，小模型把 xlsx 当工具调用这种错误靠一句话就能挡掉不少。</li>
+      <li><strong>改写结果必须过 gate</strong>：检测答案泄漏、能否加载，不合格回退原 skill；否则自演化很容易「把答案写进 skill」制造虚高。这和 <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> 强调 benchmark-disjoint 是同一类防线。</li>
+      <li><strong>评估自演化至少多跑几次</strong>：Gemma 两次跑原始 skill 差 0.075 的事实说明，单次运行的 0.02–0.05 改进不可单独作为上线依据；最好按失败模式分组看增益。</li>
+      <li><strong>对 RL 训练的启示</strong>：<a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a> 把 harness 当训练轴；这篇提醒，训练早期的小 policy 读不懂「参考手册式」skill，课程早期给它 adapt 过的 skill，可能比直接给前沿版 skill 更有效（推论，论文未做 RL 实验）。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 103 个敏感 pair 是按「前沿受益、弱档不受益」规则挑出来的。这种选择会如何影响「skill 对弱模型无效」的结论强度？论文是怎么处理的？</summary>
+      <p>选择规则本身要求 Δ<sub>G</sub> − Δ<sub>W</sub> ≥ 0.10，所以子集上的强弱差距在定义上被放大，属于选择偏差；不能据此说「skill 普遍对弱模型无效」。论文的处理：(a) 明确报告全部 607 题上 skill 对每个模型都有小幅增益、无档位规律；(b) 把 103 个 pair 定位为「改写方法的测试床」，核心证据是 86% 的失败违反了 skill 已写明的要求，以及改写后的增益——后者是在同一子集上做的干预对比，不受选择偏差影响结论方向。</p>
+    </details>
+    <details>
+      <summary>2. 为什么 Context 类失败在一次改写里增益最大（+0.103），在自演化里几乎为零（+0.007）？</summary>
+      <p>Context 问题（把示例当任务、写错交付路径）在 skill 文本层面就能看出来：开头有没有写任务与交付路径、示例有没有和当前任务隔开。强改写者不需要轨迹就能修。自演化里改写者是弱执行器自己，它往往不会意识到「我把参考材料当成了任务」（这正是它失败的原因），轨迹里的失败信号也不直接指向「skill 结构」；表里 Qwen3.5-9B 在该类上甚至 −0.107。所以 Context 问题适合交给强模型一次性改写。</p>
+    </details>
+    <details>
+      <summary>3. 一次改写时弱模型带 meta-skill 改自己的 skill 会变差，自演化里却能变好。从「改写需要什么信息」的角度解释。</summary>
+      <p>meta-skill 告诉改写者「要检查哪四类问题」，但判断「这个 skill 对我来说哪里难执行」需要元认知能力。强模型能凭阅读预判；弱模型凭空改写时往往只做表面重组，甚至删掉有用细节。自演化提供了 verifier 输出和逐步轨迹摘要，「第一个失败点」变成可观测事实，meta-skill 又规定「先修第一个失败点」，弱模型只需做局部、有证据的修改，难度大幅下降。这与 <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> 用参考轨迹修信用分配的思路一致。</p>
+    </details>
+    <details>
+      <summary>4. 设计一个最小的「skill 版本路由」：同一个 skill 库服务 Claude-Opus 级规划器和 9B 级执行器，你会存什么、何时生成、怎么防止版本漂移？</summary>
+      <p>存储：每个 skill 一份原始版 + 每个执行器档位一份 adapted 版，记录生成它的改写者、meta-skill 版本和原始版 hash。生成：原始版更新时，用强模型 + meta-skill 离线重新生成各档 adapted 版（一次改写，无轨迹），过 gate（泄漏 / 可加载 / 工具名合法）。运行时：harness 按执行器 model id 映射到档位选择版本；线上失败轨迹按四类模式打标签后，触发该档位版本的自演化修订，修订结果先在固定回归集上多次重跑、符号稳定后再替换。防漂移：adapted 版只能在原始版的约束之内加「执行化」细节，定期用 diff 检查是否引入原始版没有的事实性内容。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）论文说「skill 能告诉弱执行器做什么，做不做得到取决于模型」。哪些剩余失败更适合用 harness 机制（而非 skill 文本）解决？</summary>
+      <p>论文列举的剩余失败——改了脚本不重跑、重复同一个失败调用、写产物前就停、多约束只保留一条——大多是「执行纪律」问题，更适合交给 harness 强制：(a) 文件被修改后自动标脏，提交前要求重跑或由 harness 自动重跑测试；(b) 检测重复的失败调用 + 相同 observation 并注入提示或阻断（参见 <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a>）；(c) 终止前由 harness 检查交付路径是否存在、格式是否合法；(d) 把 skill 中的约束编译成结构化 checklist，由 harness 逐条验证。也就是把「验证循环」从 skill 文本下沉成 harness 的硬约束，弱模型就不必「记得去做」。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.33024" target="_blank" rel="noopener">arXiv:2610.33024 · Evolving to Match Capabilities: Improving Harness Self-Evolution via Skill Adaptation（Yang et al., UCAS / ISCAS / UCSC / Tsinghua / NUS）</a> · <a href="https://zhihaoyang30.github.io/skill-adaptation" target="_blank" rel="noopener">项目页</a></li>
+      <li>文中使用的基准：SkillsBench（Li et al., 2026）· DocOps（Jiang et al., 2026）· Tessl（Shaposhnikov et al., 2026）</li>
+      <li>站内：
+        <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> ·
+        <a href="daily-2026-09-09-harness-harness-evolve.html">HarnessEvolve</a> ·
+        <a href="daily-2026-10-02-harness-evoharness.html">EvoHarness</a> ·
+        <a href="daily-2026-09-11-harness-evoharness-rl.html">EvoHarness-RL</a> ·
+        <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a> ·
+        <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> ·
+        <a href="daily-2026-09-04-harness-openhands-v1.html">OpenHands V1</a> ·
+        <a href="daily-2026-09-21-harness-design-study.html">Coding Agent Harness 组件消融</a> ·
+        <a href="daily-2026-10-28-focus-active-critic.html">今日一线：FOCUS</a> ·
+        <a href="daily-2026-10-28-algo-tensor-parallel.html">今日算法：张量并行</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>

@@ -93,6 +93,27 @@
           <button class="chip" data-filter="pc">配件</button>
         </div>
         <ul class="post-list">
+          <li data-cat="agent rl">
+            <a href="posts/daily-2026-10-28-focus-active-critic.html">一线追踪｜FOCUS：长程 Agent RL 把 critic 当「主动学习」来训——在 compaction 切出的段边界分叉续跑，按「再采一条能把价值误差降多少」分配 rollout 预算；Qwen3.5-9B 上 BrowseComp-Plus 55.4 vs GRPO 48.2，GRPO 后期工具调用塌缩而 FOCUS 不塌</a>
+            <span class="post-side">
+              <span class="post-cat">Agent</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-10-28</span>
+            </span>
+          </li>
+          <li data-cat="harness agent">
+            <a href="posts/daily-2026-10-28-harness-skill-adaptation.html">学习笔记｜Skill Adaptation：Harness 自演化写出的 skill，要按执行模型的能力「改写」——同一批 SKILL.md 让 GPT-5.6-luna +31.1、Gemma-4-E4B −8.8，弱模型 86% 的失败违反的是 skill 里已写明的要求；四类失败蒸馏成 meta-skill，Kimi-K3 改写让弱模型 +5.1–14.1，五轮自演化 7 个执行器全部 +2.0–5.1</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-10-28</span>
+            </span>
+          </li>
+          <li data-cat="algo infra">
+            <a href="posts/daily-2026-10-28-algo-tensor-parallel.html">学习笔记｜张量并行（Megatron-LM）：先列切再行切，一个 MLP 前向只要一次 all-reduce——f / g 共轭算子、按头切 attention、词表并行 + 融合交叉熵、复制 LayerNorm 与分 RNG；8.3B 在 512 张 V100 上 15.1 PFLOPs，以及「TP 不出节点」背后的 8bsh(t−1)/t 通信账</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-28</span>
+            </span>
+          </li>
           <li data-cat="rl infra">
             <a href="posts/daily-2026-10-27-rounding-location.html">一线追踪｜Where Rounding Happens Matters：BF16 RL 崩掉，可能只是因为「在哪儿舍入」不一致——vLLM 融合 kernel 把 RoPE / SwiGLU / 残差 RMSNorm 的中间值留在 FP32，训练端逐个算子先舍成 BF16；只把训练端 RoPE 路径对齐就足以防崩，延迟 +0.90–2.04%</a>
             <span class="post-side">

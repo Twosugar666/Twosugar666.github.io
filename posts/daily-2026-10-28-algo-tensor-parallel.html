@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜张量并行（Megatron-LM）：先列切再行切，一个 MLP 前向只要一次 all-reduce——f / g 共轭算子、按头切 attention、词表并行 + 融合交叉熵、复制 LayerNorm 与分 RNG；8.3B 在 512 张 V100 上 15.1 PFLOPs，以及「TP 不出节点」背后的 8bsh(t−1)/t 通信账 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜张量并行（Megatron-LM）：先列切再行切，一个 MLP 前向只要一次 all-reduce——f / g 共轭算子、按头切 attention、词表并行 + 融合交叉熵、复制 LayerNorm 与分 RNG；8.3B 在 512 张 V100 上 15.1 PFLOPs，以及「TP 不出节点」背后的 8bsh(t−1)/t 通信账</h1>
+    <p class="post-meta">2026-10-28 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Mohammad Shoeybi、Mostofa Patwary、Raul Puri、Patrick LeGresley、Jared Casper、Bryan Catanzaro（NVIDIA）· <em>Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</em>（<a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053</a>，2019；本文按 v4）；
+      通信与配置经验：Deepak Narayanan、Mohammad Shoeybi、Jared Casper 等（NVIDIA / Stanford / Microsoft Research）· <em>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM</em>（<a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473</a>，SC 2021）。
+      思想先驱：Mesh-TensorFlow（Shazeer et al., 2018）。论文数字按原文（V100 / DGX-2H 时代）；「box 小实验」一节为本文在 box 上用 numpy 实跑。
+      交叉：
+      <a href="daily-2026-10-23-algo-zero.html">ZeRO</a>、
+      <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>、
+      <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>、
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a>、
+      <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      这几天的系统算法课是一条线：<a href="daily-2026-10-22-algo-mixed-precision.html">混合精度</a>把每个数变小，<a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 把参数 / 梯度 / 优化器状态切到 N<sub>d</sub> 份，<a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>用 FLOPs 换激活显存。但它们都有一个共同前提：<strong>每张卡在算一层时，仍然完整地执行这一层的矩阵乘</strong>（ZeRO-3 也是先把这层参数 all-gather 回来再算）。当单层的权重、激活或单卡算力本身成为瓶颈时，就必须把<strong>一个矩阵乘拆到多张卡上</strong>——这就是张量并行（tensor model parallelism，TP，Megatron 论文里叫 intra-layer model parallelism）。
+    </p>
+    <p>
+      Megatron-LM 的贡献不是发明「切矩阵」，Mesh-TensorFlow 已经有一套通用的分布式张量语言和编译器；它的价值在于发现 Transformer 层的结构允许一种<strong>极简切法</strong>：只在 PyTorch 里插入几个通信原语，每层前向两次 all-reduce、反向两次，不需要新编译器。2019 年用它训出 8.3B 的 GPT-2 式模型和 3.9B 的 BERT，今天 Megatron-Core、vLLM、SGLang 的 TP 实现仍是这套切法。昨天提到的 sequence parallel 也是在它之上补的一刀。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① MLP：为什么先列切 A、再行切 B</h3>
+    <pre><code># MLP: Y = GeLU(X A),  Z = Dropout(Y B)      X: [bs, h]  A: [h, 4h]  B: [4h, h]
+
+# 方案 1（不用）：A 按行切、X 按列切
+X = [X1, X2],  A = [A1; A2]  ⇒  Y = GeLU(X1 A1 + X2 A2)
+#   GeLU 非线性：GeLU(X1A1 + X2A2) ≠ GeLU(X1A1) + GeLU(X2A2) → GeLU 之前就要同步一次
+
+# 方案 2（Megatron）：A 按列切
+A = [A1, A2]  ⇒  [Y1, Y2] = [GeLU(X A1), GeLU(X A2)]     # 每卡独立做 GeLU，无需通信
+B = [B1; B2]（按行切）⇒  Z = Y1 B1 + Y2 B2               # 每卡得到部分和
+Z = all_reduce(Z_i)  → Dropout → 残差                     # 整个 MLP 前向只在这里通信一次</code></pre>
+    <p>
+      关键在于把<strong>列并行（column-parallel）接行并行（row-parallel）</strong>：第一个 GEMM 的输出按列分在各卡上，正好是第二个 GEMM 行切所需的输入，中间的非线性逐元素进行，不需要任何通信。两个 GEMM「融合」成一组，中间少了一个同步点。
+    </p>
+
+    <h3>② f 与 g：一对共轭的通信算子</h3>
+    <pre><code>class f(torch.autograd.Function):      # 放在 TP 区域入口
+    def forward(ctx, x):  return x                     # 前向：恒等（X 在每卡都是完整副本）
+    def backward(ctx, grad):  all_reduce(grad); return grad   # 反向：各卡对 X 的梯度是部分和
+
+# g 放在 TP 区域出口，与 f 相反：前向 all_reduce，反向恒等
+# 一个 Transformer 层 = attention 区域 (f … g) + MLP 区域 (f … g)
+#   ⇒ 前向 2 次 all-reduce（两个 g），反向 2 次 all-reduce（两个 f）</code></pre>
+    <p>
+      为什么反向时 f 要 all-reduce：X 被复制到所有卡上，各卡只用自己那份 A<sub>i</sub> 算了 ∂L/∂X 的一部分（∂L/∂X = Σ<sub>i</sub> ∂L/∂Y<sub>i</sub> · A<sub>i</sub><sup>T</sup>），求和才是完整梯度。g 前向把部分和加起来，反向时输出梯度对每个部分和都是同一个值，直接恒等传回即可。这对「前向恒等 ⇄ 反向求和」的对偶，和 <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 里「all-gather 的反向是 reduce-scatter」是同一种 autograd 对偶关系。
+    </p>
+
+    <h3>③ Self-attention：按头切</h3>
+    <table>
+      <thead><tr><th>子模块</th><th>切法</th><th>通信</th></tr></thead>
+      <tbody>
+        <tr><td>Q / K / V 投影</td><td>列并行：每卡拿 a/t 个头对应的列</td><td>入口 f（前向无）</td></tr>
+        <tr><td>每个头的 softmax(QK<sup>T</sup>)V</td><td>本地完成，头与头之间天然独立</td><td>无</td></tr>
+        <tr><td>输出投影</td><td>行并行：直接吃本卡头的输出</td><td>出口 g：all-reduce</td></tr>
+      </tbody>
+    </table>
+    <p>
+      多头注意力本身就是「a 个独立的小注意力」，按头分卡是零额外成本的切法。约束也随之而来：头数 a 必须能被 t 整除。到了 <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">GQA / MQA</a> 时代，KV 头只有几个，当 t 大于 KV 头数时，常见实现只能让多张卡各存一份相同的 KV 头（复制），KV cache 的切分收益在这里打折——这是选择 TP 度时容易被忽略的一点。
+    </p>
+
+    <h3>④ 词表并行 + 融合交叉熵：把 b×s×v 的通信降到 b×s</h3>
+    <pre><code># 输入嵌入 E: [h, v] 沿词表维切   E = [E1, E2]
+#   每卡只查得到自己词表段内的 token（其余置 0）→ g（all-reduce）拼出完整嵌入
+
+# 输出层（与输入嵌入共享权重）：[Y1, Y2] = [X E1, X E2]       # 每卡持有一段 logits
+# 朴素：all_gather 得到完整 logits → 通信 b × s × v 个元素（v≈5 万，巨大）
+# Megatron：把并行 GEMM 的输出直接与 cross-entropy 融合，只交换标量 → 通信降到 b × s 量级
+# 常见实现：all_reduce(max) → all_reduce(Σexp) → all_reduce(目标 logit) 三次 b×s 的标量通信</code></pre>
+    <p>
+      配套的工程细节：GPT-2 原词表 50,257，为了让每卡的 logit GEMM 是 128 的倍数且支持到 8 路 TP，论文把词表 pad 到能被 128×8=1024 整除的 51,200。
+    </p>
+
+    <h3>⑤ 不切的部分：复制计算，分开 RNG</h3>
+    <ul>
+      <li><strong>LayerNorm、dropout、残差</strong>：每卡持有 LayerNorm 参数的完整副本，拿到 g 之后的完整输出各自算一遍，而不是让一张卡算完再广播。所有值要么本地、要么复制，各 TP rank 只优化自己那份参数，<strong>不需要再同步参数</strong>。这部分重复的激活正是 <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>一文里 TP 公式 sbh(10 + 24/t + …) 中那个「10」；sequence parallel 后来沿序列维把它也切开。</li>
+      <li><strong>随机数</strong>：TP 区域外（残差前）的 dropout 必须在所有 TP rank 上一致——用同一个种子初始化；TP 区域内（attention 内部）的 dropout 作用在不同的头上，必须不同——为它维护一个按 TP rank 单独设种子的 RNG。两套 RNG 状态是 Megatron 的 <code>tensor_parallel.random</code> 的来源，也是激活重计算时必须一起保存 / 恢复的状态。</li>
+    </ul>
+
+    <h3>⑥ 与数据并行组合 + 论文实测</h3>
+    <p>
+      硬件：最多 32 台 DGX-2H（512 张 V100 32GB），服务器内 NVSwitch 300 GB/s，服务器间 8 块 InfiniBand 共 100 GB/s。TP 组放在同一台服务器内（例如 GPU 1–8），不同服务器上相同位置的 GPU 组成数据并行组做梯度 all-reduce。弱扩展实验固定每头 hidden 96，以单卡 1.2B（39 TFLOPS，单卡峰值的 30%）为基线：
+    </p>
+    <table>
+      <thead><tr><th>hidden / 头数 / 层数</th><th>参数</th><th>TP 卡数</th><th>TP 弱扩展效率</th><th>TP + 64 路 DP 卡数</th><th>TP+DP 效率</th></tr></thead>
+      <tbody>
+        <tr><td>1536 / 16 / 40</td><td>1.2B</td><td>1</td><td>100%</td><td>64</td><td>96%</td></tr>
+        <tr><td>1920 / 20 / 54</td><td>2.5B</td><td>2</td><td>95%</td><td>128</td><td>83%</td></tr>
+        <tr><td>2304 / 24 / 64</td><td>4.2B</td><td>4</td><td>82%</td><td>256</td><td>79%</td></tr>
+        <tr><td>3072 / 32 / 72</td><td>8.3B</td><td>8</td><td>77%</td><td>512</td><td>74%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      摘要里的口径是「512 卡持续 15.1 PFLOPs、76% 扩展效率」，正文与 Fig. 5 给的是 74%，两个数都出自原文。附录还有两组值得记住的数：
+    </p>
+    <ul>
+      <li><strong>头数影响</strong>（8.3B、8 路 TP）：16 头（每头 192）82%、24 头（128）80%、32 头（96）77%——头越多，每卡的 GEMM 越小、softmax 元素越多，效率越低。</li>
+      <li><strong>强扩展</strong>（1.2B、batch 固定 8）：2/4/8 卡加速 1.64 / 2.34 / 2.98×。即效率 82% / 58% / 37%（本文换算）：模型不够大时，每卡计算量下降、通信和访存开销占主导，TP 收益迅速递减。</li>
+    </ul>
+    <p>
+      训练配方（GPT-2）：<a href="daily-2026-10-22-algo-mixed-precision.html">混合精度 + 动态 loss scaling</a>，权重 N(0, 0.02) 初始化、残差前的层再乘 1/√(2N)（N 为层数），Adam + weight decay 0.01，全局梯度裁剪 1.0，dropout 0.1，每层做激活 checkpoint；序列 1024、batch 512、300k 步，lr 1.5e-4 warmup 3k 步后单周期余弦衰减到 1e-5。结果：8.3B 模型 WikiText103 困惑度 10.81（此前 SOTA 15.79），LAMBADA 准确率 66.51%（此前 63.24%）；512 卡上一个 epoch（68,507 步）约 2.10 天。BERT 侧的发现是：模型变大时必须调整 LayerNorm 与残差的位置，3.9B BERT 在 RACE 测试集上 90.9%。
+    </p>
+
+    <h3>⑦ 通信账：为什么 TP 不出节点</h3>
+    <p>
+      Narayanan et al.（PTD-P）给出了定量比较：pipeline 并行每个 micro-batch 在相邻两个 stage 之间只传一次 bsh 个元素（点对点）；TP 每层前向、反向各两次 all-reduce bsh 大小的张量，按 ring all-reduce 计，<strong>每层每卡每 micro-batch 的通信量是 8bsh(t−1)/t</strong>，且每层都要通信。
+    </p>
+    <pre><code># 本文按该公式算 GPT-3 175B 形状（b=1, s=2048, h=12288, BF16）
+t =  2: TP 每层每 micro-batch ≈ 192 MiB      对比 PP 点对点 bsh ≈ 48 MiB（每个 stage 边界一次）
+t =  4: ≈ 288 MiB
+t =  8: ≈ 336 MiB
+t = 16: ≈ 360 MiB      # (t−1)/t → 1，t 再大每卡通信量也不降，而每卡计算量按 1/t 缩小</code></pre>
+    <p>
+      所以论文的 Takeaway #1 是：<strong>用 g 卡服务器时，TP 度一般用到 g 为止，再往上用 pipeline 并行跨服务器扩展</strong>；Takeaway #2：TP×PP 的总模型并行度只要能让参数与中间状态放进显存即可，再往外用数据并行。PTD-P 的组合在 3072 张 A100 上以 502 PFLOP/s（每卡达到理论峰值的 52%）跑 1T 参数模型的训练迭代。
+    </p>
+
+    <h3>⑧ box 小实验（本文实跑）</h3>
+    <pre><code># numpy float64，X:[32,64]，A:[64,256]，B:[256,64]，GeLU(tanh 近似)
+t=2  列切A+行切B 与单卡 max|diff| = 2.4e-15   |  先行切A再GeLU（方案1）max|diff| = 0.94
+t=4  2.0e-15                                  |  1.24
+t=8  2.2e-15                                  |  1.27
+# 词表并行交叉熵（v=512, t=4，max / Σexp / 目标 logit 三次标量 all-reduce）
+与完整 logits 计算的 loss 差 0.0；通信元素 3·b·s = 96，对比 all-gather logits b·s·v = 16,384
+# 论文 Table 8 强扩展换算：1/2/4/8 卡 → 100% / 82% / 58% / 37%</code></pre>
+    <p>
+      方案 1 的误差在 1 的量级，说明「先在非线性前切开」不是数值误差问题，而是数学上就错——必须在 GeLU 之前同步。方案 2 只差浮点求和顺序带来的 1e-15，对应真实训练中 TP 改变 all-reduce 求和顺序导致的「同配置不同 TP 度 loss 不逐位一致」；这类差异在 RL 里会叠加到训推 mismatch 上（参见 <a href="daily-2026-10-27-rounding-location.html">Rounding-Location Alignment</a>）。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>TP 度 ≤ 单节点 GPU 数</strong>：8 卡 NVLink 节点上 TP ≤ 8；跨节点用 PP 或 FSDP / ZeRO-3。PCIe-only 的机器上 TP=2 也可能不划算。</li>
+      <li><strong>小模型别硬上 TP</strong>：强扩展数据说明 1.2B 规模 8 路 TP 效率只有 37%。显存放得下时，DP + <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 往往更快；TP 的价值在「单层放不下或单卡算不完」。</li>
+      <li><strong>选 TP 度先查整除性</strong>：注意力头数、KV 头数（GQA）、FFN 维度、词表（pad 到 128·t 的倍数）都要能被 t 整除；KV 头数 &lt; t 时会出现 KV 复制。</li>
+      <li><strong>TP 一开就配 sequence parallel</strong>：通信量不变（all-reduce = reduce-scatter + all-gather），却能把 LayerNorm / dropout 的重复激活也切成 1/t，见 <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>一文的公式表。</li>
+      <li><strong>RL 训推两端的 TP 度可以不同，但要会做权重重分片</strong>：rollout 引擎（vLLM / SGLang）常用较小 TP 提高并发，训练端用较大 TP；权重同步时需要按列 / 行切分规则重新分片（QKV 的列切顺序、gate/up 合并方式各框架不同），这是 weight sync 出错的高发区。</li>
+      <li><strong>Debug 先关 TP</strong>：怀疑数值问题时，用 TP=1 跑同一 batch 对齐 loss；仅有 1e-6 级差异属于求和顺序，若差距大则检查 RNG（TP 区域内外的 dropout 种子）和 f/g 是否漏插。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 Megatron 的 MLP 用「列并行接行并行」，而不是两个都列并行？两个都列并行会多出什么通信？</summary>
+      <p>两个都列并行时，第一个 GEMM 的输出 Y 按列分在各卡上，但第二个列并行 GEMM 需要每卡拿到完整的 Y 作为输入，所以中间要做一次 all-gather（Y 的大小是 bs×4h，比 bsh 还大 4 倍）；输出 Z 又是按列分布的，下一个 LayerNorm 需要完整的行，还得再 all-gather 一次。列接行的组合让中间结果「天然就是下一个 GEMM 需要的分片」，整个 MLP 只在末尾对 bs×h 的部分和做一次 all-reduce。</p>
+    </details>
+    <details>
+      <summary>2. 写出 f 的反向为什么必须 all-reduce，并说明如果漏掉这个 all-reduce 会发生什么。</summary>
+      <p>Y<sub>i</sub> = X A<sub>i</sub>，所以 ∂L/∂X = Σ<sub>i</sub> (∂L/∂Y<sub>i</sub>) A<sub>i</sub><sup>T</sup>，每张卡只能算出自己那一项。漏掉 all-reduce 后，各卡继续往前传的是不完整且彼此不同的梯度：前面所有层（包括 LayerNorm 和嵌入）的梯度都错了，而且因为每张卡上「复制」的参数收到不同梯度，原本应该一致的副本会逐步发散——loss 可能不会马上爆炸，但会明显比 TP=1 差，是一类很隐蔽的 bug。</p>
+    </details>
+    <details>
+      <summary>3. 按 8bsh(t−1)/t 估算：GPT-3 形状、t=8、每个 stage 12 层、每 step 32 个 micro-batch，单卡每步 TP 通信多少？与 NVLink（约数百 GB/s）、跨节点 IB（每卡约 25–50 GB/s）对比说明「TP 不出节点」。</summary>
+      <p>每层每 micro-batch 约 336 MiB（BF16），12 层 × 32 个 micro-batch ≈ 129,000 MiB ≈ 126 GiB / 卡 / step。按 300 GB/s 量级的节点内带宽，约 0.4–0.5 秒，且大部分可以与计算重叠；若放到每卡 25–50 GB/s 的跨节点链路上，就是 3–5 秒，几乎无法被计算掩盖。相比之下 PP 每个 stage 边界每 micro-batch 只传约 48 MiB。这就是 PTD-P 把 TP 限制在节点内、跨节点用 PP 的原因（数字为本文按公式粗算，不含协议开销）。</p>
+    </details>
+    <details>
+      <summary>4. 为什么 TP 区域外的 dropout 要用相同种子，区域内的要用不同种子？如果反过来会怎样？</summary>
+      <p>区域外（g 之后、残差之前）的张量在所有 TP rank 上是同一个完整副本，各卡各自算 dropout；如果 mask 不同，各卡的「复制」激活就不再一致，后续层在不同卡上看到不同输入，等价于模型状态分裂。区域内（attention 内部）各卡处理的是不同的头，如果用相同种子，不同头会得到完全相同的 dropout 模式，失去随机性的独立性（相当于把 mask 在头之间相关化）。反过来设置：区域外不一致会导致副本发散，区域内相同会让正则效果变差。重计算时还必须恢复这两套 RNG 状态。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）在 2 台 8×H100 节点上做 32B dense 模型（GQA，8 个 KV 头）的 RL 训练，训练端你会怎么组合 TP / PP / ZeRO-3 / SP？rollout 端 vLLM 的 TP 又怎么定？</summary>
+      <p>思路：训练端模型状态按 <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 的 16Ψ 估算约 512 GB，16 卡均分每卡 32 GB，用 FSDP / ZeRO-3 跨 16 卡即可放下，再配 selective 重计算；若长回复（如 32K）使激活过大，在节点内加 TP=4 或 8 + SP 切激活，节点间保持 ZeRO-3 / DP，避免 TP 跨节点；PP 在 2 节点规模下收益有限，通常不需要。KV 头数 8，TP≤8 不会出现 KV 复制。rollout 端：32B BF16 权重约 64 GB，TP=2 即可放下权重并留出 KV cache 空间，多开实例提高吞吐；如需更长上下文或更低延迟再用 TP=4。训推 TP 度不同意味着权重同步要做重分片，务必用逐字节或 logprob 校验确认同步正确。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">arXiv:1909.08053 · Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism（Shoeybi et al., NVIDIA）</a> · <a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">GitHub: NVIDIA/Megatron-LM</a></li>
+      <li><a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473 · Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM（Narayanan et al.）</a></li>
+      <li><a href="https://arxiv.org/abs/1811.02084" target="_blank" rel="noopener">arXiv:1811.02084 · Mesh-TensorFlow（Shazeer et al.）</a> · <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198 · Sequence Parallelism / Selective Recompute（Korthikanti et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> ·
+        <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a> ·
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a> ·
+        <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由</a> ·
+        <a href="daily-2026-10-27-rounding-location.html">Rounding-Location Alignment</a> ·
+        <a href="daily-2026-08-31-miles-v01.html">Miles v0.1（SGLang + Megatron）</a> ·
+        <a href="daily-2026-10-28-focus-active-critic.html">今日一线：FOCUS</a> ·
+        <a href="daily-2026-10-28-harness-skill-adaptation.html">今日 Harness：Skill Adaptation</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

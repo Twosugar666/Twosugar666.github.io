@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 1,
+  "next": 2,
   "daily_streams": [
     "frontline",
     "harness",
@@ -900,6 +900,27 @@
       "source": "algo",
       "topic": "激活重计算：Chen et al. O(n/k)+O(k)→k=√n、递归 k·log_{k+1}n、预算贪心 Alg.3、1000 层 ResNet 48G→7G、+30% 时间；Korthikanti et al. 每层 sbh(34+5as/h)、TP/SP/selective/full 公式、GPT-3 省 70% 仅 +2.7% FLOPs、22B 单层 39%→7%→4%、端到端 +29.0–32.1%、530B 2240 卡 MFU 54.2%；与 FlashAttention 关系；box 实验 64 层 MLP 峰值 16=2√64、梯度逐位一致（arXiv:1604.06174 / 2205.05198）",
       "file": "posts/daily-2026-10-27-algo-activation-checkpointing.html"
+    },
+    {
+      "date": "2026-10-28",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "FOCUS：长程 Agent RL 的主动 critic 学习——compaction 边界即 step、续跑树一层回传 Ḡ、κ 伪观测混合 Ṽ、段级 TD(γ=1,λ=0) 优势 + PPO clip；Beta 后验 ê²/σ̂² 与 g=−dMSE/dN 选点、异步 N_eff、C=2；Qwen3.5-9B DeonticBench 56.5 vs GRPO 52.4/VinePPO 49.4、BrowseComp-Plus 55.4 vs 48.2/46.6、LocBench 72.4/81.6；27B LoRA 76.3 vs 74.3；GRPO 后期 tool call 塌缩、压缩后立即 submit；MATH 预实验 2,782 vs 5,747/7,207 token；box 验证 g 公式、κ=1 时 N=0 g=0、扁平玩具中 g 选点不胜 round-robin（Jiang et al. JHU arXiv:2610.35801）",
+      "file": "posts/daily-2026-10-28-focus-active-critic.html"
+    },
+    {
+      "date": "2026-10-28",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Skill Adaptation：607 题→103 个 skill 敏感 pair（τ=0.10），GPT-5.6-luna +31.1 / Gemma-4-E4B −8.8，弱模型 86% 失败违反 skill 已写要求；四类失败（Tool execution / Context / Instruction / Verification，131 标签）→ meta-skill；Kimi-K3 一次改写 0.294→0.387（+5.1–14.1），一句话指令对照 meta-skill 多 5.1–6.0；弱模型自改无证据时变差；五轮自演化 7 个执行器 Δ5 +0.020–0.051；Context 一次改写 +0.103、Verification 自演化 +0.104；OpenHands / Claude Code harness、gate 防泄漏；box 复算 Table 1/2 一致、Gemma 基线重跑差 0.075（Yang et al. UCAS/ISCAS/UCSC/Tsinghua/NUS arXiv:2610.33024）",
+      "file": "posts/daily-2026-10-28-harness-skill-adaptation.html"
+    },
+    {
+      "date": "2026-10-28",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "张量并行（Megatron-LM）：MLP 列切 A + 行切 B 一次 all-reduce、f/g 共轭算子、attention 按头切、每层前向 2 次 + 反向 2 次 all-reduce；词表并行 + 融合 CE（b×s×v→b×s，pad 51,200）；复制 LayerNorm/dropout/残差、两套 RNG；8.3B 512×V100 15.1 PFLOPs、弱扩展 77%/74%（摘要 76%）、头数 82/80/77%、强扩展 1.64/2.34/2.98×；WikiText103 10.81、LAMBADA 66.51%；PTD-P 8bsh(t−1)/t 通信、TP≤节点 GPU 数、502 PFLOP/s 3072 A100；box 实验列/行切误差 1e-15 vs 先切再 GeLU 误差 ~1、词表并行 CE 误差 0（arXiv:1909.08053 / 2104.04473）",
+      "file": "posts/daily-2026-10-28-algo-tensor-parallel.html"
     }
   ]
 }

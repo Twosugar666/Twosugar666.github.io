@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜FOCUS：长程 Agent RL 把 critic 当「主动学习」来训——在 compaction 切出的段边界分叉续跑，按「再采一条能把价值误差降多少」分配 rollout 预算；Qwen3.5-9B 上 BrowseComp-Plus 55.4 vs GRPO 48.2，GRPO 后期工具调用塌缩而 FOCUS 不塌 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜FOCUS：长程 Agent RL 把 critic 当「主动学习」来训——在 compaction 切出的段边界分叉续跑，按「再采一条能把价值误差降多少」分配 rollout 预算；Qwen3.5-9B 上 BrowseComp-Plus 55.4 vs GRPO 48.2，GRPO 后期工具调用塌缩而 FOCUS 不塌</h1>
+    <p class="post-meta">2026-10-28 · 收藏夹：Agent / RL · 一线追踪<br />
+      来源：Zhengping Jiang、William Jurayj、Liaoyaqi Wang、Chunsheng Zuo、Anqi Liu、Benjamin Van Durme（Johns Hopkins University）· <em>FOCUS: Active Critic Learning for Long-Horizon Language Model Agents</em>（<a href="https://arxiv.org/abs/2610.35801" target="_blank" rel="noopener">arXiv:2610.35801</a>，cs.LG，v1 2026-10-26，出现在 arXiv 10-27 的 /new 批次）。
+      代码 <a href="https://github.com/zipJiang/FOCUS" target="_blank" rel="noopener">zipJiang/FOCUS</a>。FOCUS = <strong>F</strong>ocused <strong>O</strong>ptimization on <strong>C</strong>ritical <strong>U</strong>nderperforming <strong>S</strong>egments。
+      文中数字均为论文自报；「box 小验证」一节为本文在 box 上用 numpy 实跑。
+      交叉：
+      <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a>、
+      <a href="daily-2026-10-16-algo-gae.html">GAE</a>、
+      <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-10-27-harness-compact-bench.html">Compact-Bench</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 agent（几十到上百次 tool call 的 deep search、读法规、代码定位）做 RLVR 时，稀疏的终局奖励要被摊到整条轨迹的每个 token 上。<a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 用组内相对奖励省掉 critic，但信用是<strong>轨迹级</strong>的——一条成功轨迹里多余的、甚至有害的步骤也会被同样强化。另一条路是给中间状态估价值，来源只有两种：
+    </p>
+    <ul>
+      <li><strong>学习的 critic</strong>（<a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> / PPO 路线）：跨轨迹复用信息，但 LLM 规模的 value head 在长程任务上经常估不准；</li>
+      <li><strong>Monte Carlo 续跑</strong>（VinePPO、TreeRL、TreePO 一类）：从中间状态分叉再采若干条，均值当价值，准但贵——每个估计都要额外生成。</li>
+    </ul>
+    <p>
+      FOCUS 的提问是：既然预算有限，<strong>哪些中间状态最值得再采一条？</strong>它把「用续跑证据修 critic」建模成 critic 的主动学习（active learning）：只在「再多一条结果能最大程度降低价值估计误差」的状态上分叉，修正后的价值一边给 actor 做分段 TD 优势，一边当 critic 的训练目标。长程场景里，分叉点直接取 <strong>context compaction 的边界</strong>——这和昨天 <a href="daily-2026-10-27-harness-compact-bench.html">Compact-Bench</a> 讨论的是同一个 harness 机制，只是这里把它当成了 RL 的「天然 step 切分」。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 把 episode 当一棵树：节点 = 可恢复状态，边 = 一段续跑</h3>
+    <p>
+      对每个 prompt x，所有 rollout 组织成树 T<sub>x</sub>。非终止节点是「能用同样上下文和环境状态恢复执行」的点（论文假设至少部分中间状态可 fork，重复采样便宜），边是从该点到下一个节点之间 policy 生成的内容加环境转移。工具型 agent 里，一个节点就是一次 compaction 之后的状态：agent 带着压缩后的历史继续跑。
+    </p>
+
+    <h3>② 价值修正：critic 预测与续跑证据按「伪观测」加权</h3>
+    <pre><code># 一层回传（与 TreeRPO 相同的 backup，而不是对所有后代结局直接取平均）
+Ḡ(c) = (1/n(c)) · Σ_{c'∈ch(c)} ( R_{c→c'} + γ^{d} · Ṽ(c') )      # 终止节点 Ṽ=0
+
+# 与 critic 预测混合，κ = critic 的「伪观测数」
+Ṽ(c) = ( κ·V_φ(c) + n(c)·Ḡ(c) ) / ( κ + n(c) )                   # n=0 时 Ṽ=V_φ
+
+# critic 回归固定目标
+L_critic = E[ Σ_{c: n(c)>0} ( V_φ(c) − Ḡ(c) )² ]
+
+# actor：段级 TD 残差当优势，广播到该段 policy 生成的 token（含 compaction token），观测 mask 掉
+Â_i = δ_i = R_i + γ^{d_i}·Ṽ(c_i) − Ṽ(c_{i−1})
+L_actor = −E[ Σ_i Σ_{t∈y_{e_i}} min(ρ_t Â_i, clip(ρ_t, 1−ε, 1+ε) Â_i) ]   # 标准 PPO clip</code></pre>
+    <p>
+      为什么不用「后代叶子结局的平均」？因为分配器是<strong>有选择地</strong>扩展节点的，某个节点下面的叶子不再是从该节点 on-policy 抽出的样本；一层一层回传各子节点自己的修正价值，可以把这种选择偏差挡在每一层内部。所有实验都取 γ=1、λ=0、κ=1——也就是说优势就是相邻两个 compaction 边界之间的单步 TD 残差（附录给出一般 <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a> 扩展），critic 只算 1 个伪观测，续跑一条之后两者等权。
+    </p>
+
+    <h3>③ 选点：Beta 后验 + 期望 MSE 下降</h3>
+    <p>
+      选点用的不是上面的递归 Ṽ，而是「直接观测到的续跑结局」：N(c) 是该节点被观测到的续跑结局数，Ḡ<sub>obs</sub> 是它们的均值。对二值结局，以 critic 预测 v=V<sub>φ</sub>(c) 为中心放一个强度 κ 的 Beta 先验：
+    </p>
+    <pre><code>μ_obs = (κ·v + N·Ḡ_obs) / (κ + N)
+ê²    = (v − μ_obs)² + μ_obs(1 − μ_obs) / (κ + N + 1)     # critic 的期望平方误差
+σ̂²    = μ_obs(1 − μ_obs)                                  # 下一条结局的方差
+
+MSE(N) = (κ²e² + N·σ²) / (κ + N)²                          # 混合估计的误差
+g(c)   = −dMSE/dN = (2κ²·ê² + (N − κ)·σ̂²) / (κ + N)³       # 再采一条的边际收益
+
+while B > 0 and 候选集 F = {非终止、可恢复、g>0} 非空:
+    c* = argmax_F g(c);  ξ = Continue(c*, π_θ)   # 一路跑到终止，沿途按 compaction 切出新节点
+    B -= ξ 新增的 task 转移数（执行失败也扣 1）
+    更新 c* 及新节点的 N、Ḡ_obs；刷新 g
+最后自底向上做一次 ② 的回传</code></pre>
+    <p>
+      直觉：critic 与已观测结局偏离越大（ê² 大）越值得采；已经采了很多（N 大）收益按 (κ+N)<sup>−3</sup> 衰减。工程上分配可以异步：在途续跑数 m 计入 N<sub>eff</sub>=N+m，每个节点最多 C=2 条并发续跑，全局受 worker 数 W 限制。
+    </p>
+
+    <h3>④ Context management 与 rollout 分配解耦</h3>
+    <table>
+      <thead><tr><th>可插拔模块</th><th>论文实现</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td>compaction trigger 𝒢</td><td>prompt 超 14,336 token 或 18 次 tool call（BrowseComp-Plus 配置）</td><td>决定何时压缩</td></tr>
+        <tr><td>compaction operator 𝒞<sub>π</sub></td><td>默认「把一切写进新上下文」；消融里换成带 put / get / scan / delete 的 in-memory workspace</td><td>压缩后怎么续</td></tr>
+        <tr><td>branch predicate ℬ</td><td>与 𝒢 独立，默认在 compaction 边界存 snapshot</td><td>决定哪些点可分叉</td></tr>
+        <tr><td>credit / allocator</td><td>段级 TD + g(c) 选点</td><td>可换成别的估计器</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 结果（held-out 准确率 %，Qwen3.5-9B，matched 每步生成预算，1 epoch）</h3>
+    <table>
+      <thead><tr><th>方法</th><th>DeonticBench Overall</th><th>Airline</th><th>BrowseComp-Plus</th><th>LocBench File@1</th><th>File@5</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3.5-9B（未训）</td><td>45.9</td><td>5.3</td><td>29.7</td><td>62.1</td><td>67.8</td></tr>
+        <tr><td>GRPO</td><td>52.4</td><td>14.0</td><td>48.2</td><td>70.1</td><td>80.5</td></tr>
+        <tr><td>VinePPO</td><td>49.4</td><td>10.0</td><td>46.6</td><td>67.8</td><td>79.3</td></tr>
+        <tr><td><strong>FOCUS</strong></td><td><strong>56.5</strong></td><td><strong>21.3</strong></td><td><strong>55.4</strong></td><td><strong>72.4</strong></td><td><strong>81.6</strong></td></tr>
+        <tr><td>Δ vs GRPO（90% 配对 bootstrap CI）</td><td>+4.1 [+0.59, +7.69]</td><td>+7.3</td><td>+7.2 [+2.41, +12.05]</td><td>+2.3 [−1.1, +5.7]</td><td>+1.1 [0.0, +3.4]</td></tr>
+      </tbody>
+    </table>
+    <p>
+      要看清楚的细节：SARA-N 子集上 FOCUS 反而比 GRPO 低 4.0（CI 跨零），DeonticBench Hard 低 1.4；LocBench 的增益 CI 下界贴着 0。27B（LoRA）只跑了 DeonticBench：FOCUS 76.3 vs GRPO 74.3 / VinePPO 74.9，但未训的 27B 已经 73.4，空间小了。BrowseComp-Plus 的数字取的是训练过程中最好的 held-out checkpoint，判分用 Qwen3-32B 做等价判断。算力：9B 在 BrowseComp-Plus 上训练用 2×H200、rollout 4–6×H100、critic 修正 1×H100，critic 本身也是 9B。
+    </p>
+    <p>
+      MATH Level 4–5 的预实验（Qwen3.5-4B，32 次更新，512 题训练 / 256 题验证）：FOCUS 在第 8/16/24 次更新时准确率最高，第 32 次只比 GRPO 少答对 1 题；同时每题平均生成 2,782 token，GRPO 5,747、PPO 7,207。训练过程中 g(c) 的均值从第 1 次到第 32 次更新下降约 50%，说明 critic 在变准、「再采一条」的边际收益在变小。
+    </p>
+
+    <h3>⑥ 最有信息量的现象：GRPO 后期工具调用塌缩</h3>
+    <p>
+      三个基准上，GRPO 训练后期每 episode 的平均 tool call 数都在塌缩，VinePPO 与 FOCUS 保持在初始水平附近。附录的轨迹显示 GRPO 越来越倾向于<strong>compaction 一结束就直接 submit</strong>，哪怕法规或仓库还没读完；DeonticBench 上 GRPO 的 held-out 曲线在中途见顶后回落。作者的解释是：轨迹级组内信用让「过早提交」这种短路行为很容易被强化（有一部分短轨迹恰好答对，就整体被加分），而 VinePPO 的后缀分叉和 FOCUS 的段级修正价值能把「这一段到底有没有推进」单独打分。这与 <a href="daily-2026-09-15-gaca.html">GACA</a>、<a href="daily-2026-09-01-ahead.html">AHEAD</a> 等步级信用工作的动机一致，但给了一个更直接的病理指标：<strong>盯 tool call 数</strong>。
+    </p>
+
+    <h3>⑦ 消融与诊断</h3>
+    <ul>
+      <li><strong>选点规则</strong>：以 n=16 条 MCTS 续跑均值为「真值」，在常数初始化和随机初始化两种劣质 critic 下，按 g(c) 选点比随机选点更快压低 critic MSE；直接按「critic 与观测的残差」排序效果很差。</li>
+      <li><strong>critic 是否在学</strong>：LocBench 各 checkpoint 上，critic 值与 MCTS 目标的 Spearman 相关稳步上升。</li>
+      <li><strong>去掉修正续跑</strong>（BrowseComp-Plus）：只从题目根部采独立轨迹、价值全靠 critic，训练明显变慢，前期尤甚。</li>
+      <li><strong>换 compaction 算子</strong>（DeonticBench）：in-context 重写 vs in-memory workspace 表现接近。</li>
+      <li><strong>结构化压缩 prompt</strong>（LocBench）：强制 State / Evidence / Open questions / Next steps 四段、不合格式就拒收，曲线更平稳但峰值低于自由格式。</li>
+    </ul>
+
+    <h3>⑧ box 小验证（本文实跑）</h3>
+    <pre><code># (a) 验证 g = −dMSE/dN（κ=1, e²=σ²=0.24）
+N=1: 数值导数 0.06000 = 公式 0.06000;  N=2: 0.02667 = 0.02667;  N=4: 0.00960 = 0.00960
+
+# (b) 几个典型节点的 g（κ=1）
+v=0.8, 采1条失败   → μ=0.400, ê²=0.240, g=+0.0600   # critic 过于乐观，最该再采
+v=0.2, 采1条成功   → μ=0.600, ê²=0.240, g=+0.0600   # 对称
+v=0.5, 采1条成功   → μ=0.750, ê²=0.125, g=+0.0312
+v=0.9, 采1条成功   → μ=0.950, ê²=0.018, g=+0.0046   # critic 与证据一致，几乎不采
+v=0.8, 采3条全失败 → μ=0.200, ê²=0.392, g=+0.0173   # 误差仍大，但 (κ+N)^−3 让收益衰减
+任意 v, N=0（κ=1）→ g = 0（ê² 恰好等于 σ̂²/2），不进候选集
+
+# (c) 扁平玩具：64 个独立节点、每个已有 1 条结局、额外预算 128 条、κ=1 混合后的 MSE
+critic 噪声 σ=0.3 同质：  round-robin 0.0350 | 随机 0.0380 | 按残差 0.0471 | 按 g 0.0384
+半数节点噪声 0.02、半数 0.6：round-robin 0.0352 | 随机 0.0382 | 按残差 0.0538 | 按 g 0.0403</code></pre>
+    <p>
+      两点读法：(1) 「κ=1、N=0 时 g 恰为 0」（一般 κ 下 N=0 时 g=κσ̂²(κ−1)/((κ+1)κ³)，κ&gt;1 才为正）意味着 FOCUS 不会在从未观测过结局的节点上「盲采」——候选点都来自已完成轨迹上的节点（它们一开始就各有 1 条后缀结局）。(2) 在这个<strong>没有树结构、没有共享前缀</strong>的扁平玩具里，按 g 选点并不比 round-robin 好，和随机差不多；按残差选点则明显最差（与论文「raw residual performs poorly」一致）。g 的单样本 Beta 后验很噪，它的优势要依赖论文那种设定：节点是同一棵树上的段边界，一次续跑同时给路径上多个节点带来观测，且对比对象是随机选点。复现时值得把 round-robin / 均匀分叉也作为基线。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先把 harness 做成可 fork</strong>：FOCUS 的前提是中间状态能「同上下文 + 同环境状态」恢复。工具环境要支持 snapshot / restore（参见 <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a>），否则分叉续跑在真实 sandbox 里做不出来或代价极高。</li>
+      <li><strong>step 粒度用 compaction 边界</strong>：token 太细、整条轨迹太粗；compaction 段天然对应「一轮工作」，critic 的 horizon 以段计数也短得足以 bootstrap。即便不用 FOCUS，这也是给步级 critic 选 step 的好默认。</li>
+      <li><strong>监控 tool call 数和「压缩后立即提交」比例</strong>：GRPO 类轨迹级信用在长程任务上可能悄悄学会短路，reward 上升不代表行为健康；held-out 曲线中途见顶回落时先查这个。</li>
+      <li><strong>预算记账按 task 转移数</strong>：论文扣的是新增的环境步数，执行失败也扣 1；做 matched-budget 对比时要和 GRPO 的 group size 换算到同一口径。</li>
+      <li><strong>κ 和 critic 规模</strong>：论文全程 κ=1、critic 与 actor 同为 9B；critic 很弱时 κ 小一点让证据快速接管，critic 训好后可增大 κ 省续跑。</li>
+      <li><strong>压缩 prompt 是 RL 超参</strong>：结构化与自由格式压缩的训练曲线形状不同，换压缩 prompt 等于换环境，要和 <a href="daily-2026-10-27-harness-compact-bench.html">Compact-Bench</a> 式的离线评估一起看。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. FOCUS 的优势是 γ=1、λ=0 下的单步段级 TD 残差。它与 GAE 中 λ=0 的 TD(0) 优势有什么异同？为什么这里 λ=0 不会像经典 RL 那样带来大偏差？</summary>
+      <p>形式上相同：Â=R+γV(s')−V(s)，只用相邻两个状态的价值。经典 TD(0) 偏差大是因为 V 来自一个可能很差的 critic；FOCUS 里的 Ṽ 不是裸 critic，而是 critic 与真实续跑结局的混合（κ=1 时采一条就各占一半），被分叉过的节点价值已部分由 Monte Carlo 证据决定，偏差被证据稀释。同时段数（compaction 次数）远少于 token 数，λ=0 的「短视」影响也小。代价是没被分叉的节点只能用 critic，偏差仍在——这也是为什么要按 g 把续跑投向 critic 最可能错的节点。参见 <a href="daily-2026-10-16-algo-gae.html">GAE</a>。</p>
+    </details>
+    <details>
+      <summary>2. 为什么价值回传用「一层一层回传子节点的修正价值」，而不是「该节点下所有叶子结局的平均」？</summary>
+      <p>因为分配器只在 g 高的节点继续分叉，某节点子树中的叶子分布被选择过程扭曲：critic 估得差的分支会被过采样，叶子均值不再是该节点 on-policy 价值的无偏估计。一层回传时每个直接子节点等权（每个子节点代表从父节点出发的一次 on-policy 续跑），子树内部的过采样只影响该子节点自身的 Ṽ 精度，不改变它在父节点里的权重。</p>
+    </details>
+    <details>
+      <summary>3. κ=1 时 g(c) 在 N=0 处恒为 0，N=κ 时退化为 2κ²ê²/(2κ)³。请解释这两个特例的含义，并说说异步分配时用 N<sub>eff</sub>=N+m 的目的。</summary>
+      <p>N=0 时后验均值就是 critic 预测，ê² 只剩 Beta 方差项 σ̂²/(κ+1)，分子变成 κσ̂²(κ−1)/(κ+1)；κ=1 时为 0，g=0：没有任何证据时无法判断 critic 错没错，模型不认为再采有价值。N=κ 时方差项系数为 0，收益完全由「critic 与证据的偏离」驱动。异步时在途续跑尚未返回结果，若不计入，多个 worker 会同时扑向同一个 g 最大的节点；把 m 计入 N 让 g 提前衰减，起到「虚拟损失」（virtual loss，类似并行 MCTS）的作用，配合每节点 C=2 的并发上限。</p>
+    </details>
+    <details>
+      <summary>4. 论文观察到 GRPO 后期 tool call 塌缩、compaction 后立即提交。从信用分配角度，为什么段级价值能抑制这种行为？</summary>
+      <p>GRPO 的优势是轨迹级的：同一组里一条「早早提交恰好答对」的短轨迹拿到正优势，它的每个 token（包括「压缩后立即 submit」这个决定）都被同等强化。段级价值下，「compaction 后立即提交」这一段的优势是 R−Ṽ(压缩后状态)：如果从这个状态继续读资料的期望成功率更高（Ṽ 大），而这次提交的期望回报低，优势就是负的，哪怕个别样本碰巧答对。前提是 Ṽ 对该状态估得准——这正是在该节点分叉续跑的价值。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）box 玩具里按 g 选点没赢 round-robin。如果要在自己的 agentic RL 栈里决定是否上 FOCUS，你会设计什么实验来判断收益来自「主动选点」还是来自「有 critic + 段级信用」本身？</summary>
+      <p>至少三臂、同一 matched 生成预算：(a) 段级 critic + 段边界均匀分叉（每个 compaction 点各采固定条数）；(b) 段级 critic + 随机选点分叉；(c) 段级 critic + g 选点（FOCUS）。再加 (d) 不分叉、只用 critic（论文的「去掉修正续跑」消融）和 GRPO 基线。(c) 与 (a)(b) 的差才是主动选点的贡献，(a) 与 GRPO 的差是「段级信用 + critic」的贡献。指标上除 held-out 准确率，还要看 critic 对 MCTS 真值的 MSE / Spearman、tool call 数曲线和每条轨迹的生成 token 数。树越深、共享前缀越多，(c) 理论上越占优；扁平任务上 (a) 可能已足够。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.35801" target="_blank" rel="noopener">arXiv:2610.35801 · FOCUS: Active Critic Learning for Long-Horizon Language Model Agents（Jiang et al., JHU）</a> · <a href="https://github.com/zipJiang/FOCUS" target="_blank" rel="noopener">GitHub: zipJiang/FOCUS</a></li>
+      <li>相关：VinePPO（Kazemnejad et al., 2025）· TreeRPO（Yang et al., 2025）· Konda &amp; Tsitsiklis 1999（Actor-Critic）· Roy &amp; McCallum 2001（expected error reduction）</li>
+      <li>站内：
+        <a href="daily-2026-09-28-algo-td-lambda.html">TD(λ)</a> ·
+        <a href="daily-2026-10-16-algo-gae.html">GAE</a> ·
+        <a href="daily-2026-09-14-algo-actor-critic.html">Actor-Critic</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-09-15-gaca.html">GACA</a> ·
+        <a href="daily-2026-09-01-ahead.html">AHEAD</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-10-27-harness-compact-bench.html">Compact-Bench</a> ·
+        <a href="daily-2026-10-13-harness-sandbox-snapshots.html">Sandbox Snapshots</a> ·
+        <a href="daily-2026-10-28-harness-skill-adaptation.html">今日 Harness：Skill Adaptation</a> ·
+        <a href="daily-2026-10-28-algo-tensor-parallel.html">今日算法：张量并行</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>
