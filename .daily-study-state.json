@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 2,
+  "next": 3,
   "daily_streams": [
     "frontline",
     "harness",
@@ -921,6 +921,27 @@
       "source": "algo",
       "topic": "张量并行（Megatron-LM）：MLP 列切 A + 行切 B 一次 all-reduce、f/g 共轭算子、attention 按头切、每层前向 2 次 + 反向 2 次 all-reduce；词表并行 + 融合 CE（b×s×v→b×s，pad 51,200）；复制 LayerNorm/dropout/残差、两套 RNG；8.3B 512×V100 15.1 PFLOPs、弱扩展 77%/74%（摘要 76%）、头数 82/80/77%、强扩展 1.64/2.34/2.98×；WikiText103 10.81、LAMBADA 66.51%；PTD-P 8bsh(t−1)/t 通信、TP≤节点 GPU 数、502 PFLOP/s 3072 A100；box 实验列/行切误差 1e-15 vs 先切再 GeLU 误差 ~1、词表并行 CE 误差 0（arXiv:1909.08053 / 2104.04473）",
       "file": "posts/daily-2026-10-28-algo-tensor-parallel.html"
+    },
+    {
+      "date": "2026-10-29",
+      "domain": "infra",
+      "source": "frontline",
+      "topic": "Layerwise Repacking：1F3S 混合注意力变长训练，全注意力保留 SP16/32 parent、稀疏层 repack 到节点内 SP{1,2,4,8} child（sparse trunk）；S→F / F→S 融合进全注意力层两次 Ulysses all-to-all（可变 split + 确定性 rank-major 置换），跨节点调用点 8N_F→2N_F；节点内 275.6 vs 跨节点 39.5 GiB/s（7.0×）；B0→B1 −5.95% / +3.75pp，B0→N1 37.221→34.390 s（−7.61%）、MFU 56.47→61.30%；a2a 7.97→4.76 s；省掉的重分布 0.9–1.9 s（30–60%）；2-SP16 / SP32 两步变慢（最重样本 8 卡负载 1.47–1.70× 平均）；全窗口约 1.06%；box 验证可变 split 融合交换误差 1.8e-15（Zhang et al. KlingAI/快手 arXiv:2610.35989）",
+      "file": "posts/daily-2026-10-29-layerwise-repacking.html"
+    },
+    {
+      "date": "2026-10-29",
+      "domain": "harness agent rl",
+      "source": "harness",
+      "topic": "CoHARL：共享 policy + 最多 8 个可执行 harness 种群共演化；GRPO 组=任务×harness、DAPO clip [0.80,1.28]、无 KL；Claude Opus 4.7 proposer 读当前 policy 成败轨迹 + Pareto 存档改代码（不改训练框架/动作格式族），step 边界入池，难度校正 EWMA + LCB 调度；ρ_K(p)=1−p^K−(1−p)^K；Qwen3.5-35B-A3B LoRA r32 SWE-rebench 27.6 vs Meta-Harness 21.2 / GRPO 20.3 / Base 17.3，SWE-V 59.8，TB-2 36.8；30 步等预算 25.5 vs 固定 20.0 / 无存档 20.0 / 无轨迹 20.9 / 先搜后训 22.7 / 单 harness 交替 19.1；8B 试点伪造完成 31%→78%；box：交互项 +3.4、110 题单次 z<1.2（Chen et al. UNC/RIKEN/Cisco arXiv:2610.36469）",
+      "file": "posts/daily-2026-10-29-harness-coharl.html"
+    },
+    {
+      "date": "2026-10-29",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "序列/上下文并行：Ulysses 两次 all-to-all 序列↔头转置、每链路 4Nh/P vs Megatron-SP 4Nh、P≤头数（GQA 受 H_kv）、配 ZeRO-3、2.5× / 4× 长度 / 1M token；Ring Attention online softmax 绕环、c≥F/B（A100 NVLink 1.0K/6.2K、IB 24.5K/149.5K）、6bch、32×A100 7B 4096K；causal 负载 contiguous/striped（1.45×/1.65×）/zigzag；USP u×r、Llama3-8B SP16=U8×R2、208K 47% MFU、TP→Ulysses→Ring→DP→PP；box 验证 Ulysses 误差 0、Ring 1e-15、负载 136–904 vs 520×4（arXiv:2309.14509 / 2310.01889 / 2405.07719 / 2311.09431）",
+      "file": "posts/daily-2026-10-29-algo-sequence-parallel.html"
     }
   ]
 }

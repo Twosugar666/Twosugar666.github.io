@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜CoHARL：harness 不该在 RL 前搜一次就冻住——一个共享 policy 配一群可执行 harness 边训边演化，proposer 读当前 policy 的成败轨迹改代码、调度器按难度校正分数分 rollout；Qwen3.5-35B-A3B 在 SWE-rebench 27.6% vs Meta-Harness 21.2% / Plain GRPO 20.3%，等预算下「单 harness 交替」只有 19.1% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜CoHARL：harness 不该在 RL 前搜一次就冻住——一个共享 policy 配一群可执行 harness 边训边演化，proposer 读当前 policy 的成败轨迹改代码、调度器按难度校正分数分 rollout；Qwen3.5-35B-A3B 在 SWE-rebench 27.6% vs Meta-Harness 21.2% / Plain GRPO 20.3%，等预算下「单 harness 交替」只有 19.1%</h1>
+    <p class="post-meta">2026-10-29 · 收藏夹：Harness / Agent / RL · 学习笔记<br />
+      来源：Jianwen Chen、Peng Xia、Kaide Zeng、Siwei Han、Zhen-Yu Zhang、Charles Fleming、Xinyu Ye、Huaxiu Yao（UNC Chapel Hill / RIKEN / Cisco）· <em>CoHARL: Co-Evolving Agent Policies and Executable Harnesses with Reinforcement Learning</em>（<a href="https://arxiv.org/abs/2610.36469" target="_blank" rel="noopener">arXiv:2610.36469</a>，cs.LG，v1 页眉日期 2026-10-27，出现在 arXiv 10-28 的 /new 批次）。
+      训练基于 SkyRL；数字均为论文自报，<strong>单次训练运行、无置信区间</strong>；「box 小验证」一节为本文用 Python 对论文公式与表格实算。
+      交叉：
+      <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a>、
+      <a href="daily-2026-09-16-harnessbandit.html">HarnessBandit</a>、
+      <a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a>、
+      <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a>、
+      <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      Agent 的行为由两样东西共同决定：<strong>权重</strong>和 <strong>harness</strong>（prompt、动作解析、tool handler、回合控制）。而且同一个 harness 既是推理时的执行器，也是 RL 时的数据采集器——它决定 policy 能看到什么反馈、能学到什么。两条主流路线各缺一半：
+    </p>
+    <ul>
+      <li><strong>只训 policy</strong>（固定 harness 的 GRPO）：如果 parser 误拒合法的 tool call、或 tool 输出 handler 丢了关键反馈，梯度最多教会模型「绕开」这个缺陷，病根还在 harness 里；</li>
+      <li><strong>只搜 harness</strong>（Meta-Harness、Self-Harness、本站讲过的 <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> 一类）：能加指引和护栏，但模型不从自己的错误里学。</li>
+    </ul>
+    <p>
+      更关键的是两者<strong>在训练中互相耦合</strong>：修好一个 tool handler 会改变 policy 接下来能学到的轨迹；policy 变强后，又会暴露初始模型下看不到的新 harness 缺陷。所以「RL 前搜一次 harness 再冻住」无法响应后期失败，「冻住 policy 搜 harness」又学不到新接口下的经验。<a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a> 把「harness 变体」当作训练时的扩展轴，但变体空间是预先枚举的；<a href="daily-2026-09-16-harnessbandit.html">HarnessBandit</a> 在给定的 harness 集合上做调度，不改程序本身。CoHARL 往前一步：<strong>harness 是可执行代码，在 RL 过程中被持续改写，并且以「种群」形式同时为一个共享 policy 供数据</strong>。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 目标：部署目标 vs 调度后的训练分布</h3>
+    <pre><code>部署目标:   max_{θ,h} J(θ,h) = E_x E_{τ~Rollout(π_θ,h,x)} [ r(τ) ]          # r∈[0,1]，固定 evaluator
+训练分布:   J̄_t(θ) = E_x Σ_{h∈P_t} q_t(h | x, P_t) · E_{τ~Rollout(π_θ,h,x)} [ r(τ) ]
+            # P_t = 训练池（最多 8 个 harness 版本）；q_t = 调度器对 rollout 的分配
+            # 只有均匀分配时才是池内均匀平均；作者明确不假设 J̄ 与部署目标同最优</code></pre>
+
+    <h3>② 训练循环（Algorithm 1 精简）</h3>
+    <pre><code>P ← {h0 (SWE-mini 种子)};  F ← ∅ (Pareto 存档);  Staged ← ∅
+for t in 0..T-1:
+    P ← Admit(P, Staged); Staged ← ∅                 # 新版本只在 step 边界入池，绝不作用于已采的 batch
+    (h_1..h_N) ← Schedule(P)                        # N=6 个 slot，可重复选同一版本
+    采 B=12 个任务，每个任务绑一个 harness，各跑 K=4 条 rollout
+    batch ← PrepareBatch(超长过滤 → 组内方差过滤 → 对齐组大小)
+    if 可用样本够: θ ← GRPO 更新（优势在「同任务 × 同 harness」组内中心化）
+    更新各版本分数 g_h 与存档 F；淘汰合格的成员
+    if 到了提案节拍:                                  # 阶段 A 每 4 步、阶段 B 每 8 步；池 &lt;4 时缩到每 2 步
+        h_par ← SelectParent(P)
+        h' ~ q_LLM(· | h_par 源码, 当前 policy 在 h_par 下的成功/失败轨迹摘要, F, 同轮被拒尝试)
+        if h' 通过检查 (SWE: 结构契约检查 → 池内试用): Staged ∪= {h'}</code></pre>
+    <table>
+      <thead><tr><th>组件</th><th>设计要点</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Policy 更新</strong></td><td>GRPO，Â = R − 组内均值；组 = 同一任务 + 同一 harness，<strong>不跨 harness 比较</strong>。DAPO 式非对称 clip [0.80, 1.28]，2 个 PPO epoch，无参考策略惩罚、无 KL loss；token 级归一化，只有生成 token 进 loss，tool observation 只作条件（参见 <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、<a href="daily-2026-08-31-harness-tito.html">TITO</a>）</td></tr>
+        <tr><td><strong>Proposer</strong></td><td>更强的模型（Claude Opus 4.7）当随机变异算子，每次最多提 2 个候选；可以改 prompt、parser、tool handler 乃至 rollout 循环本身；<strong>两条硬约束</strong>：不能改训练框架，不能改 policy 使用的动作格式族</td></tr>
+        <tr><td><strong>调度分数</strong></td><td>g<sub>h</sub> = EWMA[ 平均 (r − b<sub>x</sub>)·w<sub>x</sub> ]，b<sub>x</sub> 是该任务的历史成功率 EWMA，w<sub>x</sub> 是难度权重；排序用 LCB：g<sub>h</sub> − c/√max(n<sub>h</sub>,1)。新入池版本有强制试用和最低使用次数保护。这个分数只决定「采什么经验」，<strong>不进训练优势</strong></td></tr>
+        <tr><td><strong>Pareto 存档</strong></td><td>保留「准确率不更低、平均生成 token 不更高」的非支配记录，包括已被逐出训练池的版本；只给 proposer 当上下文，存档里的版本不能当 parent</td></tr>
+        <tr><td><strong>防评测泄漏</strong></td><td>种子 harness 关闭隐藏测试注入，审计 gate 拒绝试图恢复访问的提案；5 个入池 harness 代码检查未发现隐藏测试访问；另一次固定权重搜索里 gate 拒掉了 6 轮全部 6 个「试图恢复测试访问」的提案</td></tr>
+      </tbody>
+    </table>
+    <p>
+      最后一行值得多看一眼：proposer 能改 harness 代码，就有可能把 fail_to_pass 测试塞进 agent 上下文。论文附录还记录了一个更早的 8B 试点：用 test/judge 混合奖励时，10 步内「伪造完成」比例从 31% 涨到 78%。这也是 SWE 评测坚持严格二值、无 LLM judge 的原因。
+    </p>
+
+    <h3>③ 为什么「改 harness」对 GRPO 有额外好处：组内对比概率</h3>
+    <p>
+      GRPO 组内奖励全相同时优势为 0，这一组不贡献梯度。K 条独立二值 rollout、成功率 p 时，组内「有对比」的概率是：
+    </p>
+    <pre><code>ρ_K(p) = 1 − p^K − (1−p)^K        # p 很小时 ≈ K·p；在 p=1/2 取最大值 1 − 2^(1−K)
+# 难任务上把 p 从 p 提到 c·p（cp ≪ 1/K），有对比的组大约多 c 倍
+# 异质任务要看 E_x[ρ_K(p_x)]，不是 ρ_K(E_x[p_x])；p &gt; 1/2 后关系反转</code></pre>
+    <p>
+      直觉：<strong>harness 改进最值钱的地方，是让原本「全失败」的难任务偶尔成功</strong>，把零梯度组变成有信号的组。作者强调这只是直觉、不是收敛保证。诊断数据（附录 D.1，来自较早的配置）：完整方法的组保留率均值 79.1%，固定 harness 只有 52.2%；第一个计入步分别保留 11/12 组与 3/8 组。但 SWE 的过滤分数在演化后的 harness 里可能包含过程奖励，所以保留率不能直接解读为「真实成功更多」。
+    </p>
+
+    <h3>④ SWE 训练奖励（完整运行 B0 的配置）</h3>
+    <pre><code>R_raw = 1.5·(0.9·f_F2P + 0.1·f_P2P) + 1[Submitted]·(0.05·IF + 0.05·SBE + 0.075·ETT)
+R     = R_raw − 0.1·clip((L_seq − (C − 4096)) / 4096, 0, 1)      # 软长度惩罚
+# IF : 每轮恰好一个可识别 shell 代码块的比例
+# SBE: 第一次编辑前有搜索 / 查看操作      ETT: 第一次编辑后有测试 / 验证命令
+# 评测仍是严格二值：全部 fail_to_pass 通过且 pass_to_pass 不坏才算 resolved</code></pre>
+
+    <h3>⑤ 主结果（Qwen3.5-35B-A3B，rank-32 LoRA，150 步，每步约 48 条 rollout）</h3>
+    <table>
+      <thead><tr><th>方法</th><th>权重</th><th>Harness</th><th>SWE-rebench（110 题，avg@3）</th><th>SWE-bench Verified（500 题，迁移）</th></tr></thead>
+      <tbody>
+        <tr><td>Base</td><td>初始</td><td>SWE-mini</td><td>17.3%</td><td>44.2%</td></tr>
+        <tr><td>Meta-Harness（复现，从 SWE-mini 起）</td><td>初始</td><td>搜索所得</td><td>21.2%</td><td>52.0%</td></tr>
+        <tr><td>Plain GRPO</td><td>RL</td><td>SWE-mini</td><td>20.3%</td><td>49.8%</td></tr>
+        <tr><td><strong>CoHARL</strong></td><td>RL</td><td>共演化</td><td><strong>27.6%</strong></td><td><strong>59.8%</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      SWE-rebench 训练集取 2026 年前的任务，评测取 2026 年 3 月之后的 110 题。Terminal-Bench 2.0 上单独训了一个 agent：Base（Terminus-2）26.6%、Meta-Harness 33.7%、Shepherd 报告的 Flat GRPO 34.2%（89 题 avg@5，协议不同）、CoHARL 36.8%。训练成本：150 步主实验中 CoHARL 与 RL-only 的训练 episode 数差 &lt;1%，harness 验证额外约 10%，proposer 推理另计——<strong>episode 数相近不等于总算力相等</strong>。
+    </p>
+
+    <h3>⑥ 等预算消融（30 步，110 题单次，严格 resolved）</h3>
+    <table>
+      <thead><tr><th>配置</th><th>Resolved</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><strong>CoHARL（完整）</strong></td><td><strong>25.5%（28/110）</strong></td><td>训练中搜索，8 次搜索尝试</td></tr>
+        <tr><td>A1 固定 harness RL</td><td>20.0%（22/110）</td><td>不演化</td></tr>
+        <tr><td>A2 无存档上下文</td><td>20.0%（22/110）</td><td>proposer 看不到 Pareto 历史</td></tr>
+        <tr><td>A3 无执行轨迹</td><td>20.9%（23/110）</td><td>proposer 看不到当前 policy 的成败轨迹</td></tr>
+        <tr><td>A4 先搜后训</td><td>22.7%（25/110）</td><td>RL 前搜 8 次，按 32 道验证题选出 candidate_01 后冻结</td></tr>
+        <tr><td>A5 单 harness 交替</td><td>19.1%（21/110）</td><td>第 4、8…28 步共 7 次修订，每次替换唯一的活跃 harness</td></tr>
+      </tbody>
+    </table>
+    <p>
+      最反直觉的是 A5：<strong>同样在线搜索、同样更新 policy，只是每次只保留一个活跃 harness，结果比固定 harness 还差</strong>。作者的解释是替换会同时让训练数据分布和奖励分布突变，种群保留旧接口继续采样起到缓冲作用；但作者也承认，凭最终任务数无法证明「梯度不稳」就是原因。另一次存档运行的利用率图显示：36 个调度步里 14 个版本出现过，同一步内多个版本同时贡献 rollout，老版本在新版本入池后仍在用。
+    </p>
+
+    <h3>⑦ 一个被改出来的 harness 长什么样</h3>
+    <p>
+      附录给了一个观察性例子（pygmt-4463）：父版本 swe_v050_native 对同一个搜索命令连发 42 次；子版本 swe_search_115 在 <code>get_observation()</code> 里加了重复命令检测——最近 5 次里有 3 次相同（且至少记录了 4 次）就注入 “LOOP DETECTED (3/5 recent calls identical)”。子版本的轨迹在警告后换了命令，<strong>但两次都在 100 轮 LimitsExceeded 处结束、任务都没解决</strong>，也没确认它进了主训练池。这正是 <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> 讲的循环问题，只不过这里是 proposer 自动发现并写进 harness 代码。
+    </p>
+
+    <h3>⑧ box 小验证</h3>
+    <pre><code># ρ_K(p) = 1 − p^K − (1−p)^K
+p     : 0.02  0.05  0.10  0.20  0.30  0.50  0.70  0.90
+K=4   : 0.078 0.185 0.344 0.589 0.752 0.875 0.752 0.344     # 最大值 1−2^(−3) = 0.875
+K=8   : 0.149 0.337 0.570 0.832 0.942 0.992 0.942 0.570
+# p: 0.05→0.10，K=4 时有对比的组 0.185→0.344（≈1.9×，接近 c=2）
+
+# 交互项 I = S_joint − S_harness − S_RL + S_base（附录 G 的描述性指标）
+SWE-rebench : 27.6−21.2−20.3+17.3 = +3.4   联合增益 10.3 / 分开之和 6.9 = 1.49×
+SWE-V       : 59.8−52.0−49.8+44.2 = +2.2   15.6 / 13.4 = 1.16×
+TB-2        : 36.8−33.7−34.2+26.6 = −4.5   （Flat GRPO 用的是 Shepherd 报告值，协议不匹配）
+
+# 噪声尺度：110 题单次、p≈0.255 时二项标准误 ≈ 4.2 pp
+28/110 vs 22/110 (A1) 两比例 z ≈ 0.97；vs 21/110 (A5) z ≈ 1.13；vs 25/110 (A4) z ≈ 0.47</code></pre>
+    <p>
+      最后三行说明：<strong>等预算消融里的每一个单独差距，按 110 题单次的二项噪声都不显著</strong>（|z| &lt; 1.96）。方向一致（完整方法高于全部 5 个对照）比单个差值更有说服力，但这仍是单次运行、单一 policy 模型的证据，作者在局限一节里也写明了这一点。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>把 harness 版本当作 RL 的一等公民记录</strong>：每条 rollout 带 harness 版本号，GRPO 的组按「任务 × harness」划分，不跨版本中心化奖励——否则 harness 本身的难度差会被当成策略优势。</li>
+      <li><strong>演化时保留种群而不是热替换</strong>：新 harness 先以小比例 slot 进入（强制试用 + 最低使用次数），老版本继续采样，靠调度分数逐渐淘汰。A5 的结果提示，单一接口的突然替换可能比不演化更糟。</li>
+      <li><strong>调度分数做难度校正</strong>：不同版本碰到的任务难度不同，原始平均奖励不可比；减去任务级基线 b<sub>x</sub>、再加 LCB 惩罚，和 <a href="daily-2026-09-16-harnessbandit.html">HarnessBandit</a> 的可学性信号思路相近。</li>
+      <li><strong>proposer 的权限要画边界</strong>：不能改训练框架、不能改动作格式族、不能碰 evaluator；对「恢复测试访问」做审计 gate。过程奖励（IF / SBE / ETT）要和最终严格评测分开，否则 harness 可以通过改过程奖励的计算方式让过滤分数虚高。</li>
+      <li><strong>给 proposer 两类上下文</strong>：当前 policy 在父版本下的成败轨迹（A3 去掉后 25.5→20.9）和历史准确率–成本存档（A2 去掉后 25.5→20.0）。存档分数是旧 policy 下测的，会过时，只当参考。</li>
+      <li><strong>算账要算全</strong>：proposer 用的是前沿闭源模型，harness 验证另加约 10%；与 <a href="daily-2026-10-20-harness-hda.html">HDA</a> 的建议一致，对比「搜 harness」类方法时要给 compute-matched 基线。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 GRPO 优势要在「同任务 × 同 harness」的组内中心化，而不是同任务跨 harness？</summary>
+      <p>不同 harness 对同一任务的成功率可能差很多（例如一个版本修好了 parser）。如果跨 harness 中心化，好 harness 下的 rollout 会系统性拿正优势、差 harness 下的拿负优势，policy 学到的是「harness 带来的差异」，而这部分差异不是 policy 动作决定的，属于混杂。组内固定 harness 后，奖励差只来自 policy 的采样随机性，优势才是对动作质量的估计。代价是：在某个 harness 下全成功或全失败的组没有梯度，这也是 ρ_K(p) 分析要处理的问题。</p>
+    </details>
+    <details>
+      <summary>2. 按 ρ_K(p) 的分析，harness 改进在什么情况下反而会减少可用于训练的对比组？</summary>
+      <p>ρ_K(p) 在 p=1/2 达到最大，之后下降。若某个 harness 改进把原本 p≈0.5–0.7 的任务推到 p≈0.9 以上，这些任务的组就更容易全成功、优势为 0（K=4 时 p=0.9 只剩 0.344）。所以 harness 提升对「难任务」能增加信号，对「中等难度任务」可能减少信号；结合动态采样（<a href="daily-2026-09-04-algo-dapo.html">DAPO</a>）或按难度调整任务分布，才能把信号保持在合适区间。</p>
+    </details>
+    <details>
+      <summary>3. A5（单 harness 交替）比 A1（固定 harness）还低。除了作者给的「分布突变」解释，还有哪些可能？要怎么设计实验区分？</summary>
+      <p>其他可能：(a) 纯噪声——19.1% vs 20.0% 只差 1 题，110 题单次的标准误约 4 pp；(b) 评测错配——A5 用第 30 步时恰好活跃的那个 harness 评测，若该版本刚替换上来、policy 还没适应它，评测会偏低；(c) 7 次修订中有的版本更差，而单 harness 没有淘汰机制兜底。区分方法：多种子重复；把 A5 的 policy 分别配所有历史 harness 评测（分离 policy 与评测 harness）；记录替换前后的奖励均值 / 方差和 KL，检验「分布突变」是否真的出现在替换点；再加一个「种群但不演化」（固定若干预设 harness）的对照，分离「种群」与「演化」各自的贡献——论文也指出固定 harness 对照同时去掉了演化和种群多样性。</p>
+    </details>
+    <details>
+      <summary>4. 如果把 CoHARL 搬到你的 Agent RL 管线，proposer 的权限和 harness 的可变部分你会怎么划定？</summary>
+      <p>可变：system prompt 与工具描述、tool 输出的截断与格式化、动作解析的容错、循环检测与提示注入、上下文压缩策略（参见 <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>）。不可变：动作格式族（保持 TITO 一致，否则训练分布断裂）、tokenizer 与 chat template、evaluator 与测试文件、奖励计算、沙箱权限、训练框架。所有候选在隔离沙箱里跑契约测试 + 小规模冒烟，静态扫描对测试目录、网络和 evaluator 路径的访问，并对过程奖励相关代码做 diff 审计。入池后先小流量试用，保留回滚。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）CoHARL 最终部署的是「第 150 步 policy + 最终池里排名最高的 harness」。这种部署选择可能带来什么偏差？</summary>
+      <p>池内排名由训练时的调度分数决定，分数基于训练任务、可能包含过程奖励过滤和早期 policy 的历史（EWMA），不一定等于该 harness 与最终 policy 在测试分布上的表现；而且 policy 是在混合分布 J̄ 上训练的，它在任何单一 harness 下都可能不是最优。更稳的做法是：用独立验证集对「最终 policy × 池内每个 harness」重新评估后选择，或者部署时保留多个 harness 做集成 / 路由。另外，验证集被反复用来选 harness 会造成选择过拟合（论文局限一节也提到），需要留一个从未参与选择的测试集。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.36469" target="_blank" rel="noopener">arXiv:2610.36469 · CoHARL: Co-Evolving Agent Policies and Executable Harnesses with Reinforcement Learning（Chen et al., UNC Chapel Hill / RIKEN / Cisco）</a></li>
+      <li>同批相关：<a href="https://arxiv.org/abs/2610.37255" target="_blank" rel="noopener">arXiv:2610.37255 · Your Policy Is Secretly a Harness</a>（把部署回报拆成 harness 上限减 policy 失配；把 MiniWoB++ 观测字段换个顺序，最优决策不变，训练后模型却从 85.0% 掉到 19.2%）</li>
+      <li>文中对比 / 引用：SWE-rebench（Badertdinov et al., 2025）· Terminal-Bench 2.0 · SkyRL · Meta-Harness（Lee et al., 2026）· WHALE / HASE / HarnessForge / EvoTrainer（论文附录 F 对比表）</li>
+      <li>站内：
+        <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a> ·
+        <a href="daily-2026-09-16-harnessbandit.html">HarnessBandit</a> ·
+        <a href="daily-2026-09-16-harness-modular-rsi.html">ModularRSI</a> ·
+        <a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a> ·
+        <a href="daily-2026-10-15-harness-clawloop.html">ClawLoop</a> ·
+        <a href="daily-2026-09-14-harness-harness-r1.html">Harness-R1</a> ·
+        <a href="daily-2026-09-01-harness-mini-swe.html">mini-SWE-agent</a> ·
+        <a href="daily-2026-10-16-harness-deloop.html">DeLoop</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-10-29-layerwise-repacking.html">今日一线：Layerwise Repacking</a> ·
+        <a href="daily-2026-10-29-algo-sequence-parallel.html">今日算法：序列并行</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+  <script src="../assets/glossary.js"></script>
+</body>
+</html>

@@ -93,6 +93,27 @@
           <button class="chip" data-filter="pc">配件</button>
         </div>
         <ul class="post-list">
+          <li data-cat="infra">
+            <a href="posts/daily-2026-10-29-layerwise-repacking.html">一线追踪｜Layerwise Repacking：混合注意力变长训练里，全注意力层要 SP16/32、稀疏层 SP8 就够——把「换布局」塞进全注意力层本来就有的两次 Ulysses all-to-all，被拆开的宽组里稀疏层不再跨节点；22 个宽组 step 端到端 −7.61%、MFU 56.47%→61.30%</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-29</span>
+            </span>
+          </li>
+          <li data-cat="harness agent rl">
+            <a href="posts/daily-2026-10-29-harness-coharl.html">学习笔记｜CoHARL：harness 不该在 RL 前搜一次就冻住——一个共享 policy 配一群可执行 harness 边训边演化，proposer 读当前 policy 的成败轨迹改代码、调度器按难度校正分数分 rollout；Qwen3.5-35B-A3B 在 SWE-rebench 27.6% vs Meta-Harness 21.2% / Plain GRPO 20.3%，等预算下「单 harness 交替」只有 19.1%</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span><span class="post-cat">RL</span>
+              <span class="post-date">2026-10-29</span>
+            </span>
+          </li>
+          <li data-cat="algo infra">
+            <a href="posts/daily-2026-10-29-algo-sequence-parallel.html">学习笔记｜序列 / 上下文并行（Ulysses 与 Ring Attention）：长上下文把激活撑爆后沿序列维切——Ulysses 两次 all-to-all 把「切序列」换成「切头」，每链路通信 4Nh/P 但并行度被头数封顶；Ring Attention 用 online softmax 边传 KV 边算，块长 c ≥ F/B 才盖得住通信；causal 负载不均靠 zigzag / striped 修，USP 把两者拼成 2D</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-29</span>
+            </span>
+          </li>
           <li data-cat="agent rl">
             <a href="posts/daily-2026-10-28-focus-active-critic.html">一线追踪｜FOCUS：长程 Agent RL 把 critic 当「主动学习」来训——在 compaction 切出的段边界分叉续跑，按「再采一条能把价值误差降多少」分配 rollout 预算；Qwen3.5-9B 上 BrowseComp-Plus 55.4 vs GRPO 48.2，GRPO 后期工具调用塌缩而 FOCUS 不塌</a>
             <span class="post-side">

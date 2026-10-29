@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜序列 / 上下文并行（Ulysses 与 Ring Attention）：长上下文把激活撑爆后沿序列维切——Ulysses 两次 all-to-all 把「切序列」换成「切头」，每链路通信 4Nh/P 但并行度被头数封顶；Ring Attention 用 online softmax 边传 KV 边算，块长 c ≥ F/B 才盖得住通信；causal 负载不均靠 zigzag / striped 修，USP 把两者拼成 2D · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜序列 / 上下文并行（Ulysses 与 Ring Attention）：长上下文把激活撑爆后沿序列维切——Ulysses 两次 all-to-all 把「切序列」换成「切头」，每链路通信 4Nh/P 但并行度被头数封顶；Ring Attention 用 online softmax 边传 KV 边算，块长 c ≥ F/B 才盖得住通信；causal 负载不均靠 zigzag / striped 修，USP 把两者拼成 2D</h1>
+    <p class="post-meta">2026-10-29 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Sam Ade Jacobs、Masahiro Tanaka、Chengming Zhang、Minjia Zhang、Shuaiwen Leon Song、Samyam Rajbhandari、Yuxiong He（Microsoft DeepSpeed）· <em>DeepSpeed Ulysses</em>（<a href="https://arxiv.org/abs/2309.14509" target="_blank" rel="noopener">arXiv:2309.14509</a>，2023）；
+      Hao Liu、Matei Zaharia、Pieter Abbeel（UC Berkeley）· <em>Ring Attention with Blockwise Transformers for Near-Infinite Context</em>（<a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">arXiv:2310.01889</a>，ICLR 2024）。
+      补充：Li et al. <em>Sequence Parallelism</em>（Ring Self-Attention，<a href="https://arxiv.org/abs/2105.13120" target="_blank" rel="noopener">arXiv:2105.13120</a>）、Brandon et al. <em>Striped Attention</em>（<a href="https://arxiv.org/abs/2311.09431" target="_blank" rel="noopener">arXiv:2311.09431</a>）、Fang &amp; Zhao <em>USP</em>（<a href="https://arxiv.org/abs/2405.07719" target="_blank" rel="noopener">arXiv:2405.07719</a>）。论文数字按原文；「box 小实验」一节为本文在 box 上用 numpy 实跑。
+      交叉：
+      <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>、
+      <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>、
+      <a href="daily-2026-10-23-algo-zero.html">ZeRO</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a>、
+      <a href="daily-2026-10-29-layerwise-repacking.html">今日一线：Layerwise Repacking</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      分布式训练系列走到这里，四个维度已经讲了三个：<a href="daily-2026-10-23-algo-zero.html">ZeRO</a> / 数据并行切 batch 与模型状态，<a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>切 hidden / 头，<a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>用 FLOPs 换显存。但当序列长度 s 拉到 128K、1M 时，问题换了形态：
+    </p>
+    <ul>
+      <li>激活随 s 线性（FlashAttention 之后）甚至平方增长，<strong>一个样本</strong>的激活就放不进一张卡，数据并行切 batch 无能为力（batch 已经是 1）；</li>
+      <li>张量并行度受头数和节点大小封顶（TP 通常 ≤ 8），而且 Megatron 的 sequence parallel（Korthikanti et al.）只把 LayerNorm / dropout 那段沿序列切开，attention 内部仍需完整序列；</li>
+      <li>重计算再省也省不掉「当前层正在算的那一份」。</li>
+    </ul>
+    <p>
+      于是需要第四个维度：<strong>沿序列维把一个样本切到 P 张卡</strong>。投影、MLP、Norm 都是逐 token 运算，天然可切；唯一的麻烦是 <strong>attention 需要每个 query 看到所有 key</strong>。围绕「怎么让切开的 query 看到完整的 K/V」，出现了两条路线：<strong>Ulysses</strong>（换个维度切，用 all-to-all）和 <strong>Ring Attention</strong>（K/V 绕环传递，用 online softmax 累加）。Megatron-Core 把这一维叫 context parallelism（CP），DeepSpeed 叫 sequence parallelism（SP），下文统称 SP。今天一线的 <a href="daily-2026-10-29-layerwise-repacking.html">Layerwise Repacking</a> 就是在 Ulysses 的必经 all-to-all 上做文章，读完本文再看会顺很多。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 记号与三种方案一览</h3>
+    <p>N（或 s）= 序列长度，h = hidden，H = 头数，P = SP 并行度，F = 单卡 FLOPS，B = 卡间带宽。</p>
+    <table>
+      <thead><tr><th>方案</th><th>attention 前后怎么切</th><th>通信</th><th>硬约束</th></tr></thead>
+      <tbody>
+        <tr><td>Megatron TP + SP</td><td>TP 区按头 / hidden 切，Norm / dropout 区按序列切</td><td>每层 2 次 all-gather + 2 次 reduce-scatter，消息量 Nh；每链路约 4Nh，<strong>不随 P 下降</strong></td><td>P ≤ 头数，通常 ≤ 节点内卡数</td></tr>
+        <tr><td><strong>Ulysses</strong></td><td>attention 外按序列切（N/P × h）；attention 内按头切（N × H/P）</td><td>每层 Q/K/V 一次 all-to-all（3Nh）+ 输出一次（Nh），每链路 <strong>4Nh/P</strong></td><td>P ≤ 头数（GQA 下实际受 KV 头数约束）</td></tr>
+        <tr><td><strong>Ring Attention</strong></td><td>全程按序列切，Q 块不动，K/V 块沿环转 P−1 次</td><td>P2P，每 rank 前向收发 (P−1) 个 KV 块，可与计算完全重叠</td><td>块长 c ≥ F/B 才能盖住通信；causal 要做负载均衡</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② Ulysses：两次 all-to-all，把「切序列」转置成「切头」</h3>
+    <pre><code># 每个 rank 持有 x: [N/P, h]（本地序列块）
+q, k, v = x @ Wq, x @ Wk, x @ Wv            # [N/P, H, d]，逐 token，无通信
+q, k, v = all_to_all(q, k, v, scatter=头维, gather=序列维)   # → [N, H/P, d]
+o = attention(q, k, v)                       # 每个 rank 对 H/P 个头算「完整序列」的 attention
+                                             # 可直接调 FlashAttention / 稀疏 / causal 任意 kernel
+o = all_to_all(o, scatter=序列维, gather=头维)               # → [N/P, H, d]
+y = o @ Wo;  MLP / Norm 照常逐 token 计算</code></pre>
+    <p>
+      <strong>通信账</strong>（Ulysses 论文 §3.2）：在 NVSwitch + fat-tree IB 的集群上，总消息量 M 的 all-to-all 每条链路传 M/P。每层 Q/K/V 合计 3Nh、输出 Nh，所以每链路 <strong>4Nh/P</strong>；N 与 P 同比例增大时<strong>每链路通信量不变</strong>。Megatron-SP 的 all-gather / reduce-scatter 在 P ≫ 1 时每链路成本仍是 M，所以是 4Nh，是 Ulysses 的 P 倍。论文实测（摘要）：相对 Megatron-LM SP，序列长 4× 的同时吞吐快 2.5×；1.2B GPT 在最多 256 张 A100 上把序列强扩展到 1M token。
+    </p>
+    <p>
+      <strong>两个硬伤</strong>：(1) 切的是头，<strong>P 不能超过头数</strong>；GQA 时 K/V 只有 H<sub>kv</sub> 个头，Llama3-8B 的 H<sub>kv</sub>=8，纯 Ulysses 最大 SP=8（不复制 KV 头的前提下），MQA（H<sub>kv</sub>=1）基本用不了（见 <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a>）；(2) TP 也在切头，Ulysses 与 TP 在同一维度上「抢头」。模型状态方面，Ulysses 本身不切参数，所以论文把 ZeRO-3 的分片组扩成 DP × SP 的联合组——对参数而言，切 batch 和切序列是等价的数据切分。
+    </p>
+
+    <h3>③ Ring Attention：K/V 绕环，online softmax 逐块累加</h3>
+    <p>
+      Ring 路线的数学基础与 <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> 相同：softmax 可以分块计算再合并，只要保存每行的运行最大值 m 和归一化和 l。FlashAttention 在 SRAM 里分块，Ring Attention 把「块」放到不同卡上：
+    </p>
+    <pre><code># rank r 持有 Q_r, K_r, V_r（各 N/P 个 token）
+m = −∞; l = 0; acc = 0;  (K, V) = (K_r, V_r)
+for step in 0..P−1:
+    异步: send (K, V) → rank r+1;  recv (K', V') ← rank r−1        # 与下面的计算重叠
+    S = Q_r Kᵀ / √d  (+ causal mask，按全局位置)
+    m_new = max(m, rowmax(S));  p = exp(S − m_new);  c = exp(m − m_new)
+    l = l·c + rowsum(p);  acc = acc·c + p V;  m = m_new
+    (K, V) = (K', V')
+O_r = acc / l          # 与单卡完整 attention 数学等价（无近似）
+# 反向同理绕环；Ring Attention 把 FFN 也做成 blockwise，峰值激活约 6bch 字节/层</code></pre>
+    <p>
+      <strong>什么时候能完全盖住通信</strong>（Ring Attention §3）：块长 c、hidden d。一个块的 attention 计算约 4dc² FLOPs（QKᵀ 2dc² + PV 2dc²），K/V 两个块的传输约 4cd 字节（bf16）。重叠条件 4dc²/F ≥ 4cd/B，即：
+    </p>
+    <pre><code>c ≥ F / B          # 块长要大于「算力 / 带宽」；每卡序列至少 s = 6c（论文按 6 个块的显存账）
+论文 Table 2：A100 NVLink（312 TF / 300 GB/s）c ≈ 1.0K、每卡最少 6.2K token
+             A100 InfiniBand（12.5 GB/s）  c ≈ 24.5K、每卡最少 149.5K token
+             TPU v4 c ≈ 1.0K、6.2K token</code></pre>
+    <p>
+      结论很直接：<strong>节点内 Ring 很容易盖住，跨慢网络则要求每卡序列很长</strong>。这个条件只算了 attention、没算投影 / FFN（它们只增加计算，不增加卡间通信），所以是偏保守的条件。论文 Table 3 的最大可训上下文：8×A100 NVLink 上 7B 从 32K（memory-efficient attn + FFN）到 256K（8×），32×A100 IB 上 7B 到 4096K（32×），TPUv4-1024 上 3B 到 16384K（512×）——上下文随卡数线性增长。
+    </p>
+
+    <h3>④ causal mask 下的负载不均：contiguous → striped → zigzag</h3>
+    <p>
+      连续切块时，rank 0 持有最前面的 query，只需看自己那块 key；rank P−1 要看所有块。causal 下大约一半的块是全遮蔽的，<strong>rank 间计算量呈三角形分布</strong>，最慢的 rank 决定步长。两种修法：
+    </p>
+    <table>
+      <thead><tr><th>切法</th><th>rank r 持有</th><th>效果</th></tr></thead>
+      <tbody>
+        <tr><td>Contiguous（原始 Ring）</td><td>第 r 个连续块</td><td>三角形不均：box 实验 P=4 时有效 (q,k) 对 136 / 392 / 648 / 904</td></tr>
+        <tr><td>Striped（Brandon et al.）</td><td>token r, r+P, r+2P, …（等间隔条带）</td><td>近似均衡（box：496–544）；论文自报 A100 / TPUv4 上 256K 端到端 1.45×，16 片 TPUv4 上 786K 达 1.65×</td></tr>
+        <tr><td>Zigzag / load-balance（Megatron CP、USP）</td><td>序列切 2P 块，rank r 拿第 r 块和第 2P−1−r 块（头尾配对）</td><td>完全均衡（box：520 ×4）；保持块内连续，kernel 友好；RoPE 位置要按同一重排</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ USP：Ulysses × Ring 的 2D 序列并行</h3>
+    <p>
+      USP 把 SP 组拆成 Ulysses 度 u × Ring 度 r = P：组内先做 Ulysses all-to-all（走高带宽域），再在 Ring 维上做 P2P（可走慢链路并与计算重叠）。u = P 退化为纯 Ulysses，r = P 退化为纯 Ring。好处：(1) <strong>解除头数上限</strong>——Llama3-8B（H<sub>kv</sub>=8）做 SP16 时取 u=8、r=2；(2) <strong>拓扑友好</strong>——all-to-all 放节点内，P2P 放节点间。论文 Table 2 的激活通信（前向 + 反向）：Ulysses 约 8/N·O(bs·L·d)、Ring 约 4·O(bs·L·d)、TP 约 8·O(bs·L·d)、TP-sp 约 10·O(bs·L·d)。自报结果：两台 8×A800 上 Llama3-8B、208K 序列 47% MFU（按 causal 有效计算口径）。
+    </p>
+    <p>论文给的几条经验（Tips，按原文意译）：</p>
+    <ul>
+      <li>能用 DP 就先用 DP；batch 不够切时才上 SP（SP 的 attention 通信是 DP 没有的额外开销）。</li>
+      <li>用 SP 时总是叠 ZeRO-1/2，SP 组与 DP 组合成一个 ZeRO 组。</li>
+      <li>4D 混合并行的进程组从低到高：<strong>TP → SP-Ulysses → SP-Ring → ZeRO-DP → PP</strong>（越靠前越需要高带宽、越应放在节点内）。</li>
+      <li>头数受限时，用更大的 Ring 度继续扩展 SP。</li>
+    </ul>
+
+    <h3>⑥ 选型速查</h3>
+    <table>
+      <thead><tr><th>场景</th><th>倾向</th><th>理由</th></tr></thead>
+      <tbody>
+        <tr><td>SP ≤ 8、节点内 NVLink、头数充足</td><td>Ulysses</td><td>两次 all-to-all，attention kernel 不用改，块不被切小</td></tr>
+        <tr><td>SP &gt; KV 头数（GQA / MQA）</td><td>USP（Ulysses 用满 KV 头，剩余给 Ring）</td><td>绕开头数上限</td></tr>
+        <tr><td>跨节点、每卡序列很长（≫ 6·F/B）</td><td>Ring 维放跨节点</td><td>P2P 可以被块计算盖住</td></tr>
+        <tr><td>跨节点、每卡序列不长</td><td>谨慎</td><td>Ring 盖不住、Ulysses 的跨节点 all-to-all 很慢；考虑减小 SP 或换层布局（今天的 Layerwise Repacking）</td></tr>
+        <tr><td>混合注意力 / 线性注意力层</td><td>按层类型分别规划</td><td>线性层的 attention 计算太少，Ring 的重叠没有收益；SP 宽度需求随层类型而变</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑦ box 小实验（numpy，L=64、H=8、d=16、P=4，causal）</h3>
+    <pre><code># 1) Ulysses：按序列切 → all_to_all(序列→头) → 每 rank 2 个头的完整 causal attention → all_to_all 回来
+Ulysses   max |err| vs 单卡 = 0.0             # 只做了数据搬运，逐位一致
+# 2) Ring：Q 块不动，K/V 绕环 4 步，online softmax 合并
+Ring contiguous  max |err| = 8.9e-16   每 rank 有效 (q,k) 对 = [136, 392, 648, 904]   # 最慢/最快 6.6×
+Ring striped     max |err| = 8.9e-16                         = [496, 512, 528, 544]
+Ring zigzag      max |err| = 1.1e-15                         = [520, 520, 520, 520]
+# 3) 每链路通信（单位 Nh，每层）
+P=4 : Ulysses 4/P = 1.0     P=8 : 0.5     P=16 : 0.25     P=32 : 0.125      # Megatron-SP ≈ 4
+Ring 每 rank 前向收 KV ≈ 2(P−1)/P·Nh（MHA；GQA 时按 H_kv/H 缩小）→ 1.5 / 1.75 / 1.875 / 1.94
+# 4) Ring 重叠门槛 c = F/B（本文按公开规格估算，dense BF16）
+A100 NVLink 312T/300G → c≈1.0K, 6c≈6.2K     A100 IB 12.5G → c≈25K, 6c≈150K   # 与论文 Table 2 一致
+H100 NVLink 989T/450G → c≈2.2K, 6c≈13K      H100 IB 50G   → c≈20K, 6c≈119K   # 估算</code></pre>
+    <p>
+      读法：Ring 的误差只来自浮点合并顺序（1e-15 量级），三种切法数值上都正确，差别只在负载；Ulysses 的数据搬运不涉及任何浮点运算。H100 那两行说明算力涨得比带宽快时，Ring 需要的每卡最短序列也随之变长——这也是越来越多系统转向「Ulysses 放节点内 + Ring 放节点间」的原因。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先算再选</strong>：用 c = F/B 估 Ring 的重叠门槛，用 4Nh/P 估 Ulysses 的 all-to-all；如果每卡序列低于 6·F/B 且必须跨节点，任何 SP 都会暴露通信，优先考虑把 SP 留在节点内、用 PP / DP 扩展其他维度。</li>
+      <li><strong>GQA 模型的 Ulysses 度别超过 H<sub>kv</sub></strong>：超出就要复制 KV 头（多传、多存），不如交给 Ring 维；MLA 的低秩 latent 让 KV 很小，对 Ring 的传输量更友好。</li>
+      <li><strong>causal 训练必须做负载均衡</strong>：zigzag 是默认选择（Megatron CP、USP 都这么做），记得 position id / RoPE 和 loss mask 按同一重排；变长 packing 时还要保证样本边界的 mask 正确。</li>
+      <li><strong>SP 组与 ZeRO 组合并</strong>：SP 不切参数，ZeRO 在 DP × SP 的联合组上分片才划算；梯度 all-reduce 也要跨 DP × SP。</li>
+      <li><strong>进程组排布遵循带宽层级</strong>：TP → Ulysses → Ring → DP → PP 由内到外；混合注意力模型还要考虑按层类型选择不同的 SP 宽度（见 <a href="daily-2026-10-29-layerwise-repacking.html">Layerwise Repacking</a>）。</li>
+      <li><strong>推理也能用</strong>：长 prompt 的 prefill 可用同样思路做 context parallel（例如 <a href="daily-2026-10-19-kv-tier-pcp.html">KV tier + PCP</a> 里按 PCP rank 分片 MLA KV）；decode 阶段每步只有一个 query，SP 收益很小。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 推导 Ulysses 每链路 4Nh/P 的通信量，并说明为什么 Megatron-SP 在 P ≫ 1 时每链路仍是约 4Nh。</summary>
+      <p>Ulysses：attention 前对 Q/K/V 做 all-to-all，总消息量 3Nh（三个 N×h 张量）；attention 后对输出做一次，总消息量 Nh。在全互联（NVSwitch / fat-tree）上，总量 M 的 all-to-all 中，每个 rank 把本地 M/P 数据的 (P−1)/P 发出，每链路约 M/P，合计 4Nh/P。Megatron-SP：每层 2 次 all-gather + 2 次 reduce-scatter，每次的完整张量是 Nh；ring 实现中每个 rank 收发 (P−1)/P·M ≈ M，所以每链路约 4Nh，与 P 无关。差距正好是 P 倍：N 与 P 同比例增大时 Ulysses 每链路通信不变，Megatron-SP 线性增长。</p>
+    </details>
+    <details>
+      <summary>2. Ring Attention 的重叠条件 c ≥ F/B 是怎么来的？为什么说它是保守的？对 GQA 模型条件会怎样变化？</summary>
+      <p>一个块的 attention 计算：QKᵀ 为 c×d 乘 d×c，约 2dc² FLOPs，PV 再 2dc²，共 4dc²，耗时 4dc²/F。需要传的 K、V 块各 c×d 个 bf16 元素，共 4cd 字节，耗时 4cd/B。完全重叠要求计算时间 ≥ 通信时间，即 c ≥ F/B。保守在于只计入了 attention 计算，没算投影和 FFN（它们也可以用来掩盖通信），而且 causal 下有一半块全遮蔽、不需计算但仍需传输，这一点反而让条件更紧——真实系统要两头都考虑。GQA 时 K/V 只有 H<sub>kv</sub>/H 的头，传输量按比例缩小，而计算量（按 query 头数）不变，门槛约降为 (H<sub>kv</sub>/H)·F/B，所以 GQA / MLA 模型更适合 Ring。</p>
+    </details>
+    <details>
+      <summary>3. 证明 zigzag 切法在 causal mask 下完全均衡（每个 rank 的有效 (q,k) 对数相同）。</summary>
+      <p>把序列切成 2P 个长度为 c 的块，编号 0…2P−1。causal 下，第 i 块的 query 与第 j 块的 key 交互的有效对数：j &lt; i 时为 c²，j = i 时为 c(c+1)/2，j &gt; i 时为 0。第 i 块 query 的总量为 i·c² + c(c+1)/2。rank r 拿第 r 块和第 2P−1−r 块，总量 = (r + 2P−1−r)·c² + 2·c(c+1)/2 = (2P−1)c² + c(c+1)，与 r 无关。box 实验中 L=64、P=4、c=8：7·64 + 72 = 520，与实测的 [520, 520, 520, 520] 一致。striped 切法只是近似均衡（496–544），因为每个 rank 的条带相对位置差一个 token 的偏移。</p>
+    </details>
+    <details>
+      <summary>4. 要训一个 H=32、H<sub>kv</sub>=8 的 GQA 模型，128K 上下文，2 个节点 × 8 卡 H100。SP=16 时如何配置 Ulysses / Ring 度？每卡序列是否满足 Ring 跨节点的重叠门槛？</summary>
+      <p>Ulysses 度受 KV 头数限制，取 u = 8 放在节点内（NVLink all-to-all，每卡 1 个 KV 头），Ring 度 r = 2 跨节点。每卡持有 128K/16 = 8K token；但 Ring 维上传递的是一个 Ulysses 组内「完整头切片 × 本 Ring 段」的 K/V，Ring 段长为 128K/2 = 64K token。按本文估算，H100 跨 IB（50 GB/s）门槛 c ≈ 20K，6c ≈ 119K；Ring 每步的块长是 64K，单块计算远超门槛，且 GQA 让 KV 传输量再降为 1/4，通信基本能被盖住。如果改成 u=4、r=4，Ring 段变成 32K，且有一部分 Ring 也在节点内，需要按实际带宽重新估算。causal 下 Ring 维仍需 zigzag 重排。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）SP 与 Activation Checkpointing、ZeRO-3、PP 组合时，各自可能带来什么额外的通信或复杂度？</summary>
+      <p>与重计算组合：反向重算 attention 时 Ring 需要再绕一遍环（或缓存 KV 块），Ulysses 需要再做 all-to-all，所以 selective recompute 通常避开 attention 的跨卡部分，只重算逐 token 的部分（见 <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>）。与 ZeRO-3 组合：每层前向 / 反向都要 all-gather 参数，叠加 SP 自身的 all-to-all / P2P，带宽竞争更激烈，需要预取和通信流分离。与 PP 组合：SP 切的是层内张量，与 PP 正交（USP 论文认为二者完全兼容），但每个 micro-batch 的序列很长，PP 的 micro-batch 数受限，气泡比例变大，可能需要交错调度或更少的 PP 段。此外，变长 packing 下各 rank 的负载与 mask 管理（以及今天一线讨论的按层类型改变 SP 宽度）会进一步提高调度复杂度。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2309.14509" target="_blank" rel="noopener">arXiv:2309.14509 · DeepSpeed Ulysses（Jacobs et al., Microsoft）</a> · <a href="https://github.com/microsoft/DeepSpeed" target="_blank" rel="noopener">GitHub: microsoft/DeepSpeed</a></li>
+      <li><a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">arXiv:2310.01889 · Ring Attention with Blockwise Transformers（Liu, Zaharia, Abbeel）</a></li>
+      <li><a href="https://arxiv.org/abs/2105.13120" target="_blank" rel="noopener">arXiv:2105.13120 · Sequence Parallelism / Ring Self-Attention（Li et al.）</a> · <a href="https://arxiv.org/abs/2311.09431" target="_blank" rel="noopener">arXiv:2311.09431 · Striped Attention（Brandon et al.）</a> · <a href="https://arxiv.org/abs/2405.07719" target="_blank" rel="noopener">arXiv:2405.07719 · USP（Fang &amp; Zhao）</a> · <a href="https://github.com/feifeibear/long-context-attention" target="_blank" rel="noopener">GitHub: long-context-attention</a></li>
+      <li><a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">arXiv:2205.05198 · Reducing Activation Recomputation（Megatron sequence parallel，Korthikanti et al.）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a> ·
+        <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a> ·
+        <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> ·
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a> ·
+        <a href="daily-2026-10-13-algo-rope.html">RoPE</a> ·
+        <a href="daily-2026-10-19-kv-tier-pcp.html">KV tier + PCP</a> ·
+        <a href="daily-2026-10-29-layerwise-repacking.html">今日一线：Layerwise Repacking</a> ·
+        <a href="daily-2026-10-29-harness-coharl.html">今日 Harness：CoHARL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

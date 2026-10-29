@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Layerwise Repacking：混合注意力变长训练里，全注意力层要 SP16/32、稀疏层 SP8 就够——把「换布局」塞进全注意力层本来就有的两次 Ulysses all-to-all，被拆开的宽组里稀疏层不再跨节点；22 个宽组 step 端到端 −7.61%、MFU 56.47%→61.30% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Layerwise Repacking：混合注意力变长训练里，全注意力层要 SP16/32、稀疏层 SP8 就够——把「换布局」塞进全注意力层本来就有的两次 Ulysses all-to-all，被拆开的宽组里稀疏层不再跨节点；22 个宽组 step 端到端 −7.61%、MFU 56.47%→61.30%</h1>
+    <p class="post-meta">2026-10-29 · 收藏夹：Infra · 一线追踪<br />
+      来源：Jiahao Zhang、Junwei Feng、Dongliang Huang、Xiaoling Zhou、Yiqiao Liao、Chengru Song（KlingAI Research / 快手 Kling Infra Team，北京；通讯作者 Chengru Song；一作为实习期间工作）· <em>Layerwise Repacking: Variable-Length Hybrid-Attention Training without an Extra Redistribution Pass</em>（<a href="https://arxiv.org/abs/2610.35989" target="_blank" rel="noopener">arXiv:2610.35989</a>，cs.LG，v1 页眉日期 2026-10-26，出现在 arXiv 10-28 的 /new 批次）。
+      实现基于 TorchTitan。数字均为论文自报：一个 1F3S 混合注意力模型、一个 64 卡（8 节点 × 8 卡）集群、前 200 步中触发宽组的 22 步；「box 小验证」一节为本文用 numpy 实跑 / 对论文表格实算。
+      交叉：
+      <a href="daily-2026-10-29-algo-sequence-parallel.html">今日算法：序列并行（Ulysses / Ring）</a>、
+      <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>、
+      <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>、
+      <a href="daily-2026-10-19-kv-tier-pcp.html">远端 KV tier + PCP</a>、
+      <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      2026 年的新基座几乎都是<strong>混合注意力</strong>：少量全注意力（full attention）层负责全局信息流，大量便宜层（滑窗、稀疏、线性注意力、Mamba）负责其余。Gemma 2 是局部 / 全局交替，MiniMax-01 是 7 层线性 + 1 层 softmax，Kimi Linear 是 3 层线性 + 1 层全注意力；本文研究的是 <strong>1F3S</strong>：每个全注意力层后跟 3 个稀疏注意力层（S 层里注意力只看有界数量的 key，成本由投影和 MoE 主导，近似随长度线性）。架构背景可回看 <a href="special-2026-08-27-new-models-arch.html">新模型全景</a>。
+    </p>
+    <p>
+      这类模型做<strong>变长训练</strong>（一个 step 里样本长度差很多；论文 22 个宽组 step 中最长 / 最短样本之比为 9.8–175×，中位 23×）时，序列并行（SP）的「宽度」需求在层与层之间是冲突的：
+    </p>
+    <ul>
+      <li><strong>全注意力层</strong>成本随长度平方增长，最长的那几个样本必须摊到 SP16 / SP32 的宽组上，否则单个样本在 8 卡上的成本就会远超组内平均负载；</li>
+      <li><strong>稀疏层</strong>的工作近似线性，同一批样本在节点内 SP8 就能负载均衡；</li>
+      <li>但现有变长调度器（FlexSP、ByteScale、Megatron-Core Dynamic Context Parallelism 等）都是「<strong>一个样本 / 一个 packed micro-batch 选一个 SP 组，所有层共用</strong>」。于是为全注意力层准备的宽组被原样带进后面 3 个稀疏层，稀疏层的 Ulysses all-to-all 也被迫跨节点。</li>
+    </ul>
+    <p>
+      跨节点有多贵？论文用同一计时器测得：节点内 SP8 的有效 Ulysses 速率 275.6 GiB/s，跨节点 SP16/32 只有 39.5 GiB/s，差 <strong>7.0×</strong>（这是含等待的有效速率，不是链路规格）。基线下宽组 rank 每步暴露的 all-to-all 时间 7.97 s，占 37.22 s 步长的 21.4%；SP8 rank 只有 1.60 s（4.3%）。宽 rank 每步发 278 GiB，其中约 203 GiB 属于稀疏层——这部分本来不必出节点。
+    </p>
+    <p>
+      直觉解法是「稀疏层换成 SP8 子组」，但换组意味着<strong>换了哪个 rank 持有哪个样本的哪些 token</strong>，每次 F↔S 边界都要做一次激活重分布。论文估算，单独做一遍重分布要 0.9–1.9 s / step，会吃掉 30–60% 的收益。Layerwise Repacking 的核心观察是：<strong>全注意力层本来就有两次必须的 Ulysses all-to-all，而且它们本来就把每个 token 在整个宽组里搬一遍</strong>——只要把 split size 改成可变、再加一个确定性置换，布局转换就能「搭车」完成，不多传一个字节。Ulysses 本身的原理见今天的算法课 <a href="daily-2026-10-29-algo-sequence-parallel.html">序列并行</a>。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 两种布局：宽 parent 给全注意力，节点内 child 给稀疏主干</h3>
+    <table>
+      <thead><tr><th>概念</th><th>定义</th><th>谁在用</th></tr></thead>
+      <tbody>
+        <tr><td>parent（布局 F）</td><td>基线 solver（round 1A）给出的 SP 组：固定的 rank 区间 + 有序样本列表；SP16 跨 2 节点、SP32 跨 4 节点</td><td>只有全注意力的 core attention（两次 Ulysses 交换之间）</td></tr>
+        <tr><td>child（布局 S）</td><td>把每个 SP16/32 parent 的样本重新装进若干个 <strong>SP ∈ {1, 2, 4, 8}</strong> 的子组，每个子组在一个 8 卡节点内，rank 区间铺满 parent</td><td>所有稀疏层 + 全注意力层的投影 / MoE；hidden state、残差、mask、位置元数据全程驻留在这里，作者叫它 <strong>sparse trunk</strong></td></tr>
+        <tr><td>正确性契约</td><td>parent 内所有 shard 不重不漏地划分 parent 的真实 token；逆置换能还原原始 packing 顺序；padding 只在 child 内部</td><td>保证 attention / MoE kernel 看到的都是普通 packed 输入</td></tr>
+      </tbody>
+    </table>
+    <p>
+      SP8 parent 不拆；SP16 parent 至少要 2 个样本、SP32 至少 4 个样本才能拆成非空的节点内 child（最小样本数 m = R/8）。不够时有一个 repair 步骤从别的 parent 借小样本，再不行就整体不拆；评测的 22 步里 repair 一个样本都没动过。
+    </p>
+
+    <h3>② 通信融合：两次 Ulysses 交换顺便完成 S→F 与 F→S</h3>
+    <pre><code># 一个被拆开的 parent（R 个 rank，H 个头，每 rank 头数 H/R），在每个全注意力层：
+# rank i 在 S 布局下持有 parent 打包顺序里的一组 token 位置 own[i]（长度随 child 的 SP 不同而不同）
+
+S→F（原 Q/K/V Ulysses 站点）:
+    for j in 0..R-1:  send(to=j, X[own[i]][:, 头切片 j])          # 可变 split：|own[i]| 个 token 发给每个 peer
+    recv 按源 rank 拼接（rank-major）→ 用置换 perm 排回 parent 升序 → 得到「整条 parent 流 × H/R 个头」
+full attention（varlen mask，每个样本只看自己）
+F→S（原输出 Ulysses 站点）:
+    逆置换 → 把 own[i] 那些 token 发回 rank i → rank i 拼回全部头
+
+# 均匀 shard 时 own[i] 就是第 i 个连续块、perm 是恒等 → 退化成标准 Ulysses
+# 每个张量仍只穿过每个必要交换一次；变的只有 split 大小和本地置换</code></pre>
+    <p>
+      这样做必须同时满足四条（论文 §3.4）：前向 / 反向布局变换严格互逆；<strong>每个 rank 独立算出完全相同的置换表</strong>（不能为元数据再发一次 collective，所以从共享 plan 确定性构造）；padding 和 packed length 留在 child 内部；反向与重计算图要以一致的 split 元数据逆向走同样的不均匀交换，loss 路径最后用一次不均匀 all-gather 替代原来的均匀 all-gather 还原全局顺序。
+    </p>
+    <p>
+      结构性账：前向图里跨节点的 Ulysses 调用点，基线是 2(N<sub>F</sub> + N<sub>S</sub>)，repack 后是 2N<sub>F</sub>。1F3S 有 N<sub>S</sub> = 3N<sub>F</sub>，所以<strong>8N<sub>F</sub> → 2N<sub>F</sub>，少 75%</strong>（1F1S 是 50%，MiniMax 式 1F7S 是 87.5%）。剩下那 25% 是全注意力宽组本身必需的跨节点流量，repacking 不碰它。
+    </p>
+
+    <h3>③ parent 成员决定 child 能平衡到什么程度：两分量代价的辅助 solver</h3>
+    <p>
+      child 规划只能在一个 parent 内部挪样本，所以 parent 的稀疏层最优 makespan 有硬下界：
+    </p>
+    <pre><code>M*_b ≥ max( Σ_{i∈parent b} s_i / R_b ,  max_{i∈parent b} s_i / 8 )
+          └─ 理想平均（受成员影响）─┘  └─ child 上限 SP8：最重的样本最多摊到 8 卡 ─┘</code></pre>
+    <p>
+      基线 solver 用一个对全注意力 profile 拟合的标量权重分配样本到 parent，这在同构 Transformer 堆叠里没问题；但 1F3S + repacking 下每个样本是<strong>两分量成本</strong>（平方的 full 部分 + 线性的 sparse 部分），而且两类层在不同的组上跑：full 层在 parent 上平衡，sparse 层由最慢的 child 决定。即使把两部分加成一个总和也平衡不了。辅助 solver（round 1B）保持 parent 的 rank 拓扑不变，只重分配成员：
+    </p>
+    <table>
+      <thead><tr><th>阶段</th><th>固定什么</th><th>输出</th></tr></thead>
+      <tbody>
+        <tr><td>Round 1A（基线）</td><td>DP world、允许的 SP 档</td><td>parent 拓扑 + 初始成员</td></tr>
+        <tr><td>Round 1B（改进，可选）</td><td>1A 的全部拓扑</td><td>全局 parent 成员：Compute-LPT / Memory-LPT / Anchor-Fill 三条路线生成候选，用聚合关键路径预测器打分取最小（容差内按固定顺序破平）；重样本先各占一个宽 parent；单步求解 ≤ 4 ms</td></tr>
+        <tr><td>Repair</td><td>parent 拓扑</td><td>满足 m = R/8 的可行成员</td></tr>
+        <tr><td>Round 2（child 规划）</td><td>每个 parent 的成员</td><td>节点内 child：复用 1A 的 SP 分配器，候选度 {1, 2, 4, 8}，近似最小化 child 稀疏 makespan；异常时回退均匀 SP8，再不行不拆</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ 结果：22 个宽组 step（论文 Table 2，四配置分开跑）</h3>
+    <table>
+      <thead><tr><th>配置</th><th>Mean E2E (s)</th><th>MFU</th><th>Fwd max (s)</th><th>Bwd max (s)</th></tr></thead>
+      <tbody>
+        <tr><td>B0 基线 solver / repack OFF（原系统）</td><td>37.221</td><td>56.47%</td><td>8.864</td><td>23.316</td></tr>
+        <tr><td>B1 基线 solver / ON</td><td>35.007</td><td>60.22%</td><td>7.437</td><td>22.302</td></tr>
+        <tr><td>N0 改进 solver / OFF</td><td>35.887</td><td>58.52%</td><td>8.241</td><td>22.766</td></tr>
+        <tr><td><strong>N1 改进 solver / ON（完整）</strong></td><td><strong>34.390</strong></td><td><strong>61.30%</strong></td><td>7.218</td><td>21.900</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li><strong>只开 repacking</strong>：−2.214 s（5.95%）、MFU +3.75 pp；改进 solver 下 −1.497 s（4.17%）、+2.78 pp。工作负载级 bootstrap 95% CI 都不含 0。</li>
+      <li><strong>完整系统</strong>：−2.831 s（7.61%，CI 1.86–3.77 s），MFU +4.83 pp（CI 3.31–6.27）。</li>
+      <li><strong>通信</strong>：宽 rank 暴露的 all-to-all 从 7.97 / 7.59 s 降到 4.76 / 4.60 s（基线 / 改进 solver），占步长从 21.4% 降到 13.6%；总 payload 变化 &lt; 5%，repack 后超过 70% 的 payload 走节点内 child，却只占剩余 all-to-all 时间的 14–17%；剩下 83–86%（4.08 / 3.82 s）是全注意力宽组必需的交换。</li>
+      <li><strong>省掉的那一遍重分布</strong>：转换流每宽 rank 每步 74.6 / 70.5 GiB；若单独做一遍，搬 attention 张量约 1.89 / 1.78 s，搬 hidden state 约 0.94 / 0.89 s，相当于 repacking 收益的 30–60%。</li>
+      <li><strong>两个杠杆是重叠而非叠加</strong>：solver 在 repack OFF 时省 1.334 s、ON 时只省 0.617 s（CI 0.02–1.21 s，下界接近 0，且 22 个里有 7 个不降）；合起来比单独相加少 0.717 s。原因是 repacking 已经结构性去掉了未定价的跨节点通信，child 规划也吸收了一部分成员失配。</li>
+      <li><strong>数值</strong>：第一步（尚无宽组）四配置 loss 逐位一致；宽组 step 上相对 B0 的平均 |Δloss| 为 5.7e-4（B1）/ 5.2e-4（N0）/ 4.7e-4（N1），而在两个杠杆都不改变执行的对照 step 上，非确定性归约顺序本身就造成 1.2–1.9e-4。作者明说：loss 对得上只是必要检查，正确性靠双射与反向路径契约，没有单独做输出或梯度等价测试。</li>
+      <li><strong>显存</strong>：把样本从 SP R 搬到 SP r 的 child，该样本每 rank 的驻留量最多涨 R/r 倍（SP32→SP8 是 4×，SP32→SP1 是 32×）；实测最差 rank 的 active 峰值 71%、reserved 86–90%，开 repack 前后峰值差 ≤ 0.5% 容量，无 allocator retry。</li>
+    </ul>
+
+    <h3>⑤ 失败案例与「全窗口」口径</h3>
+    <p>
+      22 步里 20 步是单个 SP16 parent，repacking 全部变快（基线 solver 下 2.6–11.7%）；<strong>剩下的 2-SP16 和 SP32 两步反而变慢（最多 +3.3 s）</strong>：按长度计，这两步里最重样本摊到 8 卡后的负载是 parent 平均每 rank 负载的 1.47–1.70×，而所有变快的步骤里最高 1.34×——正是上面下界的第二项在起作用。作者提出的 future work 也直指这里：按预测收益门控 repacking、让 child 上限变成可选（SP8 / 跨一个节点的 SP16 / 不拆）、对「执行后的计划」打分而不是对 repair 前的成员打分。
+    </p>
+    <p>
+      另一个必须读清的口径：7.61% 是<strong>每个触发宽组的 step</strong> 的收益。200 步里只有 22 步触发；其余 178 步全是 SP8，按对照 step 均值 28.27 s 估算，宽组 step 约占窗口墙钟的 14%（818.9 s / 5851 s）。乘下来全窗口节省约 <strong>1.06%</strong>（本文按论文数字估算）。收益随长度分布的离散程度变化——长尾越重，宽组越常见，收益越大；且只来自一个模型、一个集群、训练前 200 步。
+    </p>
+
+    <h3>⑥ box 小验证</h3>
+    <pre><code># (a) 可变 split 的融合 Ulysses 交换（numpy，R=16 rank、两个 8 卡「节点」、H=16 头）
+#     6 个样本长度 [40,24,16,12,8,4]，child = {SP8:[s0]} {SP4:[s1,s2]} {SP2:[s3,s4]} {SP2:[s5]}
+#     每 rank 发给每个 peer 的 token 数（split）= [5×8, 10×6, 2×2]  ← 不均匀
+#     S→F：按头切片发送 → rank-major 拼接 → argsort 置换回 parent 顺序 → varlen attention
+#     F→S：逆置换发回 → 拼回全部头
+fused repack Ulysses max err = 1.8e-15     # 与逐样本直接算 attention 的结果一致
+
+# (b) 论文 Table 2 实算
+B0→B1  −2.214 s (5.95%)  +3.75 pp     N0→N1  −1.497 s (4.17%)  +2.78 pp
+B0→N0  −1.334 s (3.58%)  +2.05 pp     B1→N1  −0.617 s (1.76%)  +1.08 pp
+B0→N1  −2.831 s (7.61%)  +4.83 pp     重叠缺口 2.214+1.334−2.831 = 0.717 s
+速率比 275.6/39.5 = 6.98×；a2a 占比 7.97/37.22 = 21.4%（SP8 rank 1.60/37.22 = 4.3%）
+稀疏层 203 GiB：39.5 GiB/s 下 ≈ 5.14 s，若在 275.6 GiB/s 节点内 ≈ 0.74 s（理想上界，非实测）
+窗口：22×37.221 + 178×28.27 = 5851 s → 宽组 step 占 14.0%，全窗口节省 ≈ 22×2.831/5851 = 1.06%
+跨节点调用点减少比例：1F1S 50% / 1F3S 75% / 1F7S 87.5%</code></pre>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>混合注意力模型的并行规划要「按层类型」做</strong>：全注意力层与线性 / 稀疏层的计算对长度的依赖不同，用同一个 SP 组是在拿线性层的 all-to-all 给平方层的负载均衡买单。先 profile 一下「宽组 rank 的 all-to-all 占比 vs 节点内 rank」，差距大就值得做。</li>
+      <li><strong>新增布局转换前，先找已有的必经通信</strong>：这篇的核心技巧是「不加新 collective，只改已有 collective 的 split 和本地置换」。同类机会还有 MoE 的 dispatch / combine（已经是 all-to-all）、TP 的 all-gather / reduce-scatter 边界（见 <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>）。</li>
+      <li><strong>置换元数据必须确定性、本地可算</strong>：所有 rank 从同一份 plan 推出同一张 rank-major 索引表；任何 tie-break 都要固定（论文的 repair 和 solver 都按 rank / sample 顺序破平），否则就会出现「某个 rank 发的 split 和对端预期不一致」这种难查的挂死。</li>
+      <li><strong>给变长调度器加两分量代价模型</strong>：quadratic full 项 + linear sparse 项分开预测，评估时看关键路径（最慢的 child）而不是总量；求解器做多候选 + 预测器选优，单步几毫秒可承受。</li>
+      <li><strong>要有「不拆」的退路，并按收益门控</strong>：当最重样本的 8 卡负载超过 parent 平均每 rank 负载约 1.3–1.5× 时（论文 22 步上的经验阈值，需在自家负载上重新标定），repacking 可能变慢。</li>
+      <li><strong>汇报收益要给全窗口口径</strong>：只在 14% 的 step 上触发的优化，整窗口大约是 1%。对 RL 训练这种长度分布更长尾的场景（参见 <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> 的 131K 长程 rollout），触发比例可能更高，值得单独测。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么不直接把稀疏层改成独立的 SP8 组、在 F↔S 边界单独做一次重分布？论文的成本估算是怎么得出的？</summary>
+      <p>因为全注意力宽组要求 token 在整个 SP16/32 组上分布，而 SP8 child 要求每个样本的 token 留在一个节点内，两者的 token 归属不同；单独重分布等于在每个全注意力层进出各多一次跨节点激活传输，而且前向、重计算、反向三遍都要做。论文用实测转换 payload（74.6 / 70.5 GiB 每宽 rank 每步）除以跨节点有效速率 39.5 GiB/s：搬 Q/K/V/O 四个 attention 张量约 1.89 / 1.78 s，搬两个 hidden state 约 0.94 / 0.89 s，相当于 repacking 本身省下的 3.20 / 2.99 s all-to-all 的 30–60%。融合方案让这部分变为零。</p>
+    </details>
+    <details>
+      <summary>2. 说明 S→F 交换中「可变 split + 置换」为什么在均匀 shard 时退化为标准 Ulysses。</summary>
+      <p>标准 Ulysses 中 rank i 持有第 i 个连续 token 块，向 rank j 发送这块 token 的第 j 个头切片；接收端按源 rank 拼接，得到的就是按 token 升序排列的完整序列，置换为恒等。Repacking 中 own[i] 是 child 布局下 rank i 的 token 位置集合（不连续、长度随 child 的 SP 变化），发给每个 peer 的 token 数为 |own[i]|，接收端按源 rank 拼接后得到的是 rank-major 顺序，需要 argsort(concat own) 这一置换才能排回 parent 升序。own[i] 退化为第 i 个等长连续块时，两者完全相同。</p>
+    </details>
+    <details>
+      <summary>3. 解释下界 M* ≥ max(Σs/R, max s/8) 两项各自对应什么瓶颈，以及为什么 round 1B 只能改善第一项。</summary>
+      <p>第一项是理想平均：parent 内所有稀疏工作均摊到 R 个 rank，它取决于 parent 内有哪些样本，round 1B 重新分配成员可以降低偏重 parent 的这一项。第二项来自 child 上限 SP8：单个样本最多摊到 8 张卡，最重样本的 s/8 不可能再低。移动最重样本只是把这一项换到另一个 parent，而它会出现在收到该样本的那个 parent 里，所以任何成员调整都消除不了。2-SP16 与 SP32 两步变慢，正是第二项（最重样本 8 卡负载是平均负载的 1.47–1.70×）主导。</p>
+    </details>
+    <details>
+      <summary>4. 为什么作者选纯 Ulysses 而不是 USP（Ulysses + Ring）？在什么条件下 Ring 维度会重新变得有价值？</summary>
+      <p>Ring 的价值在于把 KV 块的 P2P 传输与块内 attention 计算重叠，前提是块计算量足够大（Ring Attention 的条件是块大小 c ≥ F/B）。在 1F3S 的稀疏层里，attention 计算太少，无法盖住通信，后面的 MoE 又在重叠窗口之外，所以 Ring 维度预期收益很小；同时 Ulysses 的 all-to-all 是必经交换，恰好可以搭载 repacking。对剩下的全注意力宽组交换（83–86% 的剩余 all-to-all 时间），序列足够长时在宽组内引入 Ring 维度做重叠是有价值的，论文把这一组合列为与 repacking 正交的未来工作。注意 Ulysses 并行度受头数限制（GQA 下受 KV 头数限制），宽组超过头数时也必须引入 Ring。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把 Layerwise Repacking 用到 Agentic RL 的长程 rollout 训练里，你预期收益会更大还是更小？需要先测哪些量？</summary>
+      <p>可能更大：Agent RL 的轨迹长度通常更长尾（一部分轨迹 100K+ token、大量轨迹很短），宽组触发比例会高于论文的 11%（22/200），全窗口收益随之上升。但有三个风险：(a) 极长单轨迹占比高时，下界第二项（最重样本的 SP8 成本）更常主导，repacking 变慢的 step 也会更多，必须做收益门控；(b) RL 每步的长度分布随策略变化，代价预测器需要在线重标定；(c) 训练端与推理端的数值一致性（参见 <a href="daily-2026-10-27-rounding-location.html">舍入位置</a>）对 RL 更敏感，非确定性归约带来的 |Δloss| 漂移要单独监控。需要先测：宽组触发比例、宽组 rank 的 all-to-all 占比、各 step 最重样本 8 卡负载与 parent 平均负载之比的分布。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.35989" target="_blank" rel="noopener">arXiv:2610.35989 · Layerwise Repacking: Variable-Length Hybrid-Attention Training without an Extra Redistribution Pass（Zhang et al., KlingAI Research）</a></li>
+      <li>相关：<a href="https://arxiv.org/abs/2309.14509" target="_blank" rel="noopener">DeepSpeed Ulysses（arXiv:2309.14509）</a> · <a href="https://arxiv.org/abs/2405.07719" target="_blank" rel="noopener">USP（arXiv:2405.07719）</a> · <a href="https://arxiv.org/abs/2502.21231" target="_blank" rel="noopener">ByteScale（arXiv:2502.21231）</a> · <a href="https://arxiv.org/abs/2504.14960" target="_blank" rel="noopener">MoE Parallel Folding（arXiv:2504.14960）</a> · <a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noopener">TorchTitan</a></li>
+      <li>站内：
+        <a href="daily-2026-10-29-algo-sequence-parallel.html">今日算法：序列并行（Ulysses / Ring）</a> ·
+        <a href="daily-2026-10-29-harness-coharl.html">今日 Harness：CoHARL</a> ·
+        <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a> ·
+        <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a> ·
+        <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> ·
+        <a href="daily-2026-10-19-kv-tier-pcp.html">远端 KV tier + PCP</a> ·
+        <a href="daily-2026-10-22-moe-expert-skipping.html">MoE 跳专家对照</a> ·
+        <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a> ·
+        <a href="special-2026-08-27-new-models-arch.html">2026 新模型架构全景</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
