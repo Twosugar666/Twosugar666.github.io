@@ -6,7 +6,7 @@
     "gpu",
     "pc"
   ],
-  "next": 3,
+  "next": 4,
   "daily_streams": [
     "frontline",
     "harness",
@@ -942,6 +942,27 @@
       "source": "algo",
       "topic": "序列/上下文并行：Ulysses 两次 all-to-all 序列↔头转置、每链路 4Nh/P vs Megatron-SP 4Nh、P≤头数（GQA 受 H_kv）、配 ZeRO-3、2.5× / 4× 长度 / 1M token；Ring Attention online softmax 绕环、c≥F/B（A100 NVLink 1.0K/6.2K、IB 24.5K/149.5K）、6bch、32×A100 7B 4096K；causal 负载 contiguous/striped（1.45×/1.65×）/zigzag；USP u×r、Llama3-8B SP16=U8×R2、208K 47% MFU、TP→Ulysses→Ring→DP→PP；box 验证 Ulysses 误差 0、Ring 1e-15、负载 136–904 vs 520×4（arXiv:2309.14509 / 2310.01889 / 2405.07719 / 2311.09431）",
       "file": "posts/daily-2026-10-29-algo-sequence-parallel.html"
+    },
+    {
+      "date": "2026-10-30",
+      "domain": "infra gpu",
+      "source": "frontline",
+      "topic": "Batch Invariance in Agentic Kernel Generation（BIEvolve）：kernel agent 只验「allclose 正确 + 快」漏掉 BI；公开产物 83/131 有语义 batch 维、19 个（22.9%）确认违反，attention 为 High（split-KV / tiling / autotune）；契约 DSL（batch 符号 → NUM_SPLITS / RECURRENCE_SEGMENTS / RNG_SEED，fixed_across_batch）+ AST 数据/控制依赖 + 样本0 跨 batch 逐位比对；四级闸门 静态→正确性→动态→benchmark，不改 agent；K-Search / Iterative / Evolve（Gemini 3.7 Flash，H100 NVL，20/25 轮）BI 通过 75.7→97.4、48.6→89.2、78.4→89.2，合计 67.6→91.9%，加速保留 86.4/87.7/102.0%、合计 91.8%（违反组 86.0% vs 95.7%）；消融检出 静态 83% / 动态 55% / 合 92%，误拒 2%，10.21 ms；box：split-KV num_splits=132//B 下样本0 B≥8 不再逐位一致（~1e-8，BF16 后仍 1/128 维不同），固定 split 一致；AST 抓到数据+控制依赖（Bao/Wang/Chen GMU/NUS arXiv:2610.36623）",
+      "file": "posts/daily-2026-10-30-batch-invariance-kernel-agent.html"
+    },
+    {
+      "date": "2026-10-30",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Spine：work scope（Open/Close/Next/Spawn）显式声明子任务边界，边界与执行者解耦；SpineTree 平衡括号 + LR(0) 增量解析，每次调用前 JIT 编译：未完成 scope 留细节、已完成只留 result，只改写活动 Open 之后的后缀保前缀缓存；SpineCodex（~17K 行 Rust）SWE-Milestone GPT-5.6 Sol 38.1→42.6%、14→19/98、成本 $681→$461（−32.4%），AgentDiet 36.5 / Context Folding 37.1 / Recursive Subagent 42.4%（$1,749.73，32,650 请求 75.5% 在子 agent，−73.7%）；Grok 4.6 35.5→40.4；ProgramBench 62.55→73.35%；FrontierSWE 8/10 Mean@5 提升；SpinePi Gemini 3.8 Flash 35.8→39.2、输入 511K→164K，Qwen 3.8 27B 30.9→36.3（token +12.8%）；深度>1 请求 72.6%，Close 223/224 变短；消融去边界标记输入 +64–97%、成本 +30–42%；box：迷你 SpineTree 前缀一致、输入×请求≈总 token（Xiang/Chen/Zhang/Zhang 南科大/UIUC arXiv:2610.37224）",
+      "file": "posts/daily-2026-10-30-harness-spine.html"
+    },
+    {
+      "date": "2026-10-30",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "流水线并行：GPipe micro-batch 同步、气泡 (p−1)/m、M≥4K、重计算 O(N+L/K·N/M)、Transformer 83.9B/128 段 298×、P100 无 NVLink 3.3×；PipeDream 1F1B、NOAM、weight stashing/vertical sync、VGG16 5.12×/通信 −95%；PipeDream-Flush 在途 ≤p；Megatron 交错 v chunk 气泡 /v、通信 ×v、m 为 p 倍数、scatter/gather bsh/t（+11%）、重计算大 batch 2×、(n−d)/b′；Zero Bubble B/W 拆分 F:sbh(24h+4s) B:sbh(24h+8s) W:24sbh²、ZB-H1 (p−1)(F+B−W) 同 1F1B 显存、ZB-H2 (2p−1)M_B 零气泡、自动调度 + post-validation、ZB-2p 气泡 <1%、吞吐 +9–30%（Table 4）；box 模拟器 GPipe/1F1B/交错与公式一致、ZB 需 W 积压 ≥p / ≥2p−1（arXiv:1811.06965 / 1806.03377 / 2104.04473 / 2401.10241）",
+      "file": "posts/daily-2026-10-30-algo-pipeline-parallel.html"
     }
   ]
 }

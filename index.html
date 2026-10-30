@@ -93,6 +93,27 @@
           <button class="chip" data-filter="pc">配件</button>
         </div>
         <ul class="post-list">
+          <li data-cat="infra gpu">
+            <a href="posts/daily-2026-10-30-batch-invariance-kernel-agent.html">一线追踪｜God Does Not Play Dice：Agent 写的 GPU kernel 过了正确性测试，换个 batch 却可能换个答案——BIEvolve 把 batch invariance 做成 kernel agent 的验收闸门（契约静态分析 + 跨 batch 逐位比对），BI 通过率 67.6%→91.9%，保留 91.8% 几何平均加速</a>
+            <span class="post-side">
+              <span class="post-cat">Infra</span><span class="post-cat">显卡</span>
+              <span class="post-date">2026-10-30</span>
+            </span>
+          </li>
+          <li data-cat="harness agent">
+            <a href="posts/daily-2026-10-30-harness-spine.html">学习笔记｜Spine：把长程 Coding Agent 的上下文按「子任务树」编译——agent 用 Open / Close / Next / Spawn 声明 work scope，运行时每次调用前把 SpineTree 即时编译成上下文：未完成的子任务留细节、已完成的只留结果、前缀缓存不破；SpineCodex 在 SWE-Milestone 上 Score 38.1%→42.6%、成本 −32.4%，与 Recursive Subagent 同分但便宜 73.7%</a>
+            <span class="post-side">
+              <span class="post-cat">Harness</span><span class="post-cat">Agent</span>
+              <span class="post-date">2026-10-30</span>
+            </span>
+          </li>
+          <li data-cat="algo infra">
+            <a href="posts/daily-2026-10-30-algo-pipeline-parallel.html">学习笔记｜流水线并行（GPipe → 1F1B → Interleaved → Zero Bubble）：按层切 p 段、batch 切 m 个 micro-batch，气泡 (p−1)/m 是结构性代价——1F1B 不减气泡、只把在途激活从 m 压到 p；交错 v 个 chunk 把气泡除以 v、通信乘以 v；把反向拆成 B（对输入）与 W（对权重）后 W 能填洞，ZB-H1 同显存气泡降到 1/3，ZB-2p 近零气泡</a>
+            <span class="post-side">
+              <span class="post-cat">算法</span><span class="post-cat">Infra</span>
+              <span class="post-date">2026-10-30</span>
+            </span>
+          </li>
           <li data-cat="infra">
             <a href="posts/daily-2026-10-29-layerwise-repacking.html">一线追踪｜Layerwise Repacking：混合注意力变长训练里，全注意力层要 SP16/32、稀疏层 SP8 就够——把「换布局」塞进全注意力层本来就有的两次 Ulysses all-to-all，被拆开的宽组里稀疏层不再跨节点；22 个宽组 step 端到端 −7.61%、MFU 56.47%→61.30%</a>
             <span class="post-side">

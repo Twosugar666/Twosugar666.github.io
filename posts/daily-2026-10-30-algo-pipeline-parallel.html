@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜流水线并行（GPipe → 1F1B → Interleaved → Zero Bubble）：按层切 p 段、batch 切 m 个 micro-batch，气泡 (p−1)/m 是结构性代价——1F1B 不减气泡、只把在途激活从 m 压到 p；交错 v 个 chunk 把气泡除以 v、通信乘以 v；把反向拆成 B（对输入）与 W（对权重）后 W 能填洞，ZB-H1 同显存气泡降到 1/3，ZB-2p 近零气泡 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜流水线并行（GPipe → 1F1B → Interleaved → Zero Bubble）：按层切 p 段、batch 切 m 个 micro-batch，气泡 (p−1)/m 是结构性代价——1F1B 不减气泡、只把在途激活从 m 压到 p；交错 v 个 chunk 把气泡除以 v、通信乘以 v；把反向拆成 B（对输入）与 W（对权重）后 W 能填洞，ZB-H1 同显存气泡降到 1/3，ZB-2p 近零气泡</h1>
+    <p class="post-meta">2026-10-30 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Yanping Huang、Youlong Cheng、Ankur Bapna、Orhan Firat、Mia Xu Chen、Dehao Chen、HyoukJoong Lee、Jiquan Ngiam、Quoc V. Le、Yonghui Wu、Zhifeng Chen（Google）· <em>GPipe</em>（<a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">arXiv:1811.06965</a>，NeurIPS 2019）；
+      Aaron Harlap、Deepak Narayanan、Amar Phanishayee、Vivek Seshadri、Nikhil Devanur、Greg Ganger、Phil Gibbons（CMU / Stanford / Microsoft Research）· <em>PipeDream</em>（<a href="https://arxiv.org/abs/1806.03377" target="_blank" rel="noopener">arXiv:1806.03377</a>）；
+      Narayanan et al.（NVIDIA / Stanford / Microsoft Research）· <em>Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM</em>（<a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473</a>，SC'21）；
+      Penghui Qi、Xinyi Wan、Guangxing Huang、Min Lin（Sea AI Lab）· <em>Zero Bubble Pipeline Parallelism</em>（<a href="https://arxiv.org/abs/2401.10241" target="_blank" rel="noopener">arXiv:2401.10241</a>）。
+      论文数字按原文；「box 小实验」一节为本文在 box 上写的事件驱动调度模拟器实跑。
+      交叉：
+      <a href="daily-2026-10-23-algo-zero.html">ZeRO</a>、
+      <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>、
+      <a href="daily-2026-10-29-algo-sequence-parallel.html">序列 / 上下文并行</a>、
+      <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>、
+      <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      分布式训练系列到这里补上最后一维。前几篇：<a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 切模型状态、<a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>切层内矩阵、<a href="daily-2026-10-29-algo-sequence-parallel.html">序列并行</a>切序列、<a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>用 FLOPs 换显存。张量并行每层都要 all-reduce，通信量大且频繁，只适合放在 NVLink 域内（Megatron 的 Takeaway #1：TP 用到单机卡数 g 为止，跨机用 PP）。跨节点要继续扩展模型，就需要一种<strong>通信只发生在少数边界、且只是点对点</strong>的切法——这就是流水线并行（Pipeline Parallelism，PP）：
+    </p>
+    <ul>
+      <li>把 L 层按顺序切成 p 段（stage），每段放一张（组）卡；</li>
+      <li>stage 之间只传边界激活（前向）和边界梯度（反向），每个 micro-batch 每个边界一次 P2P，消息大小 b·s·h；</li>
+      <li>代价是<strong>依赖链</strong>：stage k 必须等 stage k−1 的前向结果、等 stage k+1 的反向梯度。不切 batch 的话任意时刻只有一张卡在干活。</li>
+    </ul>
+    <p>
+      过去七年的 PP 研究几乎都在回答同一个问题：<strong>如何排 F / B 的顺序，让卡尽量不闲（气泡小），同时在途激活不爆显存，同时保持同步 SGD 语义</strong>。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 记号与一张总表</h3>
+    <p>p = stage 数，m = 每个 batch 的 micro-batch 数，t<sub>F</sub> / t<sub>B</sub> = 一个 micro-batch 在一个 stage 上的前向 / 反向时间，v = 交错时每卡的 chunk 数，M<sub>B</sub> = 一个 micro-batch 在一个 stage 上需要保留的激活。</p>
+    <table>
+      <thead><tr><th>调度</th><th>气泡（占理想时间的比例）</th><th>每卡峰值在途激活</th><th>语义</th><th>额外代价</th></tr></thead>
+      <tbody>
+        <tr><td>GPipe（全 F 后全 B）</td><td>(p−1)/m</td><td>m·M<sub>B</sub>（重计算后只存边界输入）</td><td>同步</td><td>m 大才能摊薄气泡，但 m 大显存线性涨</td></tr>
+        <tr><td>PipeDream（异步 1F1B）</td><td>稳态无气泡（不 flush）</td><td>至多 NOAM 个 mb + 多版本权重</td><td><strong>异步</strong>，权重有延迟</td><td>weight stashing 存多份权重</td></tr>
+        <tr><td>1F1B / PipeDream-Flush</td><td>(p−1)/m（与 GPipe 相同）</td><td><strong>p·M<sub>B</sub></strong>（首段最多）</td><td>同步</td><td>无</td></tr>
+        <tr><td>Interleaved 1F1B（Megatron）</td><td>(1/v)·(p−1)/m</td><td>略高于 1F1B</td><td>同步</td><td>P2P 通信 ×v；m 须为 p 的倍数</td></tr>
+        <tr><td>ZB-H1</td><td>(p−1)(t<sub>F</sub>+t<sub>B</sub>−t<sub>W</sub>)，t 相等时为 1F1B 的 1/3</td><td>p·M<sub>B</sub>（与 1F1B 相同）</td><td>同步</td><td>需把反向拆成 B / W</td></tr>
+        <tr><td>ZB-H2 / ZB-2p</td><td>≈ 0</td><td>(2p−1)·M<sub>B</sub> / 2p·M<sub>B</sub></td><td>同步（优化器 post-validation）</td><td>显存约 2×；需绕开优化器同步</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② GPipe：切 micro-batch，同步累积梯度</h3>
+    <p>
+      GPipe 把 mini-batch 切成 m 个 micro-batch，先让所有 micro-batch 依次流过 p 个 stage 做前向，再全部做反向，最后一次性应用累积梯度——数学上与不切的大 batch 同步 SGD 完全等价（BatchNorm 这类跨样本统计例外，需要按 micro-batch 计算）。
+    </p>
+    <pre><code>时间 →        GPipe，p=4，m=8（F=1，B=2）
+stage0: F0 F1 F2 F3 F4 F5 F6 F7 .  .  .  .  .  .  .  .  .  B7 B6 ... B0
+stage3:          F0 F1 ... F7 B7 B6 ...                         .  .  .
+气泡 = 开头 p−1 个 F + 结尾 p−1 个 B：t_pb = (p−1)(t_F+t_B)，理想 t_id = m(t_F+t_B)
+气泡比例 = (p−1)/m        # Megatron 论文 §2.2.1 的推导；GPipe 原文写作 O((K−1)/(M+K−1))，K 为分段数</code></pre>
+    <p>
+      GPipe 的配套技巧是<strong>重计算</strong>（re-materialization，见 <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a>）：每个 stage 只存边界输入，反向时重算本段前向，峰值激活从 O(N×L) 降到 O(N + (L/K)×(N/M))（N 为 batch、L 层、K 段、M 个 micro-batch）。论文自报：
+    </p>
+    <ul>
+      <li>经验规则 <strong>M ≥ 4×K 时气泡可忽略</strong>。Table 2（TPU 归一化吞吐）：Transformer-48 在 K=8 时，M=1 / 4 / 32 分别为 1.3 / 4.8 / 6.3；M=1 时等于没有流水（任意时刻只有一张卡在算）。AmoebaNet 因层间不均衡，K=8、M=32 只有 3.48。</li>
+      <li>无 NVLink 的 P100（PCIe 经主机中转），M=32、K 从 2 到 8：AmoebaNet-D 2.7×，Transformer-24 3.3×——PP 只传边界激活，对互联要求低。</li>
+      <li>容量：单加速器最大 AmoebaNet 82M 参数，重计算后 318M，8 卡流水 1.8B（25×）；Transformer 在 128 段时到 83.9B（298×），因层同构所以随卡数线性。</li>
+    </ul>
+
+    <h3>③ PipeDream 与 1F1B：先把显存问题解决</h3>
+    <p>
+      GPipe 的问题是所有 m 个 micro-batch 的激活都要等到全部前向结束才能释放。PipeDream 提出 <strong>1F1B</strong>：启动阶段输入 stage 放入 NOAM = ⌈机器数 / 输入 stage 的机器数⌉ 个 micro-batch 填满流水，之后每个 stage 交替做一次前向、一次反向。在均衡流水下稳态无闲置；论文还指出 F 与 B 时间不相等时 1F1B 依然有效（实际中 B 总比 F 长）。
+    </p>
+    <p>
+      但 PipeDream 本身是<strong>异步</strong>的（不 flush）：stage 1 上 micro-batch 5 的前向用的是 mb1 更新后的权重，反向时已经被 mb2–4 更新过。两个修补：
+    </p>
+    <ul>
+      <li><strong>Weight stashing</strong>：每个在途 micro-batch 存一份前向时用的权重版本，反向用同一版本；更新为 w<sup>(t+1)</sup> = w<sup>(t)</sup> − ν·∇f(w<sub>1</sub><sup>(t−n+1)</sup>, w<sub>2</sub><sup>(t−n+2)</sup>, …, w<sub>n</sub><sup>(t)</sup>)，各 stage 的延迟不同；不 stash 的话更新甚至不是任何权重点上的合法梯度。</li>
+      <li><strong>Vertical sync</strong>：所有 stage 统一用进入流水时的版本，更新变为 ∇f(w<sub>1</sub><sup>(t−n+1)</sup>, …, w<sub>n</sub><sup>(t−n+1)</sup>)，语义等同于 n 机 BSP 数据并行；论文实验中影响可忽略，默认不开（要存更多元数据）。</li>
+    </ul>
+    <p>
+      PipeDream 还用动态规划做层切分（复杂度 O(N²M²)，允许 stage 复制成数据并行，如 VGG16 的「7-1」配置）。Table 1：VGG16 在 Cluster-B（8 台 V100、10 Gbps 以太网）上比 BSP 数据并行快 5.12×、通信减少 95%；Inception-v3 在 Cluster-A 上自动选出纯数据并行（1.00×）。今天大模型训练普遍使用的是它的<strong>同步版本 PipeDream-Flush</strong>（出自后续的 PipeDream-2BW 工作）：保留 1F1B 的排法，但每个 batch 结束时 flush。
+    </p>
+    <pre><code>1F1B / PipeDream-Flush，stage s（0 起）：
+  warm-up：做 p−s−1 个 F
+  steady ：重复 [F, B]   ← 每做完一个 B 就释放一个 micro-batch 的激活
+  cool-down：做完剩余 B
+气泡与 GPipe 相同：(p−1)/m
+在途激活：stage s 最多 p−s 个 micro-batch（GPipe 是 m 个）→ m ≫ p 时显存省很多</code></pre>
+    <p>
+      要点：<strong>1F1B 不是用来减气泡的，是用来让 m 可以开大的</strong>。显存不再随 m 增长之后，就可以用大 m 把 (p−1)/m 摊薄——这才间接减少了气泡。
+    </p>
+
+    <h3>④ Interleaved 1F1B：每卡放 v 个不相邻的 chunk</h3>
+    <p>
+      Megatron（2104.04473 §2.2.2）把每张卡的连续层块拆成 v 个 chunk：例如原来卡 1 放 1–4 层，现在放 1、2、9、10 层，卡 2 放 3、4、11、12 层……于是一个 micro-batch 要在 p 张卡上绕 v 圈。每个 chunk 的计算时间变成 t<sub>F</sub>/v、t<sub>B</sub>/v，填充 / 排空流水的时间也缩短 v 倍：
+    </p>
+    <pre><code>t_pb(interleaved) = (p−1)(t_F+t_B)/v       气泡比例 = (1/v)·(p−1)/m
+代价 1：P2P 通信次数 ×v（每个 micro-batch 跨卡边界从 p−1 次变成 vp−1 次）
+代价 2：m 必须是 p 的整数倍（micro-batch 按 p 个一组在 chunk 间轮转）</code></pre>
+    <p>
+      为了吃得下 v 倍通信，Megatron 配了 <strong>scatter/gather 优化</strong>：TP 组内各 rank 的层输出本来是复制的，相邻 stage 之间等于把同一个张量通过 IB 发了 t 遍；改为发送端切成 t 份、每个 rank 用自己的 IB 网卡只发 1/t，接收端在 NVLink 上 all-gather 还原，每对相邻 stage 的通信量降到 bsh/t（论文中 t=8）。论文自报：
+    </p>
+    <ul>
+      <li>摘要：交错调度在显存相当的前提下吞吐提升 10+%；Figure 18：scatter/gather 在通信密集的配置（大 batch + 交错）上提升最多 11%。</li>
+      <li>GPT-3 175B、96 卡（Figure 12）：交错 + scatter/gather 优于默认调度，但差距随 batch 增大而收窄（默认调度的气泡随 m 增大而变小，而交错的每样本通信更多）；<strong>不开 scatter/gather 时，大 batch 下默认调度反而更好</strong>。</li>
+      <li>145B 模型、128 卡、(t, p) = (8, 16)：开重计算在小 batch 时吞吐最多低 33%，但能支持更大的 batch，大 batch 下吞吐比不开重计算的最佳配置高 2×——原因正是 m 变大、气泡变小。</li>
+      <li>1T 参数模型 3072 张 A100 上 502 PFLOP/s（单卡理论峰值的 52%）；流水 stage 间 P2P 的有效二分带宽 892 GB/s，数据并行 all-reduce 为 12.9 TB/s。</li>
+    </ul>
+
+    <h3>⑤ Zero Bubble：把反向拆成 B 和 W</h3>
+    <p>
+      对线性层 y = xW，反向有两个矩阵乘：<strong>B</strong>：∂L/∂x = ∂L/∂y · Wᵀ（必须尽快算完传给上一个 stage，在关键路径上）；<strong>W</strong>：∂L/∂W = xᵀ · ∂L/∂y（只在本 stage 内部、优化器步之前需要，<strong>不在关键路径上</strong>）。传统调度把 B 和 W 绑在一起；Zero Bubble 把 W 拆出来，<strong>用它填气泡</strong>。
+    </p>
+    <table>
+      <thead><tr><th>pass</th><th>FLOPs（每层，只计 matmul，论文 Table 1）</th><th>需要保留的激活</th></tr></thead>
+      <tbody>
+        <tr><td>F</td><td>sbh(24h + 4s)</td><td>0</td></tr>
+        <tr><td>B</td><td>sbh(24h + 8s)</td><td>sb(34h + 5as)</td></tr>
+        <tr><td>W</td><td>sbh(24h)</td><td>32sbh</td></tr>
+      </tbody>
+    </table>
+    <p>
+      于是 t<sub>W</sub> &lt; t<sub>F</sub> &lt; t<sub>B</sub>、t<sub>B</sub> + t<sub>W</sub> = 2t<sub>F</sub>，且 M<sub>W</sub> &lt; M<sub>B</sub>（按论文 Table 3 的 6.2B 配置 h=4096、a=32、s=1024 算，M<sub>W</sub>/M<sub>B</sub> ≈ 0.43）。两个手工调度（Table 2）：
+    </p>
+    <table>
+      <thead><tr><th>调度</th><th>气泡</th><th>峰值激活</th><th>做法</th></tr></thead>
+      <tbody>
+        <tr><td>1F1B</td><td>(p−1)(t<sub>F</sub>+t<sub>B</sub>+t<sub>W</sub>)</td><td>p·M<sub>B</sub></td><td>B、W 绑定</td></tr>
+        <tr><td><strong>ZB-H1</strong></td><td>(p−1)(t<sub>F</sub>+t<sub>B</sub>−t<sub>W</sub>)</td><td>p·M<sub>B</sub></td><td>按 warm-up 数调整 W 的起点，让各卡在途数一致；B 更早开始，尾部气泡由推迟的 W 填掉；t 相等时气泡为 1F1B 的 1/3</td></tr>
+        <tr><td><strong>ZB-H2</strong></td><td>(p−1)(t<sub>F</sub>+t<sub>B</sub>−2t<sub>W</sub>)，t 相等时为 0</td><td>(2p−1)·M<sub>B</sub></td><td>warm-up 多塞 F 填首个 B 之前的洞；尾部 W 重排，梯形变平行四边形</td></tr>
+      </tbody>
+    </table>
+    <p>
+      实际中 t<sub>F</sub>、t<sub>B</sub>、t<sub>W</sub> 不等、还有通信时间 T<sub>comm</sub>，所以论文给了<strong>自动调度</strong>：给定 p、m、显存上限 M<sub>limit</sub> 和实测的 T<sub>F</sub>/T<sub>B</sub>/T<sub>W</sub>/T<sub>comm</sub>，启发式算法在 warm-up 阶段在显存允许内尽量多排 F；之后按 1F-1B 交替，遇到大于 T<sub>W</sub> 的空隙就插 W，显存到上限时也插 W 回收；F、B 用完后排剩下的 W；两个二元超参网格搜索。问题也可写成 ILP，用启发式结果作初值再优化。
+    </p>
+    <p>
+      <strong>最后一块拼图是优化器同步</strong>：梯度裁剪要全局梯度范数、混合精度要全局 NaN/Inf 检查（见 <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>），都需要跨 stage all-reduce，这一步会把平行四边形重新压回梯形。论文的 <strong>post-validation</strong>：每个 stage 在优化器步前从上一个 stage 收到部分归约的全局状态，并上本地的再传给下一个，并据此先行更新（发现 NaN 就跳过、部分范数超阈值就裁剪）；完整归约的状态在下一迭代的 warm-up 阶段从最后一个 stage 传回，若校验失败就回滚并按完整状态重做。依据是这些全局检查绝大多数时候不触发。
+    </p>
+    <p>论文实验（Megatron-LM 上实现，最多 32 张 A100 SXM 80G、4 节点 RoCE；首末 stage 各少一层以抵消 embedding 与 loss；ZB-1p 显存上限 p·M<sub>B</sub>，ZB-2p 为 2p·M<sub>B</sub>；用固定种子验证 ZB-1p、ZB-2p 与 1F1B 的 loss <strong>逐位一致</strong>）：</p>
+    <table>
+      <thead><tr><th>模型 / p / m</th><th>1F1B 气泡率</th><th>1F1B-I</th><th>ZB-1p</th><th>ZB-2p</th><th>吞吐（ZB-2p vs 1F1B，本文按 Table 4 计算）</th></tr></thead>
+      <tbody>
+        <tr><td>1.5B / 8 / 24</td><td>0.2431</td><td>0.1055</td><td>0.1585</td><td>0.0433</td><td>14.5 vs 11.8 samples/GPU/s（+22.9%）</td></tr>
+        <tr><td>6.2B / 8 / 24</td><td>0.2347</td><td>0.0808</td><td>0.1323</td><td>0.0029</td><td>4.32 vs 3.50（+23.4%）</td></tr>
+        <tr><td>14.6B / 16 / 48</td><td>0.2552</td><td>0.1104</td><td>0.1397</td><td>0.0066</td><td>1.81 vs 1.40（+29.3%）</td></tr>
+        <tr><td>28.3B / 32 / 96</td><td>0.2646</td><td>0.1493</td><td>0.1421</td><td>0.0038</td><td>0.99 vs 0.76（+30.3%）</td></tr>
+        <tr><td>28.3B / 32 / 256</td><td>0.1352</td><td>0.0624</td><td>0.0594</td><td>0.0018</td><td>1.00 vs 0.88（+13.6%）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      气泡率为论文 Table 5 按实测 T 理论计算的值（ZB-2p 大多数设置 &lt; 1%）。代价是显存：Table 4 中 ZB-2p 峰值约 51–74 GB，1F1B 为 30–43 GB，ZB-1p 为 32–44 GB，1F1B-I 为 39–58 GB。ZB-1p 在 8 卡单机上与 1F1B-I 相当，在多节点（带宽更紧）上明显优于 1F1B-I，因为它不增加通信。摘要中的「相近显存下 +23%、放宽显存 +31%」：主表里 ZB-2p 相对 1F1B 最多 +30.3%，与 31% 对得上；ZB-1p 相对 1F1B 在主表中最多 +15.0%，「23%」应来自其它对照（附录有等显存比较），本文未逐项核对。
+    </p>
+
+    <h3>⑥ box 小实验：事件驱动调度模拟器</h3>
+    <pre><code># 每个设备按给定顺序执行 F/B/W，开始时间 = max(设备空闲, 依赖完成)；依赖：F(s,j)←F(s−1,j)，B(s,j)←F(s,j),B(s+1,j)，W(s,j)←B(s,j)
+# (a) 前三种：F=1，B=2（B 含 W）
+p=4  m=8    GPipe         气泡 37.50%（公式 (p−1)/m = 37.50%）  峰值在途 mb = 8
+            1F1B          气泡 37.50%（37.50%）                 峰值在途 mb = 4
+            Interleaved v=2  气泡 18.75%（(p−1)/(vm) = 18.75%）  峰值在途 11 个 chunk·mb ≈ 5.5 个完整 mb
+p=8  m=32   GPipe / 1F1B  气泡 21.88%，峰值 32 / 8；Interleaved v=2 气泡 10.94%，峰值 23 个 chunk·mb
+# (b) Zero Bubble：F=B=W=1，贪心（W 积压超上限先做 W，否则 B &gt; F（F−B 在途 ≤ 上限）&gt; W），
+#     气泡按「每设备首次开始到最后结束之间的空闲」计（不跨迭代同步优化器）
+p=4  m=8    1F1B 每设备空闲 9 = (p−1)·3
+            F−B ≤ p−s（ZB-H1 显存）：W 积压上限 1/2/3/4/≥4 → 空闲 6/5/4/3/3    公式 (p−1)(F+B−W) = 3
+            F−B ≤ 2p−2s−1（ZB-H2）：W 积压上限 4/5/6/≥7 → 空闲 3/2/1/0           公式 0
+p=8  m=32   ZB-H1 型：W 积压 ≥ 8 时空闲 7（= p−1）；ZB-H2 型：W 积压 ≥ 15 时空闲 0；与 m 无关（m=8/16/32 相同）
+# (c) 论文 Table 1 代入 Table 3 配置：T_F : T_B : T_W = 1 : 1.04 : 0.96（6.2B），B+W = 2F 恒成立；M_W/M_B ≈ 0.43（1.5B 为 0.37）</code></pre>
+    <p>
+      读法：(1) GPipe、1F1B、交错三者的气泡与公式逐位吻合，1F1B 与 GPipe 气泡相同、只是峰值在途从 8 降到 4；(2) 交错的在途激活比 1F1B 多约 37%（p=4、v=2 时 5.5 vs 4 个完整 mb 的量），这就是论文说的「显存相当」里的「相当」；(3) Zero Bubble 的气泡公式成立有一个<strong>隐含条件：W 能被推迟足够久</strong>——W 积压每少一个槽位，气泡就多一个单位。W 推迟意味着要保留 ∇z 等中间量（M<sub>W</sub> = 32sbh/层），所以 ZB 的真实账是「用 M<sub>W</sub> 换气泡」，峰值激活的 p·M<sub>B</sub> 只是 B 的那一部分。这也解释了为什么论文要在 M<sub>W</sub> &lt; M<sub>B</sub> 的前提下讨论峰值显存。
+    </p>
+
+    <h3>⑦ 与其它并行维度的组合</h3>
+    <ul>
+      <li><strong>与 TP</strong>：Megatron 的 PTD-P，TP 放节点内、PP 跨节点；对固定 batch，增大 t 会减小 p，从而减小气泡（论文 §3.3 的分析），但 TP 跨节点代价很大。</li>
+      <li><strong>与 DP / ZeRO</strong>：PP 每个 batch 有 m 个 micro-batch，梯度要在最后一个 micro-batch 之后才能归约；ZeRO-2/3 的梯度 / 参数分片会在每个 micro-batch 上引入额外通信，常见实践是 PP 只与 ZeRO-1 组合（DeepSpeed 的 pipeline 引擎即如此）。Megatron §3.3.1 的推导（t=1）：总卡数 n、b′ = B/b，则 m = b′/d、p = n/d，气泡 = (p−1)/m = (n−d)/b′——固定 n 与 global batch 时，增大 d 虽然让每条流水的 m 变少，但 p 减得更多，气泡反而下降；前提是模型在更小的 p 下放得下。</li>
+      <li><strong>与 SP / CP</strong>：长序列下每个 micro-batch 很大，m 受全局 batch 限制而变小，气泡上升；这时更需要交错或 Zero Bubble 类调度（<a href="daily-2026-10-29-algo-sequence-parallel.html">序列并行</a>一文的思考题 5 提过这个问题）。</li>
+      <li><strong>与重计算</strong>：重计算让每个在途 micro-batch 只存边界输入，于是可以开更大 m 来压气泡；Megatron 的 145B 实验中大 batch 下吞吐因此提升 2×。</li>
+      <li><strong>延伸</strong>：DeepSeek-V3 技术报告中的 DualPipe 采用双向流水，并把 MoE 的 all-to-all 与计算重叠；它沿用了「把反向拆成对输入 / 对权重两部分」的思路。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先算 (p−1)/m</strong>：给定 global batch、DP 度和 micro-batch 大小，m = B/(d·b)；如果 m &lt; 4p（GPipe 的经验门槛），不要上纯 1F1B，考虑交错或 Zero Bubble，或减小 p。</li>
+      <li><strong>交错只在带宽够时开</strong>：v 倍 P2P 通信需要 scatter/gather 这类优化把它分摊到多块 IB 网卡；Megatron 的结论是大 batch、无 scatter/gather 时默认调度反而更快。</li>
+      <li><strong>按显存选 ZB 档位</strong>：显存紧就用 ZB-1p（与 1F1B 同峰值，气泡显著下降、不增加通信）；显存宽裕用 ZB-2p（近零气泡，峰值约 2×）。实现上要把 autograd 拆出 weight-grad（Megatron / 开源 zero-bubble 仓库都有实现）。</li>
+      <li><strong>首末 stage 要减层</strong>：embedding、LM head 和 loss（大词表下很重，见 <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>的词表并行）会让首末 stage 成为瓶颈；ZB 论文让首末 stage 各少一层。</li>
+      <li><strong>检查优化器同步</strong>：梯度裁剪、NaN 检查、loss scaling 都是跨 stage 的全局同步点，会把排好的流水重新对齐；要么接受这点开销，要么用 post-validation 类方案。</li>
+      <li><strong>做逐位回归测试</strong>：同步调度只改执行顺序、不改数学，应能与 1F1B 逐位一致（ZB 论文就是这样验证正确性的）；如果不一致，通常是 RNG（dropout）或归约顺序依赖调度，这也是今天一线 <a href="daily-2026-10-30-batch-invariance-kernel-agent.html">batch invariance</a> 讨论的同一类问题。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 推导 GPipe 的气泡比例 (p−1)/m，并说明为什么 1F1B 的气泡与之相同却仍是更好的调度。</summary>
+      <p>GPipe 中最后一个 stage 要等前面 p−1 个 stage 依次完成第一个 micro-batch 的前向才能开始，开头空闲 (p−1)·t<sub>F</sub>；反向时第一个 stage 要等梯度从最后一个 stage 传回，结尾空闲 (p−1)·t<sub>B</sub>。对每个 stage 而言，气泡总量为 (p−1)(t<sub>F</sub>+t<sub>B</sub>)，理想计算时间 m(t<sub>F</sub>+t<sub>B</sub>)，比例 (p−1)/m。1F1B 只改变了中间的排序，开头的填充和结尾的排空依然存在，所以气泡相同（box 模拟两者都是 37.50%）。它更好在于显存：stage s 至多有 p−s 个 micro-batch 在途，而不是 m 个，于是可以把 m 开到远大于 p，用大 m 把气泡摊薄。</p>
+    </details>
+    <details>
+      <summary>2. PipeDream 的 weight stashing 保证了什么、不保证什么？为什么今天的大模型训练普遍使用 PipeDream-Flush 而不是 PipeDream？</summary>
+      <p>weight stashing 保证同一个 micro-batch 在<strong>同一个 stage 内</strong>的前向与反向使用同一版本权重，从而该 stage 的梯度是某个权重点上的合法梯度；但不保证不同 stage 之间使用同一版本（stage 1 延迟 n−1 步、最后一个 stage 延迟 0 步），更新等价于一个各层延迟不同的异步 SGD。vertical sync 能统一版本，语义等价于 n 机 BSP。大模型训练普遍选 PipeDream-Flush，因为 (1) 同步语义与单机大 batch 训练逐位可比，便于调参与复现；(2) weight stashing 需要多份权重（大模型下权重 + 优化器状态本就是显存大头，见 <a href="daily-2026-10-23-algo-zero.html">ZeRO</a>）；(3) 异步延迟与大学习率、Adam 的交互难以分析。代价是每个 batch 结束的 flush 带来 (p−1)/m 的气泡，这又推动了交错和 Zero Bubble。</p>
+    </details>
+    <details>
+      <summary>3. 交错调度把气泡除以 v，为什么不把 v 开到每层一个 chunk？给出至少三个限制。</summary>
+      <p>(1) 通信 ×v：每个 micro-batch 跨卡边界从 p−1 次变成 vp−1 次，每次传 bsh 大小的激活，通信无法全部被计算掩盖时吞吐下降（Megatron 发现不开 scatter/gather 时大 batch 下默认调度更快）；(2) 每个 chunk 变小，计算粒度变细，kernel 启动与调度开销、P2P 延迟占比上升；(3) 在途激活增加：Megatron-LM 实现中设备 d 的 warm-up 为 (p−d−1)·2 + (v−1)·p 个 chunk 级前向（本文模拟器沿用），box 模拟中 p=4、v=2 时峰值比 1F1B 多约 37%；(4) 约束：m 必须是 p 的整数倍，层数必须能被 p·v 整除；(5) 收益递减：气泡已经是 (p−1)/(vm)，v 从 2 到 4 只再减少一半的已经很小的量。ZB 论文的 1F1B-I 基线用了每层一个 chunk 的最大交错，在多节点上仍被不增加通信的 ZB-1p 超过。</p>
+    </details>
+    <details>
+      <summary>4. 为什么把反向拆成 B 与 W 就能减少气泡？用依赖关系说明，并解释 ZB-H1 的气泡为什么是 (p−1)(t<sub>F</sub>+t<sub>B</sub>−t<sub>W</sub>)。</summary>
+      <p>流水的关键路径是 F 链（stage 0→p−1）与 B 链（stage p−1→0）。传统反向把 W 与 B 绑在一起，上一个 stage 必须等 B+W 都做完才能收到梯度，关键路径上每跳是 t<sub>B</sub>+t<sub>W</sub>。拆开后，B 一算完就发给上一个 stage，关键路径每跳只剩 t<sub>B</sub>；W 只依赖本 stage 的 B，可以挪到任何空闲处（尤其是结尾排空时的空洞）。ZB-H1 中，B 链传播更快，每个 stage 尾部原来 (p−1) 个空槽中有一部分可被推迟的 W 填掉：与 1F1B 的 (p−1)(t<sub>F</sub>+t<sub>B</sub>+t<sub>W</sub>) 相比，每跳省掉 t<sub>W</sub>（关键路径不再含 W），另外尾部再填入 t<sub>W</sub> 的 W，合计少 2t<sub>W</sub>，得到 (p−1)(t<sub>F</sub>+t<sub>B</sub>−t<sub>W</sub>)；t 相等时为 1F1B 的 1/3。ZB-H2 在 warm-up 多塞 F 再填掉开头的洞，变为 (p−1)(t<sub>F</sub>+t<sub>B</sub>−2t<sub>W</sub>)，t 相等时为 0。box 模拟表明，前提是 W 可以积压足够多（ZB-H1 型需 ≥ p 个，ZB-H2 型需 ≥ 2p−1 个）。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）Zero Bubble 的 post-validation 在什么情况下会频繁回滚？在 RL 后训练（大 batch、长序列、经常触发梯度裁剪）里使用 ZB 需要注意什么？</summary>
+      <p>post-validation 的前提是全局检查「绝大多数时候不触发」。当梯度裁剪频繁发生（例如 RL 后训练早期、loss spike、学习率偏大）或混合精度下经常出现 inf（FP16 loss scaling 调整期）时，部分归约状态与全局状态不一致的概率上升，每次不一致都要回滚并按全局状态重做优化器步，开销可能超过节省的气泡。RL 场景还要注意：(1) 序列很长、m 往往较小，正是 ZB 收益最大的地方，但显存紧张，可能只能用 ZB-1p；(2) 训练端与 rollout 端的逐位一致性要求更高（见 <a href="daily-2026-10-27-rounding-location.html">舍入位置</a>），调度改变不应改变数值——同步调度只改执行顺序，可用固定种子做逐位回归；(3) 梯度裁剪阈值若常被触及，可考虑改为基于上一步全局范数的裁剪（延迟一步的统计），从而去掉同步点，但这改变了优化器语义，需要单独验证收敛。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">arXiv:1811.06965 · GPipe（Huang et al., Google）</a></li>
+      <li><a href="https://arxiv.org/abs/1806.03377" target="_blank" rel="noopener">arXiv:1806.03377 · PipeDream（Harlap et al., CMU / Stanford / MSR）</a></li>
+      <li><a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">arXiv:2104.04473 · Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM（Narayanan et al.）</a> · <a href="https://github.com/NVIDIA/Megatron-LM" target="_blank" rel="noopener">GitHub: NVIDIA/Megatron-LM</a></li>
+      <li><a href="https://arxiv.org/abs/2401.10241" target="_blank" rel="noopener">arXiv:2401.10241 · Zero Bubble Pipeline Parallelism（Qi, Wan, Huang, Lin；Sea AI Lab）</a> · <a href="https://github.com/sail-sg/zero-bubble-pipeline-parallelism" target="_blank" rel="noopener">GitHub: sail-sg/zero-bubble-pipeline-parallelism</a></li>
+      <li>站内：
+        <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> ·
+        <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a> ·
+        <a href="daily-2026-10-29-algo-sequence-parallel.html">序列 / 上下文并行</a> ·
+        <a href="daily-2026-10-27-algo-activation-checkpointing.html">激活重计算</a> ·
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-10-30-batch-invariance-kernel-agent.html">今日一线：Batch Invariance in Agentic Kernel Generation</a> ·
+        <a href="daily-2026-10-30-harness-spine.html">今日 Harness：Spine</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

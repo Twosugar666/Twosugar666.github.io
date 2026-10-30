@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜God Does Not Play Dice：Agent 写的 GPU kernel 过了正确性测试，换个 batch 却可能换个答案——BIEvolve 把 batch invariance 做成 kernel agent 的验收闸门（契约静态分析 + 跨 batch 逐位比对），BI 通过率 67.6%→91.9%，保留 91.8% 几何平均加速 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜God Does Not Play Dice：Agent 写的 GPU kernel 过了正确性测试，换个 batch 却可能换个答案——BIEvolve 把 batch invariance 做成 kernel agent 的验收闸门（契约静态分析 + 跨 batch 逐位比对），BI 通过率 67.6%→91.9%，保留 91.8% 几何平均加速</h1>
+    <p class="post-meta">2026-10-30 · 收藏夹：Infra / 显卡 · 一线追踪<br />
+      来源：Youwei Bao、Chengpeng Wang、Simin Chen（George Mason University STAR Lab / National University of Singapore；通讯作者 Simin Chen；一作为在 GMU STAR Lab 实习期间的工作）· <em>God Does Not Play Dice: Enforcing Batch Invariance in Agentic Kernel Generation</em>（<a href="https://arxiv.org/abs/2610.36623" target="_blank" rel="noopener">arXiv:2610.36623</a>，cs.AI，v1 页眉日期 2026-10-27，出现在 arXiv 10-28 的 /new 批次；截至 10-30 08:30（北京时间）arXiv 尚未放出下一批）。
+      数字均为论文自报：实验用 Gemini 3.7 Flash 驱动三种 kernel agent，单卡 NVIDIA H100 NVL，<strong>每种配置一次受控重跑，未报告方差</strong>。「box 小验证」一节为本文用 numpy 实跑。
+      交叉：
+      <a href="daily-2026-10-27-rounding-location.html">舍入位置与 BF16 RL 防崩</a>、
+      <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a>、
+      <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      「同样的 prompt、temperature=0，为什么两次输出不一样？」2025 年 Thinking Machines Lab 的 <em>Defeating Nondeterminism in LLM Inference</em> 把主因讲清楚了：不是 GPU 原子操作的随机性（现代 LLM 前向里很少用 float atomics），而是<strong>kernel 缺乏 batch invariance（BI）</strong>。serving 系统做 continuous batching，同一个请求这一次和 3 个请求拼一批、下一次和 60 个拼一批；kernel 根据 batch 形状换 tiling、换 split-K / split-KV 份数、换算法分支，浮点加法不满足结合律，于是<strong>同一个样本的输出 bit 跟着 batch 上下文变</strong>。vLLM 后来也提供了 batch-invariant 模式，但都是针对少数手写算子（Thinking Machines 的 batch_invariant_ops 只替换了 4 个 PyTorch 算子）。
+    </p>
+    <p>
+      同一时间，另一条线在飞速发展：<strong>让 LLM agent 自动写和优化 kernel</strong>（KernelBench、FlashInfer-Bench、K-Search、Kevin 等）。这些 agent 的验收标准只有两条——和参考实现在容差内一致、比参考实现快。这篇论文指出第三条被系统性遗漏了：<strong>容差内正确 ≠ batch invariant</strong>。agent 最爱用的提速手段恰恰是「按 batch 大小调 split 数，让小 batch 也能填满 SM」，这正是 BI 的头号杀手。
+    </p>
+    <p>
+      为什么这对 RL 训练尤其重要：rollout 引擎里同一条序列在不同 step 会被拼进不同 batch，非 BI 的 kernel 会让「推理端 logprob」随 batch 漂移，放大训推不一致（training–inference mismatch）。本站 <a href="daily-2026-10-27-rounding-location.html">舍入位置</a> 一文讲的是「融合 kernel 与逐算子在哪儿舍入」带来的系统性偏差，本文讲的是「batch 上下文改变归约顺序」带来的偏差，两者是同一个问题的两个来源。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 问题定义：逐位一致，而不是容差一致</h3>
+    <p>
+      论文的定义（§2.2）：固定硬件和软件环境，对目标样本 x，允许的 batch 上下文集合包含 batch 大小、组成、x 在 batch 中的位置三种变化；kernel 是 BI 的，当且仅当 x 对应的输出在所有允许上下文下<strong>逐位相同</strong>（结构、shape、dtype、数值都一样）。这比通常的 <code>allclose</code> 严格得多，也刻意排除了另两类非确定性：同输入同上下文的 run-to-run 差异（atomics）、跨硬件 / 软件版本的差异。
+    </p>
+    <table>
+      <thead><tr><th>非确定性来源</th><th>什么变了</th><th>本文是否处理</th></tr></thead>
+      <tbody>
+        <tr><td>run-to-run（无序 float atomics）</td><td>什么都没变，调度顺序不同</td><td>否（论文称现代 LLM 前向中少见）</td></tr>
+        <tr><td>环境（GPU 型号、驱动、库版本、编译器）</td><td>硬件 / 软件栈</td><td>否</td></tr>
+        <tr><td><strong>batch 依赖</strong></td><td>同一样本周围的 batch 大小 / 组成 / 位置</td><td><strong>是</strong>：BI 的定义对象</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② 证据：发布出来的 agent kernel 里有 22.9% 违反 BI</h3>
+    <p>论文先审计了公开的 agent 生成 kernel（Table 1）：</p>
+    <table>
+      <thead><tr><th>来源 / benchmark</th><th>有语义 batch 维 / 发布总数</th><th>确认违反 BI</th><th>BI 通过率</th></tr></thead>
+      <tbody>
+        <tr><td>KernelBench.com</td><td>79 / 126</td><td>18</td><td>77.2%</td></tr>
+        <tr><td>K-Search / FlashInfer-Bench</td><td>4 / 5</td><td>1</td><td>75.0%</td></tr>
+        <tr><td><strong>合计</strong></td><td><strong>83 / 131</strong></td><td><strong>19（22.9%）</strong></td><td><strong>77.1%</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      附录 Table A1 按 kernel 族和机制拆开：<strong>attention 为 High</strong>（确认违反率 ≥50%），在 work partitioning（split-K / split-KV、sequence chunking）、reduction order（BLOCK_K / tiling 改变累加顺序）、algorithm selection（autotune、按 shape 分派）三类机制上都有确认案例；linear attention 为 Medium；MoE、Top-k、recurrent、triangle multiplication 只发现了结构性风险（Low，论文强调 Low 是证据类别、不是测得的低违反概率）；GEMM 和 transformer decoding 在被审计的产物里没有真正的语义 batch 维（N/A）。论文 Figure 2 给出的典型代码：<code>batch_size</code> 决定 <code>base_blocks</code> 和 <code>avg_pages</code>，二者再决定 <code>num_splits</code>，于是每个 split 归约的 page 范围随 batch 而变。
+    </p>
+
+    <h3>③ BIEvolve：两个模块，一个契约 DSL</h3>
+    <p><strong>静态模块：契约驱动的依赖分析。</strong>一份 BI 契约声明两样东西：</p>
+    <ul>
+      <li><strong>batch 符号</strong>（污点源）：<code>B, batch, batch_size, bsz, num_seqs, len_indptr, num_requests, num_tokens, total_q, total_kv, num_kv_indices, total_pages</code> 等，以及由它们派生的全局量；</li>
+      <li><strong>受保护参数</strong>（汇点）：当前 DSL 覆盖三种机制——<code>NUM_SPLITS</code>（split / reduction 结构，别名包括 <code>split_k, num_partitions, SPLIT_K</code> 等十几种写法）、<code>RECURRENCE_SEGMENTS</code>（递推分段）、<code>RNG_SEED</code>（随机流状态）。每个参数配一条 policy：<code>fixed_across_batch</code> / <code>may_depend_on batch</code> / <code>free</code>。</li>
+    </ul>
+    <pre><code>kernel BatchIdentity {                       # 论文附录 B 的真实契约（节选）
+  invariant_axis batch symbols [B, batch, batch_size, bsz, num_seqs, ...];
+  parameter NUM_SPLITS {
+    semantic split_structure;
+    policy fixed_across_batch;
+    aliases [num_splits, max_splits, num_partitions, split_k, ...];
+  }
+  parameter RNG_SEED { semantic rng_stream; policy fixed_across_batch; ... }
+}
+# 契约按 global → kernel family → subtype 分层继承；新任务按语义族自动继承保护规则</code></pre>
+    <p>
+      分析器对 Python / Triton 用 AST 追踪数据依赖与控制依赖（参数传递、容器访问、分支、同文件 helper），对 C/C++/CUDA 用定向模式匹配。<strong>受保护参数只要直接或传递地由 batch 符号赋值、或在依赖 batch 的 if / loop 里被选择，就拒绝</strong>，并把「哪个机制、哪一行、从哪个 batch 源经过哪条路径」作为诊断回传给 agent，附带机制相关的修复建议。静态分析看不透的（不透明 runtime dispatch、autotune）留给动态模块。
+    </p>
+    <p><strong>动态模块：跨 batch 逐位比对。</strong>样本 0 先在 batch=1 上跑并记录输出，再把同一输入原样嵌入更大的 batch 作为样本 0，抽出它的输出逐位比较，遇到第一个不一致即停。测试策略按 kernel 族选：一般 kernel 用较少上下文，attention 这类高风险族用更多上下文去碰更多执行边界。</p>
+
+    <h3>④ 插进 agent 循环：四级验收闸门，不改 agent 本身</h3>
+    <table>
+      <thead><tr><th>顺序</th><th>闸门</th><th>作用</th><th>为什么放这里</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>静态 BI 分析</td><td>拒绝已知危险模式</td><td>不用编译执行，最便宜（中位 7.69 ms / 候选）</td></tr>
+        <tr><td>2</td><td>参考正确性测试（框架原生）</td><td>过滤数值错误</td><td>避免把「算错了」误判成「不 BI」</td></tr>
+        <tr><td>3</td><td>动态 BI 验证</td><td>实测跨 batch 逐位一致</td><td>只对正确的候选跑（中位 2.24 ms / 候选）</td></tr>
+        <tr><td>4</td><td>性能 benchmark（框架原生）</td><td>测加速比</td><td>只给通过全部闸门的候选计分</td></tr>
+      </tbody>
+    </table>
+    <p>
+      一个轻量 adapter 负责把源码 / 任务元数据 / 测试 harness 交给两个模块，并把 BI 失败翻译成框架原有的反馈格式写进历史；<strong>框架自己的 prompt、正确性标准、benchmark、候选选择策略、搜索状态全部不动</strong>。这一点是论文的核心设计取向：不重写一个「BI-aware kernel agent」，而是把 BI 变成任何 agent 都能挂的额外目标。
+    </p>
+
+    <h3>⑤ 主结果：三种 agent、同等轮数预算</h3>
+    <p>
+      任务集取自 KernelBench.com 的 hard 任务与 FlashInfer trace / contest workload：attention（GQA、MLA、DSA，覆盖 paged / ragged、prefill / decode）、linear attention（KDA、Gated DeltaNet）、MoE、normalization、sampling，合计 1,180 个 workload / shape。三种 agent 覆盖三种搜索范式：<strong>Iterative Agent</strong>（单轨迹迭代改进，25 轮）、<strong>Evolve Agent</strong>（近期 + 精英候选池，25 轮）——均为 MLSys 2026 FlashInfer 竞赛 baseline；<strong>K-Search</strong>（Cao et al.，规划与代码实例化分离的共演化 world model，20 轮）。vanilla 与 BI-aware 轮数相同（Table 2）：
+    </p>
+    <table>
+      <thead><tr><th>框架</th><th>条件</th><th>BI 通过率</th><th>BI 干预率</th><th>几何平均加速</th><th>加速保留</th><th>正确性通过</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="2">K-Search</td><td>baseline</td><td>75.7%</td><td>—</td><td>40.94×</td><td rowspan="2">86.4%</td><td>94.9%</td></tr>
+        <tr><td>BI-aware</td><td><strong>97.4%</strong></td><td>23.1%</td><td>35.39×</td><td>97.4%</td></tr>
+        <tr><td rowspan="2">Iterative Agent</td><td>baseline</td><td>48.6%</td><td>—</td><td>25.84×</td><td rowspan="2">87.7%</td><td>94.9%</td></tr>
+        <tr><td>BI-aware</td><td><strong>89.2%</strong></td><td>43.6%</td><td>22.66×</td><td>94.9%</td></tr>
+        <tr><td rowspan="2">Evolve Agent</td><td>baseline</td><td>78.4%</td><td>—</td><td>22.85×</td><td rowspan="2">102.0%</td><td>94.9%</td></tr>
+        <tr><td>BI-aware</td><td><strong>89.2%</strong></td><td>25.6%</td><td>23.31×</td><td>94.9%</td></tr>
+        <tr><td rowspan="2"><strong>合计</strong></td><td>baseline</td><td>67.6%</td><td>—</td><td>28.91×</td><td rowspan="2"><strong>91.8%</strong></td><td>94.9%</td></tr>
+        <tr><td>BI-aware</td><td><strong>91.9%</strong></td><td>30.8%</td><td>26.54×</td><td>95.7%</td></tr>
+      </tbody>
+    </table>
+    <p>读表要点：</p>
+    <ul>
+      <li><strong>BI 通过率</strong>的分母是「通过正确性的最终 kernel」；<strong>干预率</strong>是优化过程中 BIEvolve 至少拒过一个候选的任务比例。干预率可以高于最终通过率的提升，说明它也拦下了那些「最终解本来就 BI」的任务里中间的非 BI 候选。</li>
+      <li><strong>最弱的 agent 最受益</strong>：Iterative Agent baseline 只有 48.6%（单轨迹贪心改进最容易滑向「按 batch 调 split」的捷径），干预率 43.6%，提升 40.6pp。</li>
+      <li><strong>代价主要落在本来就违反 BI 的任务上</strong>：按 baseline 最终 kernel 是否违反 BI 分组，加速保留 86.0%（违反组）vs 95.7%（未违反组）——BI 闸门排除的正是那些「快但依赖 batch」的优化。Evolve Agent 两组都几乎不掉（合计 102.0%），说明更宽的搜索能找回 BI 且快的替代实现，BI 的性能代价部分取决于搜索策略。</li>
+      <li>附录 Table A2：违反组 BI-aware 在最后 5 轮的 best-so-far 加速增益 26.30% vs baseline 6.11%（37 个任务，排除 2 个最终 kernel 不正确的），即受约束后优化还在继续推进；论文自己说明这<strong>不能</strong>推出「更大预算下会反超」。</li>
+    </ul>
+
+    <h3>⑥ 消融：静态与动态互补</h3>
+    <p>离线在同一个 200 候选池上（100 个独立确认违反 BI + 100 个未发现违反，标签由独立的跨边界逐位测试给出，与 BIEvolve 输出无关）对比（Table 3）：</p>
+    <table>
+      <thead><tr><th>配置</th><th>违反检出率</th><th>独有检出</th><th>重叠</th><th>误拒率</th><th>中位评估耗时</th></tr></thead>
+      <tbody>
+        <tr><td>仅静态</td><td>83%</td><td>37</td><td>46</td><td>2%</td><td>7.69 ms</td></tr>
+        <tr><td>仅动态</td><td>55%</td><td>9</td><td>46</td><td>0%</td><td>2.24 ms</td></tr>
+        <tr><td><strong>BIEvolve（顺序 + 早停）</strong></td><td><strong>92%</strong></td><td>—</td><td>—</td><td>2%</td><td>10.21 ms</td></tr>
+      </tbody>
+    </table>
+    <p>
+      动态模块只抽样有限个 batch 上下文，所以会漏（55%）：很多 split 启发式只在某个 batch 阈值才切换，抽不到那个点就看不到差异；静态模块追踪所有声明的 batch 符号到受保护参数，覆盖面广，但有 2% 误拒（依赖存在但实际不改变归约），且跨文件分析有限。合起来 92%，评估耗时与一次 kernel benchmark 相比可以忽略（计时不含 LLM 调用、编译、正确性测试和 benchmark）。
+    </p>
+
+    <h3>⑦ box 小验证（numpy，split-KV decode attention，L=4096、d=128）</h3>
+    <pre><code># 每个 split 算局部 (max, Σexp, acc)，再按 LSE 合并（FlashDecoding 式）；num_splits = max(1, min(32, 132 // B))
+#   —— 「batch 小就多切 KV 填满 SM」的典型启发式，与论文 Figure 2 同类。只计算样本 0，其它样本不参与它的数值。
+B    num_splits   样本0 与 B=1 逐位一致？    max|diff|     固定 num_splits=8
+1        32       True                      0             True
+4        32       True                      0             True
+8        16       False                     1.7e-08       True
+16        8       False                     2.2e-08       True
+64        2       False                     3.5e-08       True
+128       1       False                     5.2e-08       True
+# FP32 输出 128 维中 123 维不同；转成 BF16 后仍有 1 / 128 维不同
+# 简化版静态检查（AST 污点：batch_size → num_splits）
+launch()       → 第 5 行 num_splits 数据依赖（经 base_blocks）；第 7 行控制依赖（if avg_pages &gt; 64）
+launch_fixed() → 通过</code></pre>
+    <p>
+      读法：(1) 数学上完全相同的计算，仅仅因为 batch 改变了 split 份数，样本 0 的输出就不再逐位相同；差异只有 1e-8 量级，<strong>任何 allclose 正确性测试都会放行</strong>。(2) 降到 BF16 能「藏住」大部分差异，但仍有一维翻了一个 ulp——在自回归解码里，只要某一步 top-1 和 top-2 的 logit 足够接近，一个 ulp 就足以让 greedy 选出不同 token，之后整条序列分叉。(3) 固定 split 数是最直接的修法，代价是小 batch 下 SM 填不满（这就是论文里「加速保留 86%」的来源）。(4) 只要几十行 AST 就能抓到 <code>batch_size → base_blocks → num_splits</code> 这种显式依赖，真正难的是跨文件、autotune 和运行时 dispatch，所以需要动态比对兜底。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>kernel 验收加一列「逐位 BI」</strong>：无论 kernel 是人写还是 agent 写，CI 里都应该有「样本 0 在 batch=1 与 batch∈{边界值} 下逐位比较」的测试；特别要覆盖 split 启发式的切换阈值（例如 SM 数 / batch 的整除边界），随机抽 batch 很容易漏。</li>
+      <li><strong>把受保护参数显式化</strong>：<code>num_splits</code>、<code>BLOCK_K</code>、split-KV 份数、autotune 配置、MoE grouped-GEMM 的分组方式，都应在 kernel 接口上声明「是否允许依赖 batch」；不允许的就固定或只依赖单样本的形状（如 KV 长度），不依赖 batch 维的总量（如 <code>total_pages</code>、<code>num_tokens</code>）。</li>
+      <li><strong>RL rollout 引擎优先开 BI 模式</strong>：训推一致性问题（见 <a href="daily-2026-10-27-rounding-location.html">舍入位置</a>）里，batch 依赖是唯一会随 rollout 调度而变化的来源，最难复现；先把它消掉，剩下的系统性偏差才好定位。对 on-policy 程度要求高的算法（TIS / MIS 一类重要性修正）尤其有价值。</li>
+      <li><strong>给 kernel agent 的奖励 / 验收里加 BI 约束</strong>：不改 agent，只在评估流水线里加闸门 + 回传诊断，就能把 BI 通过率从 67.6% 拉到 91.9%；用 RL 训 kernel 模型（Kevin 一类）时，把 BI 失败当成和正确性失败同级的负反馈。</li>
+      <li><strong>性能代价按任务分开看</strong>：本来就 BI 的任务几乎不掉速（95.7% 保留），违反组掉 14%；如果预算允许，更宽的搜索（Evolve Agent 风格的候选池）能把这部分找回来。</li>
+      <li><strong>注意适用边界</strong>：本文只在 kernel 输出层面测 BI，未测端到端 token 分叉、serving 指标或 RL 曲线；单卡 H100 NVL、单一驱动模型、每配置一次运行。跨 TP 大小的确定性（通信归约顺序）是另一个问题，需要单独处理。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「和参考实现 allclose」的正确性测试原则上无法发现 BI 违反？给出一个最小反例。</summary>
+      <p>allclose 比较的是候选 kernel 与参考实现在<strong>某一个</strong>输入 batch 上的数值距离，容差通常在 1e-3 到 1e-5；BI 比较的是<strong>同一个候选</strong>在不同 batch 上下文下对同一样本的输出，要求逐位相同。两者测的是不同的关系：一个 kernel 在每个 batch 下都与参考在容差内一致，但不同 batch 之间可以有 1e-8 的差异。最小反例就是本文 box 实验：split-KV decode 的 num_splits 由 batch 决定，B=1 时切 32 份、B=64 时切 2 份，两种归约顺序都与参考实现差在 1e-7 以内（allclose 通过），但彼此不逐位相同（BI 违反）。</p>
+    </details>
+    <details>
+      <summary>2. 动态验证只检出 55%，静态分析检出 83% 但有 2% 误拒。分别说明它们漏检 / 误拒的典型原因，以及为什么顺序是「静态 → 正确性 → 动态」。</summary>
+      <p>动态漏检：它只抽样有限个 batch 上下文；split 启发式通常是分段常数（如 132 // B），只在阈值处切换，没测到切换点的两侧就看不到差异；另外有些差异只在特定形状组合（ragged 长度、page 数）下出现。静态误拒：依赖关系存在但不影响该样本的归约结构（例如 num_splits 依赖 batch，但 kernel 对每个样本的 split 边界取整后恰好不变），或者被依赖的变量只用于 launch grid 大小而不改变归约分组；静态漏检则来自跨文件依赖、opaque dispatch 和 autotune。顺序上，静态最便宜、不用编译执行，先筛掉明显的；正确性放在动态之前，是为了不把「算错了」误判为「不 BI」（错误的 kernel 跨 batch 也可能不一致）；动态最后，只对正确的候选做逐位比对；性能 benchmark 在全部通过之后，避免把预算花在不合格的候选上。</p>
+    </details>
+    <details>
+      <summary>3. Evolve Agent 的加速保留是 102.0%，而 K-Search 是 86.4%。从搜索算法角度解释这种差异，并讨论「BI 的性能代价」是否是 kernel 的固有属性。</summary>
+      <p>BI 约束把搜索空间里「快但依赖 batch」的那部分砍掉。单轨迹（Iterative）或强规划（K-Search）的方法在 vanilla 下往往收敛到某个强捷径（比如按 batch 调 split 拿到大加速），加上约束后要从更窄的可行域重新出发，在固定轮数内找不回同等速度；Evolve Agent 维护近期 + 精英两个候选池，天然保留了多条不同实现路线，其中一些本来就不依赖 batch，所以在约束下几乎不掉速，甚至因为闸门的诊断反馈让搜索更聚焦而略有提升（论文没有给出方差，102% 可能在噪声范围内）。这说明 BI 的代价不全是 kernel 的固有属性：一部分是「小 batch 下固定 split 填不满 SM」的真实代价，另一部分是搜索预算和策略决定的「没找到」。Table A2 中违反组后 5 轮仍有 26.30% 增益也指向后者，但论文明确不推断更大预算下的结果。</p>
+    </details>
+    <details>
+      <summary>4. 把 BI 用到 RL 训练：rollout 引擎开 batch-invariant 模式后，训推不一致就消失了吗？还有哪些来源？</summary>
+      <p>不会完全消失。BI 只保证「推理端同一样本在不同 batch 下输出相同」，即推理端自洽；训推一致还要求推理端与训练端（Megatron / FSDP 前向）对同一序列的 logprob 相同，而两边的 kernel（融合 vs 逐算子、FlashAttention 的版本、舍入位置、TP 大小导致的 all-reduce 归约顺序、MoE 的 token 分组）通常不同，见本站 <a href="daily-2026-10-27-rounding-location.html">舍入位置</a> 一文。BI 的价值在于把「随 rollout 调度随机漂移」的那一部分偏差变成确定性的，使剩余偏差可复现、可定位，也让重要性修正（TIS / MIS）看到的比值更稳定。要做到 zero-mismatch 还需要训练端与推理端共用同一套 BI kernel 并对齐 TP 归约顺序（论文引用了跨 TP 大小确定性推理的相关工作）。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果要把 BIEvolve 的思路推广到 MoE grouped-GEMM 与 attention 的 autotune，契约 DSL 需要增加哪些受保护参数？动态测试该如何选 batch 上下文？</summary>
+      <p>MoE：expert–token 分组方式（同一专家内 token 的排列顺序决定 GEMM 的行顺序，但不改变逐行归约；真正危险的是按总 token 数选择不同的 grouped-GEMM tile / split-K、以及容量截断 / token dropping 依赖 batch 内其它 token），因此需要保护「每专家 GEMM 的 K 维 split」和「是否发生 drop」两类参数，并把 num_tokens、每专家负载列为 batch 符号。autotune：应保护「最终选中的配置」，要求 autotune key 只包含单样本形状（head_dim、KV 长度）而不包含 batch 维总量；静态上可以检查 autotune key 列表，动态上必须在 autotune 缓存为空和已填充两种状态下都测。动态上下文选择：围绕启发式的阈值做边界测试（例如 SM 数的整除点两侧、page 数阈值两侧）、ragged batch 中目标样本的不同位置、batch 内其它样本长度极长 / 极短，这比随机 batch 大小有效得多。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2610.36623" target="_blank" rel="noopener">arXiv:2610.36623 · God Does Not Play Dice: Enforcing Batch Invariance in Agentic Kernel Generation（Bao, Wang, Chen；GMU / NUS）</a></li>
+      <li>相关：<a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/" target="_blank" rel="noopener">Thinking Machines Lab · Defeating Nondeterminism in LLM Inference</a> · <a href="https://github.com/thinking-machines-lab/batch_invariant_ops" target="_blank" rel="noopener">GitHub: batch_invariant_ops</a> · <a href="https://arxiv.org/abs/2602.19128" target="_blank" rel="noopener">K-Search（arXiv:2602.19128）</a> · <a href="https://arxiv.org/abs/2502.10517" target="_blank" rel="noopener">KernelBench（arXiv:2502.10517）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-30-harness-spine.html">今日 Harness：Spine</a> ·
+        <a href="daily-2026-10-30-algo-pipeline-parallel.html">今日算法：流水线并行</a> ·
+        <a href="daily-2026-10-27-rounding-location.html">舍入位置与 BF16 RL 防崩</a> ·
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a> ·
+        <a href="daily-2026-10-23-flashnext-rl.html">FlashNext-RL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
