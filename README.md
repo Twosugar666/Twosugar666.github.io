@@ -8,11 +8,23 @@
 
 ```
 ├── index.html          # 主页（About / Research / Experience / Publications / Blog）
+├── work.html           # 互动工作旅程（左侧 3D 手机 + 右侧经历详情，CSS/JS 内置）
 ├── assets/
 │   ├── style.css       # 全站样式（支持浅色/深色主题）
-│   └── main.js         # 主题切换 + 收藏夹筛选
+│   ├── main.js         # 主题切换 + 收藏夹筛选
+│   └── logos/apps/     # 6 个产品的官方 App 图标（512×512）
 └── posts/              # 博客文章（每篇一个 HTML 文件）
 ```
+
+## 互动工作旅程（3D 手机 + 右侧详情）
+
+`work.html` 左右分栏：左边是一台 CSS 3D 透视的拟真 iPhone（金属边框、侧键、背面厚度、地面阴影、动态壁纸、状态栏时钟、灵动岛、Widget 进度环），主屏只放 6 段实习的官方 App 图标；右边是当前选中经历的详情（标题、进度条、关键词、简介、统计、可展开项目卡片、上一段/下一段）。窄屏改为上下堆叠。
+
+交互：点手机上的图标 → 手机以**弹簧阻尼 + rAF 连续插值**转动约 9°（角度在 −32°~8° 间往复，带轻微惯性回弹）、图标高亮、右侧详情淡入切换；点机身空白处也会转；鼠标在手机上移动有阻尼视差倾斜。「重置视角」回初始角度，手机下方的「动效」可关闭动画并记忆偏好（也尊重 `prefers-reduced-motion`）。动画循环按需启动、静止自动停止，并有超时与切回标签页的对齐兜底，避免视角停在半路。键盘 ← →、左右滑动、右侧按钮都能切换经历，深链接 `work.html#exp-<id>` 直接定位。
+
+图标使用官方 App 图标，放在 `assets/logos/apps/`：微信、抖音（代表字节，Flow 无独立公开图标）、快手、网易云音乐、蔚来，以及由现有 logo 生成的第四范式品牌图标，均 512×512 满版铺满。3 个辅助 App 与 Dock 用系统风格渐变符号。带 `logo` 的图标加载失败会回退到字母图标。
+
+改内容只需编辑 `work.html` 里 `<script>` 顶部的 `EXPERIENCES` 数组；字段：`id / name / company / time / role / logo / g1,g2 / tags / summary / projects[{title, desc, metrics[]}] / todo`。`todo:false` 会去掉「待补充」提示，右侧详情版式在 `expPaneHTML` 里。新增经历时同时在 `index.html` 加一条 `href="work.html#exp-<id>"`。
 
 ## 收藏夹
 

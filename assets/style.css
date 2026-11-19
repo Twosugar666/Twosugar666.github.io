@@ -509,6 +509,47 @@ a.card-link:hover h3 { color: var(--accent); }
   gap: 0.55rem;
 }
 
+.exp-link {
+  position: relative;
+  text-decoration: none;
+  color: inherit;
+  border-radius: 8px;
+  padding: 0.25rem 0.3rem;
+  margin: -0.25rem -0.3rem;
+  transition: background 0.18s ease, transform 0.18s ease;
+}
+
+.exp-link:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  transform: translateX(3px);
+}
+
+.exp-link:hover strong { color: var(--accent); }
+
+.exp-arrow {
+  margin-left: auto;
+  padding-left: 0.4rem;
+  color: var(--accent);
+  opacity: 0;
+  transform: translate(-3px, 3px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  font-size: 0.85rem;
+}
+
+.exp-link:hover .exp-arrow,
+.exp-link:focus-visible .exp-arrow { opacity: 1; transform: translate(0, 0); }
+
+.work-more {
+  display: inline-block;
+  margin-top: 0.9rem;
+  font-size: 0.82rem;
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px dashed color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.work-more:hover { border-bottom-style: solid; }
+
 .company-logo {
   width: 20px;
   height: 20px;
