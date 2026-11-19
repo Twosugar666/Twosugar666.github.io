@@ -76,52 +76,123 @@
     .phone-perspective {
       position: relative; width: 100%;
       perspective: 1600px; perspective-origin: 50% 45%;
-      height: calc(844px * var(--sc));
+      height: calc(844px * var(--sc)); margin-top: 1rem;
       display: grid; place-items: center;
     }
     .phone-rot {
-      --ry: -17deg; --rx: 7deg; --rz: -2deg;
       position: absolute; top: 50%; left: 50%;
       margin-left: -195px; margin-top: -422px;
       width: 390px; height: 844px;
       transform-style: preserve-3d;
-      transform: rotateX(var(--rx)) rotateY(var(--ry)) rotateZ(var(--rz)) scale(var(--sc));
       transform-origin: center center;
       will-change: transform;
-      animation: phoneFade 0.9s var(--ease) both;
     }
-    @keyframes phoneFade { from { opacity: 0; } to { opacity: 1; } }
-    .phone-tilt {
-      --tx: 0deg; --ty: 0deg;
-      width: 100%; height: 100%; position: relative;
-      transform-style: preserve-3d;
-      transform: rotateX(var(--tx)) rotateY(var(--ty));
+    .phone-tilt { width: 100%; height: 100%; position: relative; transform-style: preserve-3d; }
+    .phone-float {
+      width: 100%; height: 100%; position: relative; transform-style: preserve-3d;
+      animation: floaty 8s ease-in-out infinite alternate;
+    }
+    @keyframes floaty {
+      from { transform: translate3d(0, -7px, 0); }
+      to   { transform: translate3d(0, 9px, 0); }
     }
     .phone-body { position: relative; width: 100%; height: 100%; transform-style: preserve-3d; }
-    .phone-back {
-      position: absolute; inset: 0; border-radius: 58px;
-      background: linear-gradient(140deg, #454b57, #0b0d12 55%, #313640);
-      transform: translateZ(-15px);
-      box-shadow: 0 0 0 3px #090b0f, 0 0 40px rgba(0,0,0,0.6);
+
+    /* 六面机身：W=390 H=844 D=34（接近真机宽厚比） */
+    .pface { position: absolute; top: 50%; left: 50%; transform-style: preserve-3d; }
+    .pfront {
+      width: 390px; height: 844px; margin: -422px 0 0 -195px;
+      transform: translateZ(17px);
+      transform-style: flat;   /* 关键：不压平的话屏幕内容会穿过背面显示成镜像 */
+      backface-visibility: hidden;
+      border-radius: 58px; overflow: hidden;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.16), 0 22px 46px rgba(0,0,0,0.55);
     }
+    .pback {
+      width: 390px; height: 844px; margin: -422px 0 0 -195px;
+      transform: rotateY(180deg) translateZ(17px);
+      transform-style: flat;
+      backface-visibility: hidden;
+      border-radius: 58px; overflow: hidden;
+      background: linear-gradient(150deg, #303a48 0%, #161d28 42%, #0b1017 70%, #252d3a 100%);
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.16), inset 0 0 0 2px rgba(255,255,255,0.12), inset 0 0 90px rgba(120,180,255,0.1);
+    }
+    .cam-island {
+      position: absolute; left: 26px; top: 26px; width: 126px; height: 126px;
+      border-radius: 32px; padding: 12px;
+      background: linear-gradient(145deg, #43506180, #1a222e);
+      box-shadow: inset 0 0 0 1.5px rgba(255,255,255,0.24), 0 10px 22px rgba(0,0,0,0.5);
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; place-items: center;
+      backdrop-filter: blur(4px);
+    }
+    .lens {
+      width: 44px; height: 44px; border-radius: 50%; position: relative;
+      background: radial-gradient(circle at 34% 28%, #7293bf 0%, #1b2c42 26%, #05080d 60%, #26374b 100%);
+      box-shadow: inset 0 0 0 3px #090d13, inset 0 0 0 5px rgba(170,200,235,0.38), 0 3px 7px rgba(0,0,0,0.6);
+    }
+    .lens::after {
+      content: ""; position: absolute; left: 20%; top: 15%; width: 38%; height: 26%; border-radius: 50%;
+      background: linear-gradient(140deg, rgba(200,230,255,0.9), transparent 72%); filter: blur(1px);
+    }
+    .flash {
+      width: 20px; height: 20px; border-radius: 50%;
+      background: radial-gradient(circle, #fff8d8 0%, #d8b86a 45%, #6b5a2e 100%);
+      box-shadow: 0 0 9px rgba(255,230,160,0.5);
+    }
+    .back-mark {
+      position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%);
+      width: 58px; height: 58px; border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.14); display: grid; place-items: center;
+      font-size: 0.72rem; letter-spacing: 0.12em; color: rgba(255,255,255,0.3);
+    }
+    .back-sheen {
+      position: absolute; inset: -25%; pointer-events: none;
+      background: linear-gradient(115deg, transparent 36%, rgba(180,215,255,0.17) 50%, transparent 64%);
+      transform: translateX(var(--sheen-shift, 0%));
+    }
+    .pside {
+      background: linear-gradient(90deg, #20262f, #6d7787 14%, #3a424f 36%, #98a4b5 58%, #333b47 82%, #1c222b);
+      box-shadow: inset 0 0 2px rgba(255,255,255,0.42), inset 0 0 5px rgba(0,0,0,0.35);
+      backface-visibility: hidden; opacity: var(--side-op, 1);
+    }
+    .pleft, .pright {
+      background:
+        linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.9) 3%, rgba(0,0,0,0) 9%, rgba(0,0,0,0) 91%, rgba(0,0,0,0.9) 97%, transparent 100%),
+        linear-gradient(90deg, #20262f, #6d7787 14%, #3a424f 36%, #98a4b5 58%, #333b47 82%, #1c222b);
+    }
+    .pleft, .pright {
+      background:
+        linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.9) 3%, rgba(0,0,0,0) 9%, rgba(0,0,0,0) 91%, rgba(0,0,0,0.9) 97%, transparent 100%),
+        linear-gradient(90deg, #20262f, #6d7787 14%, #3a424f 36%, #98a4b5 58%, #333b47 82%, #1c222b);
+    }
+    .pleft   { width: 34px; height: 820px; margin: -410px 0 0 -17px; transform: rotateY(-90deg) translateZ(195px); border-radius: 54px 0 0 54px; }
+    .pright  { width: 34px; height: 820px; margin: -410px 0 0 -17px; transform: rotateY(90deg)  translateZ(195px); border-radius: 0 54px 54px 0; }
+    .ptop    { width: 390px; height: 34px; margin: -17px 0 0 -195px; transform: rotateX(90deg)  translateZ(422px); border-radius: 14px 14px 0 0; }
+    .pbottom { width: 390px; height: 34px; margin: -17px 0 0 -195px; transform: rotateX(-90deg) translateZ(422px); border-radius: 0 0 14px 14px; }
+    .side-key {
+      position: absolute; left: 2px; width: 14px; border-radius: 3px;
+      background: linear-gradient(90deg, #222831, #99a3b1, #313843);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+    }
+
     .phone-frame {
       position: absolute; inset: 0; border-radius: 58px; padding: 11px;
-      background: linear-gradient(140deg, #666d7a 0%, #292e38 16%, #0d0f15 52%, #363c48 84%, #727987 100%);
-      box-shadow: 0 0 0 1px rgba(255,255,255,0.18), inset 0 0 2px rgba(255,255,255,0.45);
-      transform: translateZ(0);
+      background: linear-gradient(140deg, #6e7684 0%, #2b313c 16%, #0d0f15 52%, #39404d 84%, #7b8492 100%);
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.2), inset 0 0 2px rgba(255,255,255,0.5);
     }
     .phone-frame::after {
       content: ""; position: absolute; inset: 0; border-radius: 58px; pointer-events: none;
-      background: linear-gradient(115deg, rgba(255,255,255,0.3), transparent 26%, transparent 74%, rgba(255,255,255,0.1));
+      background: linear-gradient(115deg, rgba(255,255,255,0.32), transparent 26%, transparent 74%, rgba(255,255,255,0.12));
+      opacity: var(--frame-glow, 0.6);
       z-index: 3;
     }
-    .side-btn {
-      position: absolute; width: 3px; border-radius: 3px;
-      background: linear-gradient(90deg, #22262e, #5a616d);
+    .glass-sheen {
+      position: absolute; inset: 0; border-radius: 47px; pointer-events: none; z-index: 70;
+      background: linear-gradient(115deg, transparent 34%, rgba(255,255,255,0.14) 47%, rgba(255,255,255,0.02) 55%, transparent 68%);
+      background-size: 260% 100%;
+      background-position: var(--sheen-pos, 50%) 0;
+      mix-blend-mode: screen;
     }
-    .side-btn.s1 { left: -2px; top: 150px; height: 34px; border-radius: 3px 0 0 3px; }
-    .side-btn.s2 { left: -2px; top: 210px; height: 62px; border-radius: 3px 0 0 3px; }
-    .side-btn.s3 { right: -2px; top: 196px; height: 92px; border-radius: 0 3px 3px 0; }
 
     .phone-screen {
       position: relative; width: 100%; height: 100%;
@@ -233,7 +304,8 @@
       pointer-events: none;
     }
     .phone-shadow {
-      position: absolute; bottom: -18px; left: 50%; transform: translateX(-50%);
+      position: absolute; bottom: -18px; left: 50%;
+      transform: translateX(calc(-50% + var(--shadow-x, 0px))) scale(var(--shadow-s, 1));
       width: 62%; height: 46px; border-radius: 50%;
       background: rgba(0,0,0,0.75); filter: blur(26px); pointer-events: none;
     }
@@ -353,10 +425,6 @@
         <div class="phone-rot" id="phoneRot">
           <div class="phone-tilt" id="phoneTilt">
             <div class="phone-body" id="phoneBody">
-              <div class="phone-back" aria-hidden="true"></div>
-              <span class="side-btn s1" aria-hidden="true"></span>
-              <span class="side-btn s2" aria-hidden="true"></span>
-              <span class="side-btn s3" aria-hidden="true"></span>
               <div class="phone-frame">
                 <div class="phone-screen" id="screen">
                   <div class="wallpaper" aria-hidden="true"></div>
@@ -468,7 +536,38 @@
 
     const phoneRot = $("#phoneRot");
     const phoneTilt = $("#phoneTilt");
+
+    /* 把平面屏幕包成真正的六面机身（正面玻璃 / 背面镜头 / 四条金属侧边） */
+    (function buildChassis() {
+      const tilt = phoneTilt;
+      const floatLayer = document.createElement("div");
+      floatLayer.className = "phone-float";
+      while (tilt.firstChild) floatLayer.appendChild(tilt.firstChild);
+      tilt.appendChild(floatLayer);
+
+      const body = $("#phoneBody");
+      body.querySelectorAll(".phone-back, .side-btn").forEach((el) => el.remove());
+      body.insertAdjacentHTML("afterbegin", `
+        <div class="pface pback" aria-hidden="true">
+          <div class="cam-island"><span class="lens"></span><span class="lens"></span><span class="lens"></span><span class="flash"></span></div>
+          <div class="back-mark">XG</div>
+          <div class="back-sheen"></div>
+        </div>
+        <div class="pface pside pleft" aria-hidden="true"><span class="side-key" style="top:150px;height:34px"></span><span class="side-key" style="top:210px;height:62px"></span></div>
+        <div class="pface pside pright" aria-hidden="true"><span class="side-key" style="top:196px;height:92px"></span></div>
+        <div class="pface pside ptop" aria-hidden="true"></div>
+        <div class="pface pside pbottom" aria-hidden="true"></div>
+      `);
+      const frame = body.querySelector(".phone-frame");
+      const front = document.createElement("div");
+      front.className = "pface pfront";
+      body.insertBefore(front, frame);
+      front.appendChild(frame);
+      front.insertAdjacentHTML("beforeend", `<div class="glass-sheen" aria-hidden="true"></div>`);
+    })();
     const detailPane = $("#detail-pane");
+    const frontFace = document.querySelector("#phoneBody .pfront");
+    const backFace  = document.querySelector("#phoneBody .pback");
     const island = $("#island");
     let current = null;
     let clickSeq = 0;
@@ -496,8 +595,8 @@
     });
 
     /* ---------- 丝滑 3D 视角：弹簧阻尼 + rAF 连续插值 ---------- */
-    const view   = { ry: -17, rx: 7,  tx: 0, ty: 0 };
-    const target = { ry: -17, rx: 7,  tx: 0, ty: 0 };
+    const view   = { ry: -24, rx: 6,  tx: 0, ty: 0 };
+    const target = { ry: -24, rx: 6,  tx: 0, ty: 0 };
     const vel    = { ry: 0, rx: 0, tx: 0, ty: 0 };
     const KEYS = ["ry", "rx", "tx", "ty"];
     let frameNo = 0;
@@ -513,6 +612,23 @@
         `rotateX(${view.rx.toFixed(3)}deg) rotateY(${view.ry.toFixed(3)}deg) rotateZ(-2deg) scale(var(--sc))`;
       phoneTilt.style.transform =
         `rotateX(${view.tx.toFixed(3)}deg) rotateY(${view.ty.toFixed(3)}deg)`;
+      const body = $("#phoneBody");
+      const ry = view.ry, rx = view.rx;
+      // 正面法线 Z 分量 = cos(ry)；转过 90° 后改用背面（含镜头模组）
+      const isBack = Math.cos(ry * Math.PI / 180) < 0;
+      frontFace.style.visibility = isBack ? "hidden" : "visible";
+      backFace.style.visibility  = isBack ? "visible" : "hidden";
+      body.style.setProperty("--sheen-pos", (50 + Math.sin((ry + 24) * Math.PI / 90) * 34).toFixed(1) + "%");
+      body.style.setProperty("--sheen-shift", ((ry + 24) * 0.9).toFixed(1) + "%");
+      body.style.setProperty("--frame-glow", (0.45 + Math.abs(Math.sin(ry * Math.PI / 90)) * 0.4).toFixed(2));
+      // 接近正背面时侧边几乎侧对镜头，压暗避免变成一条脱离机身的亮线
+      const backness = Math.max(0, Math.min(1, (Math.abs(ry) - 110) / 60));
+      body.style.setProperty("--side-op", (1 - backness * 0.62).toFixed(2));
+      const shadow = $(".phone-shadow");
+      if (shadow) {
+        shadow.style.setProperty("--shadow-x", (-ry * 0.7).toFixed(1) + "px");
+        shadow.style.setProperty("--shadow-s", (1 - Math.abs(rx) * 0.006).toFixed(3));
+      }
     }
     function settle() {
       KEYS.forEach((k) => { view[k] = target[k]; vel[k] = 0; });
@@ -548,10 +664,11 @@
       islandTimer = setTimeout(() => island.classList.remove("expanded"), 1400);
     }
     function spinPhone(dir) {
+      if (target.ry > 4 || target.ry < -40) target.ry = -24;   // 拖到侧面/背面后，点一下先回到正面
       let d = dir || (clickSeq++ % 2 === 0 ? 1 : -1);
-      if (target.ry + d * 9 > 8 || target.ry + d * 9 < -32) d = -d;
-      target.ry = Math.max(-32, Math.min(8, target.ry + d * 9));
-      target.rx = 4 + (Math.abs(target.ry) % 6);
+      if (target.ry + d * 9 > 4 || target.ry + d * 9 < -40) d = -d;
+      target.ry = Math.max(-40, Math.min(4, target.ry + d * 9));
+      target.rx = 4 + (Math.abs(target.ry + 24) % 6);
       vel.ry += d * 2.4;   // 给一点初速度，转动带惯性而非瞬移
       vel.rx += 0.6;
       bumpIsland();
@@ -559,23 +676,47 @@
       kick();
     }
     function resetView() {
-      target.ry = -17; target.rx = 7; target.tx = 0; target.ty = 0;
+      target.ry = -24; target.rx = 6; target.tx = 0; target.ty = 0;
       vel.ry = 0; vel.rx = 0;
       bumpIsland();
       kick();
     }
 
-    $("#perspective").addEventListener("pointermove", (e) => {
+    let dragging = false, dragStart = null, didDrag = false;
+    const persp = $("#perspective");
+    persp.addEventListener("pointerdown", (e) => {
+      if (e.target.closest(".app-icon") || e.target.closest(".widget")) return;
+      dragging = true; didDrag = false;
+      dragStart = { x: e.clientX, y: e.clientY, ry: target.ry, rx: target.rx };
+      try { persp.setPointerCapture(e.pointerId); } catch (err) {}
+    });
+    persp.addEventListener("pointermove", (e) => {
+      if (dragging) {
+        const dx = e.clientX - dragStart.x, dy = e.clientY - dragStart.y;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
+        target.ry = Math.max(-170, Math.min(170, dragStart.ry + dx * 0.35));
+        target.rx = Math.max(-22, Math.min(24, dragStart.rx - dy * 0.22));
+        target.tx = 0; target.ty = 0;
+        kick();
+        return;
+      }
       if (!motionOn) return;
-      const r = $("#perspective").getBoundingClientRect();
-      target.ty = ((e.clientX - r.left) / r.width - 0.5) * 11;
-      target.tx = -((e.clientY - r.top) / r.height - 0.5) * 8;
+      const r = persp.getBoundingClientRect();
+      target.ty = ((e.clientX - r.left) / r.width - 0.5) * 9;
+      target.tx = -((e.clientY - r.top) / r.height - 0.5) * 7;
       kick();
     });
-    $("#perspective").addEventListener("pointerleave", () => { target.ty = 0; target.tx = 0; kick(); });
+    function endDrag() { dragging = false; dragStart = null; }
+    persp.addEventListener("pointerup", endDrag);
+    persp.addEventListener("pointercancel", endDrag);
+    persp.addEventListener("pointerleave", () => {
+      if (dragging) return;
+      target.ty = 0; target.tx = 0; kick();
+    });
     $("#reset-view").addEventListener("click", resetView);
     $("#motion-toggle").addEventListener("click", () => setMotion(!motionOn));
     $("#phoneBody").addEventListener("click", (e) => {
+      if (didDrag) { didDrag = false; return; }
       if (e.target.closest(".app-icon") || e.target.closest(".widget")) return;
       spinPhone();
     });
@@ -738,14 +879,14 @@
           p.x += dx / Math.sqrt(d2) * f; p.y += dy / Math.sqrt(d2) * f;
         }
         ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-        ctx.fillStyle = "rgba(180,220,255,0.5)"; ctx.fill();
+        ctx.fillStyle = "rgba(180,220,255,0.28)"; ctx.fill();
       });
       for (let i = 0; i < particles.length; i++) {
         for (let j = i + 1; j < particles.length; j++) {
           const a = particles[i], b = particles[j], d = Math.hypot(a.x - b.x, a.y - b.y);
           if (d < 105) {
             ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-            ctx.strokeStyle = `rgba(120,190,240,${(1 - d / 105) * 0.12})`;
+            ctx.strokeStyle = `rgba(120,190,240,${(1 - d / 105) * 0.06})`;
             ctx.lineWidth = 0.6; ctx.stroke();
           }
         }
