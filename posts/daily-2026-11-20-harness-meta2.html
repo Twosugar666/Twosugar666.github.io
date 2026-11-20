@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Meta²：不优化共享 harness，而是离线预计算「可复用的演化知识」——线上按需 KEEP / EVOLVE 做任务局部编辑；GPT-5.6-Terra 在 Terminal-Bench 2.1 拿 81.00%、DeepSWE 1.1 拿 44.44% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Meta²：不优化共享 harness，而是离线预计算「可复用的演化知识」——线上按需 KEEP / EVOLVE 做任务局部编辑；GPT-5.6-Terra 在 Terminal-Bench 2.1 拿 81.00%、DeepSWE 1.1 拿 44.44%</h1>
+    <p class="post-meta">2026-11-20 · 收藏夹：Harness / Agent · 学习笔记<br />
+      来源：Lingzhi Yuan、Yiguang Cai、Weize Liu、Siqi Yang、Feijiang Han、Yongkyun Lee、Udari Madhushani Sehwag、Furong Huang（马里兰大学；华盛顿大学；伊利诺伊大学厄巴纳-香槟分校；Scale AI）· <em>Meta²: Precomputing Reusable Knowledge for Online Harness Evolution in Long-Horizon Agents</em>（<a href="https://arxiv.org/abs/2611.05139" target="_blank" rel="noopener">arXiv:2611.05139</a>，cs.AI，v1 2026-11-03）。
+      数字均为论文自报：主表为多 seed 均值（± 标准差见方差表），Terminal-Bench 2.1 用 60 个测试任务 × 5 runs、DeepSWE 1.1 用 75 个 × 3 runs。「box 小验证」一节为本文用纯 Python 写的共享编辑 vs 任务局部编辑玩具对比。
+      交叉：
+      <a href="daily-2026-10-29-harness-coharl.html">CoHARL</a>、
+      <a href="daily-2026-10-28-harness-skill-adaptation.html">Skill Adaptation</a>、
+      <a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a>、
+      <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a>、
+      <a href="daily-2026-10-30-harness-spine.html">Spine</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 Agent 不是"模型单独在干活"，而是"模型 + harness"：提示词、上下文策略、工具、skill、memory、hook 一起框定行为。这些机制往往在执行<strong>前</strong>就定死，但真正需要改的时机却在执行<strong>中</strong>——缺的工具是试着用它时才发现，被忽略的约束是在中间产物里才浮现的，一次性的警告可能需要变成常驻检查。预先设计好的 harness 必须在证据出现前就把它预料到。
+    </p>
+    <p>
+      本站已经看过很多 harness 优化的路子：<a href="daily-2026-10-29-harness-coharl.html">CoHARL</a> 让 policy 和 harness 种群共演化，<a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a> 把收益拆成 harness / 模型 / 交互项，<a href="daily-2026-10-28-harness-skill-adaptation.html">Skill Adaptation</a> 把失败归因写成 meta-skill，<a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a> 用正交表搜组件组合。论文把它们的部署时机归纳成一个分类：
+    </p>
+    <table>
+      <thead><tr><th>范式</th><th>决策时机与可用证据</th><th>影响范围 / 主要限制</th></tr></thead>
+      <tbody>
+        <tr><td>Offline（Meta-Harness、AHE）</td><td>部署前；训练轨迹和结果</td><td>所有目标 task 共享一个 harness，运行开始就冻住，无法对新 run 里冒出来的证据反应，且可能过拟合训练 task</td></tr>
+        <tr><td>Pre-run（JIT-Agent）</td><td>t=0；目标指令和初始环境信息</td><td>当前 run 全程；用不到执行中才出现的信息</td></tr>
+        <tr><td>Within-run（Continual Harness、PILOT、Live-SWE-agent）</td><td>checkpoint t_k；指令、部分轨迹、workspace、上一次编辑状态——但<strong>看不到本 run 的最终结果</strong></td><td>只影响当前 run 的剩余部分；缺少终局反馈，还要付监控和干预开销</td></tr>
+        <tr><td>After-run（ACE、Harness-R1）</td><td>attempt 结束后；完成轨迹和结果（如可得）</td><td>下一次 attempt 或后续 task；救不了当前这次，需要重启</td></tr>
+        <tr><td><strong>Meta²</strong></td><td>离线学可复用 M；在线 within-run 把 M 和当前证据合起来，不用 y</td><td>M 跨 task 复用；每个 δ 在它那个 run 结束时作废</td></tr>
+      </tbody>
+    </table>
+    <p>
+      核心设计问题因此变成：<strong>如何让已完成训练 run 的教训指导新 run 里的选择性编辑，既不看测试期 verifier 反馈，又不让一个 task 的修正持久化到无关 task？</strong>论文的答案很有意思——把离线优化"往上移一层"：不优化 harness 本身，而是优化<strong>关于"何时/如何演化 harness"的可复用知识</strong>。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 形式化：harness 演化是一个 checkpoint 上的序列决策</h3>
+    <p>
+      任务实例 ξ=(x, E_x, V_x)：公开指令 x、交互环境 E_x、verifier V_x（其判据和结果对 agent / evolver 都不可见）。task agent 用冻住的模型 θ 加当前 harness h_t 决策：a_t ~ π_θ(· | x, τ≤t, h_t)。evolver g 在每个决策点提出编辑：
+    </p>
+    <pre><code>δ^(k) ~ g(· | h^(k−1), I^(k)),    h^(k) = Apply(h^(k−1), δ^(k))
+
+u^(k) ∈ { KEEP,  EVOLVE(δ^(k)) }        # 关键：NO-OP 是一个合法动作
+
+I^(k) = { (x, Δτ^(1), ω^(1)),                       k=1
+        { I^(k−1) ⊕ (Δτ^(k), ω^(k), σ^(k−1)),       1 &lt; k ≤ K
+
+Δτ^(k): 本 checkpoint 新增的轨迹片段
+ω^(k):  允许读取的只读 workspace 观察
+σ^(k−1):上一次编辑的状态（loaded / retained / rolled back）</code></pre>
+    <p>
+      注意 <code>KEEP</code> 是一等公民：在哪些情况下<strong>不动</strong> harness 本身就是决策的一半。evaluation 只看 held-out task 上的 V_x(s_T)。
+    </p>
+
+    <h3>② 离线：用 A/B/C 三条件对比学一个 Meta-Skill</h3>
+    <p>
+      对每个训练 task，同一个 task agent 跑三种配置：
+    </p>
+    <table>
+      <thead><tr><th>配置</th><th>evolver</th><th>能观察到什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>A</strong></td><td>无 evolver</td><td>裸 seed harness 的基线行为</td></tr>
+        <tr><td><strong>B</strong></td><td>由当前版本 M 指导</td><td>部署期真实可得的证据（测试时同样的信息集）</td></tr>
+        <tr><td><strong>C</strong></td><td>被给予特权 verifier 信息</td><td>仅训练期可得的"上帝视角"结果</td></tr>
+      </tbody>
+    </table>
+    <p>
+      A–B 对比显示当前 evolver 相对"不演化"何时成功、何时失败；B–C 对比揭示当前 evolver 错过的挽救机会，以及"有 verifier 信息的演化反而更糟"的情况。两类对比给出的是<strong>方向性证据</strong>（该动 / 该避免 / 该保持），不声称任何单次 checkpoint 编辑的因果效应。跨训练 batch 用 REFLECT 抽取教训、AGGREGATE 合并跨 task 的重复模式并抹掉实例细节、UPDATE 改写 M：
+    </p>
+    <pre><code>M^(r) = f_upd( M^(r−1),  f_agg( f_ref(G^(r), V^(r)) ) )
+
+M 的一条记录包含：ID / title、type(act|hold|avoid)、time point(start|during|end)、
+                 when to refer（可从指令/轨迹/workspace 观察到的条件）、
+                 guidance（采取或避免哪种 harness 动作、走哪个通道）、
+                 why、最多 3 个来自不同训练 task 的参考例子。</code></pre>
+    <p>
+      在线阶段 M <strong>冻结</strong>，既不用 held-out verifier 结果更新，也不把 task 特化的编辑写回 M。
+    </p>
+
+    <h3>③ 在线：frozen M + 当前证据 → KEEP / EVOLVE，编辑只作用于本 run</h3>
+    <p>
+      每个 run 从同一个 seed harness h^(0) 开始。task agent 正常执行；到 checkpoint 时，独立 evolver 拿 M 和当前证据 I^(k) 决定 KEEP 还是 EVOLVE(δ^(k))。编辑通过 notice / instruction update / hook / tool 四种通道施加，<strong>只影响当前 run 的剩余部分，不重启环境、不清空进度</strong>；run 一结束，这些 δ 就丢弃。于是"演化指导"跨 task 复用，"实际编辑"保持 task-local。它和 <a href="daily-2026-10-30-harness-spine.html">Spine</a> 的"边界与执行者解耦"、<a href="daily-2026-10-28-harness-skill-adaptation.html">Skill Adaptation</a> 的"meta-skill 跨 task 迁移"是同一条思路的不同切面：把"可迁移的通用知识"和"任务局部的具体动作"分开。
+    </p>
+
+    <h3>④ 实验设置</h3>
+    <table>
+      <thead><tr><th>Benchmark</th><th>训练 task</th><th>测试 task</th><th>每 task runs</th><th>指标</th></tr></thead>
+      <tbody>
+        <tr><td>Terminal-Bench 2.1</td><td>29</td><td>60</td><td>5</td><td>pass rate (%) + $ 成本</td></tr>
+        <tr><td>DeepSWE 1.1</td><td>38</td><td>75</td><td>3</td><td>pass rate (%) + $ 成本</td></tr>
+      </tbody>
+    </table>
+    <p>
+      主模型 GPT-5.6-Terra；额外在 Terminal-Bench 上用 DeepSeek-V4-Flash-0731 做 backbone 检验。对照组分三类：人工 harness（NexAU Seed / Codex CLI / mini-swe-agent / Pi agent / DeepSeek Harness）、自演化方法（ReasoningBank / ACE / TF-GRPO）、harness 演化方法（AHE / Meta-Harness / Continual Harness）。
+    </p>
+
+    <h3>⑤ 主结果：两个 benchmark 都第一，且成本低于同类 harness 演化</h3>
+    <p><strong>GPT-5.6-Terra</strong>（括号内为相对 NexAU Seed 的 Δpp；成本拆成离线 / 在线 / 合计）：</p>
+    <table>
+      <thead><tr><th>方法</th><th>TB 2.1 (%)</th><th>TB 成本 ($)</th><th>DeepSWE 1.1 (%)</th><th>DeepSWE 成本 ($)</th></tr></thead>
+      <tbody>
+        <tr><td>NexAU Seed</td><td>66.33</td><td>34.09</td><td>34.67</td><td>62.67</td></tr>
+        <tr><td>Codex CLI / mini-swe-agent / Pi / DeepSeek Harness</td><td>68.33 / 67.33 / 69.00 / 68.00</td><td>56.59 / 41.08 / 37.98 / 31.90</td><td>31.11 / 29.33 / 39.11 / 34.22</td><td>136.53 / 68.87 / 82.50 / 41.37</td></tr>
+        <tr><td>ReasoningBank</td><td>68.00 (+1.67)</td><td>71.64</td><td>33.33 (−1.34)</td><td>141.51</td></tr>
+        <tr><td>ACE</td><td>71.33 (+5.00)</td><td>145.64</td><td>32.00 (−2.67)</td><td>320.39</td></tr>
+        <tr><td>TF-GRPO</td><td>74.67 (+8.34)</td><td>135.17</td><td>36.44 (+1.77)</td><td>408.66</td></tr>
+        <tr><td>AHE</td><td>70.67 (+4.34)</td><td>248.35</td><td>34.67 (0.00)</td><td>862.89</td></tr>
+        <tr><td>Meta-Harness</td><td>73.33 (+7.00)</td><td>198.85</td><td>37.33 (+2.66)</td><td>870.75</td></tr>
+        <tr><td>Continual Harness</td><td>72.67 (+6.34)</td><td>112.23</td><td>33.78 (−0.89)</td><td>201.72</td></tr>
+        <tr><td><strong>Meta²</strong></td><td><strong>81.00 (+14.67)</strong></td><td>174.91</td><td><strong>44.44 (+9.77)</strong></td><td>367.86</td></tr>
+      </tbody>
+    </table>
+    <p>
+      方差表（多 seed）：Meta² 的 81.00±0.91（TB）、44.44±0.77（DeepSWE），明显高于次优的 TF-GRPO 74.67±4.62、Meta-Harness 37.33±2.67。Meta² 的离线 / 在线成本拆分是 TB 110.19 / 64.72、DeepSWE 238.52 / 129.34。相对 Meta-Harness：TB 分数 +7.67pp 而总成本 $198.85→$174.91；DeepSWE +7.11pp 而成本 $870.75→$367.86（约 2.4× 便宜）。相对 TF-GRPO 的 DeepSWE 成本更是 $408.66→$367.86 且分数 +8.00pp。
+    </p>
+    <p><strong>换 backbone（DeepSeek-V4-Flash-0731，Terminal-Bench 2.1）</strong>：Meta² 77.67±3.84，次优 Continual Harness 74.67±4.62，Meta-Harness 71.00±2.53，ACE 65.00±2.64——换模型仍排第一，说明收益不是 GPT-5.6-Terra 的专属现象。论文成本表也给出 DeepSeek 版本：Meta² 78% 左右分数对应 offline $81.90 / online $33.51 / full $115.41，低于 Meta-Harness 的 $119.04 full。
+    </p>
+
+    <h3>⑥ 消融与敏感度</h3>
+    <ul>
+      <li><strong>加在线 evolver 有收益，再加对比式 Meta-Skill 还有进一步收益</strong>：论文明确报告这两个组件的递进贡献；去掉 task-local 限制（让编辑持久化）会掉分——这是"演化指导可迁移、编辑必须局部"的直接证据。</li>
+      <li><strong>checkpoint 频率是响应性 vs 成本的权衡</strong>：更密的检查点能更早发现问题，但 evolver 调用更贵；论文单独报告了这个敏感度曲线。</li>
+      <li><strong>verifier 只在离线可见</strong>：配置 C 是训练期的特权信息，线上 evolver 从不接触 held-out verifier——这是它能和 PILOT / Harness-R1（要求 test-time verifier）区分开的关键。</li>
+    </ul>
+
+    <h3>⑦ box 小验证（纯 Python：共享编辑 vs 任务局部编辑）</h3>
+    <p>
+      为什么"离线学一个共享 harness"会过拟合，而"复用指导 + 任务局部编辑"更稳？用一个最小玩具：某个编辑（比如"每步都强制重启 shell"）在 3 个训练 task 上有正收益，在 held-out 上是负收益。离线方法看训练均值就会全局部署；Meta² 的思路是用可复用指导判断当前证据是否值得动，且即便动了也只作用在本 run：
+    </p>
+    <pre><code>共享编辑在训练 task 上的 pass-rate 增益 = [0.10, 0.08, 0.12]
+训练均值 = 0.1000  -> 离线优化决定全局部署
+同一编辑在 held-out 上的增益 = -0.0900  -> 回退
+
+Meta-Skill 复用指导：证据强度 s=[0.2, 0.7, 0.9], 阈值 tau=0.5
+决策 = ['KEEP', 'EVOLVE', 'EVOLVE']   # 证据弱时不动
+
+结论：共享编辑被训练均值"骗"到全局部署，held-out 受损；
+      reusable guidance 解决"何时动"，task-local 解决"动了别污染别人"。
+（这是说明机制状态的玩具，数字为本文构造，不是论文数据。）</code></pre>
+    <p>
+      复现脚本：<code>box_experiments.py</code> 的 BOX B；固定随机种子 20261120，纯 Python 无第三方依赖。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先问"这个编辑该不该跨 task 持久化"</strong>：大多数 harness 补丁只对暴露出问题的那类任务有效。默认任务局部、只在离线验证到跨 task 稳健增益时才提升为共享，是比"一次性搜出全局最优 harness"更安全的默认值。</li>
+      <li><strong>KEEP 必须是一等公民</strong>：在线 evolver 最容易犯的错是"每次 checkpoint 都动一下"。在决策空间里显式加入 NO-OP，并用对比轨迹学"什么时候该保持"，比只学"怎么改"更关键。</li>
+      <li><strong>离线监督用三条件对比，而不是只学成功轨迹</strong>：A（无 evolver）/ B（当前指导）/ C（特权 verifier）三种 rollout 的差，才能同时告诉你"该动、该避、该等"。只看成功轨迹会把偶然的运气当成可复用规律。</li>
+      <li><strong>编辑要能在 run 中途热生效、不重置进度</strong>：notice / instruction / hook / tool 四类通道对应不同的侵入程度，优先选不打断环境状态和已积累轨迹的通道；编辑状态（loaded / retained / rolled back）要回传给后续 checkpoint 作证据。</li>
+      <li><strong>把成本拆成离线 / 在线两本账</strong>：Meta² 的 TB 成本 110.19+64.72、DeepSWE 238.52+129.34；对比方法有的离线贵（AHE $209.44）、有的在线贵（TF-GRPO DeepSWE $322.50）。只看总成本会误判可部署性——在线成本才决定每次请求要不要多花这份钱。</li>
+      <li><strong>读数注意</strong>：Meta² 的 TB +14.67pp 是相对最弱的 NexAU Seed（66.33），相对最强基线 TF-GRPO（74.67）是 +6.33pp；DeepSWE +9.77pp 相对 Seed，相对 Meta-Harness（37.33）是 +7.11pp。写成果时说清基线。主表数为均值，方差表才给 ±。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说 Meta² 是"把离线优化往上移一层"？它和 Meta-Harness / AHE 这类离线 harness 优化的本质差别是什么？</summary>
+      <p>Meta-Harness / AHE 的优化变量是一个具体的 harness h（prompt、工具、memory、workflow 或可执行程序），产出的是一个在所有目标 task 上共享的 h*，部署后就冻住。Meta² 的优化变量是关于"何时以及如何演化 harness"的知识 M——一个跨 task 复用的文本技能，它本身不是一个能直接跑的 harness。在线时每个 run 还从同一个 seed h^(0) 开始，由 evolver 用 M 和当前证据现做出 task-local 的编辑。所以 Meta-Harness 学的是"答案"，Meta² 学的是"解题的元规则"；前者部署的是工件，后者部署的是指导，具体动作仍按 run 生成。</p>
+    </details>
+    <details>
+      <summary>2. 为什么测试期不能给 evolver verifier 反馈？如果给了，方法和结论会怎么变？</summary>
+      <p>因为很多真实任务是开放式的，没有可用的 verifier；即便有，within-run 的 verifier 结果要到 run 结束才知道，checkpoint 上拿不到。配置 C（特权 verifier 信息）只在训练期存在，专门用来制造"如果当时知道结果会怎么改"的对照信号。如果测试期也提供 verifier，方法就退化成带 oracle 的在线搜索（更接近 PILOT / Harness-R1 的设定），对比 A/B/C 里 C 的地位不再特殊，也就不必费劲学一个可迁移的 M——但代价是适用范围大幅缩小。Meta² 的价值恰恰在于"没有 verifier 也能选对编辑时机"。</p>
+    </details>
+    <details>
+      <summary>3. 编辑必须"task-local"的必要性是什么？如果让一个 run 的有效编辑持久到后续 task，最可能出什么问题？</summary>
+      <p>因为编辑是为了修复当前轨迹暴露出的具体问题，而那个问题可能是 task 特化的（某个仓库缺一个工具、某类约束被违反）。持久化会把这个局部修正泛化到不相关 task：可能引入无关的前置检查、占用 token 预算、甚至改变行为分布造成回归。论文消融显示去掉 task-local 限制会掉分。本文 box 玩具更直白：一个编辑在 3 个训练 task 上平均 +0.10，却在 held-out 上是 −0.09——把它全局部署就是拿训练均值骗自己。-task-local 相当于给每次编辑加了一个"作用域"，把风险限制在它被验证的那个 run 里。</p>
+    </details>
+    <details>
+      <summary>4. Meta² 在 TB 上 81.00±0.91，次优 TF-GRPO 74.67±4.62。为什么说"低方差"本身也是一个值得报告的结果，而不只是均值高？</summary>
+      <p>81%±0.91 意味着跨 5 runs × 60 tasks 的表现很稳定，74.67±4.62 则有明显波动。harness 演化方法依赖 LLM 生成的编辑，随机性大；方差低说明"何时 KEEP / EVOLVE"的指导把干预时机稳住了，而不是靠某几次幸运的编辑拉高均值。对部署而言，方差低意味着可预测的成本和成功率——尤其在线成本 $64.72 是会实实在在付出去的。只报均值会掩盖"某次跑特别好、多数跑一般"的情况。这也是为什么论文单列方差表、并把成本拆成离线和在线两本账。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果把 Meta² 的 M 从"文本技能"换成"可执行的 Python 压缩/引导程序"（像 ModHarness-RL 那样），会有哪些收益和风险？</summary>
+      <p>收益：可执行程序比自然语言更精确、可验证、可沙箱回放，能表达"检测到连续 3 次相同 tool call 就截断输出并注入提示"这类确定性规则，执行成本也可能低于每次让 LLM 重新推理。风险：一是可迁移性——程序比文本更贴合原 task 的接口细节，AGGREGATE 抹掉实例细节这一步更难做；二是验证成本——每个候选程序要经过执行验证、历史回放和 held-out gate，离线构建成本会上升；三是过拟合——程序一旦持久化，比文本指导更容易把局部 shortcut 固化。一个折中是：M 保持文本（负责"何时动"的判断，可迁移），而具体编辑来源允许从程序库里检索（负责"怎么动"，task-local 验证后使用）。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.05139" target="_blank" rel="noopener">arXiv:2611.05139 · Meta²: Precomputing Reusable Knowledge for Online Harness Evolution in Long-Horizon Agents（Yuan, Cai, Liu, Yang, Han, Lee, Sehwag, Huang；UMD / UW / UIUC / Scale AI）</a> · 项目页：<a href="https://meta-square.github.io/" target="_blank" rel="noopener">meta-square.github.io</a></li>
+      <li>对照方法：Meta-Harness · AHE · Continual Harness · ReasoningBank · ACE · TF-GRPO · JIT-Agent · PILOT · Harness-R1 · Live-SWE-agent · ModHarness-RL（arXiv:2611.18533）</li>
+      <li>站内：
+        <a href="daily-2026-10-29-harness-coharl.html">CoHARL：harness 种群共演化</a> ·
+        <a href="daily-2026-10-28-harness-skill-adaptation.html">Skill Adaptation：meta-skill 迁移</a> ·
+        <a href="daily-2026-10-20-harness-hda.html">Harness-Delta Attribution</a> ·
+        <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling：正交表搜组件</a> ·
+        <a href="daily-2026-10-30-harness-spine.html">Spine：子任务树编译上下文</a> ·
+        <a href="daily-2026-11-20-frontline-reverse-curriculum.html">今日一线：Depth Before Breadth</a> ·
+        <a href="daily-2026-11-20-algo-gated-deltanet.html">今日算法：Gated DeltaNet</a>。</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

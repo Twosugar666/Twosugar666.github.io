@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Gated DeltaNet：把 Mamba2 的衰减门与 DeltaNet 的精确覆写合成一个 gated delta rule，用 WY 表示做分块并行——1.3B/100B token 下 WikiText-103 PPL 16.42 vs Mamba2 16.56，S-NIAH-2 4K 检索 92.2 vs Mamba2 56.2 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Gated DeltaNet：把 Mamba2 的衰减门与 DeltaNet 的精确覆写合成一个 gated delta rule，用 WY 表示做分块并行——1.3B/100B token 下 WikiText-103 PPL 16.42 vs Mamba2 16.56，S-NIAH-2 4K 检索 92.2 vs Mamba2 56.2</h1>
+    <p class="post-meta">2026-11-20 · 收藏夹：算法 / Infra · 学习笔记<br />
+      来源：Songlin Yang（MIT CSAIL，工作完成于 NVIDIA 实习）、Jan Kautz（NVIDIA）、Ali Hatamizadeh（NVIDIA）· <em>Gated Delta Networks: Improving Mamba2 with Delta Rule</em>（<a href="https://arxiv.org/abs/2412.06464" target="_blank" rel="noopener">arXiv:2412.06464</a>，cs.CL / cs.LG，ICLR 2025 camera ready，v1 2024-12-09 / v3 2025-03-06）。
+      数字均为论文自报：主实验为 1.3B 参数、100B FineWeb-Edu token、4K 训练长度（混合模型 SWA 窗口 2K），同条件对比；S-NIAH 为 1.3B 模型零样本。「box 小验证」一节为本文用纯 Python 实现 gated delta 更新式与记忆碰撞玩具的实算。
+      交叉：
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-09-09-algo-attention.html">Attention 基础</a>、
+      <a href="daily-2026-10-29-algo-sequence-parallel.html">序列并行</a>、
+      <a href="daily-2026-10-13-algo-rope.html">RoPE</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      <a href="daily-2026-09-09-algo-attention.html">Self-attention</a> 的代价随序列长度平方增长。线性 Transformer 把 softmax 注意力换成核化的点积线性注意力，等价于一个<strong>矩阵值状态的线性 RNN</strong>，推理时每步 O(d²) 而不是 O(L·d)，显存也不随序列长度堆 KV cache。本文之前在 <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a> 里讲过另一条"压 KV"的路；线性注意力走的是"干脆不做全对比"的另一极。
+    </p>
+    <p>
+      但线性 Transformer 有个根本短板：它实现的是一种<strong>外积形式的 key-value 联想记忆</strong>，能存的近似正交 key-value 对数被模型维度 d 限住；序列一长，"记忆碰撞"不可避免，精确检索掉队。近两年的两条改进路线各自补了一块：
+    </p>
+    <ul>
+      <li><strong>门控（gating）</strong>，代表 Mamba2 / GLA / RetNet：每步用数据相关的标量衰减 α_t ∈ (0,1) 把整个状态乘小一点，<code>S_t = α_t S_{t−1} + v_t k_tᵀ</code>。好处是能"整体遗忘"，坏处是<strong>要忘一个就全部一起忘</strong>——不区分哪些联想重要。</li>
+      <li><strong>delta 更新规则</strong>，代表 DeltaNet：不是累加，而是"软替换"旧的 key-value 对——<code>S_t = S_{t−1}(I − β_t k_t k_tᵀ) + β_t v_t k_tᵀ</code>。好处是精准写入、检索强；坏处是<strong>一次只改一个 pair，没法快速清空</strong>，遇到上下文切换（旧信息要整体作废）就吃亏，真实任务上表现中等。</li>
+    </ul>
+    <p>
+      Gated DeltaNet 的洞见很干净：这两者是<strong>互补</strong>的。门控 = 快速擦除（α_t→0 清空记忆），delta = 精准更新（α_t→1 退回纯 delta rule）。把它们合进同一个更新式，就同时拿到"该清就清、该改就改"的能力，且不牺牲硬件效率——这是它能进 ICLR 2025 的核心。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 三种记忆更新：线性注意力 → Mamba2 → DeltaNet → Gated DeltaNet</h3>
+    <table>
+      <thead><tr><th>模型</th><th>状态更新</th><th>记忆语义</th><th>短板</th></tr></thead>
+      <tbody>
+        <tr><td>线性 Transformer</td><td><code>S_t = S_{t−1} + v_t k_tᵀ</code></td><td>纯累加，无遗忘</td><td>语言建模远差于 Transformer</td></tr>
+        <tr><td>Mamba2 / RetNet</td><td><code>S_t = α_t S_{t−1} + v_t k_tᵀ</code></td><td>标量衰减，整体淡出</td><td>无法定点遗忘；忘记一个就全忘</td></tr>
+        <tr><td>DeltaNet</td><td><code>S_t = S_{t−1}(I − β_t k_t k_tᵀ) + β_t v_t k_tᵀ</code></td><td>精准覆写匹配 key 的槽</td><td>无法快速清空；上下文切换吃亏</td></tr>
+        <tr><td><strong>Gated DeltaNet</strong></td><td><code>S_t = S_{t−1}(α_t(I − β_t k_t k_tᵀ)) + β_t v_t k_tᵀ</code></td><td>α 控制擦除、β 控制覆写</td><td>门控是标量（比矩阵值衰减表达力弱）</td></tr>
+      </tbody>
+    </table>
+    <pre><code>gated delta rule (Eq. 10):
+  S_t = S_{t−1} · ( α_t (I − β_t k_t k_tᵀ) ) + β_t v_t k_tᵀ
+        └ 旧状态 ┘   └─ 衰减 + 沿 k 方向擦除 ─┘   └ 新写入 ┘
+
+  α_t ∈ (0,1) 数据相关的衰减门；β_t ∈ (0,1) 写入强度
+  α_t → 0 : 整块记忆快速清空（context switch）
+  α_t → 1 : 退化为纯 delta rule，只改匹配 k_t 的那一路
+  β_t → 1 : 完全覆写；β_t 小则部分混合</code></pre>
+    <p>
+      从 SSD（state space duality）的视角，Mamba2 的衰减可以写成并行形式 <code>O = ((QKᵀ) ⊙ Γ) V</code>，其中 <code>Γ_{ij} = γ_i / γ_j</code>（i≥j）、<code>γ_j = ∏_{i≤j} α_i</code> 是累积衰减积。gated delta rule 在这一层加了"沿 k 方向的低秩擦除"，这正是它比纯衰减表达力强的来源。
+    </p>
+
+    <h3>② 硬件效率：为什么不能逐时间步串行更新</h3>
+    <p>
+      上面的递推式是 O(L) 串行的，在现代 GPU 上慢得不能用。论文沿用 DeltaNet 用 <strong>WY 表示</strong>（Bischof &amp; Loan 1985）并行化 delta rule 的思路，并把它扩展到带门控的情形：把一段内的多个秩-1 擦除 <code>(I − β_i k_i k_iᵀ)</code> 合并成一个可并行计算的矩阵求逆类结构，从而保留<strong>分块并行（chunkwise parallel）</strong>训练。三种形态各有用处：
+    </p>
+    <table>
+      <thead><tr><th>形态</th><th>计算</th><th>适用</th></tr></thead>
+      <tbody>
+        <tr><td>递推（recurrent）</td><td>逐步 S_t，O(L) 串行</td><td>推理（每步 O(d²)，不堆 KV）</td></tr>
+        <tr><td>并行（parallel）</td><td>矩阵形式一次算 L×L 掩码，O(L²)</td><td>短序列训练、理论统一（SSD）</td></tr>
+        <tr><td>分块并行（chunkwise）</td><td>切块大小 C，块内并行 + 块间递推，线性时间、rich in matmul</td><td>训练主力，吃 tensor core</td></tr>
+      </tbody>
+    </table>
+    <p>
+      分块形式的核心是：每块的初始状态 S_[t] 来自上一块末态，块内先算 <code>O_[t] = Q_[t] S_[t]ᵀ + (Q_[t]K_[t]ᵀ ⊙ M) V_[t]</code>（局部，全是矩阵乘），再把本块的贡献累进 S_[t+1]。delta 规则下多出来的低秩擦除项用 WY 表示合并，使这一步也能写成 matmul。论文报告的吞吐：在单张 H100 上，Gated DeltaNet 与 DeltaNet 几乎同速，比 Mamba2 略慢约 2–3K tokens/s（因为转移矩阵表达力更强）；混合了 2K 滑窗注意力的 H1 / H2 反而比纯 mixer 更快。
+    </p>
+    <p>
+      本站之前讲过 <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> 的"用 IO 感知的分块把注意力从显存瓶颈里救出来"，以及 <a href="daily-2026-10-29-algo-sequence-parallel.html">序列并行</a> 的 Ulysses / Ring。Gated DeltaNet 的分块并行是同一类工程哲学：<strong>把数学上等价的递推重构为 matmul-heavy 的分块形式，让算法吃到 tensor core</strong>——区别是一个在压注意力的 IO，一个在把 RNN 递推"矩阵化"。
+    </p>
+
+    <h3>③ 实验设置</h3>
+    <table>
+      <thead><tr><th>项</th><th>取值</th></tr></thead>
+      <tbody>
+        <tr><td>规模 / 数据</td><td>1.3B 参数（另有 400M），100B token，FineWeb-Edu</td></tr>
+        <tr><td>训练长度</td><td>4K token；Samba / 混合模型滑窗 2K</td></tr>
+        <tr><td>对比模型</td><td>Transformer++、RetNet、HGRN2、Mamba、Mamba2、DeltaNet、Samba，及 Gated DeltaNet / -H1 / -H2</td></tr>
+        <tr><td>评测</td><td>WikiText-103 / LMBada 困惑度、零样本常识、S-NIAH 检索、recall 密集真实任务、20K 长度外推、LongBench、单 H100 吞吐</td></tr>
+        <tr><td>混合架构</td><td>H1 = Gated DeltaNet + SWA；H2 = Mamba2 + Gated DeltaNet + SWA</td></tr>
+      </tbody>
+    </table>
+
+    <h3>④ 语言建模与常识：全面超过 Mamba2 / DeltaNet</h3>
+    <table>
+      <thead><tr><th>模型</th><th>WikiText-103 PPL ↓</th><th>LMB PPL ↓</th><th>0-shot 常识 Avg ↑</th></tr></thead>
+      <tbody>
+        <tr><td>Transformer++</td><td>18.53</td><td>18.32</td><td>52.25</td></tr>
+        <tr><td>RetNet</td><td>—</td><td>—</td><td>52.02</td></tr>
+        <tr><td>Mamba</td><td>—</td><td>—</td><td>53.12</td></tr>
+        <tr><td>Mamba2</td><td>16.56</td><td>12.56</td><td>54.89</td></tr>
+        <tr><td>DeltaNet</td><td>17.71</td><td>16.88</td><td>52.14</td></tr>
+        <tr><td><strong>Gated DeltaNet</strong></td><td><strong>16.42</strong></td><td><strong>12.17</strong></td><td><strong>55.32</strong></td></tr>
+        <tr><td>Gated DeltaNet-H1</td><td>16.07</td><td>12.12</td><td><strong>56.40</strong></td></tr>
+        <tr><td>Gated DeltaNet-H2</td><td><strong>15.91</strong></td><td>12.55</td><td>56.18</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Gated DeltaNet 相对 Mamba2：WikiText-103 PPL 16.56→16.42、LMB 12.56→12.17、常识 54.89→55.32；相对 DeltaNet 幅度更大（17.71→16.42 / 16.88→12.17 / 52.14→55.32）。门控 + 混合架构再进一步：H2 的 WikiText PPL 到 15.91，H1 的 0-shot 常识到 56.40。
+    </p>
+
+    <h3>⑤ 检索与长上下文：gated delta 的真正主场</h3>
+    <p>线性注意力最弱的是精确检索，论文用 S-NIAH（单 needle in a haystack）直接量这个能力（1.3B 模型，准确率 %）：</p>
+    <table>
+      <thead><tr><th>模型</th><th>S-NIAH-1 4K / 8K</th><th>S-NIAH-2 4K / 8K</th><th>S-NIAH-3 2K / 4K</th></tr></thead>
+      <tbody>
+        <tr><td>DeltaNet</td><td>99.0 / 98.8</td><td>18.6 / 14.4</td><td>47.0 / 22.4</td></tr>
+        <tr><td>Mamba2</td><td>65.4 / 30.4</td><td>56.2 / 17.0</td><td>47.6 / 4.6</td></tr>
+        <tr><td><strong>Gated DeltaNet</strong></td><td>91.4 / <strong>91.8</strong></td><td><strong>92.2</strong> / <strong>29.6</strong></td><td><strong>84.2</strong> / <strong>27.6</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      最醒目的是 S-NIAH-2（数字 needles）在 4K：DeltaNet 18.6、Mamba2 56.2、Gated DeltaNet <strong>92.2</strong>；8K 时各自 14.4 / 17.0 / 29.6——长到一定程度所有线性模型都掉，但 gated delta 掉得最慢。S-NIAH-1 上 DeltaNet 短上下文 99.0 略高，但 Gated DeltaNet 在 8K 有 91.8，而 Mamba2 只剩 30.4——这正是"门控擦除 + 精准覆写"相对"纯衰减"的价值：衰减把 needle 连同上下文一起淡出了。
+    </p>
+    <p><strong>真实 recall 密集任务</strong>（输入截到 2K，Avg 为六项 SWDE/SQD/FDA/TQA/NQ/Drop 的平均）：</p>
+    <table>
+      <thead><tr><th>模型</th><th>SWDE</th><th>SQD</th><th>FDA</th><th>TQA</th><th>NQ</th><th>Drop</th><th>Avg</th></tr></thead>
+      <tbody>
+        <tr><td>RetNet</td><td>14.0</td><td>28.5</td><td>7.0</td><td>54.4</td><td>16.2</td><td>17.3</td><td>22.9</td></tr>
+        <tr><td>Mamba2</td><td>19.1</td><td>33.6</td><td>25.3</td><td>61.0</td><td>20.8</td><td>19.2</td><td>29.8</td></tr>
+        <tr><td>DeltaNet</td><td>17.9</td><td>30.9</td><td>18.4</td><td>53.9</td><td>17.3</td><td>18.6</td><td>26.2</td></tr>
+        <tr><td>Gated DeltaNet</td><td>25.4</td><td>34.8</td><td>23.7</td><td>60.0</td><td>20.0</td><td>19.8</td><td><strong>30.6</strong></td></tr>
+        <tr><td>Transformer++</td><td>29.5</td><td>38.0</td><td>52.2</td><td>58.3</td><td>22.5</td><td>21.6</td><td>37.0</td></tr>
+        <tr><td>Gated DeltaNet-H2</td><td>38.2</td><td>40.4</td><td>50.7</td><td>63.3</td><td>24.8</td><td>23.3</td><td><strong>40.1</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      Gated DeltaNet 在所有纯线性模型里 Avg 最高（30.6），但仍低于 Transformer++（37.0）；混合 H2 到 40.1 反超——说明"线性状态 + 一小窗精确注意力"是现实里更能打的组合。论文还做了到 20K 的六个长基准外推，结论是 Gated DeltaNet 在 RNN 类里整体困惑度最低、长度外推相对更稳（混合结果有好有坏）。
+    </p>
+
+    <h3>⑥ box 小验证（纯 Python：更新式等价 + 记忆碰撞）</h3>
+    <p>
+      两个最小验证。第一，验证 gated delta 更新式的两种写法等价（WY 合并的代数基础）：<code>S(α(I−βkkᵀ)) + βvkᵀ</code> 应该逐位等于 <code>αS − αβ(Sk)kᵀ + βvkᵀ</code>。第二，用近平行的两个 key（cos≈0.996）演示"纯衰减会把旧联想泄漏出来，delta 覆写会把它挤掉"：
+    </p>
+    <pre><code>max |lhs − rhs| of gated-delta update rewrite = 8.882e-16     # 两种写法逐位一致
+
+k1,k2 近平行 (cos = 0.9959)，先后写入 v1, v2 后读 k1：
+  decay-only (α=0.99) : read(k1) -> v1=+0.990, v2=+0.996   # 旧 v1 还在，串味
+  gated delta (α=1,β=1): read(k1) -> v1=+0.008, v2=+0.996   # v1 被 v2 覆写
+
+结论：α_t→0 提供"整块清空"（context switch），α_t→1 退回 delta 的"定点覆写"。
+这正是 S-NIAH-2 上 gated delta 92.2 远高于 Mamba2 56.2 的微观机制。</code></pre>
+    <p>
+      复现脚本：<code>box_experiments.py</code> 的 BOX C；固定随机种子 20261120，纯 Python 手写矩阵运算、无第三方依赖。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>线性注意力选型先看"检索密度"</strong>：语言建模 PPL 上各线性模型差距不大（16.4–16.6），但 S-NIAH 差出几倍。如果下游有大量精确 key-value 召回（长文档问答、代码符号定位），优先带 delta 覆写的变体，而不是纯衰减。</li>
+      <li><strong>混合架构仍是默认最优</strong>：H1/H2 在真实 recall 任务上 39–40，超过纯 Gated DeltaNet 30.6 和 Transformer++ 37.0，且吞吐比纯 mixer 更高。工程上"主体线性状态 + 2K 滑窗注意力"是当下性价比最高的点。</li>
+      <li><strong>门控是标量，不是万能药</strong>：论文明确指出 Mamba2 的 α 是标量（对整个状态统一衰减），gated delta 继承这一点；要表达"不同维度不同衰减"需要矩阵值门控，代价是更复杂的参数化和训练算法。别指望 α 一个标量解决所有遗忘模式。</li>
+      <li><strong>推理侧的价值最实在</strong>：线性 RNN 形式每步 O(d²)、状态大小与序列长无关，长上下文推理不用堆 KV cache——这与本站 <a href="daily-2026-10-19-kv-tier-pcp.html">KV 分层</a> 讨论的"KV 比 GPU 还慢"问题是两条不同的解法。训练用分块并行，推理用递推，同一套权重两种形态（SSD 对偶）。</li>
+      <li><strong>S-NIAH-3 的 4K 列仍有陷阱</strong>：Gated DeltaNet 27.6、Mamba2 只剩 4.6，看着是 gated delta 大胜，但绝对数也不高——uuid 类高精度检索对线性状态依然困难，别用它替换需要逐字精确的注意力层。</li>
+      <li><strong>读数注意</strong>：吞吐的相对结论（比 Mamba2 慢 2–3K tok/s、混合更快）来自单 H100 的 Figure 3，论文正文只给范围描述而非逐模型精确表；引用时说"同量级、略慢"比报一个具体数更稳妥。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 Mamba2 在 S-NIAH-1 4K 只有 65.4，而 DeltaNet 有 99.0，可到了真实 recall 任务 DeltaNet 反而更差（26.2 vs Mamba2 29.8）？</summary>
+      <p>S-NIAH-1 是 pass-key 检索，key 几乎正交、只需把一个精确 pair 存住——delta 规则的"软替换"正好擅长精准写入，所以 DeltaNet 接近满分；Mamba2 的标量衰减会把 needle 随时间淡出，4K 就掉到 65.4。但真实任务里 key 高度相关、需要同时保持多段信息并灵活清理旧内容：DeltaNet 一次只改一个 pair、缺少快速清空机制，上下文一切换旧记忆还在，综合分就落到 Mamba2 之下。Gated DeltaNet 用 α 补上"快速擦除"，于是两个场景都兼顾：S-NIAH-1 8K 91.4/91.8（不像 Mamba2 崩到 30.4），真实 recall Avg 30.6（所有纯线性模型最高）。</p>
+    </details>
+    <details>
+      <summary>2. "WY 表示把 delta rule 并行化"到底解决了什么问题？如果直接逐步算递推会怎样？</summary>
+      <p>delta 更新 <code>S_t = S_{t−1}(I − β_t k_t k_tᵀ) + β_t v_t k_tᵀ</code> 表面上是 O(L) 串行：每步都要等上一步的 S。直接用 Python 循环或不能融合的 kernel，GPU 的大量 CUDA core / tensor core 闲着，长序列训练极慢。WY 表示把一段内多个秩-1 修正 <code>(I − β_i k_i k_iᵀ)</code> 累积成一个矩阵（形如 I − W Yᵀ），从而把块内计算写成大矩阵乘，可以一次性在 tensor core 上算完，块间仍递推——这就是 chunkwise parallel：线性时间、matmul-heavy。本文进一步把 α_t 门控塞进这个结构（<code>α_t(I − β_t k_t k_tᵀ)</code>），保持了同样的并行性，所以 gated delta 的吞吐能和 DeltaNet 几乎一样。</p>
+    </details>
+    <details>
+      <summary>3. 为什么说 α_t→0 和 α_t→1 分别对应两种极端记忆操作？用它解释"上下文切换"场景。</summary>
+      <p>更新式 <code>S_t = S_{t−1}(α_t(I − β_t k_t k_tᵀ)) + β_t v_t k_tᵀ</code> 里，α_t 乘在整个旧状态上。α_t→0 时旧状态整体被清零（无论 k_t 是什么），新 pair 写进空记忆——相当于"翻篇"，正好对应文档/对话主题切换时把之前所有联想作废。α_t→1 时第一项变成 <code>S_{t−1}(I − β_t k_t k_tᵀ)</code>，就是纯 delta rule：只沿 k_t 方向擦掉旧的 v、再写入新的，其它联想原样保留——对应同一主题内的定点更新。box 实验里两个近平行 key 就是这两种操作的对照：纯衰减（近似 α 统一偏小但非零）让 v1 泄漏，delta 覆写把 v1 挤掉。</p>
+    </details>
+    <details>
+      <summary>4. 本文与 <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a> 都在解决"注意力太贵"，两者的根本差别是什么？什么时候选哪条？</summary>
+      <p>MQA/GQA/MLA 属于"保留 softmax 注意力，但压缩 K/V 的表示与头数"——仍是二次复杂度的全对比，只是把每步要从显存读的 KV 变小（MLA 用低秩联合压缩 + 解耦 RoPE），服务侧收益直接、生态兼容好。Gated DeltaNet 属于"换掉 softmax 注意力"，用固定大小的矩阵状态做线性时间的联想召回——推理时完全不堆 KV，长上下文显存恒定，但精确检索弱于全注意力（真实 recall 30.6 vs Transformer++ 37.0）。选型：如果模型已基于 Transformer、要兼容现有推理栈、上下文几万以内，先上 MLA/GQA；如果追求极长上下文的恒定显存和线性推理、能接受混合架构，考虑 Gated DeltaNet + 滑窗注意力（H1/H2），它在真实 recall 上反而更高（40.1）。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）gated delta 的状态是 d_v × d_k 的矩阵，为什么长序列不会 OOM？它的"固定大小"代价是什么？</summary>
+      <p>因为状态 S 的尺寸只由 head 维度 d_v、d_k 决定，与序列长度 L 无关——每步读入新 token 就更新同一个 S，不像自注意力要把所有历史 token 的 K/V 都留着。所以 L 从 4K 涨到 1M，状态显存不变，这是它相对 KV cache 的结构性优势。代价是信息带宽：一个 d×d 的矩阵最多可靠地存约 d 个正交 key-value 对（论文强调的"memory collisions"），超过就碰撞、被覆盖——它牺牲的是"无损保留所有历史 token"的能力，换取固定显存。真实任务因此需要门控（定期清理）和 delta（精准更新）来提高有限状态的利用率；混合架构再用一小窗精确注意力兜住最近的高精度需求。理解这个 trade-off，就知道它不是注意力的"免费替代"，而是另一种资源分配。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2412.06464" target="_blank" rel="noopener">arXiv:2412.06464 · Gated Delta Networks: Improving Mamba2 with Delta Rule（Songlin Yang / MIT CSAIL、Jan Kautz / NVIDIA、Ali Hatamizadeh / NVIDIA；ICLR 2025）</a> · 代码：<a href="https://github.com/NVlabs/GatedDeltaNet" target="_blank" rel="noopener">NVlabs/GatedDeltaNet</a></li>
+      <li>方法谱系：Linear Transformer（Katharopoulos et al. 2020）· RetNet · GLA · Mamba2 / SSD（Dao &amp; Gu 2024）· DeltaNet（Schlag et al. 2021；Yang et al. 2024b）· WY 表示（Bischof &amp; Loan 1985）· Samba</li>
+      <li>站内：
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA → GQA → MLA：压 KV 的一条路</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention：IO 感知分块</a> ·
+        <a href="daily-2026-09-09-algo-attention.html">Attention：Scaled Dot-Product</a> ·
+        <a href="daily-2026-10-29-algo-sequence-parallel.html">序列 / 上下文并行</a> ·
+        <a href="daily-2026-10-13-algo-rope.html">RoPE 与长度外推</a> ·
+        <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a> ·
+        <a href="daily-2026-11-20-frontline-reverse-curriculum.html">今日一线：Depth Before Breadth</a> ·
+        <a href="daily-2026-11-20-harness-meta2.html">今日 Harness：Meta²</a>。</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

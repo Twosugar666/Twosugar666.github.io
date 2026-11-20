@@ -963,6 +963,27 @@
       "source": "algo",
       "topic": "流水线并行：GPipe micro-batch 同步、气泡 (p−1)/m、M≥4K、重计算 O(N+L/K·N/M)、Transformer 83.9B/128 段 298×、P100 无 NVLink 3.3×；PipeDream 1F1B、NOAM、weight stashing/vertical sync、VGG16 5.12×/通信 −95%；PipeDream-Flush 在途 ≤p；Megatron 交错 v chunk 气泡 /v、通信 ×v、m 为 p 倍数、scatter/gather bsh/t（+11%）、重计算大 batch 2×、(n−d)/b′；Zero Bubble B/W 拆分 F:sbh(24h+4s) B:sbh(24h+8s) W:24sbh²、ZB-H1 (p−1)(F+B−W) 同 1F1B 显存、ZB-H2 (2p−1)M_B 零气泡、自动调度 + post-validation、ZB-2p 气泡 <1%、吞吐 +9–30%（Table 4）；box 模拟器 GPipe/1F1B/交错与公式一致、ZB 需 W 积压 ≥p / ≥2p−1（arXiv:1811.06965 / 1806.03377 / 2104.04473 / 2401.10241）",
       "file": "posts/daily-2026-10-30-algo-pipeline-parallel.html"
+    },
+    {
+      "date": "2026-11-20",
+      "domain": "rl agent",
+      "source": "frontline",
+      "topic": "Depth Before Breadth：策略诱导能力区 C_η(π)={c:p_π(c)≥η} 与近边界集 N_{η,δ}；把长程任务拆成「进入能力区」（短程）与「从区内完成」（长程）；配对优势——前缀按端点 c_ℓ 去重（只比 <action> 序列）分组、V̂(e)=(1/N_R)Σ_j R_{e,j}、左优势 A^L(e)=V̂(e)−(1/n)Σ e′ m(e′)V̂(e′)（前缀加权基线）、右优势 A^R(e,j)=R_{e,j}−(1/(N_R−1))Σ_{j′≠j}R_{e,j′}（leave-one-out）、两段各自 PPO clip；反向阶段沿成功参考轨迹把起点往回退扩张能力区（Figure 1 用 Pass@1>80% 定义，ckp60 边界约到剩余 60% 步），正向阶段用策略自采前缀到达的 off-reference 状态拓宽能力区；只用终局二元奖励、无 value model/额外 rollout；Qwen2.5-1.5B/7B-Instruct，train_batch 32、n_samples 8、actor_lr 1e−6、rollout T=1.0/top_p 0.95；ALFWorld All 90.1±2.0/96.1±1.4、WebShop Succ. 80.2±3.9/82.6±1.2（vs GRPO 56.8/66.1、GiGPO 65.0/72.8），同环境预算能力区更大；消融 WebShop Succ.：Reverse only 68.8→+Forward 74.7→+Rev PA 76.6→+Fwd PA 80.2；box 复算配对优势区分端点（A^L ±0.25）而 GRPO 广播为 0（Du/Liu/Tang/Li/Bai/Pan/He 南京大学/北大/University of Wales Aberystwyth arXiv:2611.24697）",
+      "file": "posts/daily-2026-11-20-frontline-reverse-curriculum.html"
+    },
+    {
+      "date": "2026-11-20",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Meta²：把离线优化上移一层——不优化共享 harness h，而是学可复用演化知识 M（文本 Meta-Skill）；部署时机分类（offline/pre-run/within-run/after-run）；每个 checkpoint 决策 u^(k)∈{KEEP, EVOLVE(δ^(k))}，编辑走 notice/instruction/hook/tool 四通道、只作用于当前 run 剩余部分、run 结束作废；离线对同一 task agent 跑 A（无 evolver）/B（当前 M 指导）/C（特权 verifier 信息）三条件，A–B 与 B–C 对比经 REFLECT/AGGREGATE/UPDATE 迭代 M^(r)=f_upd(M^(r−1),f_agg(f_ref(G^(r),V^(r))))，在线 M 冻结、不用 held-out verifier；Meta-Skill 记录含 type(act/hold/avoid)/time point/when to refer/guidance/why/≤3 例；Terminal-Bench 2.1（29 训练/60 测试/5 runs）与 DeepSWE 1.1（38/75/3 runs），GPT-5.6-Terra 上 Meta² 81.00±0.91 / 44.44±0.77 均第一（次优 TF-GRPO 74.67±4.62、Meta-Harness DeepSWE 37.33±2.67），相对 Seed 66.33/34.67 为 +14.67/+9.77pp；成本拆离线/在线：TB 110.19/64.72=174.91、DeepSWE 238.52/129.34=367.86（vs Meta-Harness 198.85/870.75）；DeepSeek-V4-Flash-0731 在 TB 77.67±3.84 仍第一；消融证实在线 evolver 与对比式 Meta-Skill 各有增益、去 task-local 掉分、checkpoint 频率是响应性 vs 成本权衡；box 玩具展示共享编辑训练 +0.10/held-out −0.09 与 KEEP/EVOLVE 决策（Yuan/Cai/Liu/Yang/Han/Lee/Sehwag/Huang UMD/UW/UIUC/Scale AI arXiv:2611.05139）",
+      "file": "posts/daily-2026-11-20-harness-meta2.html"
+    },
+    {
+      "date": "2026-11-20",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "Gated DeltaNet：线性 Transformer 外积联想记忆受 d 限制会 memory collision；Mamba2 标量衰减 S=αS+vkᵀ 整体淡出无法定点遗忘、DeltaNet S=S(I−βkkᵀ)+βvkᵀ 精准覆写但无法快速清空；gated delta rule S_t=S_{t−1}(α_t(I−β_t k_t k_tᵀ))+β_t v_t k_tᵀ——α→0 整块清空（context switch）、α→1 退化为 delta 定点覆写；SSD 并行式 O=((QKᵀ)⊙Γ)V、Γ_{ij}=γ_i/γ_j、γ_j=∏α_i；WY 表示（Bischof & Loan 1985）把秩-1 擦除合并做分块并行（chunkwise，matmul-heavy，线性时间），递推用于推理、分块用于训练；1.3B 参数/100B FineWeb-Edu token/4K 训练（混合 SWA 2K）：WikiText-103 PPL Transformer++ 18.53 / Mamba2 16.56 / DeltaNet 17.71 / Gated DeltaNet 16.42 / H2 15.91，LMB 12.56→12.17，0-shot 常识 54.89→55.32（H1 56.40）；S-NIAH-2 4K DeltaNet 18.6 / Mamba2 56.2 / GDN 92.2、8K 14.4/17.0/29.6，S-NIAH-1 8K 98.8/30.4/91.8，S-NIAH-3 4K 22.4/4.6/27.6；真实 recall Avg（截 2K）Mamba2 29.8 / GDN 30.6 / Transformer++ 37.0 / H2 40.1；20K 长度外推 RNN 里整体 PPL 最低；单 H100 吞吐与 DeltaNet 几乎同速、比 Mamba2 略慢 2–3K tok/s、混合 H1/H2 更快；box 纯 Python：更新式两写法逐位一致 8.882e−16、近平平行 key cos=0.9959 下 decay-only 读旧 v1=0.990 泄漏 vs gated delta 0.008 被覆写（Yang(MIT CSAIL/NVIDIA)/Kautz/Hatamizadeh NVIDIA arXiv:2412.06464 ICLR 2025）",
+      "file": "posts/daily-2026-11-20-algo-gated-deltanet.html"
     }
   ]
 }

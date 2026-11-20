@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜Depth Before Breadth：把长程 Agent RL 拆成「进入能力区」与「从能力区完成」——只用终局奖励的配对优势 + 反向到正向课程；Qwen2.5-1.5B/7B 在 ALFWorld 拿到 90.1%/96.1%、WebShop 80.2%/82.6% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜Depth Before Breadth：把长程 Agent RL 拆成「进入能力区」与「从能力区完成」——只用终局奖励的配对优势 + 反向到正向课程；Qwen2.5-1.5B/7B 在 ALFWorld 拿到 90.1%/96.1%、WebShop 80.2%/82.6%</h1>
+    <p class="post-meta">2026-11-20 · 收藏夹：RL / Agent · 一线追踪<br />
+      来源：Siyuan Du（南京大学）、Yuxin Liu（北京大学）、Meng Tang（University of Wales, Aberystwyth）、Haoran Li、Yechao Bai（南京大学）、Feiyang Pan、Jia He · <em>Depth Before Breadth: Reverse-to-Forward Curriculum with Advantage Decomposition for LLM Agent</em>（<a href="https://arxiv.org/abs/2611.24697" target="_blank" rel="noopener">arXiv:2611.24697</a>，cs.AI，v1 页眉日期 2026-11-18）。
+      数字均为论文自报；主表为多次 seed 的均值 ± 标准差（如 90.1±2.0），Closed-Source 与 CRPS 行为单点。「box 小验证」一节为本文用纯 Python 实现的配对优势玩具复算。
+      交叉：
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a>、
+      <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a>、
+      <a href="daily-2026-09-15-gaca.html">GACA</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 LLM Agent 的 RL 训练卡在两件事上：<strong>奖励稀疏</strong>和<strong>信用分配</strong>。失败的 rollout 每一步都没有信号；成功的 rollout 也只有一个终局奖励，要摊到整条轨迹上。组相对方法（<a href="daily-2026-09-16-algo-grpo.html">GRPO</a>）用同题多条 rollout 的组内相对回报做优势，缓解了 value model 依赖，但把同一个轨迹级优势<strong>广播</strong>给轨迹里的每个动作——「哪一步真正把任务推向成功」仍然不可见。
+    </p>
+    <p>
+      反向课程（reverse curriculum）是常见的解法：把训练起点放在离目标很近的位置，再逐步往前推。对 LLM Agent 有一个更省事的参考锚定变体——沿一条成功参考轨迹把起点往回退。论文指出它留下两个结构性问题：
+    </p>
+    <ul>
+      <li><strong>起点越往后退，轨迹越长，同一个粗粒度终局反馈要摊到更长的序列上</strong>：早期真正有用的动作更难被单独识别。</li>
+      <li><strong>参考锚定 limiting exposure</strong>：起点只在参考轨迹上，见不到策略自己探索时遇到的 off-reference 状态（也就是分布偏移下最容易失败的地方）。</li>
+    </ul>
+    <p>
+      论文的关键观察（Figure 1）是：把训练起点往回退的同时，策略的<strong>能力区（capability region）</strong>也朝着原始起点扩张。在一条成功参考轨迹上，用 Pass@1 &gt; 80% 定义"当前策略可靠完成任务的起点集合"，在 checkpoint 20 / 40 / 60 上这个集合 progressively 向原始起点长大；到 ckp60 时，新的边界大约到了"剩余 60% 步数"的位置。这意味着一个新引入的起点虽然离目标还远，但<strong>可能只差几步就能进入策略已经会解的区域</strong>。于是"长程任务"被拆成两个短得多的问题：
+    </p>
+    <ol>
+      <li>如何<strong>进入</strong>能力区（短程，从边界外一步或几步跨进去）；</li>
+      <li>如何<strong>从能力区内完成</strong>任务（较长，但前面的训练已经部分解决）。</li>
+    </ol>
+
+    <h2>机制拆解</h2>
+    <h3>① 能力区与近边界集：只用终局奖励的定义</h3>
+    <p>
+      记决策上下文 <code>c_t = (o_{≤t}, a_{&lt;t}, x)</code>，<code>p_π(c)</code> 是策略从 c 出发完成任务的概率。给定可靠性阈值 η：
+    </p>
+    <pre><code>能力区        C_η(π) = { c : p_π(c) ≥ η }
+近边界集      N_{η,δ}(π) = { c : |p_π(c) − η| ≤ δ },  0 &lt; δ &lt; min(η, 1−η)
+
+训练上下文从近边界集 N_{η,δ}(π) 里取——这些点离"会不会"的分界最近，最 informative。
+关键：能力区是策略诱导的（policy-induced），不需要对上下文空间做任何几何假设。
+Figure 1 实操里 η 对应 Pass@1 &gt; 80% 的阈值。</code></pre>
+    <p>
+      这和本站之前几篇长程 Agent RL 的切入角度互补：<a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a> 在压缩边界上学主动 critic，<a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> 在 teacher 能恢复的最深状态接管，<a href="daily-2026-09-15-gaca.html">GACA</a> 按关键度混合步级/轨迹级优势。这里不引入额外模型，只重新组织"从哪些状态采样"和"同一个终局奖励怎么拆成两个信号"。
+    </p>
+
+    <h3>② 配对优势（Paired Advantage）：前缀按端点分组，后缀在同端点内比较</h3>
+    <p>
+      从近边界的一个起点采样一组 n 条 rollout，每条切成<strong>前缀</strong>和<strong>后缀</strong>。前缀决定到达哪个端点上下文 c_ℓ，后缀决定从该端点能否完成任务。把前缀按<strong>端点去重</strong>（两个前缀落在同一类，当且仅当它们的 <code>&lt;action&gt;</code> 序列相同——注意只比对 action，不比对 <code>&lt;think&gt;</code>）。对每个端点 e 采 N_R ≥ 2 条后缀：
+    </p>
+    <table>
+      <thead><tr><th>量</th><th>公式</th><th>直觉</th></tr></thead>
+      <tbody>
+        <tr><td>端点完成率</td><td><code>V̂(e) = (1/N_R) Σ_j R_{e,j}</code></td><td>从 e 出发能完成的频率，用后缀实测</td></tr>
+        <tr><td>左优势（前缀）</td><td><code>A^L(e) = V̂(e) − (1/n) Σ_{e′∈E} m(e′) V̂(e′)</code></td><td>这个前缀把你送进了一个更好解还是更难解的状态？</td></tr>
+        <tr><td>右优势（后缀）</td><td><code>A^R(e,j) = R_{e,j} − (1/(N_R−1)) Σ_{j′≠j} R_{e,j′}</code></td><td>同一端点下，哪条续写真的完成了？leave-one-out，不用自己</td></tr>
+      </tbody>
+    </table>
+    <p>
+      注意基线里的 <code>m(e′)</code> 是落在端点 e′ 的前缀条数——基线是<strong>前缀加权</strong>的，等于整组后缀完成率的平均。两个优势都只从终局二元奖励算出来，不需要 value model、不需要额外 rollout，也不需要 trainer 之外的 verifier 信号（论文强调"using terminal rewards alone"）。
+    </p>
+    <p>
+      更新时前缀段和后缀段用各自的 PPO-style clip：
+    </p>
+    <pre><code>J(θ) = E[ (1/n) Σ_k ( (1/ℓ) Σ_{t=0}^{ℓ-1} min[ρ_{t,k} A^L(e_k), clip(ρ_{t,k},1−ε,1+ε) A^L(e_k)]
+                       + (1/(T_k−ℓ)) Σ_{t=ℓ}^{T_k-1} min[ρ_{t,k} A^R(e_k,j_k), clip(ρ_{t,k},1−ε,1+ε) A^R(e_k,j_k)] ) ]
+
+ρ_{t,k} = π_θ(a_{t,k}|c_{t,k}) / π_θ_old(a_{t,k}|c_{t,k})
+前缀 ℓ 步共享 A^L（激励"进入能力区"）；后缀 T_k−ℓ 步共享 A^R（激励"从这里完成"）。</code></pre>
+
+    <h3>③ 反向 → 正向两阶段课程</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>起点从哪来</th><th>解决什么</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Reverse</strong></td><td>成功参考轨迹上，从近目标处沿轨迹深度逐步往回退</td><td>建立并沿轨迹深度<strong>扩张</strong>能力区，直到原始起点对多数任务可靠可解</td></tr>
+        <tr><td><strong>Forward</strong></td><td>从原始起点出发、由策略自己采的前缀所到达的状态（含 off-reference）</td><td>把能力区<strong>拓宽到参考轨迹之外</strong>，用 on-policy 探索覆盖分布偏移的状态</td></tr>
+      </tbody>
+    </table>
+    <p>
+      两个阶段都复用同一套配对优势。Reverse 阶段负责"由近及远地建立会解的区域"，Forward 阶段负责"从会解的区域往外长出去"——这正是标题 Depth Before Breadth 的含义：先把纵深做扎实，再横向铺开。
+    </p>
+
+    <h3>④ 实验设置：两个基准、两个尺度、同环境预算对比</h3>
+    <table>
+      <thead><tr><th>项</th><th>取值</th></tr></thead>
+      <tbody>
+        <tr><td>环境</td><td>ALFWorld（六类 Pick/Look/Clean/Heat/Cool/Pick2 + All）、WebShop（Score / Succ.）</td></tr>
+        <tr><td>模型</td><td>Qwen2.5-1.5B-Instruct、Qwen2.5-7B-Instruct</td></tr>
+        <tr><td>基线</td><td>Prompting（Qwen2.5 / ReAct / Reflexion）、PPO、RLOO、GRPO、CRPS、GiGPO；闭源参考 GPT-4o、Gemini-2.5-Pro</td></tr>
+        <tr><td>训练批量</td><td>train_batch_size 32，n_samples_per_prompt 8，ppo_mini_batch 16，micro 每卡 2（ALF）/ 1（Web）</td></tr>
+        <tr><td>序列 / 采样</td><td>ppo_max_token_len_per_gpu 12288 / 15360；rollout temperature 1.0、top_p 0.95；验证 temperature 0、top_p 1.0</td></tr>
+        <tr><td>优化</td><td>actor_learning_rate 1e−6；ulysses_sequence_parallel_size 1；tensor_model_parallel_size 1；use_dynamic_bsz False</td></tr>
+      </tbody>
+    </table>
+
+    <h3>⑤ 主结果：ALFWorld 与 WebShop 双榜第一</h3>
+    <p><strong>Qwen2.5-1.5B-Instruct</strong>（表中数字为 ALFWorld All / WebShop Score / WebShop Succ.，%）：</p>
+    <table>
+      <thead><tr><th>方法</th><th>ALFWorld All</th><th>WebShop Score</th><th>WebShop Succ.</th></tr></thead>
+      <tbody>
+        <tr><td>GPT-4o（闭源参考）</td><td>48.0</td><td>31.8</td><td>23.7</td></tr>
+        <tr><td>Gemini-2.5-Pro（闭源参考）</td><td>60.3</td><td>42.5</td><td>35.9</td></tr>
+        <tr><td>Qwen2.5 / ReAct / Reflexion</td><td>4.1 / 12.8 / 21.8</td><td>23.1 / 40.1 / 55.8</td><td>5.2 / 11.3 / 21.9</td></tr>
+        <tr><td>PPO</td><td>54.4±3.1</td><td>73.8±3.0</td><td>51.5±2.9</td></tr>
+        <tr><td>RLOO</td><td>69.7±2.5</td><td>73.9±5.6</td><td>52.1±6.7</td></tr>
+        <tr><td>GRPO</td><td>72.8±3.6</td><td>75.8±3.5</td><td>56.8±3.8</td></tr>
+        <tr><td>CRPS</td><td>83.0</td><td>73.0</td><td>61.0</td></tr>
+        <tr><td>GiGPO</td><td>86.7±1.7</td><td>83.1±1.6</td><td>65.0±3.2</td></tr>
+        <tr><td><strong>Ours</strong></td><td><strong>90.1±2.0</strong></td><td><strong>88.6±1.5</strong></td><td><strong>80.2±3.9</strong></td></tr>
+      </tbody>
+    </table>
+    <p><strong>Qwen2.5-7B-Instruct</strong>：</p>
+    <table>
+      <thead><tr><th>方法</th><th>ALFWorld All</th><th>WebShop Score</th><th>WebShop Succ.</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen2.5 / ReAct / Reflexion</td><td>14.8 / 31.2 / 42.7</td><td>26.4 / 46.2 / 58.1</td><td>7.8 / 19.5 / 28.8</td></tr>
+        <tr><td>PPO</td><td>80.4±2.7</td><td>81.4±3.1</td><td>68.7±5.1</td></tr>
+        <tr><td>RLOO</td><td>75.5±4.6</td><td>80.3±3.2</td><td>65.7±4.0</td></tr>
+        <tr><td>GRPO</td><td>77.6±5.2</td><td>79.3±2.8</td><td>66.1±3.7</td></tr>
+        <tr><td>CRPS</td><td>86.0</td><td>82.0</td><td>74.0</td></tr>
+        <tr><td>GiGPO</td><td>90.8±1.3</td><td>84.4±2.9</td><td>72.8±3.2</td></tr>
+        <tr><td><strong>Ours</strong></td><td><strong>96.1±1.4</strong></td><td><strong>92.5±1.1</strong></td><td><strong>82.6±1.2</strong></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>摘要里 90.1%/96.1% 对应 ALFWorld All（1.5B/7B），80.2%/82.6% 对应 WebShop Succ.（1.5B/7B）——读表时注意 WebShop 有 Score 和 Succ. 两个指标，摘要用的是后者。</li>
+      <li>1.5B 上相对最强基线 GiGPO：ALFWorld All +3.4、WebShop Score +5.5、Succ. +15.2；7B 上 +5.3 / +8.1 / +9.8。</li>
+      <li>论文还报告在<strong>相同环境交互预算</strong>下获得更大的能力区（capability region），即不只是分数高，而是"从更远的起点也能可靠完成"。</li>
+    </ul>
+
+    <h3>⑥ 消融：两个组件各值多少</h3>
+    <table>
+      <thead><tr><th>Curriculum</th><th>Reverse PA</th><th>Forward PA</th><th>WebShop Succ. (%)</th></tr></thead>
+      <tbody>
+        <tr><td>Reverse only</td><td>–</td><td>–</td><td>68.8</td></tr>
+        <tr><td>Reverse + Forward</td><td>–</td><td>–</td><td>74.7</td></tr>
+        <tr><td>Reverse + Forward</td><td>✓</td><td>–</td><td>76.6</td></tr>
+        <tr><td>Reverse + Forward</td><td>✓</td><td>✓</td><td><strong>80.2</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      拆开看：加上 Forward 阶段 +5.9（68.8→74.7），加 Reverse PA +1.9（74.7→76.6），再加 Forward PA +3.6（76.6→80.2）。两个配对优势都贡献正向增益，且 Forward PA 的边际更大——对应"参考轨迹之外"的状态确实提供了额外信息。
+    </p>
+
+    <h3>⑦ box 小验证（纯 Python：配对优势 vs GRPO 广播）</h3>
+    <p>
+      用一个最小玩具验证"配对优势能区分前缀端点，而 GRPO 广播不能"。两个前缀从同一边界起点出发，一个落在 e1、一个落在 e2；两者后面都跟了一条成功后缀（终局奖励同为 1）。设端点完成率 V̂(e1)=1.0、V̂(e2)=0.5：
+    </p>
+    <pre><code>V̂(e1)=1.00  V̂(e2)=0.50   m(e1)=1  m(e2)=1   n=2
+prefix-weighted baseline = (1/2)·(1·1.00 + 1·0.50) = 0.75
+A^L(e1) = +0.25        A^L(e2) = −0.25
+
+两条前缀的终局奖励都 = 1（同一后缀成功）
+GRPO broadcast on prefix actions = [0.0, 0.0]   ← 组内无方差，信号为 0
+
+结论：终局奖励完全相同时，GRPO 对两条前缀一视同仁；
+      配对优势用"前缀把你送进哪个端点"给出 +0.25 / −0.25 的相反信号。
+注意：A^R 用 leave-one-out（分母 N_R−1），端点内后缀全对时 A^R 为 0，
+      所以这个玩具里区分完全来自 A^L，符合论文"收益取决于中间奖励如何分配"的消融结论。</code></pre>
+    <p>
+      复现脚本：<code>box_experiments.py</code> 的 BOX A；固定随机种子 20261120，纯 Python 无第三方依赖。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>组相对不够时，先看"组内是否真的有方差"</strong>：如果同一批 rollout 终局奖励全一样（长程任务里非常常见），GRPO 的优势直接为 0。此时要么继续分组（按前缀端点、按能力区状态），要么做环境侧的课程设计。</li>
+      <li><strong>端点去重只比 action、不比 think</strong>：论文明确用 <code>&lt;action&gt;</code> 序列判定两个前缀是否落在同一端点。若把 think 也算进去，几乎不会撞到同一端点，配对就退化成逐条比较。</li>
+      <li><strong>δ 与 η 决定"边界采样"的带宽</strong>：太窄采不到足够样本去估 V̂(e)，太宽又混进能力区深处/外面的点。可先把能力区画出来（Pass@1 曲线），再按论文思路在阈值附近取带。</li>
+      <li><strong>Reverse 先、Forward 后，别反过来</strong>：Forward 依赖"已有能力区"作为落点分布，先在参考轨迹上把能力区立起来，再往 off-reference 状态扩张；直接 on-policy 探索在稀疏奖励下大概率全失败、没有可用信号。</li>
+      <li><strong>和 step-level 信用分配正交</strong>：本文拆的是"前缀 vs 后缀"，与 <a href="daily-2026-09-15-gaca.html">GACA</a> 的关键度加权、<a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a> 的主动 critic 可以叠加；代价是 Rollout 组织更复杂，需要按端点做分组和去重。</li>
+      <li><strong>读数注意</strong>：主表为多次 seed 均值±标准差，但部分基线（CRPS、闭源模型）为单点；ALFWorld All 在 1.5B 上 Ours 的 Clean 子任务（84.2）并不如 GiGPO（94.8），是 All 更高靠其它五类拉起来的。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么"前缀加权基线"要乘 m(e′)，而不是对所有端点做简单平均？如果端点数很多、每个端点只有一条前缀，会发生什么？</summary>
+      <p>(1/n)Σ_{e′} m(e′)V̂(e′) 是全部 n 条前缀的期望完成率——因为每条前缀都按它实际落到的端点计数。简单平均 (1/|E|)ΣV̂(e′) 会让"只有一条前缀落在的稀有端点"和"很多前缀落在的常见端点"等权，基线上偏或下偏。当每个端点只有一条前缀时 m(e)≡1、|E|=n，两种写法相同，A^L(e)=V̂(e)−mean(V̂)；此时 V̂(e) 靠 N_R 条后缀估计，噪声由 N_R 决定，论文要求 N_R≥2、实验里每个端点采多条后缀来压方差。</p>
+    </details>
+    <details>
+      <summary>2. A^R 用 leave-one-out（分母 N_R−1）而不是 GRPO 的 std 归一，有什么好处？如果某个端点的 N_R 条后缀全成功或全失败会怎样？</summary>
+      <p>leave-one-out 用"其它后缀的平均"作基线，天然排除样本自身，避免了把当前样本算进基线造成的偏差；也不需要估计 std（二元奖励在小样本下 std 极不稳定，N_R=2 时 std 几乎无意义）。端点内全成功时 A^R=0（没有可区分的续写），全失败时也是 0——这正是稀疏奖励的死区，光靠 A^R 学不到东西，必须靠 A^L 从"哪些前缀能进入更好的端点"提供信号；这也是消融里 Rev PA / Fwd PA 都关键的原因。</p>
+    </details>
+    <details>
+      <summary>3. Forward 阶段为什么能覆盖 off-reference 状态？它和"直接对原始起点做 on-policy 探索"有什么本质区别？</summary>
+      <p>因为 Forward 的训练上下文不是原始起点本身，而是"从原始起点出发、由当前策略采出的前缀所到达的中间状态"——这些状态是策略真实会遇到的分布内状态，包含参考轨迹上没有的分支。直接对原始起点做 on-policy 探索时，稀疏终局奖励下整条轨迹大概率全失败，组内没有相对信号；Forward 把这些中间状态当作新的"起始点"，利用 Reverse 阶段建立的能力区——其中相当一部分状态离能力区边界很近，几条后缀就能测出 V̂(e)，从而产生有效梯度。简单说，Reverse 提供了"可学的落点"，Forward 才敢往分布外走。</p>
+    </details>
+    <details>
+      <summary>4. 在 Qwen2.5-7B 上 Ours 的 ALFWorld Pick/Look/Clean/Heat 四项都是 100.0±0.0，但 Cool 只有 85.9±6.0、WebShop Succ. 82.6。这说明方法在什么类型的任务上可能仍有限制？</summary>
+      <p>饱和的是 ALFWorld 里相对模板化的单步/少步操作（Pick/Look/Heat），说明"进入能力区 + 区内完成"的拆分在这类短决策链上足够；Cool 和 WebShop 这类需要更长序列、多步状态跟踪与文本理解的任务仍有失败。能力区方法的有效性依赖"存在明显的能力边界，且跨过边界只需少数几步"——当任务本身没有这种结构（长链、边界模糊、需要组合泛化）时，配对优势能提供的信号增益会下降，且 V̂(e) 的估计也更 noisy。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果能力区的阈值 η 由 0.8 改成 0.5，Reverse 阶段和 Forward 阶段各自会怎么变？这对"从哪个状态开始训练"有什么系统性影响？</summary>
+      <p>η 降低意味着能力区变大、边界向"更难的状态"移动：Reverse 阶段按 Pass@1≥η 判定"已掌握"，会更早宣布某段轨迹可解，于是起点可能退得更快，但训练在更不可靠的状态上开始，V̂(e) 的估计方差更高。Forward 阶段的近边界集 N_{η,δ} 也随之移动，采样点更靠近策略的真实失败区——可能提供更大的学习空间，也可能因终局成功太少而信号稀疏。实践上 η 应与采样预算联动：高 η 保证 V̂(e) 估计可靠但边界推进慢，低 η 推进快但噪声大。论文用 80% 作为 Figure 1 的观测阈值，但是否作为训练超参、δ 如何取，正文给出了定义而未在摘要中固定——复现时需要在自己的环境里扫这两个值。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.24697" target="_blank" rel="noopener">arXiv:2611.24697 · Depth Before Breadth: Reverse-to-Forward Curriculum with Advantage Decomposition for LLM Agent（Du, Liu, Tang, Li, Bai, Pan, He；南京大学 / 北京大学 / University of Wales, Aberystwyth）</a></li>
+      <li>方法谱系：GRPO（<a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">DeepSeekMath, arXiv:2402.03300</a>）· GiGPO（相对步级信用）· CRPS · Reverse Curriculum（Florensa et al. 2017）· 参考锚定反向课程（Zhang &amp; Yang 2026）</li>
+      <li>站内：
+        <a href="daily-2026-09-16-algo-grpo.html">今日算法：GRPO</a> ·
+        <a href="daily-2026-10-28-focus-active-critic.html">FOCUS：主动 critic</a> ·
+        <a href="daily-2026-10-15-vh-gpo.html">VH-GPO：从可恢复状态接管</a> ·
+        <a href="daily-2026-09-15-gaca.html">GACA：关键度自适应混合优势</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO：GRPO 长 CoT 四细节</a> ·
+        <a href="daily-2026-11-20-harness-meta2.html">今日 Harness：Meta²</a> ·
+        <a href="daily-2026-11-20-algo-gated-deltanet.html">今日算法：Gated DeltaNet</a>。</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
