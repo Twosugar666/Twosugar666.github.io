@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜CrossEnv：把「订机票→订酒店→订餐厅」合成成一条可验证的长程任务——801 MCP + 682 skill 种子、10 域 / 84 能力，只用 2,954 条记录（EnvScaler 的约 1/4）训 Qwen3-8B，DeepPlanning 1.7→10.8、VitaBench 7.0→14.0、Claw-Eval 14.4→23.6 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜CrossEnv：把「订机票→订酒店→订餐厅」合成成一条可验证的长程任务——801 MCP + 682 skill 种子、10 域 / 84 能力，只用 2,954 条记录（EnvScaler 的约 1/4）训 Qwen3-8B，DeepPlanning 1.7→10.8、VitaBench 7.0→14.0、Claw-Eval 14.4→23.6</h1>
+    <p class="post-meta">2026-11-23 · 收藏夹：Agent / RL · 一线追踪<br />
+      来源：Zhengfeng Yu、Tian Lan、Zhijing Wu、Enbo Zhao、Xuannan Liu、Feihu Jiang、Qianghuai Jia、Longyue Wang、Zhao Xu、Weihua Luo、Xian-Ling Mao（北京理工大学 / 阿里巴巴集团 / 北京邮电大学）· <em>CrossEnv: Synthesizing Verifiable Cross-Environment Tasks for Long-Horizon Agent Training</em>（<a href="https://arxiv.org/abs/2611.22777" target="_blank" rel="noopener">arXiv:2611.22777</a>，2026-11-17 提交，23 页）。
+      所有分数与配置均按论文原文；「box 小实验」一节是本文在本机写的 toy 复现，数字只代表该模拟，不代表论文结果。
+      交叉：<a href="daily-2026-11-20-frontline-reverse-curriculum.html">Depth Before Breadth</a>、<a href="daily-2026-11-20-harness-meta2.html">Meta²</a>、<a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、<a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a>、<a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a>。</p>
+
+    <h2>这篇工作解决了什么</h2>
+    <p>
+      长程 Agent 的训练数据有个很自然的天花板：<strong>单环境任务只教得出单环境技能</strong>。真实工作流恰恰是跨服务的——先订机票，拿到到达时间，再结合酒店位置去订餐厅；后一个服务的参数来自前一个服务的结果，最终验收也要跨服务联合检查。已有环境合成工作（EnvScaler、Agent-World、ScaleEnv、EnvACE 等，见论文 Table 1）大多在单个环境内生成任务；跨应用 benchmark 虽然捕捉了这类依赖，但任务与评测器是人工或半手工设计的，扩不出训练规模。
+    </p>
+    <p>
+      CrossEnv 的目标是<strong>自动合成「可执行 + 可验证 + 跨环境」的训练任务</strong>，并且能控制难度。难点不在生成工具调用序列，而在<strong>数据一致性</strong>：两个环境里同一家酒店可能写着不同地址，单独看各自合法，合起来就执行不了。论文的路线是先用 entity–tool graph 找环境之间的连接点，再把任务相关记录对齐，最后用参考执行生成可检查的验证规则。
+    </p>
+    <p>
+      任务的形式化是 τ = (ℰ<sub>S</sub>, I, s<sub>0,τ</sub>, A*, C<sub>τ</sub>)：参与环境集合、指令、联合初始状态、参考执行序列、可执行验证规则。完成判定是所有规则通过，规则从工具输出和<strong>最终环境状态</strong>里取值——不只是比对字符串。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 五阶段合成流水线：先连图，再对齐</h3>
+    <p>
+      论文 §3 的流水线分五步：单环境研究 → 局部依赖图 → 跨环境组合 → 工具合成与测试 → 数据对齐与验证生成。第一阶段的规模是实打实的：从 MCP 服务与公开 skill 文档里筛出 <strong>801 个 MCP 种子 + 682 个 skill 种子</strong>，覆盖 14,657 条工具能力描述；按 Agent-World 的分类法整理成 <strong>10 个业务域、84 个能力类目</strong>。研究 agent 抓文档和数据，数据构建 agent 建初始数据库，缺信息就回头再检索。
+    </p>
+    <p>
+      entity–tool graph 的作用是回答「哪两个环境能连」：如果两个环境共享实体类型（ hotel、flight、user 等）且能通过工具把一边读出的字段喂给另一边，就形成一条候选边。任务骨架按图上的路径构造，之后才做<strong>跨环境数据对齐</strong>：把不同数据库里指代同一实体的记录映射到同一个 joint state，否则参考执行会在「地址不一致」这类地方断掉。
+    </p>
+
+    <h3>② CrossEnv-Curriculum：L1→L5 逐级加环境、域和用户</h3>
+    <p>
+      任务按三个维度分级：环境数、业务域范围、是否需要用户交互。训练顺序是 L1 全参数 SFT，再在 L2–L5 上做逐阶段的 outcome GRPO，每阶段从上一阶段 checkpoint 初始化；奖励来自工具输出与终态的可执行检查，不是二元成功信号。
+    </p>
+    <table>
+      <thead><tr><th>级别</th><th>环境数</th><th>业务域</th><th>用户交互</th><th>训练方式</th></tr></thead>
+      <tbody>
+        <tr><td>L1</td><td>1</td><td>单域</td><td>否</td><td>800 条参考轨迹做全参数 SFT</td></tr>
+        <tr><td>L2</td><td>2</td><td>同域</td><td>否</td><td>GRPO，预算 (T<sub>max</sub>, T<sub>ref</sub>) = (32, 18)</td></tr>
+        <tr><td>L3</td><td>≥3</td><td>同域</td><td>否</td><td>GRPO，(40, 30)</td></tr>
+        <tr><td>L4</td><td>≥3</td><td>跨域</td><td>否</td><td>GRPO，(40, 30)</td></tr>
+        <tr><td>L5</td><td>≥3</td><td>跨域</td><td><strong>是</strong></td><td>GRPO；ask_user 最多 3 问，用户回复由 Qwen3.8-Flash 生成并作为 tool 消息追加</td></tr>
+      </tbody>
+    </table>
+    <p>
+      奖励形式（附录 C.5）：R 由检查项进度、约束违反、非法动作、完成奖励组合，并按 (T<sub>max</sub>, T<sub>ref</sub>) 做预算项；GRPO 对每任务采 8 条轨迹，优势 Â<sub>i</sub> = (R<sub>i</sub> − μ<sub>R</sub>) / (σ<sub>R</sub> + 10<sup>−6</sup>)。这与我们之前写的 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、<a href="daily-2026-11-20-frontline-reverse-curriculum.html">配对优势</a> 是同一族方法，但这里的分组单位仍是<strong>同一任务的一组 rollout</strong>，课程顺序才是主要变量。
+    </p>
+
+    <h3>③ 数据账：2,954 条 vs EnvScaler 的 11,572 条</h3>
+    <p>
+      总量 = 800 条 L1 SFT + 2,154 条 L2–L5 RL 任务 = <strong>2,954 条训练记录</strong>，约为 EnvScaler 报告数据的四分之一（同样量级的还有 Agent-World 3,000 条、Arctic-AWM 3,315 条、Toucan 119,300 条）。骨架 Qwen3-1.7B / 4B / 8B，主表比较的是各规模最后 L5 checkpoint。
+    </p>
+    <table>
+      <thead><tr><th>模型（8B 量级）</th><th>训练记录</th><th>τ²-bench Avg</th><th>DeepPlanning Avg</th><th>VitaBench Avg</th><th>Claw-Eval Avg</th></tr></thead>
+      <tbody>
+        <tr><td>Qwen3-8B（基座）</td><td>—</td><td>11.5</td><td>1.7</td><td>7.0</td><td>14.4</td></tr>
+        <tr><td>EnvScaler-8B</td><td>11,572</td><td><strong>12.8</strong></td><td>8.3</td><td>9.0</td><td>21.5</td></tr>
+        <tr><td>Agent-World-8B</td><td>3,000</td><td>9.3</td><td>9.2</td><td>14.0</td><td>20.5</td></tr>
+        <tr><td><strong>CrossEnv-8B</strong></td><td><strong>2,954</strong></td><td>12.3</td><td><strong>10.8</strong></td><td><strong>14.0</strong></td><td><strong>23.6</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：CrossEnv-8B 在四项里三项超过 EnvScaler-8B（τ²-bench 12.3 vs 12.8 是唯一小输），并在这批 1.7B–8B 模型里拿到 DeepPlanning 与 Claw-Eval 最高聚合分、VitaBench 与 Agent-World-8B 打平。论文强调的「fewer training examples」是有具体分母的：2,954 / 11,572 ≈ 25.5%。
+    </p>
+    <p>
+      评测集规模也要记：τ²-bench 用 Retail 114 + Airline 50 + Telecom 114 + Banking 97 = <strong>375 题</strong>（pass@1）；DeepPlanning-Shopping 用 L1/L2/L3 子集 50 + 50 + 20 = <strong>120 题</strong>（平均 case score，注意这里的 L1–L3 是 benchmark 难度，不是 CrossEnv 课程级别）；VitaBench 四类各 25 题 = <strong>100 题</strong>（pass@1）。
+    </p>
+
+    <h3>④ 课程为什么有用：能力增长与外推</h3>
+    <ul>
+      <li>论文 Figure 3 从 Base 追到 L5：L1 SFT 先涨基础工具使用，L2/L3 让模型执行更多必要工具，但<strong>最终状态检查未必立刻变好</strong>；到 L4/L5 终态通过率才上来，同时早期能力大体保留。</li>
+      <li>与 Mixed 训练对比（同 L1 SFT 起点、L2–L4 同一批任务池，243.04 vs 238.85 累积 RL GPU 小时）：在相近算力下课程版在每个任务级别的严格成功率都更高，且同样算力下累积 rollout 更多——先做短的两环境任务，早期单条样本交互成本更低。</li>
+      <li>外推：训练参考工作流最长 14 次工具调用，拿 16–18 次和 24–28 次两组任务测，4B / 8B 从 L1 到 L4 在两个集合上都提升；1.7B 在长任务上出现后期回落。</li>
+      <li>Table 4 的 seen/unseen 环境组合增益也支持迁移：论文报告了对新组合、相似度较低外部任务、更长工作流的正向结果。</li>
+    </ul>
+
+    <h3>⑤ box 小实验：数据对齐与课程顺序各值多少</h3>
+    <pre><code># 纯 Python，random.seed(7/23)，无 numpy；toy 数据，只用于复现「机制方向」
+# (A) 三种酒店名写法（Grand View Hotel / grand-view hotel / grand  view  hotel）随机配对 600 次
+exact_string_match = 31.5%      # 原样字符串比较
+normalized_match   = 85.0%      # lowercase + 折叠空格 / 连字符 + 实体字典归一
+# (B) 五级技能、每级 60 次学习机会，后继只有当前驱 p >= 0.72 才可学习
+curriculum: p=[0.937,0.937,0.937,0.937,0.937]  avg=0.937  五项全过=0.722
+mixed      : p=[0.937,0.781,0.241,0.000,0.000]  avg=0.392  五项全过=0.000
+# 解释：mixed 在总采样数相同的情况下，把后级的 60 次机会分散在前驱尚未学会时，
+# 大量样本被浪费；这就是 CrossEnv-Curriculum 想避免的 「有数据但学不进去」。</code></pre>
+    <p>
+      toy 当然不是论文的 8B 训练：它只把「数据对齐为什么必要」和「为什么先易后难能省样本」两件事做成可运行的最小例子。真实系统里对齐还要处理同义字段、时间格式、用户隐私字段，课程也涉及 GRPO 的组内优势与预算项；这些都在论文 §3/§4。
+    </p>
+
+    <h2>我的判断</h2>
+    <ul>
+      <li><strong>贡献点在「连接」而不是「规模」</strong>：entity–tool graph + 跨环境数据对齐把独立环境拼成可联合验证的任务，这是之前单环境合成拿不到的监督信号。</li>
+      <li><strong>数据效率的口径要读清楚</strong>：2,954 是训练记录数，不是 token 数；论文自己的外推也承认不同模型规模收益不一样，1.7B 在长任务上会回落。</li>
+      <li><strong>与 harness 路线的分工</strong>：CrossEnv 改的是模型训练数据；今天另一篇 <a href="daily-2026-11-20-harness-meta2.html">Meta²</a> 与近期一批 harness 工作改的是冻结模型外的控制层。两者都盯着长程任务，但一个在权重里，一个在上下文与状态里。</li>
+      <li><strong>可复现性提醒</strong>：论文明确说 EnvScaler-4B 与 Agent-World-4B/8B 是作者复现（Agent-World 当时没公开实现），所以「超过 baseline」应理解为「超过作者复现的 baseline」。</li>
+    </ul>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li>做跨工具 Agent 时，先给实体建<strong>统一 ID 与别名表</strong>再生成任务；box A 里仅做小写化和连字符折叠就把对齐率从 31.5% 提到 85%，真实环境这一步只会更关键。</li>
+      <li>课程分级先按「参与服务数 × 业务域 × 是否要问用户」这三轴切，别只按长度切；CrossEnv 的 L4→L5 只加了用户交互，却专门设计了 ask_user 预算（≤3 问）。</li>
+      <li>验证器尽量读<strong>终态</strong>而不是只看工具返回文本；论文的规则从输出与最终环境状态共同取值，这是跨环境任务能自动判分的前提。</li>
+      <li>对比实验要固定算力口径：论文的课程 vs Mixed 用 243.04 vs 238.85 GPU 小时，并在相近 rollout 量上比较，这是可参考的做法。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么单环境任务即使数量足够大，也教不会跨环境依赖？</summary>
+      <p>因为监督信号里根本没有「A 服务的输出是 B 服务的输入」这类条件。单环境任务的奖励只要求本环境的终态正确，模型不需要学会读取另一个服务的字段，也不需要学会在两个状态之间搬数据。CrossEnv 的联合验证规则把跨环境约束写进奖励，才让这类行为有梯度可循。</p>
+    </details>
+    <details>
+      <summary>2. L3→L4 与 L4→L5 各自增加了什么？为什么把用户交互放在最后？</summary>
+      <p>L3→L4 把「同域三环境」变成「跨域三环境」，增加的是语义跨度：同一个实体在不同业务域的词汇、约束、权限都不同。L4→L5 保持环境数与域范围不变，只引入用户交互（ask_user 最多 3 问，用户私有信息默认不出现在公开指令里）。放在最后是因为交互会引入新的不确定性和成本：问题要消耗 assistant turn、上下文和时间，但不计入业务动作预算；先让模型具备跨服务执行能力，再教它什么时候该问人，课程更稳。</p>
+    </details>
+    <details>
+      <summary>3. 论文的 2,954 条记录「约为 EnvScaler 的 1/4」，这个比较有哪些需要小心的地方？</summary>
+      <p>三条：其一，记录数不是 token 数，两条轨迹长度可能差很远（CrossEnv 平均工具调用随 L1→L5 增长）；其二，EnvScaler-8B 与 Agent-World-8B 部分是作者复现，不同实现的训练细节可能不等价；其三，各 benchmark 的题量不同（375 / 120 / 100 / Claw-Eval 另计），少数几个百分点在不同分母下意义不同。论文自己也只说 competitive with fewer training examples，而不是全面 SOTA。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.22777" target="_blank" rel="noopener">arXiv:2611.22777 · CrossEnv（Yu, Lan, Wu et al.，BIT / Alibaba / BUPT）</a></li>
+      <li><a href="https://arxiv.org/abs/2509.08755" target="_blank" rel="noopener">AgentGym-RL：论文 §2 提到的按交互预算递进的课程基线（arXiv:2509.08755）</a></li>
+      <li>站内：
+        <a href="daily-2026-11-20-frontline-reverse-curriculum.html">今日一线对照：Depth Before Breadth</a> ·
+        <a href="daily-2026-11-20-harness-meta2.html">今日 Harness：Meta²</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> ·
+        <a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a> ·
+        <a href="daily-2026-10-15-vh-gpo.html">VH-GPO</a> ·
+        <a href="daily-2026-11-23-harness-cosight.html">今日 Harness：Co-Sight Harness</a> ·
+        <a href="daily-2026-11-23-algo-expert-parallel.html">今日算法：专家并行与 MoE 负载均衡</a>。</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜专家并行（EP）与 MoE 全链路：256 路由专家 / 每 token 激活 8 个、64 GPU × 8 节点、每 token 最多 4 节点——DeepSeek-V3 用无辅助损失偏置 b_i（γ=0.001）换掉干扰梯度，跨节点计算:通信≈1:1 靠 DualPipe 掩盖；671B 总参 / 37B 激活、14.8T token、2.788M H800 GPU 小时 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜专家并行（EP）与 MoE 全链路：256 路由专家 / 每 token 激活 8 个、64 GPU × 8 节点、每 token 最多 4 节点——DeepSeek-V3 用无辅助损失偏置 b_i（γ=0.001）换掉干扰梯度，跨节点计算:通信≈1:1 靠 DualPipe 掩盖；671B 总参 / 37B 激活、14.8T token、2.788M H800 GPU 小时</h1>
+    <p class="post-meta">2026-11-23 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：DeepSeek-AI（Aixin Liu、Bei Feng、Bing Xue 等，<em>DeepSeek-V3 Technical Report</em>，<a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437</a>，2024-12-27 提交 / 2025-02-18 v2）；
+      Lean Wang、Huazuo Gao、Chenggang Zhao、Xu Sun、Damai Dai（<em>Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts</em>，<a href="https://arxiv.org/abs/2408.15664" target="_blank" rel="noopener">arXiv:2408.15664</a>，2024-08-28）。
+      论文数字按原文；「box 小实验」为本机纯 Python toy，数字只属于该模拟。
+      交叉：<a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a>、<a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>、<a href="daily-2026-10-29-algo-sequence-parallel.html">序列 / 上下文并行</a>、<a href="daily-2026-10-30-algo-pipeline-parallel.html">流水线并行</a>、<a href="daily-2026-10-23-algo-zero.html">ZeRO</a>。</p>
+
+    <h2>为什么把并行策略系列补上最后一块</h2>
+    <p>
+      前面几篇把大模型训练的切分维度逐个拆过：<a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a>切层内矩阵（每层频繁 all-reduce，只能待在 NVLink 域内）、<a href="daily-2026-10-30-algo-pipeline-parallel.html">流水线并行</a>按层切段（边界 P2P，但有气泡）、<a href="daily-2026-10-29-algo-sequence-parallel.html">序列并行</a>切长上下文、<a href="daily-2026-10-23-algo-zero.html">ZeRO</a>切模型状态。它们切的都是<strong>稠密模型里形状固定的张量</strong>。MoE 多出一类并行：<strong>token 要按内容送到不同的专家，路由是动态的</strong>，于是通信模式从规则集合通信变成 all-to-all 派发 / 聚合。
+    </p>
+    <p>
+      <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a>那篇讲的是 Noisy Top-k Gating、Switch 的容量因子、router z-loss；这篇接着讲<strong>系统层</strong>：专家怎么摆、token 怎么跨节点送、负载怎么在不加辅助损失的情况下稳住、通信怎么被计算掩盖。DeepSeek-V3 是这套 co-design 目前最完整的公开样本。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 从 FFN 到 DeepSeekMoE：细粒度专家 + 共享专家</h3>
+    <p>
+      DeepSeek-V3 把前三层之外的所有 FFN 换成 MoE 层（论文 §2.1 / §4.2）。每层结构：
+    </p>
+    <table>
+      <thead><tr><th>项</th><th>配置</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>共享专家 N<sub>s</sub></td><td>1</td><td>所有 token 都过，承载公共知识</td></tr>
+        <tr><td>路由专家 N<sub>r</sub></td><td>256</td><td>细粒度切分，每个专家 intermediate dim = 2048</td></tr>
+        <tr><td>每 token 激活 K<sub>r</sub></td><td>8（外加共享专家）</td><td>671B 总参 / 37B 每 token 激活的账从这里来</td></tr>
+        <tr><td>专家分布</td><td>8 节点 × 64 GPU（每层）</td><td>路由专家均匀铺在 64 张 GPU 上</td></tr>
+        <tr><td>节点上限 M</td><td>4</td><td>每 token 的 8 个专家最多落在 4 个节点，省跨节点 all-to-all</td></tr>
+      </tbody>
+    </table>
+    <p>
+      路由分数用 sigmoid affinity，门控值 g<sub>i,t</sub> 由原始 affinity 经 top-K 归一化得到；输出是共享专家与选中路由专家的加权和。细粒度专家（256 个、每个只有 2048 宽）的意义是让「一个 token 激活的参数」保持 37B 量级，同时总容量堆到 671B——这正是 MoE 与稠密模型的核心经济学。
+    </p>
+
+    <h3>② 专家并行（EP）的通信账：一次 dispatch，一次 combine</h3>
+    <p>
+      EP 和 TP / DP 的区别在于<strong>专家维不是复制维</strong>：专家 i 只在 owning device 上存在。一层 MoE 的前向因此要两次集合通信：
+    </p>
+    <pre><code>token [hidden]  ──gating──▶  每 token 的 top-K 专家 id + 权重
+  ① all-to-all dispatch：把 token 发给专家所在 device（按目标专家重组 batch）
+  ② 本地专家计算：每个 device 处理自己收到的 token 子集
+  ③ all-to-all combine：把专家输出送回 token 所属 device，按 gating 权重加权求和
+反向：combine 的反向是 dispatch、dispatch 的反向是 combine，梯度还要走同一条路</code></pre>
+    <p>
+      DeepSeek-V3 的报告里，跨节点 EP 带来的<strong>计算:通信比约为 1:1</strong>（§3.1）——这不是可以顺手 overlap 掉的小项，而是必须专门设计流水的原因。作者做了两件事：
+    </p>
+    <ul>
+      <li><strong>DualPipe</strong>：把每个 forward / backward chunk 拆成 attention、all-to-all dispatch、MLP、all-to-all combine 四段；反向里 attention 与 MLP 再像 Zero Bubble 那样拆成「对输入」和「对权重」（见 <a href="daily-2026-10-30-algo-pipeline-parallel.html">流水线并行</a>的 B/W 拆分）。手工调节参与通信的 SM 比例，让 forward 与 backward chunk 成对重叠，双向喂 micro-batch；论文称 all-to-all 与 PP 通信都能被完全掩盖。</li>
+      <li><strong>跨节点 all-to-all kernel</strong>：节点间走 IB、节点内走 NVLink，与 gating 算法和集群拓扑共同设计，尽量少占通信用的 SM；配合细心的显存优化，训练<strong>没有用 TP</strong>（§3.1）。</li>
+    </ul>
+    <p>
+      <strong>node-limited routing</strong> 是降低通信量的算法侧配合：每个 token 最多发到 M 个节点，节点按「该节点上 affinity 最高的 K<sub>r</sub>/M 个专家之和」排序选出（K<sub>r</sub>=8、M=4，即每节点选 2 个专家）。论文说在这种约束下，MoE 训练框架可以接近完全的计算–通信重叠。
+    </p>
+
+    <h3>③ 无辅助损失负载均衡：b<sub>i</sub> 只进路由，不进梯度</h3>
+    <p>
+      传统做法是给 MoE 加 auxiliary loss 惩罚负载不均；但辅助损失大会把干扰梯度注入训练，损害模型质量。Wang et al. (2024) 的 Loss-Free Balancing 改成分两步：给每个专家一个 bias b<sub>i</sub>，用 s<sub>i,t</sub> + b<sub>i</sub> 做 top-K 决策；<strong>b<sub>i</sub> 只影响选谁，不影响该专家输出的门控权重</strong>（门控仍用原始 s<sub>i,t</sub>）。每步结束看整个 batch 的专家负载：过载就 b<sub>i</sub> −= γ，欠载就 b<sub>i</sub> += γ。
+    </p>
+    <pre><code># 每个训练步：
+scores_for_routing = s[:, :] + b          # 只用决策
+topk_idx = topk(scores_for_routing, K)    # b 决定去哪
+gating = normalize(s[selected])           # b 不进输出、不产生梯度
+# step 末：
+for i in experts:
+    if load[i] &gt; mean(load): b[i] -= gamma
+    if load[i] &lt; mean(load): b[i] += gamma
+# DeepSeek-V3: gamma = 0.001（前 14.3T token），最后 500B 置 0</code></pre>
+    <p>
+      DeepSeek-V3 还留了一个<strong>序列级</strong>辅助损失兜底，α = 0.0001，只为防止单条序列内极端不均。原因很实际：bias 是在 batch 粒度上调节的，单序列内部可能仍然歪；batch-wise 的自由度高，反而让专家在不同领域上更 specialization（论文 Figure 9 的 Pile 三域专家负载图）。
+    </p>
+
+    <h3>④ 效果：消融与总账</h3>
+    <p>
+      论文 Table 5（辅助损失 vs 无辅助损失，同数据同架构）说明这不只是理论偏好：
+    </p>
+    <table>
+      <thead><tr><th>基准（指标）</th><th>Small MoE：Aux-Loss</th><th>Small：Loss-Free</th><th>Large MoE：Aux-Loss</th><th>Large：Loss-Free</th></tr></thead>
+      <tbody>
+        <tr><td>Pile-test (BPB) ↓</td><td>0.727</td><td><strong>0.724</strong></td><td>0.656</td><td><strong>0.652</strong></td></tr>
+        <tr><td>BBH (EM)</td><td>37.3</td><td><strong>39.3</strong></td><td>66.7</td><td><strong>67.9</strong></td></tr>
+        <tr><td>HumanEval (Pass@1)</td><td>22.0</td><td>22.6</td><td>40.2</td><td><strong>46.3</strong></td></tr>
+        <tr><td>GSM8K (EM)</td><td>27.1</td><td><strong>29.6</strong></td><td>70.7</td><td><strong>74.5</strong></td></tr>
+        <tr><td>MATH (EM)</td><td>10.9</td><td>11.1</td><td>37.2</td><td><strong>39.6</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      不是每一项都赢（Large 的 MMLU 68.3→67.2、Small 的 MBPP 36.6→35.8），论文的说法是「most benchmarks」。另有 1B / 3B 的对照：1B MoE 验证损失 2.258（序列级 aux）/ 2.253（loss-free）/ 2.253（batch-wise aux）；3B 是 2.085 / 2.080 / 2.080——关键不在「有没有 aux loss」这个标签，而在<strong>平衡是在 batch 粒度还是 sequence 粒度上施加</strong>。
+    </p>
+    <p>
+      总账：2048 张 H800，14.8T token 预训练，每万亿 token 需 180K GPU 小时（约 3.7 天），预训练 2.664M GPU 小时；加上下文扩展 119K、后训练 5K，合计 <strong>2.788M H800 GPU 小时</strong>；按 $2/GPU 小时算约 $5.576M（论文明确说不含前期研究与消融）。全程没有不可恢复的 loss spike，也没有回滚。
+    </p>
+    <p>
+      推理侧同样有 EP 的影子：prefill 用 EP32（每 GPU 8 个专家 + 1 个冗余专家，32 个冗余专家），decode 最小部署单元 40 节点 / 320 GPU，MoE 侧 EP320、每 GPU 1 个专家，另有 64 GPU 托管冗余与共享专家；共享专家被当作必然选中的「重专家」，于是每 token 选 9 个专家。high-load 专家按在线统计每 10 分钟量级调整一次。
+    </p>
+
+    <h3>⑤ box 小实验：node-limited 与 bias 更新的 toy 复现</h3>
+    <pre><code># 纯 Python，random.seed(23)，8 专家 / 2 节点 / top-2 / 每批 2000 token；gamma=0.01（放大以便观察）
+# 每 token 的 affinity = exp(-(i-center)^2/6)*(0.85+0.3*rand)，center ~ U(0,7)
+step  0: load=[288,580,726,436,405,685,584,296]  CV=0.315  max/min=726/288
+step  1: load=[304,549,675,420,448,699,575,330]  CV=0.278  b0=+0.01 b7=+0.01
+step 10: load=[392,482,577,491,505,614,540,399]  CV=0.146  b0=+0.10 b7=+0.10
+step 50: load=[484,511,480,479,496,525,496,529]  CV=0.037  max/min=529/479  b0=+0.17 b7=+0.21
+step100: load=[481,506,466,493,502,522,492,538]  CV=0.042  （已到噪声底）
+# 读法：b_i 没有进入 gating 值，只改变 top-k 决策；CV 在 50 步内降一个数量级。
+# 注意 toy 的 gamma=0.01 远大于论文的 0.001：论文要在 14.3T token 的尺度上慢慢调。</code></pre>
+    <p>
+      这个 toy 也暴露了一个实现陷阱：bias 更新必须基于<strong>整个 batch 的负载</strong>而不是单条序列；否则单序列的随机波动会让 b<sub>i</sub> 高频震荡。DeepSeek-V3 因此用 batch 粒度 bias + 极小 α 的序列级辅助损失兜底，而不是二选一。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>EP 度不要凭总卡数拍</strong>：要让每个专家拿到足够大的 batch，否则专家内矩阵乘效率很差；推理侧的 DeepSeek-V3 用 EP32 / EP320 两个档位，并配冗余专家，就是这个原因。</li>
+      <li><strong>先把「跨节点几条边」算出来</strong>：node-limited routing（K<sub>r</sub>/M 个专家每节点）是用少量精度换通信量的旋钮；M 越大越均衡但跨节点流量越高。论文的 M=4 是在 8 节点、64 GPU 布局下定出来的。</li>
+      <li><strong>bias 与 gating 一定要分开</strong>：s + b 只用于 top-k 决策，输出权重仍用 s。把 b 混进 gating 就等于重新引入了干扰梯度，无辅助损失的收益会消失。</li>
+      <li><strong>γ 的量级要按训练 token 数缩放</strong>：论文 γ=0.001 作用在前 14.3T token，最后 500B 直接置 0；短跑实验里照搬大 γ 会震荡，toy 里放大到 0.01 只是为了让人眼看见收敛。</li>
+      <li><strong>通信重叠要和调度一起设计</strong>：DualPipe 的价值不是「多开一个 overlap 线程」，而是把反向拆成 B/W 后重排 chunk，并调 SM 分配；单独把 all-to-all 换成更快的 kernel 未必能拿到同样的效果。</li>
+      <li><strong>与 ZeRO / TP 的组合要看显存账</strong>：论文靠显存优化做到不用 TP；如果专家参数 + 优化器状态放不下，先按 <a href="daily-2026-10-23-algo-zero.html">ZeRO</a> 的分片级别算账，而不是上来就叠 TP 增加通信域。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 bias 只用于路由决策、不用于 gating 权重？如果混用会发生什么？</summary>
+      <p>因为 bias 是一个由负载统计量（不可微、逐 step 跳变）驱动的控制器输出。把它加到 gating 上，专家输出会被一个与任务无关的量缩放，相当于给主任务注入了干扰梯度——这正是 auxiliary loss 想避免的问题。只用于 top-k 时，b<sub>i</sub> 改变的是「哪些专家被选中」，而输出仍按原始 affinity 归一化，梯度的语义与没有负载均衡时一致。</p>
+    </details>
+    <details>
+      <summary>2. node-limited routing 为什么按「节点内 top K<sub>r</sub>/M 的 affinity 之和」选节点，而不是按每个专家的全局排名选？</summary>
+      <p>因为通信成本发生在节点边界：真正要省的是 token 触及的节点数 M，而不是专家数 K<sub>r</sub>。按节点聚合分数选出 M 个节点、再在节点内选 K<sub>r</sub>/M 个专家，能保证选够 K<sub>r</sub> 个专家的同时把跨节点 dispatch 限制在 M 次。若按全局排名选 8 个专家，它们可能散落在 8 个节点上，all-to-all 的跨节点流量和延迟都会上去，而 DualPipe 的 1:1 计算通信比假设也就难成立。</p>
+    </details>
+    <details>
+      <summary>3. 这篇与 10-14 的「MoE 路由与负载均衡」是什么关系？</summary>
+      <p>10-14 那篇讲的是 MoE 层的<strong>算法与训练目标</strong>：Noisy Top-k Gating、Switch Transformer 的 α·N·Σf·P 与 capacity factor、ST-MoE 的 router z-loss。这篇讲的是<strong>系统与部署</strong>：专家在 64 GPU 上怎么摆、dispatch/combine 的 all-to-all 怎么被 DualPipe 掩盖、以及用 bias 控制器替代干扰梯度。两者共用同一个问题「负载不均」，但一个从损失函数入手，一个从控制平面和通信拓扑入手。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">arXiv:2412.19437 · DeepSeek-V3 Technical Report（DeepSeek-AI）</a> · <a href="https://github.com/deepseek-ai/DeepSeek-V3" target="_blank" rel="noopener">GitHub: deepseek-ai/DeepSeek-V3</a></li>
+      <li><a href="https://arxiv.org/abs/2408.15664" target="_blank" rel="noopener">arXiv:2408.15664 · Auxiliary-Loss-Free Load Balancing Strategy for MoE（Wang, Gao, Zhao, Sun, Dai）</a></li>
+      <li><a href="https://arxiv.org/abs/2401.10241" target="_blank" rel="noopener">arXiv:2401.10241 · Zero Bubble Pipeline Parallelism（DualPipe 的 B/W 拆分来源）</a></li>
+      <li>站内：
+        <a href="daily-2026-10-14-algo-moe-routing.html">MoE 路由与负载均衡</a> ·
+        <a href="daily-2026-10-16-spectral-moe.html">Spectral-MoE</a> ·
+        <a href="daily-2026-10-22-moe-expert-skipping.html">MoE 专家动态跳过</a> ·
+        <a href="daily-2026-10-28-algo-tensor-parallel.html">张量并行</a> ·
+        <a href="daily-2026-10-30-algo-pipeline-parallel.html">流水线并行</a> ·
+        <a href="daily-2026-11-23-frontline-crossenv.html">今日一线：CrossEnv</a> ·
+        <a href="daily-2026-11-23-harness-cosight.html">今日 Harness：Co-Sight Harness</a>。</li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

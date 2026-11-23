@@ -984,6 +984,27 @@
       "source": "algo",
       "topic": "Gated DeltaNet：线性 Transformer 外积联想记忆受 d 限制会 memory collision；Mamba2 标量衰减 S=αS+vkᵀ 整体淡出无法定点遗忘、DeltaNet S=S(I−βkkᵀ)+βvkᵀ 精准覆写但无法快速清空；gated delta rule S_t=S_{t−1}(α_t(I−β_t k_t k_tᵀ))+β_t v_t k_tᵀ——α→0 整块清空（context switch）、α→1 退化为 delta 定点覆写；SSD 并行式 O=((QKᵀ)⊙Γ)V、Γ_{ij}=γ_i/γ_j、γ_j=∏α_i；WY 表示（Bischof & Loan 1985）把秩-1 擦除合并做分块并行（chunkwise，matmul-heavy，线性时间），递推用于推理、分块用于训练；1.3B 参数/100B FineWeb-Edu token/4K 训练（混合 SWA 2K）：WikiText-103 PPL Transformer++ 18.53 / Mamba2 16.56 / DeltaNet 17.71 / Gated DeltaNet 16.42 / H2 15.91，LMB 12.56→12.17，0-shot 常识 54.89→55.32（H1 56.40）；S-NIAH-2 4K DeltaNet 18.6 / Mamba2 56.2 / GDN 92.2、8K 14.4/17.0/29.6，S-NIAH-1 8K 98.8/30.4/91.8，S-NIAH-3 4K 22.4/4.6/27.6；真实 recall Avg（截 2K）Mamba2 29.8 / GDN 30.6 / Transformer++ 37.0 / H2 40.1；20K 长度外推 RNN 里整体 PPL 最低；单 H100 吞吐与 DeltaNet 几乎同速、比 Mamba2 略慢 2–3K tok/s、混合 H1/H2 更快；box 纯 Python：更新式两写法逐位一致 8.882e−16、近平平行 key cos=0.9959 下 decay-only 读旧 v1=0.990 泄漏 vs gated delta 0.008 被覆写（Yang(MIT CSAIL/NVIDIA)/Kautz/Hatamizadeh NVIDIA arXiv:2412.06464 ICLR 2025）",
       "file": "posts/daily-2026-11-20-algo-gated-deltanet.html"
+    },
+    {
+      "date": "2026-11-23",
+      "domain": "agent rl",
+      "source": "frontline",
+      "topic": "CrossEnv：用 entity–tool graph + 跨环境数据对齐自动合成可执行的跨服务长程任务（801 MCP 种子 + 682 skill 种子 / 14,657 条工具能力描述、10 业务域 / 84 能力类目）；任务 τ=(环境集, 指令, 联合初态, 参考执行, 可执行验证规则)，验证读工具输出与终态。CrossEnv-Curriculum 按环境数×业务域×用户交互分 L1–L5：L1 用 800 条参考轨迹全参 SFT，L2–L5 逐阶段 outcome GRPO（每任务 8 条轨迹，Â=(R−μ)/(σ+1e−6)；预算 L2=(32,18)、L3–L5=(40,30)；L5 ask_user ≤3 问）；合计 2,954 条训练记录，约 EnvScaler 11,572 条的 1/4。Qwen3-8B：DeepPlanning 1.7→10.8、VitaBench 7.0→14.0、Claw-Eval 14.4→23.6、τ²-bench 11.5→12.3（12.8 的 EnvScaler-8B 略高）；三项超 EnvScaler-8B、DeepPlanning/Claw-Eval 为 1.7–8B 组最高，VitaBench 与 Agent-World-8B 打平。评测集 375/120/100 题；课程 vs Mixed 在 243.04/238.85 GPU 小时下各级别严格成功率更高；参考工作流最长 14 次调用，外推到 16–18 / 24–28 次仍涨（1.7B 后期回落）。box 纯 Python：600 对酒店名精确匹配 31.5% vs 归一后 85.0%；带前置门槛的五级课程 p 均值 0.937 vs mixed 0.392（seed 7/23）（Yu/Lan/Wu et al. 北理工/阿里/北邮 arXiv:2611.22777）",
+      "file": "posts/daily-2026-11-23-frontline-crossenv.html"
+    },
+    {
+      "date": "2026-11-23",
+      "domain": "harness agent",
+      "source": "harness",
+      "topic": "Co-Sight Harness：冻结 backbone，把工作流定义/状态/领域知识外置成版本化 control assets K（K∩θ=∅），三条不变量——u 编译成 K 且由独立 verifier 评级、状态机 Σ+hooks+DoD 闸门强制合法转移与带证据有界返工（b_t≤3）、只读审计后经回归+人工批准才准入 K_{t+1}；四控制面（业务 Orchestrator→Worker→Review 11 原子子 agent / 执行外部化状态 / 双引擎检索+语义对齐 / GoldEval+三级下钻+ability-regression 划分）。三个真实部署工作流均 >200 步，Domain A 120 例：无人值守完成率 50%→100%、生成召回 68%→91.25%/精确 67%→84.38%、检索召回 56%→91.67%/精确 36%→50%、端到端 440→159 min（−64%）、需求分析 169→56.4 min、系统设计 114→26.5 min、场景召回 45%→93%、跨组件 F1 4%→61.4%；需求分析全流程召回 78.08% 未达 80% 目标。加法 ablation（n=120,R=13）：B0=50%、B1 控制线=75%、B2 知识线=60%、B3 两者=90%、B4 等算力长 prompt+重试=60%；减法：Full 88.3%、去 DoD 65.8%、去外部化状态 70.8%、去检索完成率仍 84.2% 但 R 0.88→0.55、等 token 长 prompt 61.7%、1.5× token 68.3%。跨团队接管 2×4 天 / 1×7 天。box：10 步 @0.95 串联 59.87%，逐闸门+≤3 返工 99.99%，只把单步提到 0.97 为 73.74%（Wang et al. 中兴通讯 arXiv:2611.17696）",
+      "file": "posts/daily-2026-11-23-harness-cosight.html"
+    },
+    {
+      "date": "2026-11-23",
+      "domain": "algo infra",
+      "source": "algo",
+      "topic": "专家并行（EP）与 MoE 全链路：DeepSeek-V3 每层 1 共享专家 + 256 路由专家（每个 intermediate 2048），每 token 激活 8 路由专家，专家铺在 8 节点×64 GPU，node-limited routing 按节点内 top K_r/M affinity 之和选 M=4 个节点（每节点 2 专家）以压跨节点 all-to-all；一层两次 all-to-all（dispatch→本地专家→combine），反向同理，跨节点计算:通信≈1:1，DualPipe 把 chunk 拆成 attention/dispatch/MLP/combine 并把反向拆 B/W 做双向流水重叠，IB 跨节点 + NVLink 节点内、不用 TP。无辅助损失负载均衡：s_i,t+b_i 只用于 top-k 决策、gating 仍用原始 affinity，step 末按 batch 负载 ±γ（γ=0.001 前 14.3T token，末 500B 置 0），另加序列级 α=1e−4 防极端不均；Table 5 Large MoE Pile BPB 0.656→0.652、HumanEval 40.2→46.3、GSM8K 70.7→74.5（MMLU 68.3→67.2 例外）；1B 验证损失 2.258/2.253/2.253、3B 2.085/2.080/2.080（序列 aux/loss-free/batch aux）。总账 671B/37B 激活、14.8T token、2048 H800、每万亿 token 180K GPU 小时、预训练 2.664M + 扩展 119K + 后训练 5K = 2.788M GPU 小时 ≈$5.576M。推理 prefill EP32+32 冗余专家、decode EP320（40 节点/320 GPU，64 GPU 放冗余与共享专家，共享专家当必选重专家→每 token 9 专家）。box 纯 Python（seed 23，8 专家/2 节点/top-2/γ=0.01）：负载 CV 0.315→0.146(10 步)→0.037(50 步)→0.042(100 步)（DeepSeek-AI arXiv:2412.19437；Wang et al. arXiv:2408.15664）",
+      "file": "posts/daily-2026-11-23-algo-expert-parallel.html"
     }
   ]
 }
