@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜量化三岔路：GPTQ 用逆 Hessian 逐列补偿（OPT-175B 3-bit PPL 8.68 vs RTN 7.3e3、单卡约 4 GPU 小时）、AWQ 放大 1% 显著通道（PPL 23.54→11.92）、SmoothQuant 把激活离群迁到权重（W8A8 最高 1.56×，530B 单节点） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜量化三岔路：GPTQ 用逆 Hessian 逐列补偿（OPT-175B 3-bit PPL 8.68 vs RTN 7.3e3、单卡约 4 GPU 小时）、AWQ 放大 1% 显著通道（PPL 23.54→11.92）、SmoothQuant 把激活离群迁到权重（W8A8 最高 1.56×，530B 单节点）</h1>
+    <p class="post-meta">2026-11-24 · 收藏夹：算法 / Infra · 学习笔记<br />
+      经典来源：Elias Frantar、Saleh Ashkboos、Torsten Hoefler、Dan Alistarh（IST Austria &amp; NeuralMagic / ETH Zürich）· <em>GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</em>（<a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">arXiv:2210.17323</a>，ICLR 2023）；
+      Ji Lin、Jiaming Tang、Haotian Tang、Shang Yang、Wei-Ming Chen、Wei-Chen Wang、Guangxuan Xiao、Xingyu Dang、Chuang Gan、Song Han（MIT / SJTU / NVIDIA / Tsinghua / MIT-IBM Watson AI Lab / UMass）· <em>AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</em>（<a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">arXiv:2306.00978</a>，MLSys 2024 Best Paper，本文引用 v6（2026-04-25））；
+      Guangxuan Xiao、Ji Lin、Mickael Seznec、Hao Wu、Julien Demouth、Song Han（MIT / NVIDIA）· <em>SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</em>（<a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">arXiv:2211.10438</a>，ICML 2023）。
+      论文数字均来自原文表格 / 正文；「box 小验证」一节为本文用纯 Python 构造的玩具张量实跑，不是论文复现。
+      交叉：
+      <a href="daily-2026-11-24-frontline-diss.html">今日一线：DisSparse</a>、
+      <a href="daily-2026-11-24-harness-raa.html">今日 Harness：RAA</a>、
+      <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a>、
+      <a href="daily-2026-10-19-kv-tier-pcp.html">KV cache 分层</a>、
+      <a href="daily-2026-10-30-batch-invariance-kernel-agent.html">Batch Invariance</a>、
+      <a href="daily-2026-11-23-algo-expert-parallel.html">专家并行</a>。</p>
+
+    <h2>背景与动机：三条量化路线，优化的不是同一个东西</h2>
+    <p>
+      LLM 量化先要分清两条轴：<strong>W8A8</strong> 把权重和激活都压到 INT8，目标是让 GEMM 直接吃整数算术、省显存也提吞吐；<strong>低比特 weight-only</strong>（W4A16 / W3A16）只压权重，因为自回归 decode 是访存受限，权重搬一次就决定延迟。两条轴的共同敌人是<strong>离群值</strong>：激活里极少数通道幅值比其它通道大几十倍，per-tensor INT8 的量化步长被它们撑大，普通通道几乎被量化成 0；权重侧的少数显著通道又承担了不成比例的输出贡献。
+    </p>
+    <table>
+      <thead><tr><th>方法</th><th>量化对象</th><th>核心动作</th><th>要解决的问题</th><th>论文硬件收益</th></tr></thead>
+      <tbody>
+        <tr><td>GPTQ</td><td>weight-only，3/4 bit</td><td>逆 Hessian 逐列补偿舍入误差</td><td>一次性 PTQ 的精度崩塌</td><td>3-bit OPT-175B：A100 230→71 ms（3.24×）、A6000 589→130 ms（4.53×）</td></tr>
+        <tr><td>AWQ</td><td>weight-only，4 bit 为主</td><td>按激活幅值放大 1% 显著通道</td><td>显著权重不能保 FP16（硬件不友好）</td><td>TinyChat 相对 HF FP16 平均 3.2–3.3×</td></tr>
+        <tr><td>SmoothQuant</td><td>W8A8</td><td>把激活离群“迁移”到权重：<code>X diag(s)⁻¹ · diag(s) W</code></td><td>激活难量化、混合精度又慢</td><td>A100 FasterTransformer 上最高 1.56×；530B 用 8 卡单节点</td></tr>
+      </tbody>
+    </table>
+    <p>
+      这一篇把三篇放在一起讲，是因为它们恰好对应三个不同的“等价变换”：GPTQ 变换<strong>权重数值</strong>来补偿误差，AWQ 变换<strong>通道 scale</strong>来保护少数权重，SmoothQuant 把<strong>量化难度</strong>在激活与权重之间重新分配。理解变换的等价性，比记住论文名字更重要。
+    </p>
+
+    <h2>GPTQ：把 OBQ 的贪心顺序去掉，换来三个数量级</h2>
+    <h3>① 从 OBQ 的目标函数出发</h3>
+    <p>
+      逐层量化要最小化输出扰动 <code>||W X − Ŵ X||²</code>。OBQ 把未量化集合记为 <code>F</code>，用 <code>H = 2XXᵀ + λI</code>，量化第 q 个权重后的最小增量误差为 <code>e = w_q² / [H⁻¹]_{qq}</code>，因此贪心选误差最小的权重先量化，再沿高斯消元更新逆矩阵：
+    </p>
+    <pre><code>H_inv_minus_q = (H_inv − H_inv[:,q] @ H_inv[q,:] / H_inv[q,q]) 去掉第 q 行列
+
+e_q = w_q² / [H_inv]_{qq}          # OBQ 的贪心评分
+δ = −(w_q − quant(w_q)) · H_inv[q,:] / [H_inv]_{qq}   # 误差补偿到剩余权重</code></pre>
+    <p>
+      问题在复杂度：OBQ 对每个权重都更新一次逆矩阵，<code>O(d_row·d_col³)</code>；论文提到它量化 25M 参数的 ResNet-50 要约 1 小时。175B 模型完全不可行。
+    </p>
+
+    <h3>② 三个工程化步骤</h3>
+    <table>
+      <thead><tr><th>步骤</th><th>洞察</th><th>效果</th></tr></thead>
+      <tbody>
+        <tr><td>任意顺序</td><td>大模型里贪心顺序相对固定顺序的优势很小；所有行按同一列序量化，<code>H_F⁻¹</code> 只依赖 <code>X_F</code>、与权重无关，因此每列更新一次而非每权重一次</td><td><code>O(d_row·d_col³)</code> → <code>O(max{d_row·d_col², d_col³})</code>，加速 min(d_row,d_col) 倍</td></tr>
+        <tr><td>惰性批量更新</td><td>某列的舍入只受本列更新影响，先把更新限制在 B=128 列窗口内，块处理完再全局更新</td><td>把“低算术强度、被显存带宽卡住”的操作变成大块更新，实测一个数量级加速</td></tr>
+        <tr><td>Cholesky 重参数化</td><td>大模型上反复更新会让 <code>H_F⁻¹</code> 失去正定性，误差补偿方向错误；只需逆矩阵每行从对角线起的元素，可预先用稳定 Cholesky 算出</td><td>配合 λ=平均对角线 1% 的 dampening，175B 也能稳定量化</td></tr>
+      </tbody>
+    </table>
+    <p>
+      完整算法（论文 Algorithm 1）的块内循环就是“量化 → 记误差 <code>E=(W−Q)/[H⁻¹]_{jj}</code> → 用 <code>E·H⁻¹[j,j:]</code> 更新块内剩余列 → 块结束再更新块外所有列”。校准数据只有 <strong>128 段 × 2048 token 的 C4 文本</strong>，单张 A100-80GB 一次加载一个 Transformer block（6 层）量化，整个 175B 约 <strong>4 GPU 小时</strong>。
+    </p>
+
+    <h3>③ 数字账：3-bit 没崩，4-bit 几乎无损</h3>
+    <table>
+      <thead><tr><th>OPT-175B / WikiText2 PPL</th><th>16-bit</th><th>RTN 4-bit</th><th>GPTQ 4-bit</th><th>RTN 3-bit</th><th>GPTQ 3-bit</th></tr></thead>
+      <tbody>
+        <tr><td>数值</td><td>8.34</td><td>10.54</td><td><strong>8.37</strong></td><td>7.3e3</td><td><strong>8.68</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      BLOOM-176B 类似：16-bit 8.11、GPTQ 4-bit 8.21、GPTQ 3-bit 8.64，而 RTN 3-bit 是 571。分组能再补精度：group size 1024（约 +0.02 bit）平均改善约 0.2 PPL，group size 128（再 +0.15 bit）再改善约 0.1。推理侧 Table 6：3-bit OPT-175B 在 A100 上每 token 71 ms vs FP16 230 ms（3.24×，5 卡→1 卡），A6000 上 130 ms vs 589 ms（4.53×，8 卡→2 卡）。注意这是<strong>生成阶段</strong>的访存收益，不是训练加速。
+    </p>
+
+    <h2>AWQ：显著通道由激活决定，保护方式用等价缩放</h2>
+    <h3>① 1% 的显著通道</h3>
+    <p>
+      AWQ 先做一个反直觉实验：INT3-g128 量化时，把一小部分权重通道保留 FP16。Table 1（WikiText PPL，越低越好）：OPT-1.3B 的 FP16 是 14.62、纯 RTN 是 119.00；按<strong>激活幅值</strong>选 0.1%/1%/3% 保留 FP16 分别是 25.03/16.91/16.68，而按<strong>权重幅值</strong>选是 108.71/98.55/98.08，随机选是 119.76/109.38/61.49。OPT-6.7B 同样：FP16 10.86、RTN 23.54、按激活 1% 为 11.39、按权重 1% 为 22.37。也就是说，<strong>判断重要性要看激活分布，哪怕做的是 weight-only 量化</strong>。
+    </p>
+    <p>
+      但混合精度硬件不友好。AWQ 的推导（Eq. 1–3）说明为什么放大通道 scale 能保护它：设量化步长 Δ，<code>Err(Q(w)x)=Δ·RoundErr(w/Δ)·x</code>；把 w 放大 s 倍、x 缩小 s 倍后，输出数学等价，而 <code>RoundErr</code> 的期望不变（≈0.25）、单个显著通道通常不改变组内最大值（<code>Δ′≈Δ</code>），于是相对误差约为 <code>(Δ′/Δ)·(1/s)</code>，s&gt;1 就变小。
+    </p>
+
+    <h3>② s 不是越大越好：Table 2 的权衡</h3>
+    <table>
+      <thead><tr><th>OPT-6.7B，放大 1% 显著通道</th><th>s=1</th><th>s=1.25</th><th>s=1.5</th><th>s=2</th><th>s=4</th></tr></thead>
+      <tbody>
+        <tr><td>Δ 发生变化的通道比例</td><td>0%</td><td>2.8%</td><td>4.4%</td><td>8.2%</td><td>21.2%</td></tr>
+        <tr><td>显著通道相对误差 (Δ′/Δ)/s</td><td>1</td><td>0.804</td><td>0.676</td><td>0.519</td><td>0.303</td></tr>
+        <tr><td>WikiText2 PPL</td><td>23.54</td><td>12.87</td><td>12.48</td><td><strong>11.92</strong></td><td>12.36</td></tr>
+      </tbody>
+    </table>
+    <p>
+      s 太大时 Δ′ 上升，非显著通道的误差被 <code>Δ′/Δ</code> 放大。因此最终不做手工固定 s，而是按 Eq. 4 搜索每个输入通道的 scale：<code>s* = argmin_s ||Q(W·diag(s))·diag(s)⁻¹X − WX||</code>，用一小段校准集上的激活统计量、无反向传播、无重建，因而不会像 GPTQ 那样对校准分布过拟合。Table 3 给出 OPT 全系列 INT3-g128 的 PPL：1.3B 119.47→16.32，6.7B 23.54→11.39，30B 18.80→9.77，接近“1% FP16”混合精度但硬件友好。
+    </p>
+    <p>
+      系统侧 TinyChat 用 on-the-fly dequantization、SIMD-aware weight packing 和 kernel fusion 把 4× 内存下降兑现成实测速度：桌面 / 笔记本 / 移动 GPU 上相对 HuggingFace FP16 平均 <strong>3.2–3.3×</strong>；笔记本 RTX 4070 8GB 上 13B 模型做到 30 tokens/s，Jetson Orin 64GB 上部署 Llama-2-70B。
+    </p>
+
+    <h2>SmoothQuant：把量化难度从激活搬到权重</h2>
+    <h3>① 等价变换与迁移强度 α</h3>
+    <p>
+      对每个输入通道 j 取 scale <code>s_j</code>，令 <code>Y = X·diag(s)⁻¹</code>、<code>W′ = diag(s)·W</code>，则 <code>YW′ = XW</code> 在数学上不变。纯把难度推给权重（<code>s_j=1/max|W_j|</code>）或全推给激活（<code>s_j=max|X_j|</code>）都会崩；用一个超参 α 分配：
+    </p>
+    <pre><code>s_j = max(|X_j|)^α / max(|W_j|)^(1−α)
+
+α=0   → 全部难度留在激活
+α=1   → 全部难度迁到权重
+α=0.5 → 权重 / 激活对应通道的最大幅值相近，同量化器难度相当（OPT / BLOOM）
+GLM-130B 约 30% 离群通道 → α=0.75；LLaMA 系激活离群较轻 → α=0.8</code></pre>
+    <p>
+      校准在预训练数据上离线完成，推理时激活不再额外缩放。量化粒度从 O1（per-token dynamic activation）到 O3（per-tensor static activation）逐步激进，O3 可以直接用现成 INT8 GEMM。
+    </p>
+
+    <h3>② 精度与速度：W8A8 不是“必然掉点”</h3>
+    <table>
+      <thead><tr><th>OPT-175B</th><th>7 项 zero-shot 平均</th><th>WikiText PPL</th></tr></thead>
+      <tbody>
+        <tr><td>FP16</td><td>66.9%</td><td>10.99</td></tr>
+        <tr><td>naive W8A8</td><td>35.5%</td><td>93080</td></tr>
+        <tr><td>ZeroQuant</td><td>35.8%</td><td>84648</td></tr>
+        <tr><td>Outlier Suppression</td><td>36.0%</td><td>96151</td></tr>
+        <tr><td>LLM.int8()（混合精度）</td><td>66.7%</td><td>11.10</td></tr>
+        <tr><td><strong>SmoothQuant-O3</strong></td><td><strong>66.8%</strong></td><td><strong>11.17</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      LLaMA-1 系列 WikiText2 PPL：7B 11.51→11.56、13B 10.05→10.08、30B 7.53→7.56、65B 6.17→6.20（α=0.8，per-token activation）；OPT-IML-30B 上 LAMBADA 69.12%→69.77%、WikiText 14.26→14.37。速度侧在 A100-80GB 的 FasterTransformer 上，OPT-13B / 30B 单卡最高 <strong>1.56×</strong>；OPT-66B 从 2 卡降到 1 卡、OPT-175B 从 8 卡降到 4 卡仍达到相近或更好延迟。MT-NLG 530B 在 seq=128 时 FP16 用 16 卡、1040 GB，INT8 用 8 卡、527 GB，延迟 232 ms vs 253 ms——500B 模型进单节点。
+    </p>
+
+    <h2>box 小验证：等价缩放真的能降误差吗</h2>
+    <p>两个纯 Python 玩具，用论文里的公式、自己构造的张量（seed 20261124）：</p>
+    <pre><code># C1：16 通道 INT3 分组量化，第 15 通道 w=0.38 但 x=40（显著）
+step = max(|w_i| for i != salient) * 2 / 7
+q_i  = round((w_i * s_i)/step) * step / s_i
+MSE  = Σ (q_i − w_i)² * x_i²
+
+BOX C1 输出：s=1.0 → 24.1539；s=1.5 → 3.2095；s=2.0 → 0.0168；s=3.0 → 2.4433
+
+# C2：4 通道 per-tensor INT8，ch0 激活离群 30、ch1 权重离群 20（95% 普通值 + 5% 离群）
+s_j  = Xmax_j^α / Wmax_j^(1−α)
+dx   = max_j(Xmax_j / s_j),  dw = max_j(Wmax_j * s_j)
+量化 x/s_j 用 dx/127，量化 w*s_j 用 dw/127，再乘回去
+
+BOX C2 输出：α=0.0 → 0.002344；α=0.3 → 0.001629；α=0.5 → 0.001567；
+            α=0.7 → 0.001645；α=1.0 → 0.002352</code></pre>
+    <p>
+      读法：AWQ 玩具里 s=2 把显著通道的输出误差降了三个数量级，s 再大反而回升——对应论文 Table 2 的 11.92（s=2）vs 12.36（s=4）。SmoothQuant 玩具里两端都差、α=0.5 最好，对应论文“OPT / BLOOM 取 0.5 平衡”的经验。玩具的绝对数值没有意义，只有<strong>方向与机制</strong>对标论文；真正的 PPL / 吞吐必须看论文表格。
+    </p>
+
+    <h2>三篇放在一起怎么选</h2>
+    <ul>
+      <li><strong>只要省显存、端点侧 decode：</strong>AWQ / GPTQ 这类 weight-only。AWQ 不做重建、跨模态泛化更稳；GPTQ 在有校准数据时精度更强，尤其是 3-bit。</li>
+      <li><strong>要现成 INT8 GEMM 的吞吐：</strong>SmoothQuant。它把难度摊平后可以直接用 per-tensor static 量化，避免 LLM.int8() 的混合精度分支开销。</li>
+      <li><strong>要继续压到 2-bit：</strong>GPTQ 论文也给了 2-bit / 三值结果，但依赖更细的分组；精度边界要按模型单独验。</li>
+      <li><strong>和本站其它主题的关系：</strong>量化改变每个 token 的字节数，<a href="daily-2026-10-19-kv-tier-pcp.html">KV cache 分层</a> 改变 token 放在哪层，二者正交；量化与稀疏选择叠加时要重新校准 top-p 阈值；<a href="daily-2026-10-30-batch-invariance-kernel-agent.html">Batch Invariance</a> 则提醒我们，核函数按 batch 换分块策略会引入新的数值漂移。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. GPTQ 的“任意顺序”洞察为什么在大模型上成立，在小模型上却不一定？</summary>
+      <p>OBQ 的贪心顺序优先舍入误差小的权重，减少“高误差权重在后期无可用补偿”的概率；但大模型层宽、参数高度冗余，两种顺序的最终平方误差差距很小，作者解释为早期多量化的低误差权重与末期缺少补偿的高误差权重相互抵消。小模型自由度少，这个平衡不成立，所以论文 Table 2/附录里 GPTQ 在 3-bit 小模型上略逊于最精确的 OBQ/AdaRound 类方法。</p>
+    </details>
+    <details>
+      <summary>2. AWQ 为什么“按权重范数挑显著通道”几乎和随机挑一样差？</summary>
+      <p>量化误差对最终输出的影响是 <code>Err(Q(w)x) = Δ·RoundErr(w/Δ)·x</code>，包含激活 x 这个乘子。幅值大的权重若对应的输入通道激活很小，它对输出扰动贡献有限；反过来，中等幅值权重配一个巨大激活才是真正的显著项。Table 1 里 OPT-1.3B 按权重选 1% 是 98.55 PPL，随机是 109.38，而按激活选 1% 是 16.91，差距非常直观。</p>
+    </details>
+    <details>
+      <summary>3. SmoothQuant 的 α=0.5 是普适最优吗？</summary>
+      <p>不是。它是“权重与激活用同一种量化器（per-tensor static）”时让两边最大幅值相近的经验平衡点。论文对 GLM-130B 用 0.75（约 30% 激活离群，需要多迁一些到权重），LLaMA 用 0.8（激活离群较轻，但实验用 per-token 激活量化）。α 的选择应在目标模型上按校准集扫一遍，看 PPL / 下游任务，而不是抄默认值。</p>
+    </details>
+    <details>
+      <summary>4. 三篇都说“训练-free / 无反向传播”，但 GPTQ 需要校准重建，AWQ 只需要激活统计。这会带来什么实际差异？</summary>
+      <p>GPTQ 在校准过程中按层用真实输入依次量化并回传已量化块的激活，逐列误差补偿会拟合这批校准样本；AWQ 只统计通道激活幅值并搜索 scale，不做权重重建，论文因此认为它更少过拟合、对域外与多模态更稳（并给出代码 / 数学 / 多模态基准佐证）。代价是 GPTQ 在合适的校准集上精度通常更强，尤其低比特。实践上：同域、能拿到代表性校准数据时用 GPTQ；跨域、多模态、希望流程简单可复用时用 AWQ。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把 AWQ 的“显著通道”思想和 SmoothQuant 的“难度迁移”叠加，会得到什么？</summary>
+      <p>两者都在做通道级等价缩放，但目标不同：AWQ 保护 weight-only 下的显著权重，SmoothQuant 平衡 W8A8 下的量化难度。叠加时可先用 SmoothQuant 的 α 把激活离群摊平，再在得到的权重分布上按激活统计量找 AWQ 的显著通道放大 s；但两个 scale 会共同改变每组的 Δ，必须联合搜索，否则 AWQ 的 <code>Δ′≈Δ</code> 假设会被破坏。另一个角度是低比特权重 + INT8 激活（W4A8），此时显著通道同时影响两边，需要一个新的目标函数把两类误差一起最小化——论文都没有给出这个组合的结论，不能假定“叠加必然更好”。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">arXiv:2210.17323 · GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers（Frantar, Ashkboos, Hoefler, Alistarh；IST Austria / ETH Zürich；ICLR 2023）</a> · <a href="https://github.com/IST-DASLab/gptq" target="_blank" rel="noopener">代码</a></li>
+      <li><a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">arXiv:2306.00978 · AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration（Lin, Tang, Tang, Yang, Chen, Wang, Xiao, Dang, Gan, Han；MIT / SJTU / NVIDIA / Tsinghua 等；MLSys 2024 Best Paper）</a> · <a href="https://github.com/mit-han-lab/llm-awq" target="_blank" rel="noopener">代码</a></li>
+      <li><a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">arXiv:2211.10438 · SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models（Xiao, Lin, Seznec, Wu, Demouth, Han；MIT / NVIDIA；ICML 2023）</a> · <a href="https://github.com/mit-han-lab/smoothquant" target="_blank" rel="noopener">代码</a></li>
+      <li>站内：
+        <a href="daily-2026-11-24-frontline-diss.html">今日一线：DisSparse</a> ·
+        <a href="daily-2026-11-24-harness-raa.html">今日 Harness：RAA</a> ·
+        <a href="daily-2026-10-22-algo-mixed-precision.html">混合精度训练</a> ·
+        <a href="daily-2026-10-19-kv-tier-pcp.html">KV cache 分层</a> ·
+        <a href="daily-2026-10-30-batch-invariance-kernel-agent.html">Batch Invariance</a> ·
+        <a href="daily-2026-11-23-algo-expert-parallel.html">专家并行</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

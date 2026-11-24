@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜RAA：把「看历史有多清楚」也当成一种注意力——每条交互渲染成图，0.6B reranker 估决策相关度、GRPO 校准分辨率，视觉 token 按 s² 收；三个冻结 backbone 上每任务 token 降 51.5%–57.5% 且分数不掉 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜RAA：把「看历史有多清楚」也当成一种注意力——每条交互渲染成图，0.6B reranker 估决策相关度、GRPO 校准分辨率，视觉 token 按 s² 收；三个冻结 backbone 上每任务 token 降 51.5%–57.5% 且分数不掉</h1>
+    <p class="post-meta">2026-11-24 · 收藏夹：Harness / Agent · 学习笔记<br />
+      来源：Siqi Xiang、Zhipeng Xu、Shengrui Liu、Zulong Chen、Chunyan Miao、Shijian Lu（Nanyang Technological University；Zhipeng Xu / Zulong Chen 为 Alibaba Group；Shijian Lu 为通讯作者）· <em>Resolution as Attention for Efficient Agent Memory Perception</em>（<a href="https://arxiv.org/abs/2611.24422" target="_blank" rel="noopener">arXiv:2611.24422</a>，cs.AI / cs.CV，v1 页眉日期 2026-11-18；项目页 <a href="https://sxiangag.github.io/resolution-as-attention/" target="_blank" rel="noopener">sxiangag.github.io/resolution-as-attention</a>）。
+      数字均为论文自报：评测在 ClawGym-Bench 上、backbone 全程冻结、temperature=0；主表为单次运行。「box 小验证」一节为本文用纯 Python 写的玩具分配实验，不是论文复现。
+      交叉：
+      <a href="daily-2026-11-24-frontline-diss.html">今日一线：DisSparse</a>、
+      <a href="daily-2026-11-24-algo-quantization.html">今日算法：量化三岔路</a>、
+      <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、
+      <a href="daily-2026-10-27-harness-compact-bench.html">Compact-Bench</a>、
+      <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a>、
+      <a href="daily-2026-10-21-harness-reobserve.html">上下文再观测</a>、
+      <a href="daily-2026-10-30-harness-spine.html">Spine</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 agent 的记忆管理过去只问两个问题：<strong>留什么</strong>（摘要、裁剪、检索）和<strong>什么时候取回来</strong>。本站的 <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a>、<a href="daily-2026-10-27-harness-compact-bench.html">Compact-Bench</a>、<a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a> 都在这条轴上。RAA 提出第三问：<strong>每条历史要以多高的清晰度被读到</strong>？
+    </p>
+    <p>
+      直觉来源是人类视觉：注意力不只体现为“看哪里”，也体现为“看得多清楚”。把历史渲染成图片后，分辨率就是可调的旋钮——视觉 token 数随缩放因子平方下降，缩小一半只花四分之一 token。但已有 optical context compression 通常对所有历史用<strong>同一压缩率</strong>或固定策略（例如“最近 5 轮保原图、其余减半”），于是无关交互浪费 token，关键细节又可能看不清。
+    </p>
+    <p>
+      RAA 的主张：分辨率分配应<strong>逐交互、逐步重算</strong>。四十步前不起眼的配置值可能正是当前决策的依赖，而语义相似度高的段落未必真的影响下一步；因此不能拿 reranker 的语义分数直接使用，要先对齐到“下一步决策依赖度”，再对齐到“agent 实际需要看清到什么程度”。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 文本渲染成图：token 数按 s² 缩放</h3>
+    <p>
+      每条历史 <code>h_i</code> 在首次出现时渲染成一张<strong>规范图像</strong> <code>I_i = R(h_i)</code>，整段任务内不再重渲染；每一步按当前尺度 <code>s_i ∈ (0,1]</code> 缩放它再喂给视觉 agent。对把 <code>P×P</code> patch 映射成一个视觉 token 的编码器：
+    </p>
+    <pre><code>Ñ_i = Resize(I_i, s_i)
+N_i(s_i) = ceil(s_i·W_i/P) · ceil(s_i·L_i/P) ≈ s_i² · N_i(1)
+
+M_t = { Resize(I_i, s_i^(t)) } for i = 1..t-1</code></pre>
+    <p>
+      关键点：<strong>每一步都可以用新尺度重新感知同一张图</strong>，且每次缩放都从规范图出发、不从上次缩略图再缩，避免信息逐轮劣化。最新一条交互 <code>h_{t-1}</code> 作为 query 保留文本形式，不参与缩放。agent 本身（Qwen-3.8-27B 等）全程冻结，不需要为感知层做额外训练。
+    </p>
+
+    <h3>② 相关度估计：语义相似 ≠ 决策依赖</h3>
+    <p>
+      估计器 <code>f_θ</code> 从 <code>Qwen3-Reranker-0.6B</code> 微调而来，query 是任务描述 <code>D</code> + 最新交互，key 是每条历史，取 yes/no logit 的 sigmoid 作为分数：<code>p_i^(t) = σ(z_yes − z_no)</code>。每条历史<strong>独立打分</strong>，不被长历史里其它条目稀释；query 每步更新，所以同一条历史的相关度会随任务推进变化。
+    </p>
+
+    <h3>③ 归一化 sigmoid 映射：把相关度变成尺度</h3>
+    <pre><code>g_φ(p) = [σ(k(p−b)) − σ(−kb)] / [σ(k(1−b)) − σ(−kb)]
+
+φ = {k, b}: k&gt;0 控制过渡陡峭程度，b∈(0,1) 决定中点
+g_φ(0)=0, g_φ(1)=1，且单调 —— 保持相关度排序，同时铺满整个尺度范围</code></pre>
+
+    <h3>④ 两阶段训练：先蒸馏决策依赖，再用 GRPO 校准“看得清”</h3>
+    <table>
+      <thead><tr><th>阶段</th><th>学什么</th><th>监督 / 奖励</th><th>数据</th></tr></thead>
+      <tbody>
+        <tr><td>Stage I：relevance supervision</td><td>估计器 <code>f_θ</code></td><td>密度加权 MSE：<code>L = E[w_i^(t)(p_i^(t) − p̂_i^(t))²]</code>，<code>w</code> 与评分密度成反比</td><td>1,853 个 ClawGym 训练任务的高分轨迹、12,000 条决策历史；教师 Qwen-3.8-27B 预判下一步动作后给每条历史打 0–1 依赖分</td></tr>
+        <tr><td>Stage II：resolution reinforcement</td><td><code>f_θ</code> + 映射 <code>g_φ</code> 联合校准</td><td>GRPO over K 个采样尺度；奖励 = 决策保真 + λ·节省 token</td><td>150 次更新；agent 冻结</td></tr>
+      </tbody>
+    </table>
+    <p>
+      Stage II 把 <code>g_φ∘f_θ</code> 当随机策略：对单条历史，从 logit-normal 采样尺度 <code>s_{i,j} = σ(logit(s_i^(t)) + τ ε_j)</code>，<code>ε_j~N(0,1)</code>，其他历史保持预测尺度，得到 K 份只在一条历史上清晰度不同的 memory。奖励是：
+    </p>
+    <pre><code>R_j = [ l̄(a_t | D, M_t^(j)) − l̄(a_t | D, H_t) ]  +  λ · (1 − s_{i,j}²)
+       └──────── 决策保真：冻结 agent 对原动作的对数似然 ────────┘   └ token 节省 ┘
+
+J(θ,φ) = E[ (1/K) Σ_j A_j · log q_{θ,φ}(s_{i,j}) ]   # 组内相对优势 A_j</code></pre>
+    <p>
+      用 <code>1 − s²</code> 近似节省比例，正好对应前面的平方 token 关系；<code>H_t</code>（完整文本历史）作为决策保真的参考。<code>λ</code> 越大越省 token：论文扫 0.5×10⁻³ 到 4×10⁻³，更大的 λ 会降低平均分、增加步数，tokens/task 先降到约 33K，到 λ=4×10⁻³ 又升回约 40K——因为多出来的步数吃掉了单步节省。
+    </p>
+
+    <h2>实验结果：省一半以上 token，分数不掉</h2>
+    <h3>① 主表：三个 backbone、两类迁移</h3>
+    <p>
+      ClawGym-Bench 覆盖 6 类任务（Product &amp; Collab.、Systems &amp; Auto.、Analysis &amp; Reason.、Content &amp; Domain、Planning &amp; Knowl.、Software Dev.）。RAA 只用 Qwen-3.8-27B 训练，另外两个 backbone 直接迁移、不再微调：
+    </p>
+    <table>
+      <thead><tr><th>Backbone</th><th>方法</th><th>平均分</th><th>Tokens / task</th><th>Peak tokens</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="2">Qwen-3.8-27B（训练时冻结）</td><td>Vanilla（全文本历史）</td><td>78.23</td><td>89,733</td><td>12,561</td></tr>
+        <tr><td><strong>RAA</strong></td><td><strong>78.69</strong></td><td><strong>38,169（−57.5%）</strong></td><td><strong>6,447（−48.7%）</strong></td></tr>
+        <tr><td rowspan="2">Qwen-3.6-27B（未训练，迁移）</td><td>Vanilla</td><td>67.98</td><td>64,456</td><td>9,284</td></tr>
+        <tr><td><strong>RAA</strong></td><td><strong>68.31</strong></td><td><strong>31,230（−51.5%）</strong></td><td>4,512（−51.4%）</td></tr>
+        <tr><td rowspan="2">Kimi-K3（未训练，迁移）</td><td>Vanilla</td><td>79.93</td><td>73,183</td><td>9,419</td></tr>
+        <tr><td><strong>RAA</strong></td><td><strong>79.95</strong></td><td><strong>32,258（−55.9%）</strong></td><td>5,400（−42.7%）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      对照基线（同一 backbone Qwen-3.8-27B）：FIFO 只留最近 5 轮，77.95 分 / 48,825 token；LongLLMLingua 77.87 / 62,035；OCR-Memory 64.86 / 67,921；AgentOCR 77.21 / 69,693。RAA 在<strong>分数最高的同时 token 最少</strong>。OCR-Memory 在两个迁移 backbone 上 peak token 更低，但那是因为它按“越旧越糊”无差别压缩，代价是多走 7.0% / 14.0% 的步数、每任务多花 14.4% / 10.7% token。作者还量了开销：0.6B 估计器加只渲染一次的规范图，相关度估计与渲染合计只占端到端延迟的 <strong>2.51%</strong>。
+    </p>
+
+    <h3>② 消融：两阶段缺一不可</h3>
+    <table>
+      <thead><tr><th>配置（Qwen-3.8-27B）</th><th>平均分</th><th>Tokens / task</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>Untrained（预训练 reranker + 初始映射）</td><td>76.16</td><td>≈49K</td><td>预测尺度中位数 0.98，几乎全分辨率</td></tr>
+        <tr><td>Stage I only</td><td>77.12</td><td>≈34K</td><td>尺度中位数被压到 &lt;0.5，很多交互看不清</td></tr>
+        <tr><td>Stage II only</td><td>77.92</td><td>&gt;44K</td><td>没有依赖监督，估计器仍近似语义相似</td></tr>
+        <tr><td><strong>Stage I + II</strong></td><td><strong>78.69</strong></td><td><strong>≈38K</strong></td><td>尺度铺开到接近全范围，关键交互保清晰</td></tr>
+      </tbody>
+    </table>
+    <p>
+      另一组消融把缩放图换回文本：仅保留估计器排名 top-k 的交互原文、其余丢弃，k 从 3 升到 5，分数 77.63→78.98、token 从 42.6K 涨到 61.1K；RAA 以 38.2K token 拿到 78.69。k=5 略高被归因于从图里读字仍有识别误差，而不是文本路线更优。均匀尺度 <code>s</code> 从 1.00 降到 0.70 时，token 47.8K→36.2K 但分数 77.22→75.81——关键细节变得不可读，正说明“按相关度分配”不可省。
+    </p>
+
+    <h3>③ 与已有 memory 方法叠加</h3>
+    <table>
+      <thead><tr><th>底层 memory 方法</th><th>不接 RAA：分数 / token</th><th>接 RAA：分数 / token</th><th>token 降幅</th></tr></thead>
+      <tbody>
+        <tr><td>None（全历史）</td><td>78.23 / 89,733</td><td>78.69 / 38,169</td><td>57.5%</td></tr>
+        <tr><td>ACON（摘要）</td><td>77.51 / 46,604</td><td>78.83 / 36,140</td><td>22.5%</td></tr>
+        <tr><td>A-MEM（检索）</td><td>78.22 / 55,234</td><td>78.48 / 30,565</td><td>44.7%</td></tr>
+        <tr><td>Observation Masking（掩码）</td><td>78.69 / 72,805</td><td>78.75 / 33,417</td><td>54.1%</td></tr>
+      </tbody>
+    </table>
+
+    <h2>box 小验证：平方缩放与“按需清晰”</h2>
+    <p>纯 Python 玩具：8 条历史，相关度 <code>[0.95, 0.15, 0.60, 0.10, 0.80, 0.20, 0.35, 0.05]</code>；每条全分辨率按 100 token 计，缩放后的视觉 token 近似 <code>s²×100</code>；保真代理量取 <code>Σ relevance·(0.3+0.7s)</code>。这些公式沿用论文，输入是虚构的。</p>
+    <pre><code>def report(tag, scales):
+    tok = sum(max(1, round(s*s*100)) for s in scales)
+    fid = sum(ri*(0.3+0.7*s) for ri, s in zip(r, scales))
+    print(tag, tok, fid)
+
+report("uniform s=1.0",      [1.0]*8)
+report("uniform s=0.7",      [0.7]*8)
+report("adaptive RAA-like",  [max(0.25, 0.25+0.75*ri) for ri in r])
+
+BOX B 输出（玩具，不是论文数据）：
+  uniform s=1.0     : tokens  800 (  0.0% saved), fidelity 3.200
+  uniform s=0.7     : tokens  392 ( 51.0% saved), fidelity 2.528
+  adaptive (RAA-like): tokens  288 ( 64.0% saved), fidelity 2.623</code></pre>
+    <p>
+      读法：均匀缩到 0.7 已经省 51% token，但保真代理量掉 21%；按相关度分配在<strong>更省</strong>（64%）的同时保真反而高于均匀缩放。方向和论文 Table 2 一致：均匀 s=0.70 掉到 75.81 分，RAA 用 38.2K token 拿到 78.69。玩具里的幅度更大，是因为相关度与尺度映射被我设得过于理想化。
+    </p>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么不能直接用 Qwen3-Reranker-0.6B 的语义相似度来分配分辨率？</summary>
+      <p>语义相似回答的是“这段文本和当前查询主题相关吗”，决策依赖回答的是“下一步动作有多依赖这条历史”。二者相关但不等价：一条语义上完全对题的历史可能早已被后续步骤覆盖，而一个不起眼的配置值（比如某次工具返回的错误码）可能直接决定下一步要不要重试。论文 Figure 3 的消融印证了这点：直接用预训练 reranker 的尺度中位数是 0.98，几乎全分辨率，只省很少 token；Stage I 用教师模型的依赖标注蒸馏后，估计器才学会区分。Stage II 再校准到 agent 真能读清的尺度。</p>
+    </details>
+    <details>
+      <summary>2. Stage I 和 Stage II 为什么缺一不可？只看论文表格不够，说说机制。</summary>
+      <p>Stage I 解决“估得对”：把 reranker 的语义分数对齐到决策依赖，否则 Stage II 的奖励信号再准也是在优化错误的变量。Stage II 解决“用得对”：相关度高不等于必须满分辨率，取决于 agent 的视觉识别能力；同时估计器与映射的联合校准让尺度真正铺开。只看 Stage I，映射未校准，尺度中位数被压到 0.5 以下，77.12 分；只看 Stage II，估计器仍在用语义相似，token 降到 44K 以上、分数只有 77.92。两者合起来才 78.69 / ≈38K。</p>
+    </details>
+    <details>
+      <summary>3. 奖励里的 λ(1−s²) 为什么用平方，而不是线性 (1−s)？</summary>
+      <p>因为视觉 token 数近似与缩放因子的平方成正比（论文 Eq. 3：<code>N(s)≈s²·N(1)</code>）。若写线性项，奖励会高估低分辨率的收益：把 s 从 1 降到 0.5 实际只省 75% token，线性项只给 50%。用平方项才能让“省下的 token”与奖励尺度一致。论文的 λ 扫描也显示这个代理量不是完美替代：λ 太大时 agent 要多走步数，总 token 反而回升，说明单步视觉 token 不等于任务总 token。</p>
+    </details>
+    <details>
+      <summary>4. RAA 与 Compaction / A-MEM 是竞争还是互补？</summary>
+      <p>互补。Compaction / 摘要 / 检索决定<strong>哪些信息还在上下文里</strong>，RAA 决定<strong>留下来的信息被看得多清楚</strong>。论文 Table 3 把 RAA 挂到 ACON（摘要）、A-MEM（检索）、Observation Masking（掩码）上，分别再省 22.5%、44.7%、54.1% token，且分数不降。值得注意的是 RAA 单独用的 token 已少于三者中的任何一个，说明“看得清楚”这一维度此前确实被系统性忽略。本站 <a href="daily-2026-10-21-harness-reobserve.html">上下文再观测</a> 和 <a href="daily-2026-10-30-harness-spine.html">Spine</a> 分别从“何时再看一次”和“按子任务树组织”切入，可以和 RAA 组合。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）把 RAA 用于纯文本 backbone 需要改什么？</summary>
+      <p>需要换掉感知介质：纯文本模型没有视觉 token 的平方缩放，可以把“清晰度”实现为不同程度的文本压缩粒度（保留原文 / 保留关键句 / 保留关键词），并按 token 数建立类似的成本项；估计器与两阶段训练仍可复用，但要重新定义“决策保真”的可微代理。另一个思路是让文本 backbone 读 OCR 后的多尺度图，但那会引入识别误差——论文 Table 2 里 top-k 文本版 k=5 比 RAA 高 0.29 分却多花 61% token，作者明确把这点归因于图像读字的误差，纯文本路线未必更差，值得单独验证。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.24422" target="_blank" rel="noopener">arXiv:2611.24422 · Resolution as Attention for Efficient Agent Memory Perception（Xiang, Xu, Liu, Chen, Miao, Lu；NTU / Alibaba Group）</a> · <a href="https://sxiangag.github.io/resolution-as-attention/" target="_blank" rel="noopener">项目页</a></li>
+      <li>相关：MemGPT（<a href="https://arxiv.org/abs/2310.08560" target="_blank" rel="noopener">arXiv:2310.08560</a>）· A-MEM · LongLLMLingua（编号见论文参考文献）</li>
+      <li>站内：
+        <a href="daily-2026-11-24-frontline-diss.html">今日一线：DisSparse</a> ·
+        <a href="daily-2026-11-24-algo-quantization.html">今日算法：量化三岔路</a> ·
+        <a href="daily-2026-09-07-harness-compaction.html">Context Compaction</a> ·
+        <a href="daily-2026-10-27-harness-compact-bench.html">Compact-Bench</a> ·
+        <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a> ·
+        <a href="daily-2026-10-21-harness-reobserve.html">上下文再观测</a> ·
+        <a href="daily-2026-10-30-harness-spine.html">Spine</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

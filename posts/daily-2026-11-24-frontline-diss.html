@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜DisSparse：把 top-p 稀疏注意力真正塞进 vLLM——INT4 元数据 cache 做选择、双流流水提前一层、单次 histogram kernel 定阈值；选择加速 1.17–1.80×，同显存 batch 上限最高 8×（NeurIPS 2026） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜DisSparse：把 top-p 稀疏注意力真正塞进 vLLM——INT4 元数据 cache 做选择、双流流水提前一层、单次 histogram kernel 定阈值；选择加速 1.17–1.80×，同显存 batch 上限最高 8×（NeurIPS 2026）</h1>
+    <p class="post-meta">2026-11-24 · 收藏夹：Infra · 一线追踪<br />
+      来源：Nurlan Nazaraliyev、Elaheh Sadredini、Nael Abu-Ghazaleh（University of California, Riverside）· <em>DisSparse: Pipelined Top-$p$ Sparse Attention for Long-Context LLM Serving</em>（<a href="https://arxiv.org/abs/2611.28522" target="_blank" rel="noopener">arXiv:2611.28522</a>，cs.LG / cs.CL / cs.DC，v1 页眉日期 2026-11-21；NeurIPS 2026 录用，代码 <a href="https://github.com/nnurlan008/DisSparse" target="_blank" rel="noopener">nnurlan008/DisSparse</a>）。
+      论文数字均为作者自报：精度 / kernel 实验在 NVIDIA A100、RTX 6000 Ada、RTX PRO 6000 Blackwell 上完成；系统实验用 2 张 A100-40GB 拆 prefill / decode。「box 小验证」一节为本文用纯 Python 构造的玩具分布实跑，不代表论文数据。
+      交叉：
+      <a href="daily-2026-11-24-harness-raa.html">今日 Harness：RAA</a>、
+      <a href="daily-2026-11-24-algo-quantization.html">今日算法：量化三岔路</a>、
+      <a href="daily-2026-10-19-kv-tier-pcp.html">KV cache 分层</a>、
+      <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-29-algo-sequence-parallel.html">序列 / 上下文并行</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长上下文推理的瓶颈早就从算力挪到了 KV cache：容量随上下文长度线性增长，decode 时还要把整段 KV 从 HBM 搬进 SM。两条主线各自削一刀——<strong>压缩</strong>每个 token 的字节数（量化、低秩），<strong>稀疏</strong>直接跳过大部分 token。本文走第二条，并且盯住一个很少被系统侧认真处理的细节：动态选择到底该用 top-k 还是 top-p。
+    </p>
+    <p>
+      生产系统偏爱 <strong>top-k</strong>：每头固定选 k 个 block，block 数是编译期常量，vLLM 这类 scheduler 可以提前静态分配。但论文 Figure 1 显示，Llama-3.1-8B-Instruct 在 LongBench 的 NarrativeQA 上，每层每步的“关键 token 数”差异极大；作者引用的前序工作测得固定预算 top-k 在<strong>超过 20% 的 head 上达不到目标 attention 质量</strong>。峰值分布用 k 会浪费带宽，弥散分布用 k 会丢关键上下文。
+    </p>
+    <p>
+      <strong>top-p（nucleus）</strong>按累积概率质量选到阈值 p，天然适配这种逐 head、逐层、逐步的变化；但它在 serving 里落地有两个系统级障碍：一是精确求阈值要多遍搜索，作者观察到 batch ≥ 16 时选择本身就开始主导层执行时间；二是选出的 block 数在执行前未知，和 vLLM 的确定性分配模型冲突。DisSparse 的贡献不是新分数函数，而是<strong>把 top-p 变成一条能跑在生产 scheduler 旁边的流水线</strong>。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 选择原语：固定 k 与自适应 p 的错配</h3>
+    <table>
+      <thead><tr><th>维度</th><th>top-k</th><th>top-p（DisSparse 采用）</th></tr></thead>
+      <tbody>
+        <tr><td>选择预算</td><td>每 head 固定 k 个 block，编译期已知</td><td>累积质量达到 p 即停，运行时才知道 block 数</td></tr>
+        <tr><td>峰值 / 弥散 attention</td><td>要么浪费带宽，要么丢上下文</td><td>峰值 head 少取、弥散 head 多取</td></tr>
+        <tr><td>系统代价</td><td>与静态 block table 天然兼容</td><td>分配不确定、选择 kernel 可能比 attention 还贵</td></tr>
+        <tr><td>论文解决方案</td><td>—</td><td>混合分配器 + 双流流水 + 单次 histogram kernel</td></tr>
+      </tbody>
+    </table>
+
+    <h3>② 系统骨架：disaggregated prefill/decode + INT4 元数据 cache</h3>
+    <p>
+      论文先量了一个前提：在 16K 平均序列长度、2 GPU 分离式 vLLM 上，<strong>decode 占总推理时间约 78%</strong>，序列越长占比越高，所以优化重点放在 decode。prefill 引擎产出首 token 与 KV 后，通过异步 NCCL 把主 FP16 key cache 的 <strong>INT4 副本</strong>传给 decode 引擎——元数据 cache 比原 cache 小 <strong>8×</strong>，只给 sparse analyzer 算分数用。
+    </p>
+    <p>
+      <strong>混合块分配</strong>是解掉“运行时才知道 block 数”的关键：scheduler 仍负责新生成 token 和元数据 cache 的块，device 侧 executor 负责每步临时抓取的远端块，两者在每步末尾同步；executor 空闲池不够时，用 per-batch boolean mask 让受影响请求 stall，而不改 batch 配置。生命周期（释放、prefix caching）仍归 scheduler。
+    </p>
+    <p>
+      <strong>双流流水</strong>解掉“选择挡住前向”的问题：连续层 hidden state 高度相似（论文实测 cosine 相似度 <strong>0.87–0.95</strong>：Llama-2-7B-Chat 4K 为 0.878±0.002、Longchat-7B-v1.5-32k 为 0.891±0.001、Llama-3.1-8B-Instruct 为 0.868、Phi-3-mini-128k 为 0.930±0.001、Qwen3-32B 32K 为 0.951±0.001），于是用第 ℓ 层的 hidden state 经第 ℓ+1 层的 <code>W_Q</code> 算 query，<strong>提前一层</strong>为 ℓ+1 做选择与远端块抓取；compute stream 同时跑第 ℓ 层前向。选择延迟被藏在层计算背后。
+    </p>
+
+    <h3>③ 两个 kernel：INT4 GEMV 打分数，64 桶 histogram 定阈值</h3>
+    <p>
+      评分 kernel 借鉴 FlashAttention-2 的 tiling / online-softmax，在 INT4 key 副本上流式算 <code>Q·Kᵀ</code> 并聚合成每 block 的 LSE，不显式做 per-token softmax；同时维护 <code>k=8</code> 个最大 block LSE 的流式缓冲。选择 kernel 先看 Top-8 是否已覆盖目标质量 <code>P_tgt</code>：覆盖就走快路径，阈值设在最小值下方；否则构造 <code>B=64</code> 个 bin 的直方图，在 log 概率窗口 <code>[V_min−W, V_min]</code>（<code>W=8</code>，覆盖 Top-k 边界以下 2⁸ 倍概率范围）上做后缀累加，取刚好覆盖剩余质量的桶下沿作阈值。最后原子分配选中块的物理 ID，−1 表示跳过，与 paged attention block table 格式兼容。
+    </p>
+    <p>论文 Table 1 在 LongBenchV2 上把这套近似和 FP16 精确 sort-and-cumsum 对比：</p>
+    <table>
+      <thead><tr><th>阈值 p</th><th>FP16 选中块</th><th>INT4 选中块</th><th>多出块数</th><th>选中 recall</th><th>质量覆盖 FP16 → INT4</th></tr></thead>
+      <tbody>
+        <tr><td>0.80</td><td>66.9</td><td>72.3</td><td>+5.3</td><td>97.54%</td><td>0.8346 → 0.8612</td></tr>
+        <tr><td>0.85</td><td>89.1</td><td>94.9</td><td>+5.8</td><td>97.43%</td><td>0.8737 → 0.8906</td></tr>
+        <tr><td>0.90</td><td>123.3</td><td>129.2</td><td>+5.8</td><td>97.23%</td><td>0.9140 → 0.9227</td></tr>
+        <tr><td>0.95</td><td>187.4</td><td>193.5</td><td>+6.0</td><td>97.31%</td><td>0.9559 → 0.9590</td></tr>
+      </tbody>
+    </table>
+    <p>也就是说：INT4 + 直方图只多读约 5–6 个块，换取选择阶段不再做多遍排序，且覆盖质量略高于 FP16 精确阈值。</p>
+
+    <h3>④ token relocation：block 内部也稀疏</h3>
+    <p>
+      固定大小 block 把高、低重要度 token 混在一起，top-p 为了达到 p 被迫连低价值 token 所在的块一起搬——论文称为 <strong>intra-block sparsity</strong>。Figure 2 的例子里，block 级 top-p 达到 p=0.95 要选的 token 数约为 token 级 oracle 的 <strong>2×</strong>。
+    </p>
+    <p>
+      修正方法是 prefill 后<strong>物理重排 KV cache</strong>：把 prefill 注意力得分按 query 位置求和（GQA 组内 <code>G=H_q/H_kv</code> 个 head 再聚合），按每 KV head 独立排序；但不能直接全局排序——那会破坏因果局部性。论文用<strong>分带排序</strong>：先按重要度排，切成 <code>R</code> 个连续带（<code>d_band=4096</code> tokens），带内再按原始位置升序，最后 per-head gather 重排 K/V。因为 RoPE 在缓存前已作用于 key，重排不会丢位置信息。结果：8 组（模型 × benchmark × block size）上关键 block 数下降 <strong>7.2%–14.1%</strong>（LongChat-7B 14.1%，Llama-3.1-8B block=32 时 13.2%），LongBench 最大掉 0.80 分，LongBenchV2 反而 0 到 +2.25 分。
+    </p>
+
+    <h2>实验结果：精度、kernel 与系统三本账</h2>
+    <h3>① LongBench 12 任务：与 dense 打平甚至略高</h3>
+    <table>
+      <thead><tr><th>方法</th><th>LongChat-7B 预算 / 平均分</th><th>Llama-3.1-8B 预算 / 平均分</th></tr></thead>
+      <tbody>
+        <tr><td>Full Attention（dense）</td><td>32k / 36.10</td><td>32k / 52.01</td></tr>
+        <tr><td>Quest + Twilight</td><td>137 / 37.33（+3.4%）</td><td>489 / 52.00（−0.0%）</td></tr>
+        <tr><td>DS + Twilight</td><td>126 / 37.98（+5.2%）</td><td>446 / 51.73（−0.5%）</td></tr>
+        <tr><td><strong>DisSparse</strong></td><td><strong>170 / 37.79（+4.7%）</strong></td><td><strong>610 / 52.20（+0.4%）</strong></td></tr>
+      </tbody>
+    </table>
+    <p>
+      中等长度上差异更说明问题（Table 3）：Llama-3.1-8B 的 GSM8K 上 dense flexible/strict 是 0.776/0.713，Twilight 0.785/0.737，DisSparse 0.779/0.726，而固定预算的 Quest-128 塌到 <strong>0.401/0.384</strong>；PG-19 PPL 上 dense 11.28、Twilight 11.28、DisSparse 11.28，Quest-128 却到 <strong>79.23</strong>。RULER 11 个子任务（16K / 32K）所有稀疏配置平均距 dense 不超过 0.8 分，单针检索 DisSparse 与 dense 都是 100%。
+    </p>
+
+    <h3>② 选择阶段 1.17–1.80×，靠的是减少 post-pass 而非改打分</h3>
+    <p>
+      Figure 9 把两种方法都拆成“GEMV 打分 + top-p post-pass”的相同两核结构，只比 analyzer 端到端延迟。DisSparse 在全部配置上快 <strong>1.17×–1.80×</strong>；batch 64、8K 序列时达到 1.80×（token 级）/ 1.72×（block 级），64K 时降到 1.17×–1.43×——因为序列越长，GEMV 占比越大，能优化的 post-pass 份额变小。
+    </p>
+
+    <h3>③ 系统收益：同显存 batch 上限从 4/2 提到 32/8</h3>
+    <p>
+      在 2×A100-40GB、LongBenchV2 ≤32K 的分离式 vLLM 上，Llama-3.1-8B-Instruct（GQA）的 dense vLLM 在 batch 4 就 OOM，DisSparse 撑到 <strong>32</strong>；Phi-3-mini-128k-instruct（MHA）dense 在 batch 2 OOM，DisSparse 撑到 <strong>8</strong>，峰值吞吐分别约 <strong>2×</strong> 与 <strong>2.5×</strong>。原因不只是稀疏抓取：prefill→decode 传的是小 8× 的 INT4 key 副本，FP16 cache 在后台卸载到 CPU，NCCL buffer 压力显著下降。
+    </p>
+    <p>
+      代价也说得很直白：小 batch 下 dense 的 TPOT 约快 <strong>1.5×</strong>，因为 DisSparse 的双流与 vLLM 单流 CUDA Graph 不兼容，作者关掉了 graph capture，暴露了 kernel launch 开销；当前 vLLM 集成也没启用 Quest 作为 top-k 页过滤，于是要在整个 INT4 cache 上做大 GEMV。两者都被归为实现限制，不是方法本身的上界。
+    </p>
+
+    <h2>box 小验证：固定 k 到底错在哪</h2>
+    <p>纯 Python（seed 20261124）构造 8 个 head × 64 个 block 的合成 attention 质量分布，比较固定 top-3 与 top-p=0.90；再用 8 桶直方图近似阈值。</p>
+    <pre><code>rng = random.Random(20261124)
+def masses(sharp):
+    raw = [rng.random() ** sharp for _ in range(64)]
+    s = sum(raw)
+    return sorted([x/s for x in raw], reverse=True)
+# top-k: 取前 k 个；top-p: 累加到 p 即停
+for name, sharp in [("peaky", 6.0), ("diffuse", 0.8)]:
+    ...  # 8 个 head 求平均
+
+BOX A 输出（合成分布，不是论文数据）：
+  peaky  : top-3 mass 0.3058, blocks 3.0 | top-p mass 0.9075, blocks 18.0
+  diffuse: top-3 mass 0.0791, blocks 3.0 | top-p mass 0.9076, blocks 48.1
+  histogram(B=8): exact blocks 39, approx blocks 52, mass 0.9882</code></pre>
+    <p>
+      读法：同一个 k=3，在峰值分布上只覆盖 30.6% 质量，在弥散分布上只有 <strong>7.9%</strong>；top-p 两次都稳定在 90.7% 左右，但代价是 block 数从 18 变到 48——这正是“变长 block 列表”必须被系统层接住的原因。直方图桶太粗时会多选（52 vs 39），与论文 Table 1 中 +5～6 块的过度覆盖方向一致，但玩具分布更偏、幅度更大，不能拿来对标论文的 recall 97%。
+    </p>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么“双流提前一层”可行？如果换成提前两层，哪些假设会先失效？</summary>
+      <p>可行性来自相邻层 hidden state 的高相似度（本文实测 cosine 0.87–0.95），所以第 ℓ 层的 query 经 ℓ+1 层的 W_Q 仍能大致预测 ℓ+1 层该选哪些块；同时选择结果只影响“取哪些 KV block”，真正的 attention 输出仍由第 ℓ+1 层自己的 query/key 算，预测错了只是召回不完美，不会算错。提前两层则要跨过两次残差与 FFN 变换，相似度是否还够高论文没有验证；层数差越大，选择分布漂移越明显，而且流水要缓存两层的选中块，调度状态与显存开销都会上升。论文只验证了提前一层这一档。</p>
+    </details>
+    <details>
+      <summary>2. token relocation 为什么必须“分带排序”而不是按重要度全局排序？</summary>
+      <p>attention 的很多模式（local window、recent tokens、文本相邻位置）依赖 token 的原始顺序。全局按重要度排会把连续片段拆散，块内不再保留局部结构，模型读到的是被打乱的序列；RoPE 虽然把位置编码进了 key，但语义上的相邻关系仍然被破坏。分带排序先把高重要度 token 集中到前几个带，带内恢复时间顺序，于是既减少“高价值 token 散落在很多块里”的放大效应，又保住局部因果结构。论文用 d_band=4096 的带大小，实测 block 数降 7.2%–14.1% 而精度基本不掉。</p>
+    </details>
+    <details>
+      <summary>3. 为什么小 batch 下 DisSparse 的 TPOT 反而比 dense 慢 1.5×？这算方法的缺陷吗？</summary>
+      <p>直接原因是 vLLM 的 CUDA Graph 是单流的，DisSparse 的两条 stream（compute + selection/transfer）无法被同一张图捕获，作者只能关掉 graph capture；小 batch 时 kernel launch 开销占比高，于是 TPOT 吃亏。这是当前集成的工程限制，不是 sparse attention 的信息论代价——batch 2 的 Phi-3-mini（MHA、KV cache 大）上 DisSparse 已经端到端反超 dense，说明一旦 KV 带宽成为瓶颈，稀疏收益就会盖过 launch 开销。要修，要么让 serving 框架支持多流 CUDA Graph，要么把选择/抓取合回单流但用预计算阈值降低延迟。</p>
+    </details>
+    <details>
+      <summary>4. 这篇和 PagedAttention / KV cache 分层工作是什么关系？可以叠加吗？</summary>
+      <p>正交。本站 <a href="daily-2026-10-19-kv-tier-pcp.html">KV cache 分层</a> 与 <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a> 讲的是“把 token 放在哪一层存储、按什么策略换入换出”，每个 token 仍被读；DisSparse 讲的是“这一步读哪些 token”。论文的 INT4 元数据 cache 本身就是一种压缩副本，但只用于打分；FP16 主 cache 可以再叠加量化或低秩压缩，只要 scoring 副本能近似出正确的 LSE。需要注意的是叠加后要重新验证 top-p 阈值：主 cache 量化改变了 attention 质量分布，表 1 的 +5～6 块余量未必还够。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果 batch 内请求长度差异极大，双流流水和混合分配器哪里最容易出问题？</summary>
+      <p>两个地方。第一，selection stream 提前一层为整个 batch 做选择，长请求的 block 列表远大于短请求，GPU 上的选择 kernel 与抓取量与 batch 内最长序列相关，短请求会被拖慢；需要按请求分组或给选择 kernel 加 per-request 的 budget 上限。第二，executor 的空闲块池由所有请求共享，长请求某一步突然选中大量远端块就可能耗尽池子，boolean mask stall 会波及同批其它请求；论文目前只保证“不改 batch 配置”，没有给出按请求隔离的 QoS。更稳的做法是给每个请求预留上限块数，但那又会把 top-p 变回某种固定预算，设计上仍需权衡。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.28522" target="_blank" rel="noopener">arXiv:2611.28522 · DisSparse: Pipelined Top-$p$ Sparse Attention for Long-Context LLM Serving（Nazaraliyev, Sadredini, Abu-Ghazaleh；UC Riverside；NeurIPS 2026）</a> · <a href="https://github.com/nnurlan008/DisSparse" target="_blank" rel="noopener">代码</a></li>
+      <li>相关：<a href="https://arxiv.org/abs/2406.10774" target="_blank" rel="noopener">Quest（arXiv:2406.10774）</a> · <a href="https://arxiv.org/abs/2502.02770" target="_blank" rel="noopener">Twilight（arXiv:2502.02770）</a></li>
+      <li>站内：
+        <a href="daily-2026-11-24-harness-raa.html">今日 Harness：RAA</a> ·
+        <a href="daily-2026-11-24-algo-quantization.html">今日算法：量化三岔路</a> ·
+        <a href="daily-2026-10-19-kv-tier-pcp.html">KV cache 分层</a> ·
+        <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a> ·
+        <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> ·
+        <a href="daily-2026-10-29-algo-sequence-parallel.html">序列 / 上下文并行</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
