@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜ARC：同步 RL 的 rollout 不该「全跑完再挑」——在线校准的组内早停 + 暂停续跑，rollout 时间 −37.4%、有效 GRPO 吞吐 +50.1%，保住 98.9% 本会入选的组 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜ARC：同步 RL 的 rollout 不该「全跑完再挑」——在线校准的组内早停 + 暂停续跑，rollout 时间 −37.4%、有效 GRPO 吞吐 +50.1%，保住 98.9% 本会入选的组</h1>
+    <p class="post-meta">2026-11-25 · 收藏夹：RL / Infra · 一线追踪<br />
+      来源：Yihui Zhang、Tianyu Wo、Jinghao Wang、Xiao Zhou、Huitian Xue、Xiaoyang Sun†、Zeying Wang、Chunming Hu、Renyu Yang†（† 通讯；北京航空航天大学，含 University of Leeds 合作）· <em>ARC: Adaptive Rollout Control for Efficient Synchronous LLM Reinforcement Learning</em>（<a href="https://arxiv.org/abs/2611.29156" target="_blank" rel="noopener">arXiv:2611.29156</a>，cs.LG / cs.DC，v1 页眉日期 2026-11-22；已下载 PDF 原文核对公式、算法 1–3 与表 1–10）。
+      数字均为论文自报：2 节点 × 8×H20、双 Xeon Platinum 8558、2.2TB DRAM、25.6TB NVMe；Qwen3.5-35B-A3B 长 CoT 与 Qwen3.5-4B 指令两阶段；端到端表 3 为 20 步、B=16、S=16 的单次运行，<strong>无方差</strong>。「box 小验证」一节为本文用纯 Python 复算论文公式与图 5/6 的示意，非论文数据。
+      交叉：
+      <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>、
+      <a href="daily-2026-09-23-rollart.html">ROLLART</a>、
+      <a href="daily-2026-10-20-gr-opd.html">GR-OPD</a>、
+      <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>。</p>
+
+    <h2>背景与动机：动态采样把「多生成」写进了配方，却没人管「生成完没用上」</h2>
+    <p>
+      DAPO 的动态采样 + GRPO 的组相对优势，已成为 LLM RL 的常用底座：每个 prompt 采样 S 条 completion 成一组，奖励全同的组（zero-variance，对 GRPO 没有梯度信号）被过滤掉，再从超额候选池里补，直到凑够每步 B 个有效组。问题在于<strong>超额生成的候选，生成完、算完奖励，最后没进训练 batch 的部分是纯浪费</strong>。
+    </p>
+    <p>
+      ARC 的在线实测把这笔账摊开了：在 slime 默认配置下，为了交付 149.4M 有用 token，一共生成了 445.0M token，<strong>有用比例只有 33.6%</strong>——约三分之二的 rollout 算力被 DAPO 过滤器按设计丢弃。而哪些组会被丢，往往在生成到一半时就有线索：一个组的奖励已经全同就注定被丢（图 1 的 G1），全不同就注定留下；难以判断的是中间态，以及「有效组生成完了但 batch 已经选满」这种调度性浪费。
+    </p>
+    <p>
+      本文把 rollout 从「静态准入 + 无条件跑完」改成<strong>组粒度的闭环控制</strong>。它不碰模型、不碰奖励、不碰策略更新，只改调度层：三个机制 CSB / DGC / AAP 依次解决「要不要继续跑」「停了是不是就丢了」「空出来的槽怎么填」。和本站此前的 <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>（消除 staleness）、<a href="daily-2026-09-23-rollart.html">ROLLART</a>（异构解耦）不同，ARC 优化的是<strong>同步 RL 里 rollout 阶段的产出率</strong>，保留同步语义。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 挑战一：先完成的先留，会系统性压长回答</h3>
+    <p>
+      论文 §2.2 指出：常见的 first-finished-first-kept 策略虽然降低 wall-clock，却让训练 batch 偏向短回答——长 CoT 样本还没生成完，B 个名额已经被短样本占满。这不是奖励层面的偏好，纯粹是调度造成的分布偏移。但反过来按长度排序又要等长度已知，同样卡在「信息是随着生成才逐步出现的」。
+    </p>
+
+    <h3>② 挑战二：按优先级排序的天花板很低</h3>
+    <p>
+      Seer 式的 probe 重排只改变<strong>已准入工作</strong>的顺序。ARC 在同等粒度上实测（表 3）：Seer 相对 Slime 只换来 rollout 时间 −0.83%、有效吞吐 +0.25%，而 CSB 在同一负载上收回 38.9%。原因很直接：重排不改变「有多少组注定白跑」，只改变它们谁先跑完。
+    </p>
+
+    <h3>③ CSB：用在线校准表估计「这个组最终会被保留的概率」</h3>
+    <p>
+      Calibrated Streaming Backfill 把「早期可观测信号」映射到 p：给定组已完成 n 个样本、是否已出现分歧 c∈{0,1}，查一张在线维护的校准表得 p<sub>keep</sub>(c, n)。每次训练步末做一次指数衰减（λ=0.85）+ 批量计数更新（算法 1）：
+    </p>
+    <pre><code>hit[c,n] ← λ·hit[c,n];  tot[c,n] ← λ·tot[c,n]
+for (c_i, n_i, y_i) in step_outcomes:      # y_i = 该组最终是否被保留
+    tot[c_i,n_i] += 1;  hit[c_i,n_i] += y_i
+p_keep[c,n] = hit[c,n] / tot[c,n];   p0 = n_keep / max(n_seen,1)
+is_warm = (n_seen ≥ τ_warm)</code></pre>
+    <p>
+      一个关键设计是<strong>按步批量更新而不是按组更新</strong>：若每完成一组就衰减一次，有效历史计数趋于 Σλⁱ = 1/(1−λ) = 6.667（λ=0.85），永远够不到 τ<sub>warm</sub>=40 的有效观测门槛，学习式早停永远不会启用。按步更新让计数随训练推进增长，最终越过 warm-up；越权前只跑确定性过滤规则。表里没见过的桶先退回到同 c 的最近 n，再退到全局率 p0。
+    </p>
+    <p>
+      有了 p，停不停由期望成本决定（论文式 2）。继续的成本是跑完剩余样本 C<sub>rem</sub>，加上「最终还是被丢」的概率 (1−p) 再补一个替换组的成本 C<sub>repl</sub>；早停的成本只有 C<sub>repl</sub>。于是：
+    </p>
+    <pre><code>E[C | LearnedStop]  = C_repl
+E[C | Continue]     = C_rem + (1 - p) * C_repl
+ LearnedStop  ⇔  p_keep(c,n) &lt; C_rem / C_repl          # 论文式(2)</code></pre>
+    <p>
+      再乘一个「替换是否可行」的供给因子（未准入候选 R、同时在找替换的组 J、基础保留率 p0），替换稀缺时阈值自动收紧。图 5 的示意：S=4、n=2 时，G1 已完成样本一致（c=0）、校准 p=0.20，G2 已分歧（c=1）、p=0.82；查表后 G1 早停腾槽、G2 继续。
+    </p>
+
+    <h3>④ DGC：把「早停」改成「暂停」，而不是「丢弃」</h3>
+    <p>
+      早停的代价是可能把一个 true-KEEP 组误杀。Deferred Group Completion 用 park/resume 替代取消：暂停组保留<strong>已完成的样本、token、奖励、策略版本元数据、完成度 n</strong>，只释放待跑的 GPU 槽；之后从断点续跑，只重生成剩下的 S−n 条。算法 3 三条过程：
+    </p>
+    <table>
+      <thead><tr><th>过程</th><th>动作</th><th>边界条件</th></tr></thead>
+      <tbody>
+        <tr><td>TryPark</td><td>LearnedStop 时入池，r<sub>g</sub>←0、age←0</td><td>池容量 M 满则丢弃；确定性失败不暂停</td></tr>
+        <tr><td>PopBestAndResume</td><td>按完成度 n 最大者先续跑，复用 probe 优先级 μ<sub>g</sub> 与 KV 前缀</td><td>r<sub>g</sub>+1 &gt; C<sub>max</sub> 则 resume-lock，之后必须跑到终局</td></tr>
+        <tr><td>EndStepAge</td><td>每步 age+1，超过 T<sub>age</sub> 则移出池</td><td>age 作为饥饿保护，任何组不会无限等待</td></tr>
+      </tbody>
+    </table>
+    <p>
+      resume-cycle 上界不是装饰：早期部署没加这条时，组在 Parked/Active 之间平均循环 8.4 次，每次重新派发再取消剩余样本，step 时间反而<strong>涨了 55%</strong>；加上上界（默认 C<sub>max</sub>=0，即续跑一次后锁定）才把延期从净亏变成 4.46% 的毛成本。论文还记录了一个工程细节：续跑若跨策略更新，保留的前缀样本可能来自旧策略，调度器按样本记录策略版本，把陈旧前缀从 policy-gradient loss 里排除。
+    </p>
+
+    <h3>⑤ AAP：按完成度派发 + 供给感知的准入</h3>
+    <p>
+      Adaptive Admission and Pipelining 有两半。Streaming：一个组的命运一确定（CSB 停、过滤器判、DGC 暂停），槽位立刻补上，不等整批排空，让固定容量的流水线整步保持饱和。准入计数用 CSB 已有的信念信号：
+    </p>
+    <pre><code>{已接受组} + Σ_{g∈未决} p_keep(g) &lt; B   ⇒   再准入一个新候选
+校准未热时退化为悲观界（所有未决组都算作会被接受）+ 操作者设定的 oversampling 上限</code></pre>
+    <p>AAP 只消费 p 这个信号，决定「下一个跑哪个已准入的样本」；它不反过来改 CSB 的续跑判断，两者职责干净分开。关掉 AAP 就退回 FIFO。</p>
+
+    <h2>主结果：20 步、B=16、S=16 的端到端对照</h2>
+    <p>所有配置的目标都是同样的 320 个接受组，B、S、oversampling=3×B 全程固定，差异只来自调度机制（表 3）：</p>
+    <table>
+      <thead><tr><th>指标</th><th>Slime</th><th>Seer</th><th>ARC (CSB only)</th><th>ARC（全）</th><th>Oracle ARC</th></tr></thead>
+      <tbody>
+        <tr><td>Rollout 时间（s）</td><td>194,999</td><td>193,372</td><td>119,152</td><td><strong>122,087（−37.39%）</strong></td><td>81,221</td></tr>
+        <tr><td>Step 时间（s）</td><td>219,889</td><td>219,330</td><td>146,286</td><td><strong>146,538（−33.36%）</strong></td><td>106,111</td></tr>
+        <tr><td>GPU rollout 吞吐（tok/GPU/s）</td><td>95.80</td><td>99.70</td><td>171.90</td><td><strong>153.69（+60.43%）</strong></td><td>236.57</td></tr>
+        <tr><td>有效 GRPO 吞吐（组/小时）</td><td>5.24</td><td>5.25</td><td>7.87</td><td><strong>7.86（+50.1%）</strong></td><td>10.86</td></tr>
+      </tbody>
+    </table>
+    <p>读表要点：</p>
+    <ul>
+      <li><strong>「有效」是关键限定词</strong>：GPU 吞吐的分子只算进入训练 batch 的 token。全 ARC 生成 272.0M、其中 150.1M 有用（55.2%）；Slime 生成 445.0M、只有 149.4M 有用（33.6%）， discarded share 少了 21.6pp。</li>
+      <li><strong>CSB 几乎承包全部收益，DGC/AAP 负责把质量找回来</strong>：拆解表 6——w/ CSB 是 1.64× rollout 加速但 recall 只有 80.6%；w/ DGC 加速降到 1.54×、recall 升到 98.9%；w/ AAP 回到 1.60×、recall 不变。CSB-only 比全配置在每一行都略快，那 0.17% 的 step 时间差就是 DGC 为保住误停组付的钱。</li>
+      <li><strong>分布没被扭曲</strong>：CSB-only 因「短样本先确认先入选」把接受组的平均长度拉长 +7.9%、中位数 +20.5%；全 ARC 把均值拉回 Slime 的 0.4% 内、P90/P99 差在 1.6% 内、中位数从 +20.5% 收窄到 +8.2%。这说明 DGC 恢复的是训练分布形状，不只是 98.9% 这个数。</li>
+      <li><strong>精度没掉</strong>：六个数学基准上任一单项差 ≤1.87pp、数学均值差 ≤0.44pp（全 ARC 88.74% vs Slime 89.02%）；推理三项均值 72.15%→73.33%（IFBench +4.66pp，论文归为采样噪声，但至少排除了系统性退化）。训练期 task_score 累计均值与 Slime 的偏差不超过单轮自身的步间噪声 ±0.11。</li>
+      <li>Oracle ARC（用 trace 回放的反事实结论替换校准概率）是 10.86 组/小时、rollout 81,221 s——说明校准表还有约 1.4× 的理论空间，但那是完美预知的上界，不可达。</li>
+    </ul>
+
+    <h3>长程与调度细节</h3>
+    <p>
+      Qwen3.5-4B 的第二阶段（32K 预算、135 步）是一次真实分布漂移测试：ARC 把 makespan 降 63.2%。此时 pool 长期饱和——M=16 拒绝了 9,859 次学习式丢弃（是第一阶段 4,111 次的 2.4 倍），说明换预算后 CSB 想停的次数远多于池子容量，容量 M 成了新的旋钮（表 10 扫描：M=16 时恢复率 92.9%）。这提示工程上 M 应按阶段调，而不是全程固定。
+    </p>
+
+    <h3>box 小验证（纯 Python：论文式 2 + 图 5/6 的示意）</h3>
+    <pre><code>BOX A - cost-aware stop rule + DGC park/resume (toy, paper Fig.5/6)
+C_repl= 2.0  threshold C_rem/C_repl=3.00 | G1(c=0,p=.20)->LearnedStop  G2(c=1,p=.82)->LearnedStop
+C_repl= 5.0  threshold 1.20               | G1->LearnedStop  G2->LearnedStop
+C_repl=10.0  threshold 0.60               | G1->LearnedStop  G2->Continue
+C_repl=20.0  threshold 0.30               | G1->LearnedStop  G2->Continue
+  cheap replacement (small C_repl): both stop; expensive (large C_repl): only agree group stops
+  G3: resume -> all agree      -> DROP (stop confirmed)
+  G1: resume -> later disagree -> KEEP (discarding would lose it)
+  G4: ages out, never resumed  -> DROP
+  DGC accounting: 2 finished tokens kept + 6 regenerated = 8, but no new candidate needed</code></pre>
+    <p>
+      读法：(1) 式 2 的阈值 C<sub>rem</sub>/C<sub>repl</sub> 本身就编码了供给——替换越便宜（C<sub>repl</sub> 小），越该早停；替换越贵，越该保守。(2) 图 6 的三个组因同一原因被停，续跑后却是三种结局，这正是「停」必须做成「暂停」而不是「取消」的实证理由。(3) DGC 的续跑只重生成 S−n 条，token 总量与全跑相同，省的是「再找一个替换组」那一整条候选链；论文里这条链的节省随 oversampling 倍数放大。(4) 这是论文公式与示意数值的复算，不是对 37.4% 加速的复现——后者需要完整 RL 训练栈与线上 trace。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先量「有用 token 比例」再谈 rollout 优化</strong>：如果日志里生成量 / 进入训练量远大于 3×，先确认是不是 DAPO 过滤器 + batch 选满造成的；ARC 报告 33.6%→55.2% 是从这里省的。</li>
+      <li><strong>校准表按步批量更新，并显式设置 warm-up</strong>：按组更新会因有效计数上限 1/(1−λ) 卡在门槛下，学习式早停永远不启用（论文 λ=0.85 时上限 6.667 &lt; τ=40）。</li>
+      <li><strong>暂停一定要有 resume-cycle 上界</strong>：无上界时组会平均循环 8.4 次、step 时间反涨 55%；C<sub>max</sub>=0（续跑一次后锁定）足以把它变成净收益。</li>
+      <li><strong>按阶段调池容量 M</strong>：长预算阶段拒绝次数可能是短阶段的 2.4 倍，固定 M 会把新的可停组全部挡在外面；用「拒绝次数 / 入池次数」做在线旋钮。</li>
+      <li><strong>检查分布形状而非只看均值</strong>：早停容易偏向短回答，务必同时看接受组的 P50/P90/P99 与截断率（本文 1.86%→1.80%，CSB-only 会涨到 2.48%）。</li>
+      <li><strong>同步语义的边界要写清</strong>：续跑跨策略更新时，旧策略前缀必须从 policy-gradient loss 排除；这与 <a href="daily-2026-10-20-gr-opd.html">GR-OPD</a> 里 sampled-token OPD 的同策略假设是同一类问题。</li>
+      <li><strong>注意适用边界</strong>：端到端表是单次运行、无方差；只测了 math 数据与两个 Qwen3.5 模型；池命中与 KV 复用带来的收益在报告中被刻意不计入，跨框架、跨模型的泛化仍需验证。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么按组做指数衰减会让学习式早停永远不启用？给出有效观测数的推导，并说明按步批量更新为什么能越过 warm-up。</summary>
+      <p>若每完成一个组就对 hit/tot 乘 λ 再加 1，则一条持续流入的观测流的有效计数是 Σ<sub>i≥0</sub> λⁱ = 1/(1−λ)。λ=0.85 时是 6.667，/configured τ<sub>warm</sub>=40 差一个量级，n<sub>seen</sub> 永远追不上门槛，IsWarm 一直为假，CSB 与概率准入都被禁用。按步批量更新时，一步内先累积所有完成组的计数、步末只衰减一次，有效历史随「训练步数」而不是「完成组数 × 一个衰减上限」推进，因此能随训练进展越过 40。论文还强调学习式早停产生的 Drop 标签不能回填校准表（反事实结论未知，回填会引入偏差），只有完整组与确定性结论可以更新。</p>
+    </details>
+    <details>
+      <summary>2. CSB-only 的 rollout 时间比全 ARC 更短（119,152 s vs 122,087 s），为什么论文仍把全配置作为主结果？</summary>
+      <p>因为 CSB-only 的 recall 只有 80.6%——它把 19.4% 最终本会被保留的组直接丢了。表 5 显示这些被误杀的组偏长（CSB-only 接受组均值 +7.9%、中位数 +20.5%），训练分布被系统性扭曲；数学均值也略低（88.58% vs 全配置 88.74%）。DGC 用 4.46% 的毛 step 时间成本把 recall 拉回 98.9%，AAP 再把流水线填满，净效果是 rollout 时间只多 2.5%（122,087/119,152），但保住了分布形状与训练数据完整性。RL 的目标是策略质量而非纯吞吐，"省掉本该训练的样本"是虚假的加速。</p>
+    </details>
+    <details>
+      <summary>3. resume-cycle 上界为什么是必需的？描述无上界时的振荡机制，并解释 C_max=0 的含义。</summary>
+      <p>被暂停的组已经满足早停的最小样本前提，续跑后第一个完成的样本若又显得不利，CSB 会再次停它、再次入池，形成 Parked↔Active 振荡，永远到不了终局判定。早期部署实测平均循环 8.4 次，每次都重新派发并取消剩余样本，step 时间反涨 55%。C<sub>max</sub> 是每组的续跑次数上界：一旦 r<sub>g</sub> &gt; C<sub>max</sub>，置 resume-lock ℓ<sub>g</sub>=True，永久豁免于后续学习式早停，必须把剩余样本跑到确定结论。默认 C<sub>max</sub>=0 意为「续跑一次后就锁定」，用有界的一点额外生成换终止性保证。这与 DGC 的 age 上界 T<sub>age</sub> 是两种不同的终止保护：前者防振荡，后者防饥饿。</p>
+    </details>
+    <details>
+      <summary>4. 式 2 里没有显式的供给约束，论文说 P_joint(R, p0, J) 让规则在替换稀缺时自动保守。解释其直觉，并说明为什么不能只用固定阈值 p&lt;τ。</summary>
+      <p>式 2 假设「想要替换时总能拿到一个」，即 C<sub>repl</sub> 是常数。现实中替换组来自有限的 oversampling 候选池：未准入候选 R 越少、同时在找替换的组 J 越多，每个组拿到替换的概率越低。P<sub>joint</sub>(R,p0,J) 把「R 个候选各自以基础率 p0 被接受、J 个组同时竞争」的联合可行性算进来，替换稀缺时阈值收紧、更多组选择继续跑完（因为停了也补不上）。固定阈值 τ 无法感知这种拥塞：池空时继续早停会造成短时大批组同时等替换，形成论文所说的 shortfall wave（表 7：按组更新时出现 11 次，按步更新归零）。此外早停产生的 Drop 标签不能反哺校准，否则会系统性高估停的收益。</p>
+    </details>
+    <details>
+      <summary>5. ARC 保留同步 RL 语义的代价是什么？如果改成异步，哪些机制会失效或需要重设计？</summary>
+      <p>同步语义要求一步内所有训练样本来自同一策略版本。DGC 的暂停可能跨策略更新，续跑组里会混入旧策略生成的样本；论文的做法是每样本记录策略版本，把陈旧保留前缀从 policy-gradient loss 中排除——这牺牲了部分已生成 token 的可用性，换来无偏梯度。改成异步后：(1) 早停判断的 p0 与校准表会随在训策略漂移，需要版本化或按策略分表；(2) 「batch 选满就停准入」的供给约束不再成立，因为更新不再按步对齐；(3) 续跑组的旧前缀在 off-policy 下需要重要性修正（见 <a href="daily-2026-09-07-algo-importance-sampling.html">重要性采样</a> 与 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 的讨论），简单排除会变成样本浪费。异步方向的已有工作见 <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a>（零 staleness）与 <a href="daily-2026-09-23-rollart.html">ROLLART</a>（异构解耦），它们解决的是另一类问题，不能与 ARC 直接叠加而不重做这套供给控制。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.29156" target="_blank" rel="noopener">arXiv:2611.29156 · ARC: Adaptive Rollout Control for Efficient Synchronous LLM Reinforcement Learning（Zhang, Wo, Wang et al.；Beihang University / University of Leeds）</a></li>
+      <li>相关：<a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">DAPO（arXiv:2503.14476）</a> · <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">DeepSeekMath / GRPO（arXiv:2402.03300）</a> · <a href="https://github.com/THUDM/slime" target="_blank" rel="noopener">GitHub: THUDM/slime</a></li>
+      <li>站内：
+        <a href="daily-2026-11-25-harness-agent-kernel-sgr.html">今日 Harness：Agent-Kernel / SGR</a> ·
+        <a href="daily-2026-11-25-algo-bpe-byte-patch.html">今日算法：BPE 与字节 patch</a> ·
+        <a href="daily-2026-10-07-thundersyncrl.html">ThunderSyncRL</a> ·
+        <a href="daily-2026-09-23-rollart.html">ROLLART</a> ·
+        <a href="daily-2026-10-20-gr-opd.html">GR-OPD</a> ·
+        <a href="daily-2026-10-21-arctic-swe.html">Arctic-SWE</a> ·
+        <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> ·
+        <a href="daily-2026-09-16-algo-grpo.html">GRPO</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

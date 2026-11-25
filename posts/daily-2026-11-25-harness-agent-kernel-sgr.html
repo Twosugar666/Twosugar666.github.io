@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜fork() for Agents：把 Spark 的子图恢复搬进 LLM 内容平面——Agent-Kernel 用 SQLite 七状态机 + 上下文继承做到失败不回滚全部，14,434 次运行中预算=3 恢复率 100% vs 全回放 55%，最高 12.7× 加速 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜fork() for Agents：把 Spark 的子图恢复搬进 LLM 内容平面——Agent-Kernel 用 SQLite 七状态机 + 上下文继承做到失败不回滚全部，14,434 次运行中预算=3 恢复率 100% vs 全回放 55%，最高 12.7× 加速</h1>
+    <p class="post-meta">2026-11-25 · 收藏夹：Harness / Agent · 学习笔记<br />
+      来源：Ankit Chadha、Pratyay Banerjee（Amazon, AGI / Sunnyvale，ankitrc、pratyay@amazon.com）· <em>fork() for Agents: Agent Kernel for Non-blocking LLM Orchestration</em>（<a href="https://arxiv.org/abs/2611.31727" target="_blank" rel="noopener">arXiv:2611.31727</a>，cs.CL / cs.DC，v1 2026-11-24；已下载 PDF 原文核对算法、表 1–6 与消融）。
+      数字均为论文自报：主实验 Claude Sonnet 4.5 经 API、三区域轮询，跨 backbone 加 Haiku 4.5 / Opus 4.5，共 14,434 次运行（核心网格 11,809 + 对照/扩展 2,625）；墙钟为 3 seed 均值点估计、未给出逐 seed 离散度。<strong>论文明确说明 10× 那个数字来自它对 Sherlock 的适配实现，不代表最优 Sherlock</strong>。「box 小验证」一节为本文用纯 Python 复算重执行节点数与状态保持不变量，非论文数据。
+      交叉：
+      <a href="daily-2026-10-13-harness-sandbox-snapshots.html">整机快照</a>、
+      <a href="daily-2026-10-21-harness-reobserve.html">PersistGym</a>、
+      <a href="daily-2026-10-30-harness-spine.html">Spine</a>、
+      <a href="daily-2026-11-20-harness-meta2.html">Meta²</a>、
+      <a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM</a>、
+      <a href="daily-2026-10-08-harness-refold.html">ReFold</a>。</p>
+
+    <h2>背景与动机：agent 失败一次，完成的兄弟节点全白干</h2>
+    <p>
+      主流 agent harness 的执行模型是同步、全有或全无：工具调用一个接一个跑，任何一个抛异常，整条轨迹重来。这相当于操作系统在 <code>fork()</code> 之前的状态——一次一个任务、没有并发、没有选择性恢复。而分布式系统早就解决了这个问题：Spark / Erlang/OTP / Dryad 的子图选择性恢复，只重跑失败节点的传递后代，保留已完成的兄弟。
+    </p>
+    <p>
+      agent 侧也有接近的方案，但都带额外装置：Sherlock 用 verifier、AgentGit 用版本控制、Atomix 用事务化工具边界来保留已完成工作；AsyncLM 做 token 级非阻塞调用却忽略声明的依赖；AIOS 做 OS 式调度但没有反应式级联恢复；DynTaskMAS 依赖 planner LLM 输出 DAG，失败时重规划整张剩余图。本文的问题是：<strong>能不能不训练 verifier、不装 planner，就靠一个原始异常信号，把「只重跑受影响子图」搬到 LLM 的内容平面？</strong>
+    </p>
+    <p>
+      所谓内容平面，指节点之间传递的不是字节而是文本：父节点的输出要被组合进子节点的 prompt（论文叫 context inheritance），token 预算有限、文本长度可变，重试时 prompt 还可能要按错误信息改写。这是控制/状态类运行时（Spark、Atomix、AgentGit）没有作为一等策略暴露的部分。本站此前的 <a href="daily-2026-10-13-harness-sandbox-snapshots.html">整机快照</a> 用整机状态换 Go-Explore 式重试、<a href="daily-2026-10-21-harness-reobserve.html">PersistGym</a> 用可恢复性探针决定重观察，都是「保留状态」的思路；本文更接近把它们下沉成运行时的原语。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① SGR：一次异常，只重置失败节点及其不可达后代</h3>
+    <p>
+      失败级联先把失败节点的传递后代标记为 unreachable。调用方（不是 SGR 本身）按节点尝试历史执行预算约束，在还有预算时调用 retry。SGR 的核心只有几行：
+    </p>
+    <pre><code>subgraph_retry(node_id):
+    assert state(node_id) == FAILED
+    for d in transitive_closure(node_id):
+        if state(d) == UNREACHABLE:      # = F 里所有未完成后代
+            transition(d, WAITING)
+    re_evaluate(node_id)                 # -> WAITING/RUNNING，前向级联重跑其余节点</code></pre>
+    <p>
+      形式化保证（§3.1）：设 G=(V,E) 为任务 DAG，F⊂V 为失败子图（失败节点 + 传递后代），C=V\F 为补集，则 <strong>∀c∈C，其状态与输出不变</strong>。关键论证很干净：严格后代只有在祖先完成后才会完成，所以失败时 F 里的非完成节点恰好就是级联标记的不可达节点，重置它们不丢弃任何已完成工作。重执行是 level-triggered：DSP 把父节点全部 complete 的 reset 节点重新派发，前向成功级联带动其余节点。
+    </p>
+    <p>
+      <strong>保证的边界要说清</strong>：它覆盖 SAB 记录的状态与输出，不覆盖节点对外部世界已经产生的副作用。非幂等工具调用（付款、写文件、发消息）若成功后节点再失败，重跑会重复副作用；论文把这件事故交给下一层的事务化工具边界（如 Atomix  tagging + abort 补偿），两层组合使用。检测与恢复也是分离的：SGR 消费失败信号但不判断什么算失败——schema 校验、参数检查、工具调用检查、verifier 的不一致都能触发同一套级联。
+    </p>
+
+    <h3>② 底座：SQLite Sub-Agent Buffer + DAG State Propagator</h3>
+    <p>SGR 需要两个底座性质：已完成工作能扛住崩溃与重试（持久存储），reset 节点在父节点就绪时能自动重派（反应式调度）。</p>
+    <table>
+      <thead><tr><th>组件</th><th>职责</th><th>关键实现</th></tr></thead>
+      <tbody>
+        <tr><td>SAB（Sub-Agent Buffer）</td><td>持久化每个子 agent 的状态与输出</td><td>SQLite WAL 模式；7 状态 FSM：pending→waiting→running→complete|failed|cancelled|unreachable；状态转移原子（单条 SQL 事务）；edges 表 O(1) 找传递闭包</td></tr>
+        <tr><td>记录字段</td><td>恢复所需的所有上下文</td><td>task / role / state / depends_on / intermediate_outputs / attempt_history / retry_budget（基准设为 3）</td></tr>
+        <tr><td>DSP（DAG State Propagator）</td><td>四种级联的后台守护</td><td>前向成功：父全 complete→派发并把父输出注入子 prompt；失败：标记后代 unreachable；Retry：重置失败子图；Cancel：标记后代不可达</td></tr>
+        <tr><td>Context inheritance</td><td>内容平面特有的正确性</td><td>派发子节点时读所有声明父节点的 intermediate_outputs，按 token 预算组合成结构化块；保证子节点看到父节点的真实输出而非陈旧/缺失数据</td></tr>
+      </tbody>
+    </table>
+    <p>
+      崩溃测试（附录 D）：completed 节点在进程被杀后幸存，陈旧 running 节点被重新入队。注意 fork 与 retry 不冗余——fork 创建新后代，retry 重置并重派已有节点。
+    </p>
+
+    <h3>③ 五个动词的 API</h3>
+    <pre><code>a = fork("Get price from Vendor A", role="researcher")   # 立即返回
+b = fork("Get price from Vendor B", role="researcher")
+c = fork("Get price from Vendor C", role="researcher")
+s = fork("Compare and recommend", role="analyst",
+         depends_on=[a, b, c])
+# 主循环不等待。若 a 失败：
+retry(a)     # SGR 重置 a 与 s，保留 b、c 的已完成输出</code></pre>
+    <p>
+      五个动词是 fork / retry / cancel / query / fetch，每个映射一种调度级联：spawn、SGR reset、cancel cascade、集合读、单记录读。主循环调用 fork 后立即返回，MLAL（主循环确认延迟，接受新工作的时间）实测 <strong>0.15 ms，而阻塞式基线是 1,600–2,000 ms</strong>——这就是「非阻塞」在数字上的样子。
+    </p>
+
+    <h2>主结果：14,434 次运行</h2>
+    <h3>① 恢复率与速度：同样的预算，差别在「重试范围」</h3>
+    <p>
+      合成失败网格 n=120、失败率 0.1–0.3、budget=3：
+    </p>
+    <table>
+      <thead><tr><th>系统</th><th>恢复率</th><th>墙钟</th><th>策略</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Agent-Kernel</strong></td><td><strong>100.0% [97.0, 100.0]</strong></td><td>21 s</td><td>SGR（按失败节点）</td></tr>
+        <tr><td>ReAct-per-step（B3）</td><td>100.0%</td><td>135 s</td><td>逐步重试（串行）</td></tr>
+        <tr><td>Sherlock-generous</td><td>100.0%</td><td>149 s</td><td>Rollback</td></tr>
+        <tr><td>AsyncLM-style</td><td>100.0% [97.0, 100.0]</td><td>—</td><td>Retry-once（忽略依赖）</td></tr>
+        <tr><td>ReAct+retry</td><td>55.0% [46.1, 63.6]</td><td>15 s</td><td>整轨迹回放</td></tr>
+        <tr><td>ReAct-serial / AIOS-style</td><td>36.7% [28.5, 45.7]</td><td>3 s / —</td><td>Halt</td></tr>
+      </tbody>
+    </table>
+    <p>45pp 的差距（55%→100%）隔离的是「在哪重试」，不是「是否重试」：两个系统都是 budget=3、相同瞬态失败注入，但 Agent-Kernel 的预算按失败节点算，ReAct+retry 的预算按整条轨迹算。加强对照把范围与次数分开：给 Agent-Kernel 的底座 3 次整任务重起的 FullReplan 只有 56.2%；给串行 ReAct 逐步作用域的 B3 能完全恢复但慢。所以 SGR 不是唯一能恢复的机制，但它是<strong>最快的那个</strong>——比 B3 快 3.3–12.7×，比作者的 Sherlock-generous 适配快约 10×（后者墙钟在失败率 0 时也平坦在 139–167 s，因为每次中间输出都跑 verifier，这个差距反映的是适配实现，论文自己特别声明了）。
+    </p>
+    <p>
+      AsyncLM-style 也 100% 恢复，但代价是依赖正确性：它同时派发所有节点，在有顺序要求的工作负载上场景级正确率 0%。B3、Sherlock-generous 的依赖正确性来自串行。只有 Agent-Kernel 同时拿到依赖正确性和并行。
+    </p>
+
+    <h3>② 真实模型推理：结构决定收益</h3>
+    <table>
+      <thead><tr><th>基准</th><th>AK 墙钟</th><th>ReAct 墙钟</th><th>加速</th><th>可并行比例</th><th>结构</th></tr></thead>
+      <tbody>
+        <tr><td>AutomationBench（20 任务）</td><td>5.5 s</td><td>24.8 s</td><td><strong>4.5×</strong></td><td>5%</td><td>独立 API</td></tr>
+        <tr><td>InterruptBench（113）</td><td>14.2 s</td><td>38.1 s</td><td><strong>2.7×</strong></td><td>44%</td><td>非阻塞</td></tr>
+        <tr><td>AAR Hard（15）</td><td>72.4 s</td><td>85.2 s</td><td>1.18×</td><td>39%</td><td>菱形</td></tr>
+        <tr><td>Synthetic K=32</td><td>22.1 s</td><td>281.4 s</td><td><strong>12.7×</strong></td><td>—</td><td>8×32 DAG</td></tr>
+        <tr><td>tau-bench（1,320）</td><td>17.2 s</td><td>17.1 s</td><td>1.0×</td><td>84%</td><td>线性</td></tr>
+        <tr><td>Gaia2（640）</td><td>18.2 s</td><td>18.0 s</td><td>1.0×</td><td>39%</td><td>线性</td></tr>
+      </tbody>
+    </table>
+    <p>
+      读法：收益与 DAG 并行度成正比。线性链上 AK 与 ReAct 精度在噪声内打平（tau-bench 84%、Gaia2 39%），底座只是「加了恢复和并行、没降精度」；有扇出的地方才拉开。跨 backbone 复现：Sonnet 4.5 / Haiku 4.5 在 K∈{8,32} 都 100%，Opus 4.5 在 K=8 也是 100%（均为 fr=0.3），说明 SGR 不是单一模型的运气。
+    </p>
+
+    <h3>③ 上下文继承：K=128 时 top-k 比 raw-concat 省 17×</h3>
+    <table>
+      <thead><tr><th>K</th><th>raw-concat token</th><th>summarizer token</th><th>top-k token</th><th>准确率</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>86</td><td>80</td><td>86</td><td>100%</td></tr>
+        <tr><td>16</td><td>339</td><td>243</td><td>136</td><td>100%</td></tr>
+        <tr><td>32</td><td>608</td><td>416</td><td>136</td><td>100%</td></tr>
+        <tr><td>128</td><td>2,363</td><td>1,588</td><td><strong>140</strong></td><td>100%</td></tr>
+      </tbody>
+    </table>
+    <p>top-k 检索让注入 token 基本恒定，K=128 时是 raw-concat 的约 1/17，准确率全程 100%。这是「内容平面」这一层真正要做的事：不是把父节点输出无脑拼接，而是在预算内选出子节点真正需要的那些。
+    </p>
+
+    <h3>④ 消融：去掉 SGR 就打回原形</h3>
+    <p>
+      全配置 100%；NoSAB 100%、NoDSP 100%（这个基准上看不出差别）；FullReplan（等预算）56.2%；<strong>NoSGR 39.4%</strong>——正好掉到 halt-on-failure 的水平。real-binary 集成（LangGraph 1.2 / LlamaIndex 0.14 / AutoGen v0.4 装在 diamond fan-out DAG 上、一个失败叶子）：Agent-Kernel 60/60 恢复、重执行 1.0、0.12 s；LangGraph 60/60 但 0.52 s；后两者 0/60。论文明确区分合成网格与真实二进制集成，没有把后者包装成基准。
+    </p>
+
+    <h3>box 小验证（纯 Python：重执行节点数与状态保持不变量）</h3>
+    <pre><code>BOX B - whole replay vs sub-graph retry
+K=8 L=8 fail@depth4: full replay re-exec 32 nodes/attempt | SGR 5 nodes/attempt | 6.4x fewer
+per-node transient p=0.01: P(no new failure during retry) replay=0.725  SGR=0.951
+per-node transient p=0.02:                                replay=0.524  SGR=0.904
+per-node transient p=0.05:                                replay=0.194  SGR=0.774
+guarantee: all 7 completed states in V\F unchanged; only 5 nodes in F reset</code></pre>
+    <p>
+      读法：(1) 论文 §4.2 的原例——K=8、L=8、失败在深度 4，整轨迹重起每次要重跑 32 个已完成节点，SGR 只碰失败节点 + 4 个后代，6.4× 的差距。(2) 把「每次重执行可能遇到新瞬态失败」建模为每节点独立概率 p，重跑 32 个节点时「一轮内不再失败」的概率随 p 陡降（p=0.02 时 0.524），而 SGR 只碰 5 个节点是 0.904——这就是预算被白耗掉的机制，也解释了 55% vs 100%。(3) 状态保持不等式是确定性的：V\F 里的 7 个已完成状态一个不动。这里用的是论文的示例拓扑，不是对 12.7× 墙钟的复现。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>先判断你的 DAG 有没有扇出</strong>：线性链上这套运行时收益接近零（tau-bench / Gaia2 都是 1.0×），真正吃到的是独立 API 调用、菱形汇聚、可并行的研究型工作流。别把它当成通用加速插件。</li>
+      <li><strong>把「失败检测」与「恢复」解耦</strong>：SGR 只消费信号，verifier / schema check / 参数校验都可以当检测器。这样可以在不重写 harness 的前提下挂上恢复层，和 <a href="daily-2026-11-20-harness-meta2.html">Meta²</a> 那种把优化上移一层的思路是互补的两个轴。</li>
+      <li><strong>非幂等副作用必须单独包一层事务边界</strong>：付款、写文件、发消息这类调用，SGR 的保证覆盖不到；论文建议与 Atomix 式的 tagging + abort 补偿组合。这是上线前最容易漏的一条。</li>
+      <li><strong>预算按节点算，不要按轨迹算</strong>：45pp 的恢复率差距全部来自作用域，而不是尝试次数。把 retry_budget 记在每个 SubAgentRecord 上，配合 attempt_history 判定。</li>
+      <li><strong>上下文继承要有 token 预算与检索策略</strong>：raw-concat 在 K=128 时 2,363 token，top-k 是 140，准确率相同。这与 <a href="daily-2026-10-08-harness-refold.html">ReFold</a>、<a href="daily-2026-11-24-harness-raa.html">RAA</a> 的「不是留什么而是怎么看」是同一条上下文工程线索。</li>
+      <li><strong>注意基线的公平性声明</strong>：论文自己说 10× 是相对它适配的 Sherlock（verifier 常开、串行闭包回放），不是相对最优 Sherlock；引用时别写成「比 Sherlock 快 10×」的绝对结论。</li>
+      <li><strong>执行完成率有小幅代价</strong>：论文附录 B.8 记录因尾延迟超时，AK 的 execution-completion rate 比某些基线低 1–2%；长线性链上也有小的 context inheritance token 成本。这些都是已披露的边界，不是零开销。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「严格后代只在祖先完成后才完成」就能保证重置丢弃不了已完成工作？如果 DAG 允许子节点先于父节点完成，保证还成立吗？</summary>
+      <p>在正常的依赖语义下，子节点只有在父节点 complete 后才被派发，因此任何严格后代的完成时间都晚于祖先。失败节点此刻是 failed，它的所有后代要么还没跑（waiting/running/unreachable），要么不可能已经 complete——否则会与「祖先未完成」矛盾。所以 F 里的非完成节点恰好等于级联标记的不可达集合，重置它们不碰任何 complete 状态，∀c∈V\F 保持不变。若允许子节点先完成（打破依赖，如 AsyncLM 的无视依赖扇出），这个论证失效：子节点可能在父节点失败时已经产出并被消耗，重置父节点会留下「基于已失效输出」的已完成子节点，状态保持与依赖正确性都无法保证——这正是论文里 AsyncLM 在有序工作负载上场景级正确率 0% 的根源。</p>
+    </details>
+    <details>
+      <summary>2. ReAct+retry 和 Agent-Kernel 都是 budget=3，为什么恢复率一个 55% 一个 100%？FullReplan 与 B3 两个对照分别排除了什么解释？</summary>
+      <p>差别在预算作用域：ReAct+retry 的 3 次尝试是「整条轨迹」的，Agent-Kernel 的 3 次是「每个失败节点」的。深度 d 处失败时，整轨迹重起每次都要重新生成 d 层已完成工作，任何一层冒出新的瞬态失败就白耗一次预算；SGR 跳过已完成层，预算只花在真正的失败点及其后代。FullReplan 给 Agent-Kernel 底座同样 3 次整任务重起，只到 56.2%——排除了「Agent-Kernel 的底座/存储本身让重试更可靠」的解释，说明收益来自重试范围。B3 给串行 ReAct 逐步作用域，能 100% 恢复——排除了「只有并行/非阻塞才有效」的解释，说明恢复率来自作用域，速度来自并行，两者是可分离的两个维度。</p>
+    </details>
+    <details>
+      <summary>3. SGR 的 state-preservation guarantee 为什么必须显式排除外部副作用？给出一个会出错的具体场景，并说明论文建议的补救在哪一层。</summary>
+      <p>保证只覆盖 SAB 记录的状态与输出，不覆盖节点对外部世界的 effect。反例：节点 a 调用支付 API 成功（外部已扣款），随后因为解析返回格式失败而进入 failed；调用方 retry(a)，a 再次执行支付，产生二次扣款。SAB 里 a 的状态从 failed→waiting 完全符合保证，V\F 也没被动，但外部世界已经不一致。论文建议用事务化工具边界（如 Atomix 的调用 tagging 与 abort 补偿）在下一层 guards 外部 effects；两层组合：SGR 负责内容平面状态的选择性重置，工具边界负责外部副作用的幂等/补偿。检测与恢复的解耦也在这里有用——schema 校验可作为 detector 触发级联，而补偿由工具层处理。</p>
+    </details>
+    <details>
+      <summary>4. Context inheritance 为什么是 LLM harness 独有的 correctness 属性？只看「无脑拼接父输出」会在什么情况下出错？</summary>
+      <p>控制/状态类运行时传递的是字节或结构化值，复制父节点输出没有语义损失；LLM 内容平面传递的是自然语言，长度可变、需要压进 token 预算，而且子进程 prompt 的措辞会影响它的行为。无脑拼接有三个问题：(1) 父输入的中间输出是过程性的，直接喂给子节点会引入噪声，甚至把父节点自己都否定的草稿当成事实；(2) 并行分支里某个父节点失败或重试后输出被改写，陈旧拼接会让子节点基于旧数据决策（这就是论文说的 unordered parallelism 违反的正确性）；(3) K 大时 token 成本爆炸（raw-concat K=128 是 2,363 token）。Agent-Kernel 的答案是：从 SAB 读声明父节点的 intermediate_outputs，按 token 预算组合成结构化块，K 大时用 top-k 检索（140 token，准确率不变）。它与 <a href="daily-2026-10-30-harness-spine.html">Spine</a> 的「只改写活动 scope 之后的后缀保前缀缓存」是同一类工程的两种切面。</p>
+    </details>
+    <details>
+      <summary>5. （开放题）如果一个失败节点的传递后代里有一个已经完成的兄弟路径也依赖它，SGR 重置它是否违反状态保持？应该如何设计依赖图或恢复策略？</summary>
+      <p>按论文定义 F 是「失败节点 + 传递后代」，V\F 才是保证不动的集合。若某节点同时依赖失败节点和另一个已完成父节点，而且它已经完成——这在正常依赖语义下不可能（父节点 failed 时它不会被派发完成）；如果真的出现，说明依赖图被破坏或检测器误判。设计上应保证：(1) 依赖在 fork 时静态声明并落 edges 表，DSP 只在所有父节点 complete 时派发；(2) 检测器若判错，应把它当成「需要人工介入的不一致」而不是继续 SGR；(3) 对确实存在多父汇聚的节点，考虑把恢复单位从「节点」扩到「强连通分量」或用 versioned outputs（每个父输出带版本号，子节点绑定版本），这样重置一个父节点只让绑定该版本 descendants 失效，其它已完成汇聚路径保留。论文的形式保证只在标准 DAG 语义下成立，跨策略/跨版本场景需要额外设计，相关讨论见 <a href="daily-2026-10-13-harness-sandbox-snapshots.html">整机快照</a> 里的失败模式分析。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.31727" target="_blank" rel="noopener">arXiv:2611.31727 · fork() for Agents: Agent Kernel for Non-blocking LLM Orchestration（Chadha &amp; Banerjee, Amazon AGI）</a></li>
+      <li>相关：论文对照的运行时 <a href="https://arxiv.org/abs/2412.07017" target="_blank" rel="noopener">AsyncLM / Asynchronous LLM Function Calling（Gim et al.，arXiv:2412.07017）</a> · <a href="https://arxiv.org/abs/2403.16971" target="_blank" rel="noopener">AIOS: LLM Agent Operating System（Mei et al.，arXiv:2403.16971）</a> · <a href="https://github.com/langchain-ai/langgraph" target="_blank" rel="noopener">LangGraph</a></li>
+      <li>站内：
+        <a href="daily-2026-11-25-frontline-arc-rollout-control.html">今日一线：ARC 自适应 rollout 控制</a> ·
+        <a href="daily-2026-11-25-algo-bpe-byte-patch.html">今日算法：BPE 与字节 patch</a> ·
+        <a href="daily-2026-10-13-harness-sandbox-snapshots.html">整机快照</a> ·
+        <a href="daily-2026-10-21-harness-reobserve.html">PersistGym 重观察</a> ·
+        <a href="daily-2026-10-30-harness-spine.html">Spine</a> ·
+        <a href="daily-2026-11-20-harness-meta2.html">Meta²</a> ·
+        <a href="daily-2026-10-06-harness-tomasullm.html">TomasuLLM</a> ·
+        <a href="daily-2026-10-08-harness-refold.html">ReFold</a> ·
+        <a href="daily-2026-11-24-harness-raa.html">RAA</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜字节对编码（BPE）与字节 patch：350M / 100 亿字节的匹配双胞胎实验，BPE-8k 在 BPB 上领先 4.9%–9.3%，字符任务微调却反过来 40.0%→53.7%——顺带拆穿「bits/token 当 BPB」这类评测陷阱 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜字节对编码（BPE）与字节 patch：350M / 100 亿字节的匹配双胞胎实验，BPE-8k 在 BPB 上领先 4.9%–9.3%，字符任务微调却反过来 40.0%→53.7%——顺带拆穿「bits/token 当 BPB」这类评测陷阱</h1>
+    <p class="post-meta">2026-11-25 · 收藏夹：算法 · 学习笔记<br />
+      来源：Asadullah Maliyawala、Andrej Lisal（independent researchers）· <em>Byte Patches versus BPE at Matched Data: A Matched-Twin Comparison at 350M Parameters</em>（<a href="https://arxiv.org/abs/2611.31790" target="_blank" rel="noopener">arXiv:2611.31790</a>，cs.LG / cs.CL，v1 2026-11-24；已下载 PDF 原文核对表 1–6、§8 评测陷阱与 §9 局限）。
+      经典源头：Rico Sennrich、Barry Haddow、Alexandra Birch，<em>Neural Machine Translation of Rare Words with Subword Units</em>（<a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noopener">arXiv:1508.07909</a>，2015-08-31）；Lili Yu 等（Meta），<em>MEGABYTE: Predicting Million-byte Sequences with Multiscale Transformers</em>（<a href="https://arxiv.org/abs/2305.07185" target="_blank" rel="noopener">arXiv:2305.07185</a>，2023-05-12）。
+      新论文数字为作者自报：350M 参数、10<sup>10</sup> 训练字节、real_v3（85/10/5 划分）、单尺寸单 seed；配对 bootstrap / McNemar + Holm 校正。「box 小验证」一节为本文用纯 Python 复算 BPE 合并规则与 BPB 分母，非论文数据。
+      交叉：
+      <a href="daily-2026-09-09-algo-attention.html">Attention</a>、
+      <a href="daily-2026-10-13-algo-rope.html">RoPE</a>、
+      <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a>、
+      <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a>、
+      <a href="daily-2026-11-20-algo-gated-deltanet.html">Gated DeltaNet</a>。</p>
+
+    <h2>背景：一个被当成「预处理」的经典算法</h2>
+    <p>
+      BPE（Byte-Pair Encoding）最早是 1994 年的数据压缩算法，2015 年 Sennrich 等人把它引入 NMT，用来把稀有词切成高频子词片段——从此它成了「文本 → 模型」的默认接口。它的做法极其朴素：从字节/字符词表出发，反复统计相邻符号对的频率，把最高频的一对合并成新符号，直到词表达到目标大小。分词器在语言模型<strong>之前</strong>固定训练好，模型无法修改它。
+    </p>
+    <p>
+      代价是：拼写和词形被切碎、代码里的空白变得脆弱、词表大小要在训练前拍板。于是一条反方向的路线一直存在——直接对字节建模，用层次结构把序列长度压回来。MEGABYTE（Yu et al. 2023）就是代表：小块 encoder 把几个字节压成一个 patch，大模型在短 patch 序列上跑，小模型在局部把 patch 展开成字节。
+    </p>
+    <p>
+      这两条路线此前很难公平比较：分词研究固定 token 预算换 tokenizer，字节模型研究固定 FLOPs 做 scaling sweep，二者的「一个 token/字节花了多少算力」根本不在同一基准上。今天这篇论文的贡献不是提出新架构，而是<strong>把原始字节、字节顺序、优化器配方全部固定</strong>，在 350M / 10<sup>10</sup> 字节上训一对「匹配双胞胎」，问一个干净的问题：固定 patch 的字节模型，到底能不能取代分词器？
+    </p>
+
+    <h2>两个模型的结构</h2>
+    <h3>① LOCAL 64：patch-4 encoder → 26 层全局 Transformer → 64 字节局部解码器</h3>
+    <p>输入 T 个字节，四阶段处理（图 1）：</p>
+    <table>
+      <thead><tr><th>阶段</th><th>做法</th><th>关键数字</th></tr></thead>
+      <tbody>
+        <tr><td>1. Patch encoder</td><td>每 4 字节一组；256×1024 字节嵌入表 + patch 内正弦位置；4 个向量卷积压成 1 个 patch 向量</td><td>无 attention、无 VQ；p=4</td></tr>
+        <tr><td>2. 全局 Transformer</td><td>输入 LayerNorm + 26 层 pre-LN，RoPE；attention 在 patch 上跑</td><td>D=1024；2048 字节序列 → 512 patch 位置</td></tr>
+        <tr><td>3. 一格延迟条件</td><td>全局状态 h<sub>t−1</sub> 复制到 patch t 的 4 个字节；patch 0 用零向量</td><td>保证目标字节不进入自己的条件</td></tr>
+        <tr><td>4. 局部解码器</td><td>两层因果解码器，64 字节滑动窗口<strong>跨 patch 边界</strong>，位置 i 看字节 i−1</td><td>两层叠加信息最远回传 2×64−1 字节</td></tr>
+      </tbody>
+    </table>
+    <p>
+      与原始 MEGABYTE 的三点差异（论文附录 H 在代码里核实）：固定 patch=4 且无 VQ；局部 attention 是跨 patch 的 64 字节滑窗而非 patch 内解码；只做一对匹配比较而非 patch size 的 scaling study。作者明确不宣称推理速度或 scaling 优势。
+    </p>
+
+    <h3>② BPE-8k：宽度/深度/头数/RoPE/MLP 全对齐的孪生兄弟</h3>
+    <p>
+      decoder-only Transformer，与 LOCAL 64 的全局栈同宽同深同头数，只是把 patch 换成 8,000 个字节级 BPE token。共享的 26 层主干两边都是 <strong>327.4M 参数</strong>；LOCAL 64 多出 19.4M 局部解码器 + 4.5M patch encoder，BPE-8k 多出 8.2M tied embedding——字节模型总参数多 <strong>4.7%</strong>，每字节训练 FLOPs 按 matmul 估算约多 2%（比值 0.983）。所以这是一个<strong>数据与优化器匹配、而非 FLOPs 匹配</strong>的比较，字节模型在这组实验里并不更便宜。
+    </p>
+
+    <h3>③ 训练配方</h3>
+    <pre><code>data:  real_v3, 10^10 bytes, 85/10/5 (train 59.5B / 7.0B / 3.5B bytes)
+optim: AdamW β=(0.9,0.95), wd 0.1, clip 1.0, bf16, dropout 0
+LR:    cosine on bytes, peak 3e-4, warmup 1%, floor 10%
+LOCAL64:  2048 B/seq, 65,536 B/step (~152.6k steps), ~56.6 h
+BPE-8k:   512 token packs (~66k B/step), ~60.6 h  (from ~114k B/step retuned)
+BPB = (Σ -ln p(x_i | x&lt;i)) / (N_bytes · ln 2)        # 论文式(1)</code></pre>
+    <p>BPE 词表 8k 在训练前固定、未调；BPE-8k 的运行在约 9.98×10<sup>9</sup> 字节处从 checkpoint 恢复过一次。两侧各一次运行到 10<sup>10</sup> 字节。
+    </p>
+
+    <h2>主结果：似然 BPE 赢，字符任务字节模型赢</h2>
+    <h3>① 匹配字节跨度下的 BPB（表 4）</h3>
+    <p>
+      让两个模型评分<strong>完全相同的字节范围</strong>（document sliding stride 512 B；BPE-8k 取 min(512 token, 2048 B)），配对 bootstrap 给出 95% 区间：
+    </p>
+    <table>
+      <thead><tr><th>域</th><th>LOCAL 64</th><th>BPE-8k</th><th>Δ [95% CI]</th><th>相对差距</th></tr></thead>
+      <tbody>
+        <tr><td>overall</td><td>0.9634</td><td>0.9155</td><td>−0.0479 [−0.0506, −0.0453]</td><td><strong>−5.2%</strong></td></tr>
+        <tr><td>text</td><td>0.9907</td><td>0.9448</td><td>−0.0459 [−0.0486, −0.0434]</td><td>−4.9%</td></tr>
+        <tr><td>code</td><td>0.6563</td><td>0.6003</td><td>−0.0560 [−0.0683, −0.0439]</td><td><strong>−9.3%</strong></td></tr>
+        <tr><td>math</td><td>1.1023</td><td>1.0388</td><td>−0.0635 [−0.0749, −0.0530]</td><td>−6.1%</td></tr>
+      </tbody>
+    </table>
+    <p>
+      四个区间都不含 0。差距随数据量缩小但不消失：overall Δ 从 2B 的 −0.113 → 4B −0.067 → 6B −0.059 → 8B −0.052 → 10B −0.048；最后三个 checkpoint 收窄变慢，作者明确不外推到 10<sup>10</sup> 字节以外。
+    </p>
+
+    <h3>② 下游任务（表 5 / 6）：统计显著的具体是哪些</h3>
+    <p>
+      十个测试用 Wilson 95% 区间、配对 McNemar 精确检验、Holm 校正跨十项；α=0.05 下 BPE-8k 赢 PIQA raw/len-norm、ARC-Easy len-norm、fact200，LOCAL 64 赢 CharBench equal-FT；α=0.01 下只剩 fact200 与 CharBench equal-FT。
+    </p>
+    <table>
+      <thead><tr><th>任务</th><th>LOCAL 64</th><th>BPE-8k</th><th>Holm p</th><th>赢家</th></tr></thead>
+      <tbody>
+        <tr><td>fact200</td><td>0.0700</td><td><strong>0.1650</strong></td><td>0.0079</td><td>BPE-8k（α=0.01 也显著）</td></tr>
+        <tr><td>PIQA raw</td><td>0.5887</td><td><strong>0.6143</strong></td><td>0.034</td><td>BPE-8k</td></tr>
+        <tr><td>PIQA len-norm</td><td>0.5756</td><td><strong>0.6034</strong></td><td>0.014</td><td>BPE-8k</td></tr>
+        <tr><td>ARC-Easy len-norm</td><td>0.3281</td><td><strong>0.3842</strong></td><td>0.013</td><td>BPE-8k</td></tr>
+        <tr><td>CharBench equal-FT</td><td><strong>0.5367</strong></td><td>0.4000</td><td>&lt;10<sup>−5</sup></td><td>LOCAL 64（α=0.01 也显著）</td></tr>
+        <tr><td>HellaSwag raw / LAMBADA</td><td>0.2846 / 0.2360</td><td>0.2846 / 0.2401</td><td>1.000 / —</td><td>平局（HellaSwag 在此尺寸近随机）</td></tr>
+      </tbody>
+    </table>
+    <p>
+      作者的两个假设（明确标注 Hypothesis，未做消融验证）：字符级任务（首/末字符、计数、反转、大小写、编辑、排序、回文，12 任务 ×50 题）更贴合字节状态，且优势<strong>只在微调后出现</strong>——few-shot 版本是平局；命名实体和短选项在同样字节预算下作为完整子词更省样本，所以 fact200 偏向 BPE。
+    </p>
+
+    <h3>③ 同一对 checkpoint，换个评测协议结论就翻转</h3>
+    <p>
+      这是全文最值得记住的一点。在 own-context 协议下，LOCAL 64 看约 1,866 B 代码上下文，BPE-8k 因词表压缩只看约 900 B（8k 词表对代码约 1.95 字节/token，512 token 只覆盖约 900 B）——此时代码 BPB 从「BPE 领先 0.056」翻成「LOCAL 64 领先 0.024」。共享上限协议也是代码平局。作者因此把<strong>匹配字节跨度</strong>设为主协议，把另两种当诊断。换句话说：一个「字节模型在代码上更好」的结论，可能只是它看到了两倍上下文。
+    </p>
+
+    <h2>评测陷阱清单（§8）：这篇论文真正的工程价值</h2>
+    <table>
+      <thead><tr><th>陷阱</th><th>实际发生的事</th><th>后果</th></tr></thead>
+      <tbody>
+        <tr><td>bits/token 当 BPB</td><td>内部一条 BPE 路径只把 mean token CE 除以 ln 2，得 3.1979</td><td>那是 bits/<strong>token</strong>，不是 bits/byte；数值放大约 5 倍</td></tr>
+        <tr><td>错误的 BPE 分母</td><td>用「重新编码解码后窗口」的 UTF-8 字节数做分母（比目标 token 的实际字节短）</td><td>uncapped 窗口 BPB 0.9792（错）→ 0.9774（对）</td></tr>
+        <tr><td>首位置不对称</td><td>LOCAL 64 能从学习到的 start state 给字节 0 打分，BPE 的第一个 token 不计分</td><td>加前导分隔符 0x1E 后配对 Δ 最多变 0.001</td></tr>
+        <tr><td>LAMBADA 首字符</td><td>context 末尾空格时 choices[0] 取错</td><td>LOCAL 64 0.2926→0.2360；BPE 0.0930→0.2401（结论反转）</td></tr>
+        <tr><td>上下文长度外推</td><td>同一个 BPE-8k checkpoint，匹配跨度下代码 BPB 0.600；固定 2048 B 窗口下 0.843</td><td>后者远超训练范围（512 token≈900 B 代码），不可比</td></tr>
+        <tr><td>bytes/step 不一致</td><td>BPE 从约 114k 调到约 66k B/step 才与 LOCAL 64 的 65,536 对齐</td><td>不对齐则「同样算力」的说法不成立</td></tr>
+      </tbody>
+    </table>
+    <p>作者把这些列成 checklist，并指出 BPB 本身不是 tokenizer 无关的：它等于 tokens/byte × bits/token，两个因子不会抵消，低 BPB 也不一定对应更好的下游质量——这也是他们同时报十个下游任务的原因。
+    </p>
+
+    <h3>box 小验证（纯 Python：合并规则 + 分母陷阱）</h3>
+    <pre><code>BOX C - learned merges + bits/token vs bits/byte
+corpus: {'low':5, 'lower':3, 'newest':2, 'widest':2}
+merge rules: [('l','o'), ('lo','w'), ('low','&lt;/w&gt;'), ('e','s'), ('es','t'), ('est','&lt;/w&gt;')]
+segmented: 'low&lt;/w&gt;' | 'low e r &lt;/w&gt;' | 'n e w est&lt;/w&gt;' | 'w i d est&lt;/w&gt;'
+  <- 频率最高的 'low' 先合并；'lower' 因频次低只能留下 l-o-w-er 的残片
+
+internal path: 3.1979 nats/token / ln2 = 4.6136 bits/TOKEN
+correct metric (paper Table 4, overall): 0.9155 bits/BYTE
+ratio = 5.04  <- bytes/token 因子；把 bits/token 当 BPB 会把数字放大约 5x
+paper's wrong-vs-correct BPB on uncapped windows: 0.9792 -> 0.9774
+same BPE-8k checkpoint, code BPB: 0.600 (matched span) vs 0.843 (2048B window)</code></pre>
+    <p>
+      读法：(1) BPE 的合并顺序完全由频率驱动，高频的 low 先成词，低频组合只能留残片——这就是「compress frequent strings into atomic vocabulary items」的全部机制。(2) 3.1979 是 nats/token，除以 ln2 得到 bits/token；要变成 BPB 还得除以每 token 覆盖的字节数，这里约 5 倍因子。把两者混用，能让一个模型「看起来」差 5 倍，甚至翻转排名。(3) 这两个数字来自论文自报的不同路径，不是同一 run 的严格换算，box 只演示分母的量级效应。(4) 0.600 vs 0.843 提醒：比较跨 tokenizer 的似然前，先确认两边看的是同一段字节。
+    </p>
+
+    <h2>局限与判断</h2>
+    <ul>
+      <li><strong>单尺寸、单 seed、一个固定 8k 词表</strong>：350M 的结论不能外推到 7B/70B；作者明确不做 scaling claim。</li>
+      <li><strong>embedding 初始化不对称</strong>：BPE-8k 嵌入从 N(0, 0.02<sup>2</sup>) 采样，LOCAL 64 的字节嵌入保持框架默认 N(0, 1)（残差输出两侧都缩放）。未做消融，部分差距可能来自这个配方差异而非架构。</li>
+      <li><strong>BPB 不是下游质量的代理</strong>：BPE 在 BPB 上四域全胜，但字节模型在字符微调上大胜；主结果必须和下游任务一起读。</li>
+      <li><strong>匹配跨度也不完全中性</strong>：它把代码对齐到 BPE 较短的上下文（约 900 B），可能让 LOCAL 64 吃亏；own-context 又给它更多字节。两种协议都不完美，只是主协议更可控。</li>
+      <li><strong>初始化、patch size、局部窗口/深度都没消融</strong>；HellaSwag 在此尺寸近随机、不提供信息。</li>
+    </ul>
+    <p>
+      我的判断：这篇论文最有价值的不是「BPE 还是字节 patch 更好」——单 seed 单尺寸给不出这个答案——而是<strong>它把跨 tokenizer 比较的方法论钉死了</strong>：固定原始字节、固定评分跨度、BPB 分母写对、下游任务补证、多重比较校正。这套 checklist 对任何做 tokenizer-free 模型、或者拿不同词表模型比困惑度的人，都比结论本身更有用。
+    </p>
+
+    <h2>实践建议</h2>
+    <ul>
+      <li><strong>报 BPB 时把公式写在 paper 里</strong>：Σ NLL / (字节数 × ln 2)，并说明字节数是目标 token 的实际 UTF-8 长度，不是重编码解码后的字符串长度。</li>
+      <li><strong>先固定评分跨度再比</strong>：让两个模型看到同一段字节范围；否则「谁好」可能只是「谁看得更长」。</li>
+      <li><strong>下游任务必须跨 tokenizer 用同一单位归一</strong>：多选题的长度归一用 UTF-8 字节数，而不是 token 数。</li>
+      <li><strong>多重比较要校正</strong>：十个测试一起看，McNemar + Holm；否则「显著」里会混进假阳性。本文 α=0.05 下有 5 项显著，α=0.01 下只剩 2 项。</li>
+      <li><strong>做 tokenizer 消融时记录 bytes/step</strong>：这是把「同样算力」落到可核查数字上的唯一办法。</li>
+      <li><strong>字符级任务作为 tokenizer-free 的专项探针</strong>：CharBench equal-FT 上的 40.0%→53.7% 是字节模型的真实强项，值得作为独立评测维度保留。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 BPB = tokens/byte × bits/token 对 tokenizer 不中立？举一个「BPB 更低但下游更差」的可能机制。</summary>
+      <p>BPB = (Σ NLL)/(bytes·ln2) = (tokens/bytes) × (Σ NLL/tokens/ln2)，两个因子分别受词表压缩率和每 token 预测难度影响。换词表时，压缩率高的词表让 tokens/byte 变小，同时每个 token 的预测分布可能更尖（bits/token 更低或更高），两者不按简单比例抵消。因此更低的 BPB 只说明「在这段字节上平均每个字节的编码位数更少」，不等于对下游任务更有利：例如更激进的合并把罕见实体压成单个 token，似然上很省字节，但模型只在少数样本见过该 token，factoid 回忆反而变差——本文 fact200 上 BPE 赢字节模型，而字节模型在字符任务上赢，正说明似然排名与任务排名可以不一致。作者据此同时报 BPB 与十个下游任务，并把结论限定在本设置内。</p>
+    </details>
+    <details>
+      <summary>2. 为什么「同一 checkpoint，匹配跨度代码 BPB 0.600、2048 B 窗口 0.843」不构成矛盾？这对你的评测脚本意味着什么？</summary>
+      <p>8k BPE 对代码约 1.95 字节/token，训练时 512 token 只覆盖约 900 B。2048 B 窗口需要约 1,050 个 token，是训练长度的 2 倍以上，属于长度外推，困惑度上升是预期的；匹配跨度协议把两边都限制在约 900 B，落在训练范围内。两者测的是不同长度条件下的分布，自然不同。对评测脚本的含义：(1) 记录并报告每个模型的训练上下文长度与评测跨度；(2) 跨模型比较时用同一字节跨度而非同一 token 数或同一窗口字节数；(3) 不要把外推区间的数字当作模型质量下降的证据，也不要用它去论证某个 tokenizer 更好；(4) 把首位置对齐、字节分母等陷阱写进 checklist，避免 0.9792→0.9774 这类分母错误。</p>
+    </details>
+    <details>
+      <summary>3. LOCAL 64 的「一格延迟」条件为什么必要？如果直接用 h_t 条件 patch t 的字节会出什么问题？</summary>
+      <p>全局状态 h_t 是在 patch 0..t 上因果计算出来的，其中已经包含了 patch t 的四个字节。若把 h_t 直接作为 patch t 内字节的条件，目标字节就通过了全局状态进入自己的预测路径，形成信息泄漏——模型可以「抄答案」，BPB 变得虚低。论文的做法是把状态移一格：用 h<sub>t−1</sub>（只汇总 patch t 之前的字节）复制到 patch t 的四个字节作为条件，patch 0 用零向量；局部解码器再用 64 字节滑窗（位置 i 看 i−1）在 patch 内自回归展开。这样目标字节既不通过全局也不通过局部进入自身条件。这是自回归语言模型「target token 不进自己 context」原则在层次字节模型里的对应物，和 decoder-only Transformer 的 causal mask 是同一个约束。</p>
+    </details>
+    <details>
+      <summary>4. 字符任务微调后 LOCAL 64 从平局变成大胜（40.0%→53.7%），few-shot 却打平。这个现象支持什么假设？为什么不能据此宣称字节模型全面更好？</summary>
+      <p>支持「字符级操作更贴合字节状态」的假设——计数、索引、反转、大小写变换直接在字节上做，不需要先经过子词合并再拆解；但优势只在微调后出现，说明需要任务数据把这种对齐「教」出来，few-shot 的上下文不足以激活。不能推广的原因：(1) 单尺寸单 seed，350M 的字符任务优势不保证在更大规模保持；(2) 同一实验里 BPE 在 BPB 四域全胜、fact200 与多个选择题上显著更好，不是全面落后；(3) 初始化不对称未消融，部分差距可能来自配方；(4) 字节模型参数多 4.7%、FLOPs 多约 2%，也不是免费；(5) 作者明确把字符任务优势标为 Hypothesis 而非验证结论。正确的读法是：字符级任务是字节模型的一个专项强项，值得作为独立评测维度，而不是全局优劣的判据。</p>
+    </details>
+    <details>
+      <summary>5. 如果要重做这个实验并修正已知的局限，你会优先改哪三件事？说明每一件会影响哪个结论。</summary>
+      <p>(1) 统一 embedding 初始化（两侧都用 scaled init，或做一次交换初始化的对照）：目前 BPE 用 N(0,0.02²)、LOCAL 64 用默认 N(0,1)，未消融，可能解释部分 BPB 差距——这直接影响「BPE 似然领先」的归因。(2) 加长 BPE 训练上下文或按字节跨度匹配训练范围：目前 512 token 在代码上只有约 900 B，own-context 与 matched-span 两种协议都不中性，代码排名会翻转——这会澄清「谁在代码上更好」。(3) 多 seed + 多词表大小（至少 8k/32k）+ patch size 消融：单 seed 单尺寸无法区分架构效应与随机性，8k 词表未调——这决定结论能否外推。其次可以补 FLOPs 匹配的第三臂（让两侧每字节算力严格相等）和推理速度测量，把「字节模型并不更便宜」这条从 matmul 估算升级为实测。相关扩展方向可参考 <a href="daily-2026-11-20-algo-gated-deltanet.html">线性注意力 / Gated DeltaNet</a> 与 <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">KV 压缩</a> 里对长序列效率的讨论。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.31790" target="_blank" rel="noopener">arXiv:2611.31790 · Byte Patches versus BPE at Matched Data: A Matched-Twin Comparison at 350M Parameters（Maliyawala &amp; Lisal）</a> · <a href="https://github.com/AsadullahMaliyawala/bytelm-local64" target="_blank" rel="noopener">GitHub: AsadullahMaliyawala/bytelm-local64（代码 / 评测 / checkpoint）</a></li>
+      <li>经典源头：<a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noopener">arXiv:1508.07909 · Neural Machine Translation of Rare Words with Subword Units（Sennrich, Haddow, Birch）</a> · <a href="https://arxiv.org/abs/2305.07185" target="_blank" rel="noopener">arXiv:2305.07185 · MEGABYTE（Yu et al., Meta）</a></li>
+      <li>站内：
+        <a href="daily-2026-11-25-frontline-arc-rollout-control.html">今日一线：ARC 自适应 rollout 控制</a> ·
+        <a href="daily-2026-11-25-harness-agent-kernel-sgr.html">今日 Harness：Agent-Kernel / SGR</a> ·
+        <a href="daily-2026-09-09-algo-attention.html">Attention</a> ·
+        <a href="daily-2026-10-13-algo-rope.html">RoPE</a> ·
+        <a href="daily-2026-10-19-algo-mqa-gqa-mla.html">MQA / GQA / MLA</a> ·
+        <a href="daily-2026-10-15-algo-rmsnorm.html">RMSNorm</a> ·
+        <a href="daily-2026-11-20-algo-gated-deltanet.html">Gated DeltaNet</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
