@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Delegent：前沿模型只当指挥，把「跑测试 / 搜语料」交给本地 SLM——按调用角色路由 + 报告回传，DeepSWE 前沿成本 −67%、694 条检索 −59%，解题数一题不降 · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Delegent：前沿模型只当指挥，把「跑测试 / 搜语料」交给本地 SLM——按调用角色路由 + 报告回传，DeepSWE 前沿成本 −67%、694 条检索 −59%，解题数一题不降</h1>
+    <p class="post-meta">2026-11-26 · 收藏夹：Harness / Agent · 学习笔记<br />
+      主来源：Lingwei Gu、Jimmy Lin（David R. Cheriton School of Computer Science, University of Waterloo）· <em>Delegent: A Multi-Agent Harness That Reduces Cost without Sacrificing Performance</em>（<a href="https://arxiv.org/abs/2611.33098" target="_blank" rel="noopener">arXiv:2611.33098</a>，v1 2026-11-24；<a href="https://github.com/castorini/delegent" target="_blank" rel="noopener">代码</a>）。
+      数字按论文 Tables 1–4、§5 与 §7 抄录；「box 账本」为本文用论文价格/表格做的算术复算，不是新实验。
+      交叉：
+      <a href="daily-2026-11-25-harness-agent-kernel-sgr.html">Agent-Kernel / SGR</a>、
+      <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a>、
+      <a href="daily-2026-10-19-harness-specagent.html">SpecAgent</a>、
+      <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a>、
+      <a href="daily-2026-10-29-harness-coharl.html">CoHARL</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程 agent 的成本结构有一个朴素事实：每走一步，前沿模型都把越来越长的上下文重读一遍。一个上百步的 coding agent，付的是上百次越来越贵的 prompt。但其中大量动作是<strong>跑测试、定位代码、查文档、搜语料</strong>这类苦活，不需要前沿模型。已有两条省钱路线都不太对：
+    </p>
+    <ul>
+      <li><strong>cascade</strong>：先让小模型答，再决定是否交给大模型——小模型拿到的是整个任务，2B 基本做不了；</li>
+      <li><strong>router</strong>：训一个路由器为每个 query 选一个模型——同样要求被选中的模型独立完成任务。</li>
+    </ul>
+    <p>
+      Delegent 换了一个轴：<strong>按调用角色（role）路由，而不是按任务路由</strong>。前沿模型始终主导任务、写最终 patch/答案；子代理的调用一律发给本地 SLM。不训任何路由器或模型，两边都可热插拔。作者的定位很明确：这是 harness 工程贡献，不是模型贡献。
+    </p>
+    <p>
+      数据动机也很直接：在不改造的 Claude Code 上，GPT-6.1-Sol 有 <strong>98%</strong> 的 DeepSWE 任务会启动子代理，这些跑在 Sol 上的子代理调用比主循环还多，占其成本的 <strong>53%</strong>。把这部分搬走，本身就是最大的省钱空间。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 一层 relay，把模型调用按 role 分到两个价格带</h3>
+    <pre><code>用户 ──&gt; 主循环（frontier model，规划 / 判断 / 最终回答）
+             │ Agent tool / Delegate tool
+             └─&gt; 子代理（本地 SLM：查代码、跑测试、搜语料）
+                    │ 最终 report（答案 + 证据 + confidence）
+                    └─&gt; 只有 report 进入 frontier 上下文，工具输出不回传
+
+relay 说 Anthropic Messages API ⇒ Claude Code 原样运行，无需改代码
+  主循环调用       → frontier（同一 task 内固定 prompt-cache key）
+  子代理 / 辅助调用 → SLM（vLLM proxy 把每个子代理 pin 到一个 GPU replica，前缀常驻缓存）</code></pre>
+    <p>
+      「本地」的定义是单 GPU、用户可控：27B FP8（Qwen3.8-27B-FP8）要工作站卡，2B（MiniCPM5-2B）能塞进笔记本。注意成本口径：<strong>只算前沿模型被收的钱（含 prompt caching）</strong>，SLM 跑在自己的卡上；对 coding 任务另按 Chutes 上同款 FP8 的 API 价折算总成本，作为对照。
+    </p>
+
+    <h3>② 两个任务族，两种子代理</h3>
+    <ul>
+      <li><strong>Coding</strong>：直接基于 Claude Code，保留其 Agent 工具与子代理，前沿模型写 brief（子任务说明），子代理在同一容器里用默认工具查代码、读文件、跑测试/复现脚本；多个子任务并发。</li>
+      <li><strong>Search</strong>：加一个 Delegate 工具；子代理借鉴 AREX-Turbo（原本用 4B 模型）的 search / visit / compress notes / finish 四工具循环，返回「答案 + 引用证据 + sources + confidence」。harness 会逐条回到原文检查引用是否逐字存在。</li>
+    </ul>
+    <p>
+      关键约束：<strong>SLM 的输出不会被直接采信</strong>。前沿模型读每份 report、决定是否相信，最终答案只由前沿模型产出。因此「2B 能不能做这个任务」不是必要条件——它只要能把「找文件、跑测试、读文档」做对就够了。
+    </p>
+
+    <h3>③ 一句短指令贡献了大部分收益</h3>
+    <p>
+      harness 给前沿模型一段简短的经济学说明：每步都重读全部上下文，所以最省钱的计划是<strong>减少前沿模型自己的步数</strong>；把工具密集的活派出去，自己只做少量定向检查。coding 与 search 都用这条指令，但不改模型。后面 §5 的消融显示：没有这条指令，2B 子代理会让任务掉 7 题；有指令后 2B 与 27B 打平。
+    </p>
+    <pre><code># 前沿侧定价（论文 §3，按每百万 token 计）
+cost = $2 · T_in,uncached + $0.10 · T_in,cached + $10 · T_out     # 输出含 reasoning token
+# SLM 侧按 Chutes 同款 FP8 计
+in $0.039/M；重复上一子代理请求时 $0.0039/M；out $1.25/M
+# 实际运行中 SLM 输入的 86%–90% 是重复前缀 ⇒ 每 coding 任务只加 3–10 美分</code></pre>
+
+    <h2>实验：3 个 coding 集 + 5 个 search 集，前沿成本普遍砍半</h2>
+    <p>
+      coding：SWE-bench Verified (50)、SWE-bench Pro (75)、DeepSWE v1.1 (50)；search：BrowseComp-Plus (200/80)、Total Recall QA (68)、HotpotQA (204)、DeepSearchQA find-one/find-all (71/71)，共 694 题。前沿模型 GPT-6.1-Sol（high reasoning effort），DeepSWE 另做 Claude Opus 5.5 消融；基线是同一 harness 关掉 Delegate 工具与指令、所有调用都走前沿模型（连 Claude Code 默认发给 Haiku 的也改发前沿）。所有系统用 provider prompt cache，因此省的是相对缓存后基线的钱。
+    </p>
+    <table>
+      <thead><tr><th>Coding，Table 1</th><th>系统</th><th>解出 / 总数</th><th>前沿成本 $/题</th><th>相对成本</th><th>计入 SLM API 价</th><th>前沿调用 / 题</th><th>SLM 调用 / 题</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="3">SWE-bench Verified</td><td>Sol 单独</td><td>46/50</td><td>0.244</td><td>100%</td><td>0.244 (100%)</td><td>32.4</td><td>—</td></tr>
+        <tr><td>+ Qwen3.8-27B-FP8</td><td>46/50</td><td>0.108</td><td>44%</td><td>0.139 (57%)</td><td>12.7</td><td>32.7</td></tr>
+        <tr><td>+ MiniCPM5-2B</td><td>47/50</td><td>0.129</td><td>53%</td><td>—</td><td>15.2</td><td>79.0</td></tr>
+        <tr><td rowspan="3">SWE-bench Pro</td><td>Sol 单独</td><td>63/75</td><td>0.617</td><td>100%</td><td>0.617 (100%)</td><td>61.2</td><td>—</td></tr>
+        <tr><td>+ Qwen3.8-27B-FP8</td><td>63/75</td><td>0.227</td><td>37%</td><td>0.266 (43%)</td><td>19.9</td><td>42.7</td></tr>
+        <tr><td>+ MiniCPM5-2B</td><td>62/75</td><td>0.274</td><td>44%</td><td>—</td><td>23.1</td><td>65.5</td></tr>
+        <tr><td rowspan="3">DeepSWE</td><td>Sol 单独</td><td>29/50</td><td>2.110</td><td>100%</td><td>2.110 (100%)</td><td>176.1</td><td>—</td></tr>
+        <tr><td><strong>+ Qwen3.8-27B-FP8</strong></td><td><strong>29/50</strong></td><td><strong>0.704</strong></td><td><strong>33%</strong></td><td>0.806 (38%)</td><td>46.6</td><td>82.0</td></tr>
+        <tr><td>+ MiniCPM5-2B</td><td>30/50</td><td>0.712</td><td>34%</td><td>—</td><td>48.1</td><td>106.1</td></tr>
+      </tbody>
+    </table>
+    <table>
+      <thead><tr><th>Search，Table 2（+ Qwen3.8-27B-FP8）</th><th>解出 / 总数</th><th>前沿成本 $/题</th><th>相对成本</th><th>前沿调用 / 题</th><th>SLM 调用 / 题</th></tr></thead>
+      <tbody>
+        <tr><td>BrowseComp-Plus，自有语料（200）</td><td>193 → 192</td><td>0.114 → 0.071</td><td>63%</td><td>8.8 → 5.7</td><td>305.2</td></tr>
+        <tr><td>BrowseComp-Plus，ClimbMix（80）</td><td>72 → 71</td><td>0.211 → 0.066</td><td>31%</td><td>13.9 → 6.2</td><td>495.7</td></tr>
+        <tr><td>Total Recall QA（68）</td><td>64 → 67</td><td>0.048 → 0.015</td><td>31%</td><td>6.2 → 3.1</td><td>69.1</td></tr>
+        <tr><td>HotpotQA（204）</td><td>198 → 198</td><td>0.033 → 0.008</td><td>25%</td><td>5.4 → 2.5</td><td>29.3</td></tr>
+        <tr><td>DeepSearchQA，find one / find all（71/71）</td><td>70→70 / 66→65</td><td>0.067→0.020 / 0.121→0.032</td><td>29% / 26%</td><td>7.7→3.6 / 10.3→4.3</td><td>106.2 / 223.9</td></tr>
+        <tr><td><strong>全部（694）</strong></td><td><strong>663 → 663</strong></td><td><strong>0.091 → 0.037</strong></td><td><strong>41%</strong></td><td>8.2 → 4.2</td><td>194.2</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>9 个评测里有 8 个前沿成本降超过一半；DeepSWE 上 27B 与 2B 都把前沿成本压到约 1/3；694 条检索题答对数<strong>完全相同（663）</strong>，每题最多差 3 题。</li>
+      <li>BrowseComp-Plus 自有语料只降到 63%，ClimbMix 上降到 25%–31%：前者可用 <code>rg</code> 只返回匹配行，后者只能 BM25 返回整篇文档再读，需要搬走的阅读量完全不同。作者认为 ClimbMix 的数字更能代表 agentic search。</li>
+      <li>成本因任务而异（Figure 2，350 个 coding 任务对）：基线前沿调用 &lt;25 次的任务只降到约 60%，其中 11% 反而更贵；&gt;200 次的任务降到约 1/4，且从不更贵。</li>
+      <li>延迟不是免费的：DeepSWE 中位耗时 25→38 分钟，短 SWE-bench Verified 任务约翻倍，瓶颈在本地 SLM 硬件。</li>
+    </ul>
+
+    <h3>钱到底省在哪：三张消融账</h3>
+    <table>
+      <thead><tr><th>DeepSWE，Table 3（50 题）</th><th>解出</th><th>Sol 成本</th><th>Sol LLM turns</th></tr></thead>
+      <tbody>
+        <tr><td>Sol 单独（默认把子代理也跑在 Sol 上）</td><td>29</td><td>100%</td><td>84</td></tr>
+        <tr><td>无指令 + Qwen3.8-27B-FP8</td><td>28</td><td>55%</td><td>101</td></tr>
+        <tr><td>无指令 + MiniCPM5-2B</td><td>22</td><td>51%</td><td>90</td></tr>
+        <tr><td>有指令 + 子代理仍为 Sol</td><td>34</td><td>60%</td><td>52</td></tr>
+        <tr><td><strong>有指令 + Qwen3.8-27B-FP8</strong></td><td>29</td><td><strong>33%</strong></td><td>46</td></tr>
+        <tr><td><strong>有指令 + MiniCPM5-2B</strong></td><td>30</td><td><strong>34%</strong></td><td>48</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>53% 的子代理成本 + 搬走后解释 80% 的节省；其余来自主循环自身：前沿 turns 84→46–48，测试调用约 8 次→1–2 次，不再做每任务约 23 次的「维护任务列表/给子代理发消息」，传入前沿的工具输出也少 11%–12%（SWE-bench Pro 为 13%–24%）。</li>
+      <li>拆分「指令 vs SLM」：指令本身把成本压到 60%（−40pp），换 SLM 再压 27pp，约六四分；但没有指令时换 2B 会掉题（22 vs 29），所以<strong>指令是必要条件</strong>。</li>
+      <li>SLM 强弱影响很小：同 30 题上 27B 单独解 5 题、2B 解 0 题，当子代理却打平；2B 只是多花调用（106 vs 82 次/题），并偶尔（9/50 局）也去改源码文件。</li>
+      <li>换前沿模型看「工作习惯」（Table 4）：Sol 单独 84 turns、第 18 turn 才首次编辑，委派主要发生在编辑之后，约 94 turns 转给 SLM，成本降到 34%；Opus 5.5 单独 18 turns、第 7 turn 就首次编辑，委派主要发生在编辑之前（SLM 在首次编辑前拿到的 turn 占 59% vs Sol 的 25%），brief 约 130 词 vs Sol 的 45 词，只有约 21 turns 转出，成本降到 69%。省得最多的是「自己爱干苦活」的模型。</li>
+    </ul>
+
+    <h3>box 账本：把论文价格表复算一遍</h3>
+    <pre><code># 纯 Python 算术；全部输入来自 paper Table 1/2 与 §3 定价，非新实验
+Verified   $0.244 -&gt; $0.108  = 44.3%  (saving 55.7%), solved 46 -&gt; 46
+Pro        $0.617 -&gt; $0.227  = 36.8%  (saving 63.2%), solved 63 -&gt; 63
+DeepSWE    $2.110 -&gt; $0.704  = 33.4%  (saving 66.6%), solved 29 -&gt; 29
+Search-694 $0.091 -&gt; $0.037  = 40.7%  (saving 59.3%), solved 663 -&gt; 663
+DeepSWE with SLM at API price: $2.110 -&gt; $0.806 = 38.2%
+frontier calls DeepSWE: 176.1 -&gt; 46.6 = 26.5%; SLM calls 82.0
+frontier input price with 86% cache hit: $0.366/M (5.5x cheaper than uncached)
+frontier input price with 90% cache hit: $0.290/M (6.9x cheaper than uncached)
+53% subagent cost x 80% rerouted = 42.4 pp of the 66.6% DeepSWE saving</code></pre>
+    <p>
+      复算的意义有三点：(1) 前向调用数降到 26.5%，但成本只降到 33.4%——前沿自己留下的调用 token 更贵（上下文更长），所以<strong>调用数不是成本的同义词</strong>；(2) 计入 SLM API 价后总成本 38.2%，结论不变，因为 SLM 输入的 86%–90% 命中缓存；(3) 53%×80%=42.4pp 与「总共 66.6pp、子代理解释 80%」的口径一致（剩余部分来自主循环减少）。
+    </p>
+
+    <h2>与其它 harness 工作的关系</h2>
+    <ul>
+      <li><strong>与按层压缩上下文的工作</strong>：<a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a> 和 <a href="daily-2026-10-08-harness-refold.html">ReFold</a> 压的是「 frontier 看到的上下文」；Delegent 不改上下文内容，改的是「谁产生这些 token」——子代理的完整工具输出根本不回传。两者可叠加：<a href="daily-2026-10-19-harness-specagent.html">SpecAgent</a> 也是让小模型起草、大模型只做一次判断，但它用 prefill 压缩语义有效前缀，Delegent 用的是角色路由。</li>
+      <li><strong>与失败恢复</strong>：<a href="daily-2026-11-25-harness-agent-kernel-sgr.html">Agent-Kernel / SGR</a> 解决子图失败后只重跑受影响节点；Delegent 的子代理并发运行但没有提到事务边界，如果子代理有写副作用，需要自己加幂等/事务保护。</li>
+      <li><strong>与 harness 搜索</strong>：<a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a> 用正交表搜组件组合，<a href="daily-2026-10-29-harness-coharl.html">CoHARL</a> 让 policy 与 harness 共演化；Delegent 只改了一个变量（调用角色路由 + 一句指令），就拿到 33%–63% 的成本，说明 harness 侧的低垂果实还有很多。</li>
+    </ul>
+
+    <h2>局限与实践建议</h2>
+    <ul>
+      <li>成本口径是<strong>前沿账单</strong>，不是总算力；本地 27B 需要工作站 GPU，2B 才能上笔记本；延迟增加明显。</li>
+      <li>主结果只测 coding 与 agentic search；Opus 5.5 消融只在 DeepSWE；search 侧没记 per-call token，所以只报前沿成本、没折算 SLM 总成本。</li>
+      <li>judge 用的也是 GPT-6.1-Sol（low effort），同模型自评的偏差需要留意；所有题都限制在同一 max turns / 时间。</li>
+      <li>落地顺序：先统计自己 agent 的子代理调用占比与前沿调用数分布 → 若 &lt;25 calls 的任务占比高，别急着上（可能更贵）→ 加一句「把工具密集活派出去、自己只做定向检查」的指令，先验证不掉题 → 再接本地 SLM，用 pinned replica + 稳定 cache key 保住前缀命中 → 对 search 子代理做引用逐字校验。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「按调用角色路由」比 cascade / router 更适合 Agent 场景？</summary>
+      <p>cascade / router 的分工单位是「整个任务」：小模型要么独立答、要么把整个任务转交，2B 模型在 SWE-bench/DeepSWE 这种长程 coding 上单独只解 0–5/30 题，无法承担。Delegent 的分工单位是「一次模型调用」：前沿模型永远掌握任务分解、判断与最终输出，SLM 只接窄子任务（找代码、跑测试、读文档）。因此 SLM 的能力门槛降到「能正确执行一种工具循环」，且没有训练路由器；前沿模型读每份 report 后才决定是否采信。代价是调用次数变多（82–106 次 SLM/题），但 SLM 在自己硬件上边际成本近零。</p>
+    </details>
+    <details>
+      <summary>2. 为什么 BrowseComp-Plus 自有语料只省 37%，ClimbMix 上能省 69%–75%？这对 agent 工具设计意味着什么？</summary>
+      <p>Table 2：自有语料 $0.114→$0.071（63%），ClimbMix $0.211→$0.066（31%）。差别在工具返回粒度：自有语料是一组文件，<code>rg</code> 只回匹配行，前沿模型自己读的量本来就小，可搬走的 legwork 少；ClimbMix 只能通过 BM25 返回整篇文档再逐页读，同一问题要读两倍以上的内容，大部分可以搬给 SLM。启示：省成本的不是「模型大小」本身，而是「前沿模型被迫读了多少 token」；工具设计得越粗粒度、越返回原文， delegating 的收益越大。</p>
+    </details>
+    <details>
+      <summary>3. 为什么没有指令时 2B 子代理会掉题，而有指令后就与 27B 打平？</summary>
+      <p>Table 3：无指令时 Sol+MiniCPM5-2B 只解 22/50（单独 29/50），成本 51%；有指令后解 30/50、成本 34%。原因是 Claude Code 默认会派大量子任务；没有经济学说明，前沿模型把主编码任务也交出去，而 2B 做不了。短指令明确「主编码任务自己做、只把工具密集的活派出去」，前沿模型的调用从 90 降到 48，2B 多跑一些调用（106/题 vs 27B 的 82/题）但不影响最终结果。作者由此估计约 3/5 的节省来自指令、2/5 来自 SLM 本身——harness 的 prompt 设计比模型尺寸更关键。</p>
+    </details>
+    <details>
+      <summary>4. 两个前沿模型（Sol 与 Opus 5.5）的节省差异说明了什么？</summary>
+      <p>Table 4：Sol 单独 84 turns、第 18 turn 首次编辑、委派后约 94 turns 转给 SLM、成本 34%；Opus 5.5 单独 18 turns、第 7 turn 首次编辑、只转约 21 turns、成本 69%。Sol 是「先改再测再修」的长循环，委派发生在开始编辑之后，可搬走的测试/查代码多；Opus 是「先规划再动手」，自己不长的循环里本来就没多少测试苦活，SLM 主要用于编辑前了解代码，brief 也从 45 词变成 130 词。结论：在评估任何 delegation harness 前，先看前沿模型自己的 turn 结构与首次编辑位置；省得最多的不一定是「最强模型」，而是「最爱自己干苦活的模型」。</p>
+    </details>
+    <details>
+      <summary>5. Delegent 的子代理并发运行，哪些失效恢复问题没有解决？</summary>
+      <p>论文没有提到子代理写副作用的事务边界或重试机制。对比 <a href="daily-2026-11-25-harness-agent-kernel-sgr.html">Agent-Kernel 的 SGR</a>：失败时把失败节点与不可达后代重置为 waiting，只重跑子图；但它也明确 SGR 的保证只覆盖 Sub-Agent Buffer 记录，不覆盖外部副作用。Delegent 的 coding 子代理会写约 4 个/题的临时脚本（多数在仓库外），search 子代理只读，因此当前设计基本避开写冲突；若把 delegation 用在会改仓库/发请求的多步任务上，需要补事务边界或幂等键，否则「前沿读 report 后决定」不足以保证全局一致性。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.33098" target="_blank" rel="noopener">arXiv:2611.33098 · Delegent: A Multi-Agent Harness That Reduces Cost without Sacrificing Performance（Lingwei Gu / Jimmy Lin，University of Waterloo，v1 2026-11-24）</a></li>
+      <li><a href="https://github.com/castorini/delegent" target="_blank" rel="noopener">GitHub: castorini/delegent</a></li>
+      <li>论文引用实现：<a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">vLLM（arXiv:2305.14314）</a> · <a href="https://code.claude.com/docs" target="_blank" rel="noopener">Claude Code 文档</a></li>
+      <li>站内：今日 <a href="daily-2026-11-26-frontline-rlvb-posterior-reward.html">一线：RLVB</a> · <a href="daily-2026-11-26-algo-mamba-selective-ssm.html">算法：Mamba 选择性 SSM</a> · <a href="daily-2026-11-25-harness-agent-kernel-sgr.html">Agent-Kernel / SGR</a> · <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a> · <a href="daily-2026-10-19-harness-specagent.html">SpecAgent</a> · <a href="daily-2026-10-23-harness-scaling.html">Harness Scaling</a> · <a href="daily-2026-10-29-harness-coharl.html">CoHARL</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

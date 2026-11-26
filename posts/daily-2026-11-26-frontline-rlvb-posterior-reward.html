@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜RLVB：别只给最终答案发奖励——用模拟器精确后验给每一步打分，9/9 设置超过基座平均 +17.1%，证据充分才提交（51%/12%/74% vs 8%/0.4%/36%） · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜RLVB：别只给最终答案发奖励——用模拟器精确后验给每一步打分，9/9 设置超过基座平均 +17.1%，证据充分才提交（51%/12%/74% vs 8%/0.4%/36%）</h1>
+    <p class="post-meta">2026-11-26 · 收藏夹：RL / Agent · 一线追踪<br />
+      主来源：Richmond Sin Jing Xuan、Peilin Feng（共同一作）、Wenbin Wang、Soujanya Poria（DeCLaRe Lab, Nanyang Technological University, Singapore）· <em>Lazy Agents Answer Against Their Own Beliefs: Reinforcement Learning with Verifiable Beliefs Teaches Them to Act on What They Believe</em>（<a href="https://arxiv.org/abs/2611.32884" target="_blank" rel="noopener">arXiv:2611.32884</a>，v1 2026-11-24；<a href="https://github.com/declare-lab/RLVB" target="_blank" rel="noopener">代码</a>）。
+      所有论文数字均按原文 Tables 1–5、§4.5–4.6 抄录；「box 小实验」为本文在 box 上写的最小复现，明确不是论文数据。
+      交叉：
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a>、
+      <a href="daily-2026-10-08-harness-refold.html">ReFold</a>、
+      <a href="daily-2026-10-21-harness-reobserve.html">PersistGym-lite</a>、
+      <a href="daily-2026-11-25-frontline-arc-rollout-control.html">ARC</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      RLVR 在数学、代码上很好用，因为有终局可验证答案。但长程 agent 的决策不止「答什么」，还有「什么时候答」。论文把证据不够就提交的行为叫 <strong>laziness</strong>：cups 任务里，掀开两个杯子后红柱仍可能在 2 号或 4 号杯下（各 1/2），agent 写出的 belief line 明明还是 <code>Possible: cups 2, 4</code>，动作却是 <code>SUBMIT 4</code>。终局奖励只看答案对错，一次蒙对和一次查实后答对拿同样的分，于是根本学不到「继续查」这件事。
+    </p>
+    <ul>
+      <li>基础模型在证据不足、自己的 belief line 仍列多个答案的回合上，提交比例高达 <strong>3%–68%</strong>；HiddenGames 上 64%–97% 的答案出现在证据充分之前。</li>
+      <li>加一个 belief line 不改训练也有用：Base (w/ belief) 在 9 个设置中的 8 个超过 Base，平均 +3.8%（Qwen3.5-4B 的 HiddenGames 上 +11.6%），但早提交率几乎没变。</li>
+      <li>用 outcome reward 训练的 GRPO / PPO 平均反而低于基座：GRPO −1.0%、PPO −5.1%（Table 1 九列平均）。</li>
+      <li>用 LLM judge 给每步打分也不稳：judge 看到隐藏答案后会奖励「蒙对的好运」、惩罚「正确但仍不确定的判断」，还要多训一个 critic、每步调一次 judge。</li>
+    </ul>
+    <p>
+      RLVB 的切入点是：<strong>训练沙盒本来就知道隐藏答案与观测规则</strong>，因此能算出每一步的精确后验；这个后验才是「证据支持的信念」，可以像 RLVR 验证最终答案一样被验证。于是 verifiable reward 从终点扩展到每一步——这就是标题里的 Verifiable Beliefs。
+    </p>
+
+    <h2>机制拆解</h2>
+    <h3>① 精确后验与「证据充分」的操作定义</h3>
+    <p>每个任务有固定隐藏目标 θ、先验 p<sub>0</sub>、动作 a<sub>t</sub> 与观测 o<sub>t</sub>∼p(·|θ,a<sub>1:t</sub>)。沙盒枚举 Θ，按式 (1) 算后验：</p>
+    <pre><code>b_t(θ) ∝ p_0(θ) ∏_{s&lt;t} p(o_s | θ, a_{1:s})          # 论文式 (1)
+
+本论文的观测是确定性的 ⇒ b_t 就是 p_0 限制在与全部观测一致的 θ 上
+B_t* = { y : b_t(y) &gt; 0 }        # 证据仍允许的答案集合
+"证据充分" 的操作定义：最高答案后验 ≥ 0.95（RoboQuest 无后验，用任务要求满足率代替）</code></pre>
+    <p>这比让 LLM 自己写「我确定」要硬：0.5 就是 0.5，不能靠措辞蒙混。论文 §4.6 的分解分析全部建立在这个可回放的后验上。</p>
+
+    <h3>② 后验教师：把「何时停」当成最优停止问题</h3>
+    <p>式 (3) 用后验给答案与探索动作估值，再按式 (4) 得到教师策略 π<sup>*</sup>：</p>
+    <pre><code>Q(b, y)   = log( c(t) · ρ̂(b) · b(y) / b_max )       c(t) = exp(−λ t / T)
+Q^(n)(b,a) = Σ_o p(o | b, a) · V^(n−1)(b_{a,o})      V^(n)(b) = max_u Q^(n)(b,u)
+
+p_ans   = σ( Δ / τ )          Δ = 最佳答案价值 − 最佳探索动作价值
+π*(y|b) = p_ans · softmax_y Q(b,·)/τ
+π*(a|b) = (1 − p_ans) · softmax_a Q^(n)(b,a)/τ</code></pre>
+    <p>
+      其中 ρ̂(b) 是 agent 自己答案的实测正确率（教师因此对 agent 的自适应），b<sub>max</sub>=max<sub>y</sub>b(y)，n 是前瞻深度。直觉很直接：如果现在答对概率最多 1/2，而再掀一个杯子就能确定，教师几乎把概率全给「掀杯子」。cups 示例里，掀杯子得约 0 分、提前答得约 −7.42 分（Figure 1），两类错误被<strong>非对称</strong>惩罚——多走一步只付一点时间折扣，早答付巨额负分。
+    </p>
+
+    <h3>③ 逐步奖励：只打分动作，不读 agent 写的信念</h3>
+    <p>论文式 (5) 给出完整 turn 的奖励：</p>
+    <pre><code>R(h, x) = log π*(u | b)  +  S_dec  +  η (S + W)
+          └──── action ────┘   └──── stated belief 项（消融用）────┘
+
+u       = 本回合动作（证据动作或提交答案）
+S       = Σ_y b(y) log b_β(y)      # belief line 的对数得分，β 是 line 解析出的集合
+W       = −m · |B \ B*| / |B|     # 惩罚 line 过宽
+S_dec   = log π*(a_β | b)          # 按 line 当后验时教师会做的动作
+主结果 RLVB 只用 action 项；RLVB (EM) 与消融才加 belief 项。</code></pre>
+    <p>
+      关键点常被误读：奖励<strong>从不读取</strong> agent 写的 belief line，却因为更新提高整个 turn（推理 + line + 动作）的似然，line 被顺带训练。作者测出的结果是 agent 学会了「按自己写的 line 行动」，而不是「把 line 写得更准」——这正好是元认知里 monitoring 与 control 的区别，也是本文最值得记的一句话。
+    </p>
+
+    <h3>④ 更新：同一历史内比较多个 turn，而不是整条轨迹</h3>
+    <p>
+      Phase k 先固定 π<sub>k</sub> 采 episode；在每个历史 h 上采样 N 个 turn x<sub>i</sub>，用 R 打分，再做组内加权对数似然更新；当 π<sub>φ</sub> 与 π<sub>k</sub> 的 KL 超过 ε 就结束本 phase（每 phase 相当于一次策略镜像下降）。教师动作以 0.5 起始、逐 phase 衰减的概率介入，类似 DAgger；一半训练场景还会从随机证据动作开局，覆盖 agent 自己到不了的状态。
+    </p>
+    <pre><code>轨迹级（GRPO）：Σ_e Σ_t A_e ∇ log π(x_{e,t} | h_{e,t})     # A_e 由整条 episode 的最终奖励给出
+步级（RLVB）  ：Σ_h Σ_i w_i ∇ log π(x_i | h)              # w_i 只比较同一 h 下的 N 个 turn
+
+RLVB    : w_i ∝ R(h,x_i) − (1/(N−1))Σ_{j≠i} R(h,x_j)      # 论文式 (10)，组内相对
+RLVB-EM : w_i ∝ exp(R(h,x_i)/α)，在 h 内归一化            # 直接估计 q_k(x|h) ∝ π_k e^{R/α}
+教师拒绝的动作（π*(u|b) &lt; π*(u_best|b)/20）不给正权重。</code></pre>
+    <p>因此它与 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 用的是同一类组内相对 learner，差别只在「组」的单位：GRPO 组是整条轨迹的 G 个样本，RLVB 组是同一历史下的 N 个候选 turn。这也是作者做公平对照的关键：同 learner，换奖励，九列全部胜出。</p>
+
+    <h2>实验：九配置、三个基准、两种 learner</h2>
+    <p>
+      三个 VLM：Qwen3-VL-4B-Thinking / 8B-Thinking / Qwen3.5-4B；三个基准：HiddenGames（7 类任务、756 个未见局，训练任务的新种子/地图/颜色）、Pro-Worlds（新提出，15 种视觉谜题 × 20 局；小窗口看大世界，最多 35 步后从 8 个候选中答，Jigsaw 为 10 个；后验教师平均 14.7 步解开）、RoboQuest（10 类移动操作任务 × 50 局，无精确后验）。Pro-Worlds 与 RoboQuest 训练中从未见过。全部方法训练 LoRA，最多 50 updates；测试 3 个采样 seed 取平均。
+    </p>
+    <table>
+      <thead><tr><th>方法（Table 1，准确率 %）</th><th>Q3-VL-8B<br />HiddenGames</th><th>Q3-VL-8B<br />Pro-Worlds</th><th>Q3-VL-8B<br />RoboQuest</th><th>Q3-VL-4B<br />HiddenGames</th><th>Q3-VL-4B<br />Pro-Worlds</th><th>Q3-VL-4B<br />RoboQuest</th><th>Q3.5-4B<br />HiddenGames</th><th>Q3.5-4B<br />Pro-Worlds</th><th>Q3.5-4B<br />RoboQuest</th></tr></thead>
+      <tbody>
+        <tr><td>后验教师（参考上界）</td><td>97.5</td><td>100.0</td><td>—</td><td>97.5</td><td>100.0</td><td>—</td><td>97.5</td><td>100.0</td><td>—</td></tr>
+        <tr><td>Base</td><td>22.9</td><td>14.8</td><td>36.2</td><td>24.6</td><td>17.2</td><td>28.4</td><td>26.5</td><td>20.2</td><td>39.6</td></tr>
+        <tr><td>Base (w/ belief)</td><td>23.9</td><td>20.5</td><td>39.8</td><td>24.5</td><td>18.2</td><td>34.0</td><td>38.1</td><td>23.9</td><td>41.3</td></tr>
+        <tr><td>PPO (action-only)</td><td>23.7</td><td>12.6</td><td>39.2</td><td>26.5</td><td>14.4</td><td>20.9</td><td>22.9</td><td>11.6</td><td>12.6</td></tr>
+        <tr><td>GRPO (action-only)</td><td>23.1</td><td>14.9</td><td>34.7</td><td>24.9</td><td>15.2</td><td>24.3</td><td>32.5</td><td>15.1</td><td>36.9</td></tr>
+        <tr><td>PPO (belief + action, judge 过程奖励)</td><td>26.4</td><td>16.9</td><td>51.4</td><td>25.9</td><td>15.1</td><td>38.7</td><td>40.5</td><td>29.1</td><td>57.1</td></tr>
+        <tr><td><strong>RLVB (EM)</strong></td><td>29.0</td><td>32.4</td><td>47.2</td><td>31.5</td><td>23.1</td><td>42.6</td><td>42.9</td><td>28.1</td><td>47.3</td></tr>
+        <tr><td><strong>RLVB</strong></td><td><strong>31.1</strong></td><td>29.9</td><td><strong>62.7</strong></td><td><strong>36.2</strong></td><td><strong>28.7</strong></td><td><strong>61.2</strong></td><td><strong>48.5</strong></td><td><strong>32.1</strong></td><td>54.0</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>RLVB 或 RLVB (EM) 在 9 列中的 8 列最佳；相对 Base 平均 <strong>+17.1%</strong>（RLVB）/ +10.4%（EM），全部 9 个设置均为正。迁移到未见基准：Pro-Worlds 最高 +17.6%、RoboQuest 最高 +32.8%。</li>
+      <li>相对 judge 过程奖励 PPO (belief + action)，RLVB 在 9 列中赢 8 列，平均 <strong>+9.3%</strong>；唯一例外是 Qwen3.5-4B 的 RoboQuest（54.0 vs 57.1）。</li>
+      <li>成本（Table 4，Qwen3.5-4B / A100 80GB 单次训练）：judge-PPO <strong>120.1 GPU·h + 12.6k 次 judge 调用（$9.8）</strong>，RLVB 74.2 GPU·h（1.6× 更省），EM 版 29.7 GPU·h（4× 更省）。每次 run 设 50 updates，但 KL 限幅让 RLVB 在 20–35 updates 就停。</li>
+      <li>训练稳定性（Figure 3）：GRPO 训练 50 updates 后，18.8%–53.1% 的采样组全是失败、组内优势为零、没有学习信号；RLVB 的无信号组约 2%（两个 Qwen3-VL）/ 14%（Qwen3.5-4B）。这与 <a href="daily-2026-09-04-algo-dapo.html">DAPO</a> 动态采样的动机同源，但 RLVB 是在每一步而非整条轨迹上拿到信号。</li>
+    </ul>
+
+    <h3>消融：收益来自 action 项，不是「让模型写对信念」</h3>
+    <table>
+      <thead><tr><th>Qwen3-VL-4B-Thinking，Table 3</th><th>belief 项</th><th>action 项</th><th>样本集</th><th>HiddenGames</th><th>Pro-Worlds</th><th>RoboQuest</th></tr></thead>
+      <tbody>
+        <tr><td>Base (w/ belief)</td><td>—</td><td>—</td><td>—</td><td>24.5</td><td>18.2</td><td>34.0</td></tr>
+        <tr><td><strong>RLVB（主设置）</strong></td><td>—</td><td>✓</td><td>large（1,200 采样 / 800 训练）</td><td><strong>36.2</strong></td><td><strong>28.7</strong></td><td><strong>61.2</strong></td></tr>
+        <tr><td>小样本集</td><td>—</td><td>✓</td><td>small（300 / 200）</td><td>35.3</td><td>23.9</td><td>55.5</td></tr>
+        <tr><td>小样本 + belief 项</td><td>✓</td><td>✓</td><td>small</td><td>35.9</td><td>21.7</td><td>45.8</td></tr>
+        <tr><td>只用 belief 项（且关掉教师接受规则）</td><td>✓</td><td>—</td><td>small</td><td>24.6</td><td>14.6</td><td>19.7</td></tr>
+      </tbody>
+    </table>
+    <p>样本集减到 1/4 主要伤害两个 OOD 基准；给 line 加监督不升反降（RoboQuest 45.8%）；只训练 line 则几乎退回 Base。结论：让 agent <strong>按信念决定停不停</strong>才是收益源，而不是把信念文本写得像标准答案。</p>
+
+    <h2>为什么涨点：更多证据，而不是同证据下更聪明</h2>
+    <p>
+      论文把准确率按「回答时的证据水平 e」拆成两部分（式 11）：<strong>more evidence</strong> = 在不同证据档位上重新分配何时回答；<strong>same evidence</strong> = 同一档位下的回答准确率变化。这是很漂亮的归因实验，值得任何 agent 训练复盘照抄。
+    </p>
+    <table>
+      <thead><tr><th>基准（三模型合并，Figure 5）</th><th>Base 平均证据</th><th>RLVB 平均证据</th><th>more evidence 贡献</th><th>same evidence 贡献</th><th>RLVB 总准确率</th></tr></thead>
+      <tbody>
+        <tr><td>HiddenGames</td><td>21.5%</td><td>39.6%（+26.7 的分配收益）</td><td>+26.7</td><td>−8.5</td><td>21.5 → 39.6</td></tr>
+        <tr><td>Pro-Worlds</td><td>17.2%</td><td>30.2%</td><td>+15.8</td><td>−2.8</td><td>17.2 → 30.2</td></tr>
+        <tr><td>RoboQuest</td><td>35.8%</td><td>67.9%</td><td>+31.8</td><td>+0.3</td><td>35.8 → 67.9</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>证据充分时（top posterior ≥ 0.95）回答的比例：RLVB <strong>51% / 12% / 74%</strong>，Base 8% / 0.4% / 36%，judge-PPO 20% / 3% / 57%。所有方法在证据充分档的正确率是 66%–92%，最低证据档只有 0%–13%——「什么时候答」几乎决定了成绩。</li>
+      <li>Table 2 的行为账（Qwen3-VL-4B）：HiddenGames 早答率 95.1%→34.5%、每局证据步数 3.6→8.3；Pro-Worlds 100%→90.4%、9.8→31.7 步；RoboQuest 61.8%→21.8%、4.2→10.0 步。三个模型九个设置均是最少早答、最多步数。</li>
+      <li>RQ3（按自己的 line 行动）：在「证据不足且 line 仍列多个答案」的回合上，RLVB 提交率仅 <strong>0.1%–2.2%</strong>，Base (w/ belief) 为 3%–68%。</li>
+      <li>RQ1（line 是否更准）：不一致。Pro-Worlds 上三个模型的 line 精确率都下降 4.9–7.8 个百分点；Tabletop 任务末回合 line 写单答案的占 83%，其中正确率 57%（证据充分时 70%）。</li>
+      <li>RQ2（步是否更有信息量）：不明显。Pro-Worlds 上教师一步把后验提高 5.9%，所有 agent 只有 0.7%–1.3%；HiddenGames 首步后验提升 Base / judge-PPO / RLVB 分别 15.6% / 14.9% / 14.8%。</li>
+      <li>Harness 层的小检查（Table 36）：不允许第一次回答、要求再查一次，对 HiddenGames / Pro-Worlds 上 RLVB 的改动 ≤ 2.8 个百分点；对 RoboQuest 反而 +1.9–7.7 个百分点（Qwen3.5-4B 54.0%→61.7%）。原因是 harness 看不到 agent 的观测，判断不了证据是否已足够。这和 <a href="daily-2026-10-21-harness-reobserve.html">PersistGym-lite 的预注册探针</a>讨论的是同一类可观测性边界。</li>
+    </ul>
+    <p>
+      换句话说：RLVB 训出的是「说到做到的停止策略」，不是更强的读数或更强的探索。这也解释了作者为何强调后续方向是「让 posterior 可学习」「改善下一步选择」「证据充分时正确读观测」。与 <a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a> 的段级 critic 相比，RLVB 把 credit 细化到 turn，但依赖 simulator 的后验；与 <a href="daily-2026-11-25-frontline-arc-rollout-control.html">ARC</a> 的 rollout 控制相比，一个优化「生成哪些样本」，一个优化「何时停止采样」，可以叠加但要重做 reward 对齐。
+    </p>
+
+    <h3>box 小实验：四杯谜题的后验、教师 log-reward 与两组权重</h3>
+    <pre><code># 纯 Python，seed 无关；把 paper 式 (3)(4)(5)(10) 缩到最小：b={2:0.5,4:0.5}，
+# Q(answer)=log b(y)，一步掀杯后验塌缩 ⇒ Q(lift)=log 1=0，τ=1，α=0.5。
+# 这只是量级/符号验证，不是论文 Figure 1 的数值（那边 τ/前瞻深度/ρ̂ 不同）。
+posterior b after lifts 1,3: {2: 0.5, 4: 0.5}
+top posterior = 0.5000; sufficient threshold in paper = 0.95 -&gt; NOT sufficient: keep gathering
+pi*(LIFT   2 | b) = 0.3333   log-reward = -1.0986
+pi*(LIFT   4 | b) = 0.3333   log-reward = -1.0986
+pi*(SUBMIT 2 | b) = 0.1667   log-reward = -1.7918
+pi*(SUBMIT 4 | b) = 0.1667   log-reward = -1.7918
+group-relative (eq.10) weights: [0.4621, 0.4621, -0.4621, -0.4621]
+EM weights (alpha=0.5): [0.4, 0.4, 0.1, 0.1]</code></pre>
+    <p>
+      读法：(1) 0.5 &lt; 0.95，正确决策是继续掀杯；(2) 两个提交动作的 log-reward 比两个掀杯低 0.6932 nats，正好是 log(1/0.5)；(3) 同一历史内四个 turn 做组内相对，两个掀杯拿 +0.462、两个提交拿 −0.462；EM 权重 0.4/0.4/0.1/0.1 更极端地把概率压向「继续」。论文 Figure 1 的对应数字是掀杯 −0.07、提交 −7.42，量级差来自它用了更完整的前瞻与教师设置——方向一致，数值不要混用。
+    </p>
+
+    <h2>局限与实践建议</h2>
+    <ul>
+      <li><strong>规则必须已知</strong>：后验可精确计算是整套方法的前提。开放任务要先学/估 posterior；动作空间大时 n 步前瞻要改浅层或采样。</li>
+      <li><strong>line 的表达力有限</strong>：集合形式无法表达「60% 可能是 A」，只能列可能项；这会影响 monitoring 的上限。</li>
+      <li><strong>证据足够也会读错</strong>：训练后「有充分证据却答错」的比例从 2%–4% 升到 10%–15%（主要在 Tabletop），因为 agent 会按自己错的 line 行动。</li>
+      <li><strong>离教师仍远</strong>：Pro-Worlds 教师 100%，RLVB 最好 32.4%；作者的下一步是学 posterior、改善动作选择、训练观测读取。</li>
+      <li>落地顺序建议：先确认环境能输出后验/充分性信号 → 用同 learner 做 outcome vs posterior reward 的 A/B（保持采样预算一致）→ 用式 (11) 拆 more/same evidence → 最后才考虑 harness 层的兜底检查。只加「拒绝首次回答」而不给 agent 证据反馈，在视觉任务上几乎无用。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么说 outcome reward 「不能教 agent 何时提交」，即使正确答案可以被验证？</summary>
+      <p>因为终局奖励把整条轨迹压成一个标量：一次证据不足的幸运猜测和一次查实后的正确回答赋值相同，而一次谨慎但最后失败的搜索被罚。停止决策依赖「当前证据是否已经锁定答案」，这是回合级信息，终局答案里没有。论文的实证是 GRPO / PPO (action-only) 在九列平均低于基座 1.0% / 5.1%，且 50 updates 后 18.8%–53.1% 的组全失败、组内优势为零。LLM judge 补的是「信念文本是否真实」，但 judge 看隐藏答案时会奖励蒙对、惩罚正确的不确定，仍不是证据充分性。</p>
+    </details>
+    <details>
+      <summary>2. RLVB 的奖励从不读 belief line，为什么 line 的训练反而变了？这对 agent harness 设计意味着什么？</summary>
+      <p>因为一个 turn 被定义为 x=(z, β, u)：推理、belief line、动作整体由 π<sub>φ</sub>(·|h) 生成，加权对数似然 L=−Σw<sub>i</sub> log π<sub>φ</sub>(x<sub>i</sub>|h) 会同时提高三者概率。奖励只看 u，但 β 与 u 的联合分布被一起拉近。结果是 agent 学会「line 说多个答案就继续、说单答案就提交」——control 跟随了 monitoring。对 harness 的启示：不要只把文本当解释性副产品；把 line 放进被更新的 turn，它就会变成策略的一部分，且不需要给它单独的 judge。</p>
+    </details>
+    <details>
+      <summary>3. 式 (11) 的 more evidence / same evidence 分解为什么能区分「会停」与「会更准」？</summary>
+      <p>把准确率写成 Σ<sub>e</sub> f(e)a(e)，f 是在证据档 e 回答的局数占比、a 是该档的正确率。Acc<sub>M</sub>−Acc<sub>B</sub> 可恒等拆成 Σ(f<sub>M</sub>−f<sub>B</sub>)ā(e) + Σ(a<sub>M</sub>−a<sub>B</sub>)f̄(e)：第一项只改回答在证据档上的分布，第二项只在同档内改准确率。HiddenGames 的 +26.7 与 −8.5 说明 RLVB 几乎全靠「把回答挪到高证据档」，同档里甚至更差（观察读错）。这也提示评估 agent 训练时别只看总准确率，要记录回答时的证据直方图。</p>
+    </details>
+    <details>
+      <summary>4. 既然 harness 检查「拒绝首次回答」对 HiddenGames / Pro-Worlds 几乎无效，为什么 RoboQuest 上又有效？</summary>
+      <p>Table 36：HiddenGames / Pro-Worlds 上加检查，RLVB 变化 ≤2.8pp；RoboQuest 上 +1.9–7.7pp（Qwen3.5-4B 54.0→61.7）。差别在可观测性：前两个基准的「证据是否充分」取决于 agent 通过小窗口看到的观测，harness 没有这些观测，要求再查一次只能产生低信息量的动作（Tabletop 上 base 继续工作的比例 17%/2%/3%，后续步有用的比例很低）；RoboQuest 的充分性由任务要求是否满足决定，harness 能直接检查，再查一次能补上真实缺口。结论：harness 兜底只在「充分性外置可查」时有效，否则要把信号放进训练而不是推理时闸门。</p>
+    </details>
+    <details>
+      <summary>5. RLVB 和 DAPO 的动态采样、FOCUS 的段级 critic 分别解决什么层面的问题？能否直接互换？</summary>
+      <p>DAPO 动态采样（<a href="daily-2026-09-04-algo-dapo.html">见此文</a>）解决「整条轨迹全对/全错导致组内无梯度」，在 episode 层面过滤/补采；ARC（<a href="daily-2026-11-25-frontline-arc-rollout-control.html">见此文</a>）进一步在 rollout 调度层早停与续跑；FOCUS（<a href="daily-2026-10-28-focus-active-critic.html">见此文</a>）把 compaction 边界当 step，做段级信用分配；RLVB 则在每一步用环境后验给 turn 打分，并把「停」本身作为被训练的动作。四者粒度不同、前提不同：RLVB 需要可算后验，FOCUS 需要续跑树，DAPO/ARC 需要可重采样。互换前要重定义 reward 与组，不能直接把 RLVB 的 w<sub>i</sub> 套到轨迹级组内。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.32884" target="_blank" rel="noopener">arXiv:2611.32884 · Lazy Agents Answer Against Their Own Beliefs: Reinforcement Learning with Verifiable Beliefs Teaches Them to Act on What They Believe（Sin Jing Xuan / Feng / Wang / Poria，NTU DeCLaRe Lab，v1 2026-11-24）</a></li>
+      <li><a href="https://github.com/declare-lab/RLVB" target="_blank" rel="noopener">GitHub: declare-lab/RLVB</a></li>
+      <li>方法背景：<a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">GRPO / DeepSeekMath（arXiv:2402.03300）</a> · <a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">DAPO（arXiv:2503.14476）</a></li>
+      <li>站内：今日 <a href="daily-2026-11-26-harness-delegent-role-routing.html">Harness：Delegent</a> · <a href="daily-2026-11-26-algo-mamba-selective-ssm.html">算法：Mamba 选择性 SSM</a> · <a href="daily-2026-10-28-focus-active-critic.html">FOCUS</a> · <a href="daily-2026-10-08-harness-refold.html">ReFold</a> · <a href="daily-2026-10-21-harness-reobserve.html">PersistGym-lite</a> · <a href="daily-2026-11-25-frontline-arc-rollout-control.html">ARC</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
