@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>一线追踪｜SPLICE：整组全失败时别让老师写完整轨迹——在当前策略的历史上插短选项，SWE-bench 25.7%、BrowseComp-Plus 50.7%，失败任务毕业率 8.1%→18.9% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>一线追踪｜SPLICE：整组全失败时别让老师写完整轨迹——在当前策略的历史上插短选项，SWE-bench 25.7%、BrowseComp-Plus 50.7%，失败任务毕业率 8.1%→18.9%</h1>
+    <p class="post-meta">2026-11-27 · 收藏夹：RL / Agent · 一线追踪<br />
+      主来源：Haowen Hou、Yicheng Liu（共同一作）、Zhen Huang、Jiaqi Wang（Shanghai Jiao Tong University / Shanghai Innovation Institute / JD.com）· <em>When Every Rollout Fails: Splicing Learner-Conditioned Options into Long-Horizon Agent RL</em>（<a href="https://arxiv.org/abs/2611.34777" target="_blank" rel="noopener">arXiv:2611.34777</a>，v1 2026-11-25）。
+      所有论文数字按原文 Tables 1–4、§5.1–5.5 抄录；「box 小实验」为本文在 box 上写的最小复算，明确不是论文数据。
+      交叉：
+      <a href="daily-2026-09-16-algo-grpo.html">GRPO</a>、
+      <a href="daily-2026-09-04-algo-dapo.html">DAPO</a>、
+      <a href="daily-2026-11-20-frontline-reverse-curriculum.html">Depth Before Breadth</a>、
+      <a href="daily-2026-11-25-frontline-arc-rollout-control.html">ARC</a>、
+      <a href="daily-2026-11-26-frontline-rlvb-posterior-reward.html">RLVB</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      二值 outcome reward 下的 GRPO 有一个熟悉的死区：同一个任务采 G 条轨迹，如果全错，组内方差为零，<code>Â_i=(R_i−mean R)/std R</code> 全是 0，这一组对策略没有任何基于奖励的梯度。论文把这种组叫 <strong>all-fail group</strong>。长程 agent 上它特别常见：Qwen3.5-9B 在 SWE 任务上的 rollout 平均 <strong>83.7 个 agent turn</strong>，靠随机探索碰巧走完整条修复路径的概率很低。
+    </p>
+    <ul>
+      <li>常见补救是让强模型给完整成功轨迹做 SFT / 在线指导，但完整轨迹既贵（每个 turn 都要调 proposal 模型），又把学生暴露在长段离策略历史上。</li>
+      <li>作者的观察是：失败往往是<strong>局部</strong>的。只要在失败轨迹的中途插一小段纠正动作，学生策略自己就能把剩下的任务做完——监督应该只落在这一小段上。</li>
+      <li>SPLICE 因此把问题重写成「学习者条件化的选项拼接」：只在 all-fail 组上启动分支，用学生自己的续跑给候选选项估值，只监督被验证为正的短段。</li>
+    </ul>
+
+    <h2>机制拆解</h2>
+    <h3>① 三组路由：只有全失败组才走 splice 分支</h3>
+    <pre><code>route(G) = GRPO      if 0 &lt; Σ_i R_i &lt; G      # 混合成败：标准组内相对优势
+           Skip       if Σ_i R_i = G          # 全成功：没有新信息
+           Splice     if Σ_i R_i = 0          # 全失败：本文要救的组      (式 3)
+
+Train 时 GRPO 与 splice 样本进不同 mini-batch，交替更新；
+proposal 模型与分支重建只在训练期使用，推理时不增加任何开销。</code></pre>
+    <p>这个路由很关键：它把「昂贵老师」的调用严格限制在零信号组，而且不改动混合组的 GRPO 行为。与 <a href="daily-2026-09-04-algo-dapo.html">DAPO 动态采样</a>相比，一个是在采样前过滤零方差组，一个是在零方差出现后就地造出局部监督。</p>
+
+    <h3>② 选 splice 点、生成短选项、用学生续跑估值</h3>
+    <p>从 all-fail 组随机取一条失败轨迹 τ⁻；proposal 模型在每 C=4 个 turn 记录的可恢复点里挑一个 t*，从该点恢复环境并生成 K=3 个候选选项 ω<sub>k</sub>，每个选项最多 H<sub>b</sub> 个 turn：</p>
+    <pre><code>H_b = max(1, floor( α · (1/|B_b|) Σ_{τ∈B_b} T(τ) ))    α=0.3      (式 4)
+Q̂_k = (1/M) Σ_{j=1..M} R(τ_{k,j})    M=3，续跑全部来自 π_old     (式 5)
+I = { k : Q̂_k &gt; 0 }                 # 零收益选项直接丢弃
+
+若选项执行中任务就结束，则用 verifier 直接给 Q̂_k∈{0,1}。</code></pre>
+    <p>
+      注意续跑策略是学生的 π<sub>old</sub> 而不是老师。老师觉得有用的选项，学生未必接得住；用学生续跑的成功率估值，会把「老师写得好」和「学生用得上」分开。论文 §5.5 的对照很直白：换成老师续跑，Resolve 只从 25.7% 升到 26.2%，proposal 模型的 turn 数却从 93.5k 涨到 <strong>372.5k（4.0×）</strong>。
+    </p>
+
+    <h3>③ 收益加权的局部目标：软分布优于「只学最好的那个」</h3>
+    <pre><code>Q̃_k = (Q̂_k − mean_{l∈I} Q̂_l) / (std_{l∈I} Q̂_l + ε_Q)        (式 6)
+q*(ω_k | h_{t*}) = exp(Q̃_k) / Σ_{l∈I} exp(Q̃_l)                (式 7)
+
+Proposition 1：在同一批保留候选上，
+  Σ_k q*(ω_k|h) Q̂_k ≥ (1/|I|) Σ_k Q̂_k                          (式 8)
+  （保留项收益不全相等时严格大于；这是目标层面的结论，不承诺有限步更新后的真实回报）</code></pre>
+    <p>也就是说，不是「谁估值最高就只学谁」（hard top-Q̂），也不是「所有正选项等权」（uniform positive），而是按标准化后的续跑回报分配一个软概率。</p>
+
+    <h3>④ 局部 KL 投影：只算选项 token 的平均 loss</h3>
+    <p>式 (9) 是序列级投影 <code>D_KL(q* ∥ P_θ(·|h))</code>，展开成 token 后（式 10）会让长选项因为 token 多而天然占更大权重。作者改用长度归一化的代理目标：</p>
+    <pre><code>L_splice(θ) = Σ_k q*_k · [ −(1/N_k) Σ_{n=1..N_k} log π_θ(y_{k,n} | c_{k,n}) ]   (式 11)
+
+监督范围：只包含保留选项中由 proposal 模型生成的 action token；
+GRPO 的 token-level importance ratio / clip 仍然用于混合组（式 1–2）。</code></pre>
+    <p>作者自己强调式 (11) 不是变长序列上的精确 KL 投影，而是一个保留 q* 权重、让每个选项按平均 token loss 贡献的代理。这类「承认是近似」的写法比含糊地说「最小化 KL」可信得多。</p>
+
+    <h2>实验：两套策略族、两类长程任务</h2>
+    <p>
+      SWE 用 SWE-Gym + R2E-Gym 子集（排除与 SWE-bench 重叠的仓库），在 SWE-bench Verified 上测 resolve rate；Deep Research 用开源数据精选集，在 BrowseComp-Plus 上用 Qwen3-Embedding-8B 检索、gpt-oss-20b 判分。两个域各固定 3,200 个训练任务。策略族为 Qwen3-8B-CS（共享 cold-start、关思考）与 Qwen3.5-9B（原版 checkpoint、开思考）；proposal 模型统一 Qwen3.5-122B-A10B。SWE scaffold 是 OpenHands，Deep Research 是定制的 Uni-Agent（search / open / find 三个工具），turn 上限 150、上下文 128k。各项报 3 次运行的 mean ± SD。
+    </p>
+    <table>
+      <thead><tr><th>方法（Table 1，%）</th><th>Qwen3-8B-CS<br />SWE-bench V.</th><th>Qwen3-8B-CS<br />BrowseComp-Plus</th><th>Qwen3.5-9B<br />SWE-bench V.</th><th>Qwen3.5-9B<br />BrowseComp-Plus</th></tr></thead>
+      <tbody>
+        <tr><td>Initial policy</td><td>11.2</td><td>16.4</td><td>53.2</td><td>42.5</td></tr>
+        <tr><td>SFT（老师完整轨迹 + 拒绝采样）</td><td>21.5±1.4</td><td>24.2±0.7</td><td>57.9±0.8</td><td>48.2±0.9</td></tr>
+        <tr><td>RL（直接 GRPO）</td><td>15.9±0.7</td><td>20.2±0.9</td><td>58.4±0.4</td><td>46.2±0.4</td></tr>
+        <tr><td>SFT + RL</td><td>24.4±1.1</td><td>26.7±0.4</td><td>59.9±1.7</td><td>49.4±0.9</td></tr>
+        <tr><td>ReLIFT（在线完整老师轨迹）</td><td>19.7±0.6</td><td>23.5±0.6</td><td>59.1±1.0</td><td>47.6±1.9</td></tr>
+        <tr><td><strong>SPLICE</strong></td><td><strong>25.7±0.8</strong></td><td><strong>29.3±0.7</strong></td><td><strong>61.2±1.0</strong></td><td><strong>50.7±0.3</strong></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>直接 RL 四个设置只涨 <strong>3.7–5.2 pp</strong>；SPLICE 相对 GRPO 涨 <strong>2.8–9.8 pp</strong>，四个设置全部最高；相对 ReLIFT 再涨 2.1–6.0 pp，比计算量更大的 SFT+RL 还高 1.3–2.6 pp。</li>
+      <li>初始策略差距很大（11.2% vs 53.2%），但收益不是「弱模型才有效」：Qwen3.5-9B 上仍是 61.2% / 50.7%，均优于所有基线。</li>
+      <li>Table 2（SWE 训练任务）：proposal 命中率 SPLICE 30.7% vs ReLIFT 55.1%（低 24.4 pp），proposal 模型 turn 数 93.5k vs 113.4k（<strong>−17.5%</strong>），但失败任务「毕业率」<strong>8.1%→18.9%</strong>，比 ReLIFT 的 15.9% 还高 3.0 pp，比 RL 高 10.8 pp。</li>
+      <li>Table 3（按难度，n=342/1,087/1,771）：Easy 已饱和（99.4→99.3）；Medium 0.5%→10.9%（RL）/ 24.8%（SPLICE），SPLICE 增益 24.3 pp 比 RL 多 13.9 pp；Hard 0.2%→6.4% / 15.4%。</li>
+    </ul>
+
+    <h3>消融：目标构造比选项长度更关键</h3>
+    <table>
+      <thead><tr><th>Table 4 消融</th><th>Resolve (%)</th><th>Graduation (%)</th><th>π_ρ turns (k)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>SPLICE</strong>（学生续跑 + 收益加权，仅选项）</td><td><strong>25.7±0.8</strong></td><td><strong>18.9±0.3</strong></td><td>93.5±2.6</td></tr>
+        <tr><td>Single option（不验证，直接学一个）</td><td>21.2±0.4</td><td>12.3±1.1</td><td>—</td></tr>
+        <tr><td>Hard top-Q̂（只学估值最高的）</td><td>24.3±0.6</td><td>17.7±0.2</td><td>—</td></tr>
+        <tr><td>Uniform positive（正选项等权）</td><td>23.7±0.2</td><td>17.1±1.1</td><td>—</td></tr>
+        <tr><td>老师续跑 + 仅选项监督</td><td>26.2±1.6</td><td>19.4±1.3</td><td>372.5±12.0</td></tr>
+        <tr><td>老师续跑 + 完整后缀监督</td><td>22.3±1.5</td><td>15.4±1.4</td><td>365.9±18.3</td></tr>
+        <tr><td>α=0.1 / α=0.5（选项长度比例）</td><td>18.2 / 24.3</td><td>10.7 / 17.1</td><td>33.7 / 157.0</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>收益加权比 hard top-Q̂ 高 1.4 Resolve / 1.2 Graduation，比 uniform positive 高 2.0 / 1.8，比单个未验证选项高 4.5 / 6.6——软分布确实优于塌缩成单点。</li>
+      <li>把监督扩到老师生成的成功后缀反而掉到 22.3% / 15.4%（与「仅选项」的老师续跑版用掉的 proposal 计算量相当），说明离策略暴露与协变量偏移是真实成本，不是理论担忧。</li>
+      <li>α=0.1 把 proposal turn 砍掉 64.0%（93.5k→33.7k），但 Resolve 掉到 18.2%；α=0.5 多了 67.9% 计算量、命中率升 2.3 pp，成绩反而略降。短到不能把学生带到「自己能收尾」的状态，就没有意义。</li>
+      <li>成本图（Figure 2）：SPLICE 25.7% @ 93.5k proposal turns / 13.5 h；ReLIFT 19.7% @ 113.4k / 13.9 h；SFT 21.5% @ 138.4k / 15.8 h；RL 15.9% @ 0 / 11.9 h。SPLICE 的后期曲线才超过基线（Figure 2a），早期并不占优。</li>
+    </ul>
+
+    <h2>box 小实验：全失败组、选项权重与 Proposition 1</h2>
+    <pre><code># 纯 Python；把式 (3)(5)(6)(7)(8) 缩到最小，数字不是论文数据
+group rewards [0, 0, 0] -&gt; GRPO advantage std= 0.0 (epsilon ignored: all-fail A=0)
+option Qhat [0.6667, 0.0, 1/3] retained I [0, 2]
+standardize: mean=0.5000 std=0.1667
+q*(option) weights {0: 0.8808, 2: 0.1192}
+empirical value: return-weighted=0.6269 vs uniform=0.5000 (delta=0.1269)
+adaptive horizon: mean turns=83.5 alpha=0.3 -&gt; Hb=25 turns</code></pre>
+    <p>
+      读法：(1) 二值奖励全 0 时分母为零，GRPO 优势确实消失；(2) 三个选项续跑成功率 2/3、0/3、1/3，零收益项被丢掉；(3) 标准化后 softmax 把 0.8808 的概率压给 2/3 那项，等权只有 0.5，收益加权项的实测均值 0.6269，符合 Proposition 1 的方向；(4) 若一批 rollout 平均 83.5 turn，α=0.3 得到的选项预算是 25 turn——和论文 SWE 任务的 83.7 turn 同量级，但请注意这只是量级演示，论文里的 H<sub>b</sub> 按当前 batch 的实际轨迹长度逐批计算。
+    </p>
+
+    <h2>局限与实践建议</h2>
+    <ul>
+      <li><strong>依赖可恢复环境</strong>：需要能从 t* 回放前缀或恢复容器快照；论文 SWE 用容器快照，Deep Research 只存交互历史就能重放。无状态工具链才好接。</li>
+      <li><strong>只救全失败组</strong>：混合组与全成功组照常 GRPO / Skip；如果 zero-variance 组占比很低，额外分支的收益有限。</li>
+      <li><strong>选项估值有噪声</strong>：M=3 条续跑的均值就是 0、1/3、2/3、1 四档，粒度很粗；论文没有报告不同 M 的敏感性，落地时要自己扫。</li>
+      <li><strong>最终差距仍大</strong>：Qwen3-8B-CS 上 SWE-bench 只有 25.7%，离强模型还远；毕业率 18.9% 也意味着 81% 的初始失败任务没救回来。</li>
+      <li>落地顺序建议：先统计 all-fail 组占比与 rollout 平均 turn → 确认 t* 能被可靠恢复 → 用 K=M=3、α=0.3 跑小预算 A/B → 再扫「学生续跑 vs 老师续跑」和 α；不要一上来就监督老师生成的完整后缀。<a href="daily-2026-11-26-frontline-rlvb-posterior-reward.html">RLVB</a> 是在 turn 级用环境后验造奖励，<a href="daily-2026-11-20-frontline-reverse-curriculum.html">Depth Before Breadth</a> 是把长程拆成能力区内外的课程，三者都是给「零信号」补监督，但前提和粒度完全不同。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「老师写完整成功轨迹」在长程 agent 上不只是贵，还可能更差？</summary>
+      <p>两个成本叠加：一是轨迹平均 83.7 turn，强模型为每个全失败组从头生成一遍，计算量随长度线性增长；二是完整轨迹是学生极少采到的离策略历史，把其中所有 token 当监督会带来暴露偏差与协变量偏移。论文 Table 4 把这一点做成了对照：老师续跑 + 完整后缀监督用 365.9k proposal turns，Resolve 22.3%、Graduation 15.4%，反而低于只用学生续跑 + 只监督短选项的 25.7% / 18.9%（93.5k turns）。</p>
+    </details>
+    <details>
+      <summary>2. 为什么用 π_old 而不是 π_ρ 做续跑估值？这会不会低估真正有用的选项？</summary>
+      <p>会低估「只有老师自己会用的选项」，但那恰恰不是要教学生的东西。Q̂_k 定义为学生从该选项接手后完成任务的概率，是 learner-conditioned value。老师续跑的估值反映的是老师的能力，学生未必复现。论文的消融显示换成老师续跑只多 0.5 pp Resolve、0.5 pp Graduation，却要 4.0× proposal turns——这个交换不划算。它与 <a href="daily-2026-09-16-algo-grpo.html">GRPO</a> 的 on-policy 精神一致：监督信号要在学生的状态分布上测。</p>
+    </details>
+    <details>
+      <summary>3. Proposition 1 是否说明 return weighting 一定带来更高的真实回报？</summary>
+      <p>不说明。命题比较的是同一批已保留候选、同一组观测续跑结果下的<strong>经验目标值</strong>：Σ q*Q̂ ≥ 均值(Q̂)，且保留值不全相等时严格大于。作者明确写到这不承诺有限样本策略更新后的真实回报提升。它是「目标构造的合理性证明」，不是「算法收敛保证」。读这类命题时要分清 target-level 与 policy-level。</p>
+    </details>
+    <details>
+      <summary>4. 为什么监督范围要限制在 proposal 生成的选项 token，而不是连成功的续跑一起学？</summary>
+      <p>续跑由 π_old 采样，本来就是学生自己的分布，不需要再监督；而老师生成的后缀是离策略的。Table 4 中「老师续跑 + 后缀监督」与「老师续跑 + 仅选项」用了几乎相同的 proposal 计算（365.9k vs 372.5k turns），前者 Resolve/Graduation 从 26.2/19.4 掉到 22.3/15.4，把差异收敛到监督范围这一个变量上。这与 harness 侧的「最小改动面」思路相通：<a href="daily-2026-11-25-harness-agent-kernel-sgr.html">Agent-Kernel</a> 也只恢复受影响的子图，而不是重跑整条历史。</p>
+    </details>
+    <details>
+      <summary>5. SPLICE、DAPO、ARC、RLVB 都在处理「没信号」，该怎么选？</summary>
+      <p>DAPO（<a href="daily-2026-09-04-algo-dapo.html">见此文</a>）在采样层过滤/补采零方差组；ARC（<a href="daily-2026-11-25-frontline-arc-rollout-control.html">见此文</a>）在 rollout 调度层早停与续跑以省吞吐；RLVB（<a href="daily-2026-11-26-frontline-rlvb-posterior-reward.html">见此文</a>）在 turn 层用模拟器精确后验造逐步奖励；SPLICE 在轨迹中段插入短选项造局部监督。前提分别是：可重采样、可中断续跑、可算后验、可恢复分支点。环境不具备相应能力时换方法，而不是把超参乱调。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.34777" target="_blank" rel="noopener">arXiv:2611.34777 · When Every Rollout Fails: Splicing Learner-Conditioned Options into Long-Horizon Agent RL（Hou / Liu / Huang / Wang，SJTU + Shanghai Innovation Institute + JD.com，v1 2026-11-25）</a></li>
+      <li>方法背景：<a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">GRPO / DeepSeekMath（arXiv:2402.03300）</a> · <a href="https://arxiv.org/abs/2503.14476" target="_blank" rel="noopener">DAPO（arXiv:2503.14476）</a></li>
+      <li>任务与框架：<a href="https://arxiv.org/abs/2310.06770" target="_blank" rel="noopener">SWE-bench（arXiv:2310.06770；论文实验用其 Verified 子集）</a> · <a href="https://arxiv.org/abs/2504.12516" target="_blank" rel="noopener">BrowseComp（arXiv:2504.12516；论文用 Plus 版本）</a> · <a href="https://arxiv.org/abs/2407.16741" target="_blank" rel="noopener">OpenHands（arXiv:2407.16741）</a></li>
+      <li>站内：今日 <a href="daily-2026-11-27-harness-home-memory-harness.html">Harness：HoMe</a> · <a href="daily-2026-11-27-algo-swin-transformer.html">算法：Swin Transformer</a> · <a href="daily-2026-11-20-frontline-reverse-curriculum.html">Depth Before Breadth</a> · <a href="daily-2026-11-25-frontline-arc-rollout-control.html">ARC</a> · <a href="daily-2026-11-26-frontline-rlvb-posterior-reward.html">RLVB</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜HoMe：把记忆系统的 harness 当 Git 仓库来优化——跨案例失败归因 + 前半预算只许改机制，6 次评估涨 2.8/5.4 pp 且 query token −59%/−41% · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜HoMe：把记忆系统的 harness 当 Git 仓库来优化——跨案例失败归因 + 前半预算只许改机制，6 次评估涨 2.8/5.4 pp 且 query token −59%/−41%</h1>
+    <p class="post-meta">2026-11-27 · 收藏夹：Harness / Agent · 学习笔记<br />
+      主来源：Yifei Xu、Li Yu、Zhaoyang Liu、Ce Wang、Sen Huang、Yanyan Shen、Yun Lin、Linpeng Huang、Hong Mei（Shanghai Jiao Tong University / Alibaba Group / Peking University）· <em>HoMe: Toward Practical Harness Optimization of Memory Systems for AI Assistants</em>（<a href="https://arxiv.org/abs/2611.34624" target="_blank" rel="noopener">arXiv:2611.34624</a>，v1 2026-11-25；<a href="https://github.com/agentscope-ai/ReMe" target="_blank" rel="noopener">代码</a>）。
+      所有论文数字按原文 Tables 1–3、§3–4 抄录；「box 小实验」为本文在 box 上写的最小复算，明确不是论文数据。
+      交叉：
+      <a href="daily-2026-11-20-harness-meta2.html">Meta²</a>、
+      <a href="daily-2026-11-23-harness-cosight.html">Co-Sight Harness</a>、
+      <a href="daily-2026-11-25-harness-agent-kernel-sgr.html">Agent-Kernel</a>、
+      <a href="daily-2026-10-08-harness-refold.html">ReFold</a>、
+      <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      长程助手的记忆系统不是一个“存了就算”的 KV 库，而是一套由<strong>代码 + prompt + 配置</strong>共同决定的系统。论文把它定义成 harness <code>h=(c,p,θ)</code>：c 管记忆构建、维护、检索、回答的实现与恢复机制；p 是各阶段的指令；θ 是 schema、索引、阈值等配置；底层 LLM 固定、不在 h 内。医疗助手要忠实保存症状史，日程助手要让新事件覆盖旧状态——同一套 harness 不可能通吃，部署前要调，部署后随着历史增长还要继续调。
+    </p>
+    <ul>
+      <li>人工调 harness 很慢，搜索空间又大；把「任意改代码」交给 code agent 也不够—— unrestricted editing 会产出大量 prompt/参数微调，看似一直在改，实际没碰到结构。</li>
+      <li>作者在两个 ReMe 优化实验里观察到：允许改代码的情况下，MemPro 提出的所有候选<strong>只改了 prompt 或参数</strong>。</li>
+      <li>长程场景还有两个额外难点：一次低分可能来自「当时没写进去 / 后来被覆盖 / 存了但没检索到 / 检索到了却用错」，诊断很难；每次正式评估都要为所有 case 重建记忆、逐 query 调 judge，非常贵。</li>
+    </ul>
+
+    <h2>机制拆解</h2>
+    <h3>① 形式化：优化的是保留接口的 h=(c,p,θ)</h3>
+    <pre><code>m_t = C_h(m_{t−1}, s_t)   t∈[1,T]        # 每个 session 后更新记忆状态
+r_q  = R_h(m_T, q)                     # 检索
+a_q  = A_h(q, r_q)                     # 回答
+(h_j, y_j, e_j, κ_j) = Eval(h_j; D)    # 分数 / 执行轨迹 / 每 query token
+h_{b+1} = Π(O_b, D)                    # 从全部历史证据提出下一个候选</code></pre>
+    <p>目标是在 B 次正式评估内选出全集 D 上分数最高的 h*，并在分数相近时偏好更低的 query 阶段 token 数 κ<sub>b</sub>。注意 O<sub>b</sub> 保留的不只是分数，还有执行轨迹 e 与 token 账 κ——诊断和「省 token」的取舍都靠它。</p>
+
+    <h3>② 三组件循环：Developer Agents / Experiment Manager / Evaluation Environment</h3>
+    <ul>
+      <li><strong>Diagnoser Agent</strong> 读历史与最近候选的失败，产出紧凑诊断；<strong>Optimizer Agent</strong> 根据诊断挑一个已评估过的 h<sub>j</sub> 当父节点：沿当前分支细化、从更早节点开新分支，或合并两条互补分支。</li>
+      <li><strong>Experiment Manager</strong> 维护一个 Git 式的 harness repository（每个分支一个假设），控制工具权限，决定候选是否值得一次正式评估。</li>
+      <li><strong>Evaluation Environment</strong> 在隔离 Docker sandbox 里跑构建 / 检索 / 回答 / 打分；所有 case 并发，预热 sandbox 池降低启动开销。构建时每个 session 后 commit 一次记忆文件，于是天然得到「记忆仓库」。</li>
+    </ul>
+    <p>把 harness 改动和诊断报告一起 commit 是这套设计的核心纪律：每一轮都站在上一轮的证据上，而不是重新发现同样的坑。<a href="daily-2026-11-20-harness-meta2.html">Meta²</a> 也在做「把离线优化上移一层」，但 HoMe 强调版本化的分支/合并与评估预算，而不是学一个可复用文本 Meta-Skill。</p>
+
+    <h3>③ 失败归因：从低分 query 倒查到具体 session 与组件</h3>
+    <pre><code>if r_q 含有答案所需信息        → answering 失败
+elif 最终记忆 m_T 含有该信息   → retrieval 失败
+else                          → construction 失败
+    ├─ 找到源 session s_t，检查 m_{t−1}→m_t 的 diff：没写进去 → never written
+    └─ 写进去了，就顺着后续 diff 找哪一次修订把它覆盖/删掉 → overwritten/deleted</code></pre>
+    <p>
+      「每个 session 一次 commit + diff」让 agent 可以按需取任意一个中间状态或单次改动，不必把上千条消息塞进上下文。Diagnoser 用 map-reduce：map 阶段并行起 Case Study Agent，每个 case 独立上下文做上述倒查并给出一个紧凑结论；reduce 阶段按失败机制分组，只有被多个 case 佐证的共同原因才升级为「共享 harness 缺陷」，交给 Optimizer 去改代码。这一步是在压制单 case 诊断噪声——和 <a href="daily-2026-11-25-harness-agent-kernel-sgr.html">Agent-Kernel 的子图恢复</a>一样，都是「只动责任范围」的思路。
+    </p>
+
+    <h3>④ 省预算的三把刀：smoke test + gate、自适应采样、记忆复用</h3>
+    <pre><code>smoke test : 真实 case 截断到几个 session/query，确定性地跑 → 拒绝运行时错误（不花正式预算）
+candidate gate:
+   前 B/2 轮（exploration）：只放行改运行时机制的 diff（表示/构建/检索），
+                             拒绝 prompt-only、参数-only、不改信息流/控制流的表面代码改动
+   后 B/2 轮（refinement）  : 闸门放开，允许 prompt/配置微调
+
+EMA loss      : ℓ̄_v^(b) = α(1 − y_v^(b)) + (1 − α) ℓ̄_v^(b−1)      α=0.3     (式 4)
+priority      : r_v = ℓ̄_v + λ_s log(1+Δ_v) + λ_n √(n_v)/(n_v+1) + λ_u u_v   (式 5)
+sample prob   : p_v = (1−ε) softmax(r)_v + ε/|V|                    ε=0.2
+memory reuse  : 若 diff 不碰构建阶段用到的代码/prompt/配置，则以 ρ=0.6 复用祖先的记忆状态，
+                只重跑检索、回答、打分</code></pre>
+    <p>
+      Δ<sub>v</sub> 是距上次评估多久，u<sub>v</sub> 是尚未复核的误差量，n<sub>v</sub> 是有效观测次数：难度与未解决误差把采样拉向失败，staleness / 不确定性 / 均匀项保住覆盖率。两级采样先在 case 层按 p<sub>v</sub> 抽，再在选中 case 的 query 层用同一规则抽。代价是各轮子集不同、聚合分数不能直接比较，最终挑选必须看共享 case/query、覆盖度和难度——论文由 Experiment Manager 提供对比表辅助判断。
+    </p>
+
+    <h2>实验：ReMe 上只做 6 次正式评估</h2>
+    <p>
+      LongMemEval-S：500 个单 query case，平均 115K 历史 token，六类问题，随机对半分训练/测试。BEAM：训练用 BEAM-100K（20 case × 20 query，平均 131K token），测试用 BEAM-1M（35 case × 20 query，平均 1.04M token，最长 1.52M）。两者都从人工调好的同一 ReMe harness 出发；记忆构建用 qwen3.6-flash，其余 LLM 调用 qwen3.7-max，embedding 用 Qwen3-Embedding-0.6B。HoMe 预算 B=6，并发 28；LME 每轮 28 case，BEAM 每轮 10 case / 100 query。
+    </p>
+    <table>
+      <thead><tr><th>Table 1（每 query 平均）</th><th>LME<br />Score</th><th>LME<br />Token</th><th>LME<br />Calls</th><th>BEAM<br />Score</th><th>BEAM<br />Token</th><th>BEAM<br />Calls</th></tr></thead>
+      <tbody>
+        <tr><td>A-MEM</td><td>0.740</td><td>19.8K</td><td>2.0</td><td>0.642</td><td>30.3K</td><td>2.0</td></tr>
+        <tr><td>SimpleMem</td><td>0.728</td><td>37.7K</td><td>8.1</td><td>0.440</td><td>34.8K</td><td>6.8</td></tr>
+        <tr><td>ReMe（初始 harness）</td><td>0.888</td><td>43.9K</td><td>4.7</td><td>0.650</td><td>101.8K</td><td>4.5</td></tr>
+        <tr><td>MemPro（自动 harness 优化基线）</td><td>0.812</td><td>96.9K</td><td>5.5</td><td>0.693</td><td>65.4K</td><td>6.7</td></tr>
+        <tr><td><strong>HoMe</strong></td><td><strong>0.916</strong></td><td><strong>17.9K</strong></td><td>3.0</td><td><strong>0.704</strong></td><td><strong>60.4K</strong></td><td>6.7</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>相对初始 ReMe：LME 0.888→<strong>0.916（+2.8 pp）</strong>，query token 43.9K→17.9K（<strong>−59%</strong>），LLM 调用 4.7→3.0；BEAM 0.650→<strong>0.704（+5.4 pp）</strong>，101.8K→60.4K（<strong>−41%</strong>），调用数 4.5→6.7 但每次更短。论文另跑了一次独立 BEAM 搜索，0.720 @ 68.3K。</li>
+      <li>相对 MemPro：分数 +10.4 pp（LME）/ +1.1 pp（BEAM），query token −81.5% / −7.6%。MemPro 训练选出的 harness 在 LME 测试集只有 0.812，反而低于其起点 0.888——只改 prompt/参数的搜索确实会退化。</li>
+      <li>跨基准迁移（Table 2）：BEAM-100K 上优化的 harness 直接拿去测 LME 得 0.908 @ 26.6K，优于 MemPro 的 0.800 @ 42.2K 与初始 ReMe 的 0.888 @ 43.9K；LME 上优化的拿去测 BEAM-1M 得 0.639 @ 39.0K，比 ReMe 少 62% token、只低 1.1 pp，仍在 Pareto 前沿。注意测试历史比优化时长约 8×。</li>
+      <li>不是所有类目都涨：LME 的 single-session preference、BEAM 的 contradiction resolution 增益最大；LME multi-session、BEAM knowledge update / information extraction 反而下降。整体提升不能替代按类目复盘。</li>
+    </ul>
+
+    <h3>成本账：正式评估从 153.5 h 压到 2 min</h3>
+    <table>
+      <thead><tr><th>Table 3（逐项累乘）</th><th>LME cases(queries)</th><th>LME 时间</th><th>相对上行</th><th>BEAM cases(queries)</th><th>BEAM 时间</th><th>相对上行</th></tr></thead>
+      <tbody>
+        <tr><td>Full, serial</td><td>250 (250)</td><td>153.5 h</td><td>—</td><td>20 (400)</td><td>14.4 h</td><td>—</td></tr>
+        <tr><td>+ Parallel</td><td>250 (250)</td><td>5.5 h</td><td>−96%</td><td>20 (400)</td><td>87 min</td><td>−90%</td></tr>
+        <tr><td>+ Sampling</td><td>28 (28)</td><td>37 min</td><td>−89%</td><td>10 (100)</td><td>38 min</td><td>−56%</td></tr>
+        <tr><td>+ Reuse</td><td>28 (28)</td><td>2 min</td><td>−94%</td><td>10 (100)</td><td>8 min</td><td>−78%</td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>BEAM 上 HoMe 总优化 10.4 h，MemPro 11 h 23 min；优化 token 消耗 185.2M vs 331.2M（<strong>−44.1%</strong>）。HoMe 跑到 BEAM Pareto 前沿用了 6.3 h。</li>
+      <li>采样节省的工作量：BEAM 每轮 10 case / 100 query，比 MemPro 少 50% case、75% query；LME 每轮 28 case vs 50（−44%）。六个 BEAM 候选上，采样子集与全集的 query-token 降幅正相关（Pearson r=0.870）。</li>
+      <li>收益在早期就出现：BEAM 第二个候选已落在 Pareto 前沿，第 2–4 个候选给出不同取舍（最高 0.73 分或低至 31.8K token）；最后两个不再推进前沿，作者据此指出后续迭代更容易过拟合采样噪声。</li>
+    </ul>
+
+    <h3>它到底改了什么：四个被诊断出来的机制</h3>
+    <ul>
+      <li><strong>跨 session 目录</strong>（两个数据集各自独立发现）：摘要与原始对话抢检索槽，改成按日期分组的紧凑 topic 列表，回答 prompt 先扫列表再定向读。</li>
+      <li><strong>来源多样化</strong>（同样独立发现）：长原始 transcript 占掉多个检索槽，改成每文件槽位上限（原始 transcript 更严），触顶后由其他文件的 chunk 补位。</li>
+      <li><strong>LME 用户动作索引</strong>：构建时给每条 note 增加一行「用户自己做了什么」，并对这些行建倒排索引，解决动作细节被埋在长 note 里的问题。</li>
+      <li><strong>BEAM 证据压缩</strong>：检索 chunk 内按 query 关键词给行打分，低分行换成保留行号的占位符；需要时再按行号定向读回。省 token 但不丢可达性。</li>
+    </ul>
+    <p>四个改动都指向「让 Answer Agent 看到什么、要看多少」，而不是加大上下文或换更强 LLM。这与 <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a> 对前缀命中/失效的分析是同一层面的问题：harness 层真正稀缺的是可用证据与预算，不是模型能力。</p>
+
+    <h2>box 小实验：归因决策树与 EMA 采样优先级</h2>
+    <pre><code># 纯 Python；复刻式 (3.2) 的归因决策树与式 (4)(5) 的 EMA/softmax，数字不是论文数据
+C1 (r_q no, m_T no, written yes, later deleted yes) -&gt; construction: overwritten/deleted
+C2 (r_q yes, ...)                                  -&gt; answering
+C3 (r_q no, m_T yes, ...)                          -&gt; retrieval
+C4 (r_q no, m_T no, written no)                    -&gt; construction: never written
+EMA loss after h0 (L0=0) [0.24, 0.06, 0.15]
+EMA loss after h1            [0.378, 0.102, 0.135]
+priority r [0.5323, 0.2621, 0.3221]
+sampling p [0.3775, 0.3039, 0.3186] sum=1.0000
+ranking [1, 3, 2]</code></pre>
+    <p>
+      玩具设定：h0 三个单元得分 [0.2, 0.8, 0.5]，h1 得分 [0.3, 0.8, 0.9]，α=0.3。单元 1 从 0.2 微升到 0.3，但因为初始损失高且 staleness/unresolved 项累积，EMA loss 反而从 0.240 升到 0.378，下一轮采样概率最高（0.3775）；单元 3 一开始就差、h1 又拿到 0.9，EMA loss 从 0.15 降到 0.135，仍排第二；一直满分行为的单元 2 概率最低。这演示了「向失败倾斜但保留覆盖」的方向。真实实现里 u<sub>v</sub> 有自己的累计规则、λ 参数论文未在正文给全，所以这里只做排序演示，不要把这个 p 当论文数值。
+    </p>
+
+    <h2>局限与实践建议</h2>
+    <ul>
+      <li><strong>采样分数不可比</strong>：每轮子集不同，聚合分数不能直接排序；必须有共享 case 对比表与覆盖度记录，否则 Optimizer 会被采样噪声牵着走。</li>
+      <li><strong>依赖记忆可版本化</strong>：归因的前提是每次 session 后能 commit 记忆文件并做 diff；纯向量库或不可快照的外部记忆系统要先补这一层。</li>
+      <li><strong>gate 是启发式</strong>：前 B/2 轮拒绝 prompt-only 改动是经验选择；如果预算 B 很小、起点又有明显 prompt 缺陷，硬闸门可能挡住低成本大收益。</li>
+      <li><strong>类目回退</strong>：multi-session / knowledge update 等类目下降，整体分数提升不代表所有查询都变好；上线前必须按应用类目做回归。</li>
+      <li>落地顺序建议：先把记忆构建做成可 diff 的版本化文件 → 给失败 case 做「写/覆盖/检索/回答」四段归因 → 小预算（3–6 次）跑一次，前半只放行结构性改动 → 用共享 case 对比表选最终 harness。与 <a href="daily-2026-11-23-harness-cosight.html">Co-Sight 的版本化 control assets</a>相比，HoMe 多了执行轨迹级归因和预算分配；与 <a href="daily-2026-10-08-harness-refold.html">ReFold</a> 的上下文压缩相比，一个改系统、一个改喂给模型的上下文。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么「允许任意改 harness」反而需要一道 gate 把 prompt-only 候选挡在门外？</summary>
+      <p>因为 prompt/参数编辑便宜、见效快，无约束 optimizer 会一直产出局部修补；这些改动既可能掩盖共享机制缺陷，又会被后来的代码改动作废。论文观察到 MemPro 在允许改代码的前提下所有候选仍只改 prompt/参数，最终 LME 测试分从起点 0.888 掉到 0.812。HoMe 把前 B/2 预算专门留给运行时机制（记忆表示、构建、检索），后 B/2 再放开微调，实际上是在做「先找结构性收益，再做局部抛光」的搜索排程。</p>
+    </details>
+    <details>
+      <summary>2. session 级记忆版本化为什么能同时改善诊断和成本？</summary>
+      <p>诊断侧：每个 session 后的 commit 就是中间状态 m_{i,t}，相邻 diff 精确记录这一次 session 改了什么，agent 可以按需取一个状态或一次改动，不用把上百 K token 的历史读进上下文；也因此能顺着后续 diff 找出「哪一次修订覆盖/删除了答案」。成本侧：同一个记忆仓库可以作为复用缓存——若候选只改了检索/回答，就恢复到祖先的记忆状态，只重跑后两阶段。LME 上这一步省了 94% 的单次正式评估时间。</p>
+    </details>
+    <details>
+      <summary>3. 自适应采样让各轮分数不可比，最终怎么挑 harness？</summary>
+      <p>不能按各轮聚合分直接排序。Experiment Manager 提供跨评估对比表，Optimizer 看共享 case / 共享 query 上的表现、覆盖度与难度分布，优先选答案质量高且 token 更省的候选。论文还用六个 BEAM 候选验证：采样子集与全集的 query-token 降幅正相关 r=0.870，说明采样至少在 token 维度上能反映全集趋势。这是一个很重要的评估纪律：<a href="daily-2026-10-21-harness-reobserve.html">PersistGym-lite 的预注册探针</a>讨论的是「评估能否观测到成败」，这里讨论的是「采样评估能否支撑跨轮比较」。</p>
+    </details>
+    <details>
+      <summary>4. 为什么省下来的 query token 与分数提升可以同时发生？</summary>
+      <p>因为两者来自同一个机制：让 Answer Agent 看到更准、更紧凑的证据。按日期分组的 topic 列表减少重复检索，单文件槽位上限提高来源多样性，行级压缩 + 保留行号把长 chunk 缩短且保留按需读回的能力。LME 的调用数从 4.7 降到 3.0，BEAM 调用数增加但每次 token 更少。也就是说，token  savings 不是「少看所以少答对」，而是「少看无关内容所以答得更准」——前提是归因找到的确实是证据覆盖问题。</p>
+    </details>
+    <details>
+      <summary>5. MemPro 起点更强却输给 HoMe，说明了什么关于 harness 优化的普遍教训？</summary>
+      <p>说明「搜索空间自由」不等于「搜索有效」。没有跨案例机制诊断，优化容易变成对单个 case 的过拟合式补丁；没有预算排程，全部花在便宜的 prompt 微调上；没有可复用记忆与采样，评估成本会限制迭代次数。HoMe 的四件事——归因到组件、分支/合并的版本历史、前期结构探索、评估加速——其实都是通用 harness 工程问题，不只针对记忆系统。把它和 <a href="daily-2026-11-20-harness-meta2.html">Meta²</a> 的「学可复用演化知识」组合起来看：一个管「每轮怎么改」，一个管「跨任务带什么走」。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2611.34624" target="_blank" rel="noopener">arXiv:2611.34624 · HoMe: Toward Practical Harness Optimization of Memory Systems for AI Assistants（Xu / Yu / Liu / Wang / Huang / Shen / Lin / Huang / Mei，SJTU + Alibaba + PKU，v1 2026-11-25）</a></li>
+      <li><a href="https://github.com/agentscope-ai/ReMe" target="_blank" rel="noopener">GitHub: agentscope-ai/ReMe</a></li>
+      <li>背景系统：<a href="https://arxiv.org/abs/2410.10813" target="_blank" rel="noopener">LongMemEval（arXiv:2410.10813）</a> · <a href="https://arxiv.org/abs/2510.27246" target="_blank" rel="noopener">BEAM / Beyond a Million Tokens（arXiv:2510.27246）</a></li>
+      <li>站内：今日 <a href="daily-2026-11-27-frontline-splice-options.html">一线追踪：SPLICE</a> · <a href="daily-2026-11-27-algo-swin-transformer.html">算法：Swin Transformer</a> · <a href="daily-2026-11-20-harness-meta2.html">Meta²</a> · <a href="daily-2026-11-23-harness-cosight.html">Co-Sight Harness</a> · <a href="daily-2026-10-22-harness-cache-engineering.html">Cache Engineering</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>

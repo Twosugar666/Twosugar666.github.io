@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>学习笔记｜Swin Transformer：把全局注意力切成固定窗口，再用移位把窗口缝起来——复杂度从 (hw)² 降到 hw，87.3% top-1 / 58.7 box AP / 53.5 mIoU · Xuanbo Guo</title>
+  <link rel="stylesheet" href="../assets/style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="../index.html">Xuanbo&nbsp;Guo</a>
+      <div class="nav-links">
+        <a href="../index.html#blog">Blog</a>
+        <button id="theme-toggle" aria-label="切换主题">◐</button>
+      </div>
+    </div>
+  </nav>
+
+  <article class="post-body">
+    <a class="back-link" href="../index.html#blog">← 返回博客列表</a>
+    <h1>学习笔记｜Swin Transformer：把全局注意力切成固定窗口，再用移位把窗口缝起来——复杂度从 (hw)² 降到 hw，87.3% top-1 / 58.7 box AP / 53.5 mIoU</h1>
+    <p class="post-meta">2026-11-27 · 收藏夹：算法 · 学习笔记<br />
+      主来源：Ze Liu、Yutong Lin（共同一作，MSRA 实习生）、Yue Cao、Han Hu、Yixuan Wei、Zheng Zhang、Stephen Lin、Baining Guo（Microsoft Research Asia）· <em>Swin Transformer: Hierarchical Vision Transformer using Shifted Windows</em>（<a href="https://arxiv.org/abs/2103.14030" target="_blank" rel="noopener">arXiv:2103.14030</a>，v1 2021-03-25 / v2 2021-08-17，ICCV 2021；<a href="https://github.com/microsoft/Swin-Transformer" target="_blank" rel="noopener">代码</a>）。
+      所有论文数字按原文 Eqs. (1)–(4)、Tables 1–6 抄录；「box 小实验」为本文在 box 上写的最小复算，明确不是论文数据。
+      交叉：
+      <a href="daily-2026-09-09-algo-attention.html">注意力基础</a>、
+      <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a>、
+      <a href="daily-2026-10-13-algo-rope.html">RoPE</a>、
+      <a href="daily-2026-11-24-frontline-diss.html">DisSparse</a>。</p>
+
+    <h2>背景与动机</h2>
+    <p>
+      ViT 把图像切成固定大小的 patch，然后对所有 patch 做全局自注意力。语言里 token 数几千尚可，视觉里一张 224×224 图按 4×4 切就有 56×56=3,136 个 token，稠密任务分辨率更高；全局注意力的 FLOPs 对 token 数是二次的，直接不可扩展。另一个问题是「尺度」：视觉实体大小差异很大，ViT 只产出单一低分辨率特征图，接 FPN / U-Net 这类稠密预测结构很不方便。
+    </p>
+    <ul>
+      <li>卷积网络的层级特征图天然适配检测/分割；Swin 的目标就是在不放弃注意力的前提下，把这种层级结构拿回来。</li>
+      <li>思路一：只在固定大小的局部窗口内算注意力，窗口数随图像面积线性增长，窗口内 token 数固定 → 对图像尺寸线性复杂度。</li>
+      <li>思路二：相邻两层把窗口划分平移半个窗口，让第 l+1 层的窗口跨过第 l 层的边界，补偿被局部化切断的跨窗口连接。</li>
+      <li>补丁合并（patch merging）逐阶段把 2×2 相邻 patch 的特征拼接并线性投影成 2C 维，token 数每阶段除以 4，得到 H/4、H/8、H/16、H/32 四级特征图——和 ResNet 的空间分辨率对齐。</li>
+    </ul>
+
+    <h2>机制拆解</h2>
+    <h3>① 复杂度账：为什么窗口大小固定就能线性</h3>
+    <pre><code>设 h×w 个 patch，每个窗口 M×M，通道 C（论文忽略 SoftMax 的开销）
+Ω(MSA)    = 4hwC² + 2(hw)²C                 (式 1，对 hw 二次)
+Ω(W-MSA)  = 4hwC  + 2M²hwC                  (式 2，M 固定时对 hw 线性)
+默认 M = 7；每个 head 的 query 维 d = 32；MLP 扩展比 α = 4</code></pre>
+    <p>第一项是把输入投影到 Q/K/V 再把输出投回去的代价，第二项才是注意力打分与加权求和。窗口化之后第二项中的「序列长度」被钉死在 M²=49，所以整项变成线性。代价是窗口之间不通信——这正是下一层要补的。</p>
+
+    <h3>② 移位窗口：W-MSA 与 SW-MSA 交替</h3>
+    <pre><code>8×8 特征图、M=4：第 l 层从左上角规则切成 2×2 个窗口；
+第 l+1 层窗口起点平移 (⌊M/2⌋, ⌊M/2⌋)=(2,2)，新窗口跨过旧窗口边界。
+
+ẑ^l   = W-MSA(LN(z^{l−1})) + z^{l−1}
+z^l   = MLP(LN(ẑ^l)) + ẑ^l
+ẑ^{l+1} = SW-MSA(LN(z^l)) + z^l
+z^{l+1} = MLP(LN(ẑ^{l+1})) + ẑ^{l+1}                       (式 3)
+
+两个 block 必须成对出现：单独堆 W-MSA 等价于没有跨窗口连接。</code></pre>
+    <p>第 l 层窗口内的任意两个 token 直接互看；第 l+1 层通过移位，让原本属于不同窗口的 token 落进同一窗口，于是感受野逐层扩张而 FLOPs 不变。论文消融（Table 4）里，去掉 shift 会让 Swin-T 的 ImageNet top-1 从 81.3% 掉到 80.2%，COCO box AP 50.5→47.7，ADE20K mIoU 46.1→43.3。</p>
+
+    <h3>③ cyclic shift：把移位后多出来的窗口数压回去</h3>
+    <p>
+      朴素移位后，窗口数会从 <code>⌈h/M⌉×⌈w/M⌉</code> 变成 <code>(⌈h/M⌉+1)²</code>；2×2 的情形变成 3×3，多 2.25× 计算。直接 padding + mask 可行但浪费。论文的做法是把特征图<strong>朝左上角循环移位（cyclic shift）</strong>，移位后同一个 batch window 可能由特征图上不相邻的几块子窗口拼成，再用 attention mask 把跨子窗口的注意力屏蔽掉；算完再 reverse cyclic shift 复原。这样窗口数与规则划分完全相同。
+    </p>
+    <pre><code>regular windows     : ⌈h/M⌉ × ⌈w/M⌉
+naive shifted       : (⌈h/M⌉+1) × (⌈w/M⌉+1)
+cyclic-shift batched: 与 regular 相同 + attention mask 屏蔽非相邻子窗口</code></pre>
+
+    <h3>④ 相对位置偏置：小表参数化</h3>
+    <pre><code>Attention(Q,K,V) = SoftMax( Q Kᵀ / √d + B ) V               (式 4)
+B ∈ R^{M²×M²}，但每个轴上的相对位移只在 [−M+1, M−1]，
+所以真正要学的表 B̂ ∈ R^{(2M−1)×(2M−1)}，从 B̂ 里查值填进 B。
+M=7 时：B̂ 只有 13×13=169 项，而不是 49×49=2,401 项。
+ViT 式绝对位置嵌入再加上去反而略降：+0.4% top-1，但 COCO −0.2 box/mask AP、ADE20K −0.6 mIoU。</code></pre>
+    <p>预训练学到的 B̂ 还可用双三次插值迁移到不同窗口大小的微调任务。这个「相对位移空间比 token 对空间小得多」的技巧在 <a href="daily-2026-10-13-algo-rope.html">RoPE 的相对性推导</a>里也出现过——一个是把位置编码进 Q/K，一个是直接学一个偏置表。</p>
+
+    <h2>实验：从分类到密集预测</h2>
+    <p>四个变体：Swin-T / S / B / L，首阶段通道 C=96 / 96 / 128 / 192，层数分别 {2,2,6,2}、{2,2,18,2}、{2,2,18,2}、{2,2,18,2}；Swin-T/S 的计算量大致对应 ResNet-50 / ResNet-101。吞吐在 V100 上按统一仓库测。</p>
+    <table>
+      <thead><tr><th>Table 1（ImageNet-1K）</th><th>输入</th><th>#param</th><th>FLOPs</th><th>吞吐 img/s</th><th>top-1 %</th></tr></thead>
+      <tbody>
+        <tr><td>DeiT-S</td><td>224²</td><td>22M</td><td>4.6G</td><td>940.4</td><td>79.8</td></tr>
+        <tr><td><strong>Swin-T</strong></td><td>224²</td><td>29M</td><td>4.5G</td><td>755.2</td><td><strong>81.3</strong></td></tr>
+        <tr><td>DeiT-B</td><td>224²</td><td>86M</td><td>17.5G</td><td>292.3</td><td>81.8</td></tr>
+        <tr><td><strong>Swin-B</strong></td><td>224²</td><td>88M</td><td>15.4G</td><td>278.1</td><td><strong>83.3</strong></td></tr>
+        <tr><td>ViT-L/16（22K 预训练）</td><td>384²</td><td>307M</td><td>190.7G</td><td>27.3</td><td>85.2</td></tr>
+        <tr><td><strong>Swin-L</strong>（22K 预训练）</td><td>384²</td><td>197M</td><td>103.9G</td><td>42.1</td><td><strong>87.3</strong></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>同量级对比：Swin-T 比 DeiT-S 高 <strong>+1.5 pp</strong>（81.3 vs 79.8），Swin-B 比 DeiT-B 高 +1.5 / +1.4 pp（224² / 384²）；Swin-L 用 197M 参数 / 103.9G FLOPs 拿到 87.3%。</li>
+      <li>COCO test-dev（HTC++、多尺度测试）：Swin-L 达 <strong>58.7 box AP / 51.1 mask AP</strong>，比此前 SOTA 高 +2.7 box AP（Copy-paste，不用外部数据）/ +2.6 mask AP（DetectoRS）。不用多尺度测试时是 57.7 / 50.2。</li>
+      <li>ADE20K val：Swin-L（22K 预训练 + UperNet）<strong>53.5 mIoU</strong>，比此前最好的 SETR 50.3 高 +3.2，且 SETR 模型更大（308M）。</li>
+      <li>只换 backbone 的公平对照：Cascade Mask R-CNN 下 Swin-T 比 ResNet-50 在各框架上高 +3.4~4.2 box AP；比补齐层级特征的 DeiT-S 高 +2.5 box AP / +2.3 mask AP，同时 15.3 vs 10.4 FPS。Swin-S 在 ADE20K 上比 DeiT-S 高 5.3 mIoU（49.3 vs 44.0）。</li>
+    </ul>
+
+    <h3>速度：移位窗口不是「看着便宜、实际慢」</h3>
+    <table>
+      <thead><tr><th>Table 5（V100）</th><th>S1 MSA ms</th><th>S2 ms</th><th>S3 ms</th><th>S4 ms</th><th>Swin-T FPS</th><th>Swin-S FPS</th><th>Swin-B FPS</th></tr></thead>
+      <tbody>
+        <tr><td>sliding window（naive）</td><td>122.5</td><td>38.3</td><td>12.1</td><td>7.6</td><td>183</td><td>109</td><td>77</td></tr>
+        <tr><td>sliding window（kernel）</td><td>7.6</td><td>4.7</td><td>2.7</td><td>1.8</td><td>488</td><td>283</td><td>187</td></tr>
+        <tr><td>window（不移位）</td><td>2.8</td><td>1.7</td><td>1.2</td><td>0.9</td><td>770</td><td>444</td><td>280</td></tr>
+        <tr><td>shifted window（padding）</td><td>3.3</td><td>2.3</td><td>1.9</td><td>2.2</td><td>670</td><td>371</td><td>236</td></tr>
+        <tr><td><strong>shifted window（cyclic）</strong></td><td><strong>3.0</strong></td><td><strong>1.9</strong></td><td><strong>1.3</strong></td><td><strong>1.0</strong></td><td><strong>755</strong></td><td><strong>437</strong></td><td><strong>278</strong></td></tr>
+      </tbody>
+    </table>
+    <ul>
+      <li>cyclic 相对 padding：整体吞吐 +13% / +18% / +18%（T/S/B）；相对 naive sliding window 的整体架构快 4.1× / 4.0× / 3.6×，而 Table 6 显示精度相当。</li>
+      <li>单个 MSA 模块在四个 stage 上分别比 naive / kernel 滑窗快 40.8×/2.5×、20.2×/2.5×、9.3×/2.1×、7.6×/1.8×；越深的 stage 加速比越小，因为绝对耗时已经很低。</li>
+      <li>移位本身几乎免费：不移位 770 FPS vs cyclic 755 FPS，只差约 2%，却换来 +1.1 top-1 / +2.8 box AP / +2.8 mIoU。</li>
+    </ul>
+
+    <h2>box 小实验：复杂度、窗口数与偏置表</h2>
+    <pre><code># 纯 Python；按式 (1)(2) 与 cyclic shift 的窗口计数复算，数字不是论文数据
+h=w=56 patches C=96 M=7
+Omega(MSA)   = 2003828736 FLOPs-ish (2.004G)
+Omega(W-MSA) =   30707712 FLOPs-ish (0.031G)
+ratio MSA/W-MSA = 65.25x
+windows: regular=64, naive shifted=81 (1.2656x), cyclic-shift=64
+relative bias table (2M-1)^2=169 vs full M^2xM^2=2401 (14.21x smaller)</code></pre>
+    <p>
+      取 224² 输入、patch=4 → 56×56 patch、C=96、M=7：一个全局注意力层约 2.00G「FLOPs-ish」运算，窗口版约 0.031G，差 65×。这里没有乘 head 数、没算 SoftMax，论文同样省略了 SoftMax，所以只能当复杂度量级演示，不能当实测 FLOPs。窗口计数更直观：规则 8×8=64 个窗口，朴素移位变成 9×9=81（+26.6%），cyclic shift 把 batched window 数压回 64。偏置表的 169 vs 2,401 说明「相对位移的取值空间」比「token 对数」小两个量级。
+    </p>
+
+    <h2>局限与实践建议</h2>
+    <ul>
+      <li><strong>局部性假设</strong>：窗口内注意力天然不擅长需要远距离一一对应的任务；移位只能让感受野逐层扩张，不等于单层全局。需要长距离精确匹配时，仍要考虑全局/稀疏机制（如 <a href="daily-2026-11-24-frontline-diss.html">DisSparse</a> 的 top-p 稀疏路由）。</li>
+      <li><strong>窗口大小是主要旋钮</strong>：M 越大感受野越广但成本按 M² 增长；M=7 是分类/检测/分割的共同折中，换分辨率时不要 blindly 沿用。</li>
+      <li><strong>实现细节决定真实速度</strong>：论文反复强调 naive sliding window 在 PyTorch 上很慢，cyclic shift + mask 才能拿到吞吐；FLOPs 低不等于 GPU 上快，这和 <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention 的 IO 视角</a>是同一个教训。</li>
+      <li><strong>不是 LLM 上下文方案</strong>：Swin 的窗口划分针对 2D 特征图与层级下采样；把「固定窗口 + 移位」搬到 1D 长序列需要重新定义移位与跨窗口连接，不能照抄。</li>
+      <li>落地顺序建议：先按式 (1)(2) 估 FLOPs 与窗口数 → 确认下游是否需要多尺度特征图 → W-MSA / SW-MSA 成对搭 block → cyclic shift + mask 实测吞吐 → 最后再看相对位置偏置与绝对位置的消融。与 <a href="daily-2026-09-09-algo-attention.html">标准自注意力</a>和 <a href="daily-2026-11-20-algo-gated-deltanet.html">线性注意力</a>并排读，可以看清「降复杂度」的三条路：局部化、低秩/核化、稀疏化。</li>
+    </ul>
+
+    <h2>思考题</h2>
+    <details>
+      <summary>1. 为什么 SW-MSA 必须和 W-MSA 成对出现，而且移位量恰好是 ⌊M/2⌋？</summary>
+      <p>单层 W-MSA 的窗口互不重叠，跨窗口 token 之间没有直接注意力路径；连续两层的窗口起点错开半个窗口，才能让上一层的任意相邻窗口在新窗口里相交，从而用两层深度换到跨窗口连接。移半个窗口是最小且对称的选择：移 1 个窗口等于换了个划分起点，相邻关系完全不变；移 ⌊M/2⌋ 能让边界两侧的 token 在新的窗口内有最大重叠。式 (3) 把四个子层写成一个 block 对，就是这个原因。</p>
+    </details>
+    <details>
+      <summary>2. cyclic shift + mask 为什么能把窗口数压回去 yet 不引入错误连接？</summary>
+      <p>循环移位把图像当作环形平移，移位后每个 batch window 仍然按 M×M 切，数量与规则划分相同；但一个 batch window 里可能拼进了特征图上相隔很远的子窗口。attention mask 把不属于同一原始子窗口的 Q-K 对置为不可见，所以计算量按 batch window 数走，语义上仍只在同一子窗口内做注意力。算完之后 reverse cyclic shift 把特征图放回原位置。Table 5 显示 cyclic 比 padding 版整体快 13%–18%，而 Table 6 精度相当。</p>
+    </details>
+    <details>
+      <summary>3. 相对位置偏置为什么用 (2M−1)² 的表而不是 M²×M²？</summary>
+      <p>注意力分数需要的是每个 query-key 对在窗口内的相对位移，两个轴各自只有 −M+1…M−1 共 2M−1 个取值，因此所有可能的相对位移组合只有 (2M−1)² 个；而直接与 M²×M² 个位置对一一对应会重复存大量相同的位移。M=7 时是 169 vs 2,401。这个参数化还带来一个实用好处：换窗口大小时可以对 B̂ 做双三次插值迁移。论文消融里 rel. pos. 比 no pos. 高 1.2 pp top-1，比 abs. pos. 在密集任务上高约 1.3 box AP / 1.5 mIoU。</p>
+    </details>
+    <details>
+      <summary>4. 为什么说它是「层级」Transformer，而不只是「局部」Transformer？</summary>
+      <p>因为每个 stage 之间有 patch merging：2×2 相邻 patch 的特征被拼接成 4C 维，再线性投影到 2C，token 数除以 4、通道翻倍，输出分辨率依次是 H/4、H/8、H/16、H/32，和 VGG/ResNet 的特征图层级一致。这让它能直接替换检测/分割 backbone 并接 FPN / UperNet；ViT/DeiT 只产单一低分辨率特征图，需要额外反卷积才能做密集预测。局域窗口解决的是复杂度，层级下采样解决的是尺度与下游兼容性，两者缺一不可。</p>
+    </details>
+    <details>
+      <summary>5. FLOPs 低 65×，为什么整体只能快 4×？</summary>
+      <p>因为式 (1)(2) 只算了注意力的两次矩阵乘，没算投影、MLP、LayerNorm、数据搬运与 kernel 启动开销；而且 box 里的 65× 是「一层、C=96、56×56 patch」的单点对比，四个 stage 的 C 与序列长度都不同。论文 Table 5 给出的真实答案是：MSA 模块本身在 S1 上快 40.8×/2.5×，但整体架构相对 naive sliding window 只快 4.1×（Swin-T）。这也提醒我们评估注意力变体时既要看理论复杂度，也要看端到端吞吐，这正是 <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> 的切入点。</p>
+    </details>
+
+    <h2>参考链接</h2>
+    <ul>
+      <li><a href="https://arxiv.org/abs/2103.14030" target="_blank" rel="noopener">arXiv:2103.14030 · Swin Transformer: Hierarchical Vision Transformer using Shifted Windows（Liu / Lin / Cao / Hu / Wei / Zhang / Lin / Guo，MSRA，v1 2021-03-25，ICCV 2021）</a></li>
+      <li><a href="https://github.com/microsoft/Swin-Transformer" target="_blank" rel="noopener">GitHub: microsoft/Swin-Transformer</a></li>
+      <li>相关基础：<a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">ViT（arXiv:2010.11929）</a> · <a href="https://arxiv.org/abs/2103.14030" target="_blank" rel="noopener">Swin（本主来源）</a></li>
+      <li>站内：今日 <a href="daily-2026-11-27-frontline-splice-options.html">一线追踪：SPLICE</a> · <a href="daily-2026-11-27-harness-home-memory-harness.html">Harness：HoMe</a> · <a href="daily-2026-09-09-algo-attention.html">注意力基础</a> · <a href="daily-2026-10-08-algo-flashattention.html">FlashAttention</a> · <a href="daily-2026-11-24-frontline-diss.html">DisSparse</a></li>
+    </ul>
+  </article>
+
+  <footer>
+    <p>© 2026 Xuanbo Guo · Built with ♥ and hosted on GitHub Pages</p>
+  </footer>
+
+  <script src="../assets/main.js"></script>
+</body>
+</html>
